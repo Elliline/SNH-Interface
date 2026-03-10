@@ -42,8 +42,6 @@ const PORT = process.env.PORT || 3000;
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
-const TTS_HOST = process.env.TTS_HOST || 'http://localhost:5050';
-const STT_HOST = process.env.STT_HOST || 'http://localhost:5051';
 const SEARXNG_HOST = process.env.SEARXNG_HOST || 'http://192.168.4.97:8888';
 
 // Additional allowed Ollama hosts (comma-separated in .env)
@@ -1132,20 +1130,24 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text too long (max 10000 characters)' });
     }
 
-    // Resolve active TTS provider from config, fall back to env var
+    // Resolve active TTS provider from config
     // Cloud types always use hardcoded official API hosts (never user-supplied host)
     const CLOUD_TTS_HOSTS = { 'openai-tts': 'https://api.openai.com', 'elevenlabs': 'https://api.elevenlabs.io' };
     const ttsProvider = getVoiceProvider('tts');
     const ttsType = ttsProvider?.type || 'kokoro';
-    const ttsHost = CLOUD_TTS_HOSTS[ttsType] || ttsProvider?.host || TTS_HOST;
+    const ttsHost = CLOUD_TTS_HOSTS[ttsType] || ttsProvider?.host;
 
     let response;
     if (ttsType === 'piper') {
-      // Piper uses GET with query params
+      // Piper uses GET /api/tts with query params
       const params = new URLSearchParams({ text });
       response = await fetch(`${ttsHost}/api/tts?${params}`, { method: 'GET' });
+    } else if (ttsType === 'qwen3tts') {
+      // Qwen3 TTS uses GET /tts with query params
+      const params = new URLSearchParams({ text });
+      response = await fetch(`${ttsHost}/tts?${params}`, { method: 'GET' });
     } else {
-      // OpenAI-compatible: kokoro, chatterbox, orpheus, qwen3tts, openai-tts, elevenlabs
+      // OpenAI-compatible: kokoro, chatterbox, orpheus, openai-tts, elevenlabs
       const fetchOpts = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1196,7 +1198,7 @@ const CLOUD_STT_HOSTS = { 'deepgram': 'https://api.deepgram.com', 'openai-whispe
 
 function buildSTTRequest(sttProvider, boundary, contentType, body) {
   const sttType = sttProvider?.type || 'whisper';
-  const sttHost = CLOUD_STT_HOSTS[sttType] || sttProvider?.host || STT_HOST;
+  const sttHost = CLOUD_STT_HOSTS[sttType] || sttProvider?.host;
 
   if (sttType === 'openai-whisper') {
     // OpenAI Whisper API: POST /v1/audio/transcriptions, multipart with model field
@@ -2002,13 +2004,15 @@ app.listen(PORT, () => {
   console.log(`  - SquatchServe: ${SQUATCHSERVE_HOST}`);
   console.log(`  - Llama.cpp: ${LLAMACPP_HOST}`);
   console.log(`  - SearXNG: ${SEARXNG_HOST}`);
+  const startupConfig = getConfig();
+  const startupTts = getVoiceProvider('tts');
+  const startupStt = getVoiceProvider('stt');
   console.log('Voice services:');
-  console.log(`  - TTS (Kokoro): ${TTS_HOST}`);
-  console.log(`  - STT (Whisper): ${STT_HOST}`);
+  console.log(`  - TTS (${startupTts?.type || 'none'}): ${startupTts?.name || 'Not configured'} → ${startupTts?.host || 'N/A'}`);
+  console.log(`  - STT (${startupStt?.type || 'none'}): ${startupStt?.name || 'Not configured'} → ${startupStt?.host || 'N/A'}`);
   console.log('Conversation features:');
   console.log('  - Chat history: SQLite');
   console.log('  - Semantic memory: LanceDB (vector) + SQLite FTS5 (BM25)');
-  const startupConfig = getConfig();
   console.log(`  - Hybrid search: ${startupConfig.memory.hybridSearchWeights.vector} vector + ${startupConfig.memory.hybridSearchWeights.bm25} BM25`);
   console.log('  - Fact extraction: Auto-extract after each exchange');
   console.log('  - Memory flush: Auto-compact at 80% context usage');
