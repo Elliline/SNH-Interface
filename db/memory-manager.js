@@ -255,7 +255,9 @@ async function executeSplits(auditResults) {
 
         // Resolve members that actually exist in this cluster
         const membersToMove = [];
-        for (const factId of split.factIds) {
+        for (const rawFactId of split.factIds) {
+          // Strip "id:" prefix the LLM echoes back from the audit prompt
+          const factId = rawFactId.replace(/^id:/, '');
           const member = db.prepare('SELECT * FROM cluster_members WHERE id = ? AND cluster_id = ?')
             .get(factId, clusterId);
           if (member) {
