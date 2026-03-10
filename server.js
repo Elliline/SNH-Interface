@@ -26,7 +26,7 @@ const memoryManager = require('./db/memory-manager');
 const MCPClient = require('./mcp/mcp-client');
 
 // Configuration
-const { getConfig, updateConfig, getProviderInstance } = require('./db/config');
+const { getConfig, updateConfig, getProviderInstance, getVoiceProvider } = require('./db/config');
 
 // Routes
 const conversationsRouter = require('./routes/conversations');
@@ -1030,6 +1030,92 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
+// ============ Voice Provider API ============
+
+app.get('/api/voice/providers', (req, res) => {
+  const config = getConfig();
+  const voice = JSON.parse(JSON.stringify(config.voice || {}));
+  // Redact API keys — only expose whether one is set
+  for (const category of ['stt', 'tts']) {
+    if (voice[category]?.providers) {
+      for (const p of voice[category].providers) {
+        if (p.api_key) {
+          p.hasApiKey = true;
+          delete p.api_key;
+        }
+      }
+    }
+  }
+  res.json(voice);
+});
+
+const VALID_STT_TYPES = new Set(['whisper', 'faster-whisper', 'canary', 'parakeet', 'deepgram', 'openai-whisper']);
+const VALID_TTS_TYPES = new Set(['kokoro', 'piper', 'chatterbox', 'orpheus', 'qwen3tts', 'elevenlabs', 'openai-tts']);
+const CLOUD_VOICE_TYPES = new Set(['deepgram', 'openai-whisper', 'elevenlabs', 'openai-tts']);
+
+app.post('/api/voice/providers', (req, res) => {
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return res.status(400).json({ error: 'Request body must be a JSON object' });
+  }
+
+  const typeAllowlists = { stt: VALID_STT_TYPES, tts: VALID_TTS_TYPES };
+
+  // Only accept known categories
+  const sanitized = {};
+  for (const category of ['stt', 'tts']) {
+    if (!req.body[category]) continue;
+    const cat = req.body[category];
+
+    sanitized[category] = {};
+    if (cat.active && typeof cat.active === 'string') {
+      sanitized[category].active = cat.active;
+    }
+
+    if (cat.providers && !Array.isArray(cat.providers)) {
+      return res.status(400).json({ error: `voice.${category}.providers must be an array` });
+    }
+
+    if (Array.isArray(cat.providers)) {
+      sanitized[category].providers = [];
+      for (const p of cat.providers) {
+        if (!p.name || typeof p.name !== 'string') {
+          return res.status(400).json({ error: 'Each provider must have a name' });
+        }
+        if (!p.type || typeof p.type !== 'string' || !typeAllowlists[category].has(p.type)) {
+          return res.status(400).json({ error: `Invalid type "${p.type}" for ${category} provider` });
+        }
+
+        const cleaned = { name: p.name.trim(), type: p.type };
+
+        if (CLOUD_VOICE_TYPES.has(p.type)) {
+          // Cloud providers: accept api_key, strip any host
+          if (p.api_key && typeof p.api_key === 'string') {
+            cleaned.api_key = p.api_key;
+          } else {
+            // Preserve existing key if client didn't send one (redacted round-trip)
+            const config = getConfig();
+            const existing = config.voice?.[category]?.providers?.find(
+              ep => ep.name === cleaned.name && ep.type === cleaned.type
+            );
+            if (existing?.api_key) cleaned.api_key = existing.api_key;
+          }
+        } else {
+          // Local providers: require valid host
+          if (!p.host || !isValidOllamaHost(p.host)) {
+            return res.status(400).json({ error: `Invalid host for provider "${p.name}": must be localhost or private network` });
+          }
+          cleaned.host = p.host;
+        }
+
+        sanitized[category].providers.push(cleaned);
+      }
+    }
+  }
+
+  const updated = updateConfig({ voice: sanitized });
+  res.json(updated.voice || {});
+});
+
 // ============ Voice Assistant Proxy ============
 
 // Text-to-Speech proxy (Kokoro TTS)
@@ -1046,15 +1132,35 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text too long (max 10000 characters)' });
     }
 
-    const response = await fetch(`${TTS_HOST}/tts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text,
-        voice: voice || 'af_heart',
-        speed: speed || 1.0
-      })
-    });
+    // Resolve active TTS provider from config, fall back to env var
+    // Cloud types always use hardcoded official API hosts (never user-supplied host)
+    const CLOUD_TTS_HOSTS = { 'openai-tts': 'https://api.openai.com', 'elevenlabs': 'https://api.elevenlabs.io' };
+    const ttsProvider = getVoiceProvider('tts');
+    const ttsType = ttsProvider?.type || 'kokoro';
+    const ttsHost = CLOUD_TTS_HOSTS[ttsType] || ttsProvider?.host || TTS_HOST;
+
+    let response;
+    if (ttsType === 'piper') {
+      // Piper uses GET with query params
+      const params = new URLSearchParams({ text });
+      response = await fetch(`${ttsHost}/api/tts?${params}`, { method: 'GET' });
+    } else {
+      // OpenAI-compatible: kokoro, chatterbox, orpheus, qwen3tts, openai-tts, elevenlabs
+      const fetchOpts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: text,
+          voice: voice || 'af_heart',
+          speed: speed || 1.0
+        })
+      };
+      // Cloud providers need API key in Authorization header
+      if (ttsProvider?.api_key) {
+        fetchOpts.headers['Authorization'] = `Bearer ${ttsProvider.api_key}`;
+      }
+      response = await fetch(`${ttsHost}/v1/audio/speech`, fetchOpts);
+    }
 
     if (!response.ok) {
       const error = await response.text();
@@ -1084,33 +1190,70 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
-// Speech-to-Text proxy (Whisper STT)
+// STT helper: resolve host/endpoint/headers by provider type
+// Cloud types always use hardcoded official API hosts (never user-supplied host)
+const CLOUD_STT_HOSTS = { 'deepgram': 'https://api.deepgram.com', 'openai-whisper': 'https://api.openai.com' };
+
+function buildSTTRequest(sttProvider, boundary, contentType, body) {
+  const sttType = sttProvider?.type || 'whisper';
+  const sttHost = CLOUD_STT_HOSTS[sttType] || sttProvider?.host || STT_HOST;
+
+  if (sttType === 'openai-whisper') {
+    // OpenAI Whisper API: POST /v1/audio/transcriptions, multipart with model field
+    return fetch(`${sttHost}/v1/audio/transcriptions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        ...(sttProvider?.api_key ? { 'Authorization': `Bearer ${sttProvider.api_key}` } : {})
+      },
+      body
+    });
+  } else if (sttType === 'deepgram') {
+    // Deepgram: POST /v1/listen, raw audio body
+    return fetch(`${sttHost}/v1/listen`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType,
+        ...(sttProvider?.api_key ? { 'Authorization': `Token ${sttProvider.api_key}` } : {})
+      },
+      body
+    });
+  } else {
+    // Whisper-compatible: whisper, faster-whisper, canary, parakeet — POST /transcribe, multipart
+    return fetch(`${sttHost}/transcribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body
+    });
+  }
+}
+
+// Speech-to-Text proxy
 app.post('/api/stt', express.raw({ type: ['audio/*', 'application/octet-stream'], limit: '10mb' }), async (req, res) => {
   try {
     if (!req.body || req.body.length === 0) {
       return res.status(400).json({ error: 'No audio data provided' });
     }
 
-    // Create multipart form data for Whisper STT
-    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+    const sttProvider = getVoiceProvider('stt');
     const contentType = req.headers['content-type'] || 'audio/webm';
     const extension = contentType.includes('wav') ? 'wav' : 'webm';
 
+    // Build multipart form data
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
     const header = Buffer.from(
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="audio"; filename="recording.${extension}"\r\n` +
       `Content-Type: ${contentType}\r\n\r\n`
     );
     const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-    const body = Buffer.concat([header, req.body, footer]);
+    const multipartBody = Buffer.concat([header, req.body, footer]);
 
-    const response = await fetch(`${STT_HOST}/transcribe`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`
-      },
-      body: body
-    });
+    // Deepgram uses raw audio, others use multipart
+    const sttType = sttProvider?.type || 'whisper';
+    const body = sttType === 'deepgram' ? req.body : multipartBody;
+
+    const response = await buildSTTRequest(sttProvider, boundary, contentType, body);
 
     if (!response.ok) {
       const error = await response.text();
@@ -1135,13 +1278,24 @@ app.post('/api/stt/upload', express.raw({ type: 'audio/*', limit: '10mb' }), asy
       return res.status(400).json({ error: 'No audio data provided' });
     }
 
-    const response = await fetch(`${STT_HOST}/transcribe`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': req.headers['content-type'] || 'audio/webm'
-      },
-      body: req.body
-    });
+    const sttProvider = getVoiceProvider('stt');
+    const contentType = req.headers['content-type'] || 'audio/webm';
+
+    // Build multipart form data
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+    const extension = contentType.includes('wav') ? 'wav' : 'webm';
+    const header = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="audio"; filename="recording.${extension}"\r\n` +
+      `Content-Type: ${contentType}\r\n\r\n`
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const multipartBody = Buffer.concat([header, req.body, footer]);
+
+    const sttType = sttProvider?.type || 'whisper';
+    const body = sttType === 'deepgram' ? req.body : multipartBody;
+
+    const response = await buildSTTRequest(sttProvider, boundary, contentType, body);
 
     if (!response.ok) {
       const error = await response.text();

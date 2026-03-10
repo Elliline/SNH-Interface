@@ -1590,27 +1590,250 @@ async function loadBrainRoleModels(instanceValue, modelSelect, preselectModel) {
   }
 }
 
-function loadSettingsVoiceTab() {
+async function loadSettingsVoiceTab() {
   const container = document.getElementById('settingsTabVoice');
   if (!container) return;
+  container.innerHTML = '<div class="config-loading">Loading voice providers...</div>';
 
-  const ttsHost = localStorage.getItem('ttsHost') || '';
-  const sttHost = localStorage.getItem('sttHost') || '';
+  const STT_TYPES = ['whisper', 'faster-whisper', 'canary', 'parakeet', 'deepgram', 'openai-whisper'];
+  const TTS_TYPES = ['kokoro', 'piper', 'chatterbox', 'orpheus', 'qwen3tts', 'elevenlabs', 'openai-tts'];
+  const CLOUD_TYPES = new Set(['deepgram', 'openai-whisper', 'elevenlabs', 'openai-tts']);
 
-  container.innerHTML = `
-    <div class="settings-section">
-      <h3>Voice Hosts</h3>
-      <p class="settings-hint">Override default TTS and STT service endpoints</p>
-      <div class="setting-item">
-        <label for="settings-ttsHost">TTS Host</label>
-        <input type="text" id="settings-ttsHost" class="api-key-input" placeholder="http://localhost:5500" value="${escapeHtml(ttsHost)}">
-      </div>
-      <div class="setting-item">
-        <label for="settings-sttHost">STT Host</label>
-        <input type="text" id="settings-sttHost" class="api-key-input" placeholder="http://localhost:5600" value="${escapeHtml(sttHost)}">
-      </div>
-    </div>
-  `;
+  let voiceConfig = { stt: { active: '', providers: [] }, tts: { active: '', providers: [] } };
+  try {
+    const res = await fetch('/api/voice/providers');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.stt) voiceConfig.stt = data.stt;
+      if (data.tts) voiceConfig.tts = data.tts;
+    }
+  } catch (e) {
+    console.error('[Settings] Failed to load voice config:', e);
+  }
+
+  container.innerHTML = '';
+
+  function buildProviderSection(category, label, types) {
+    const catConfig = voiceConfig[category] || { active: '', providers: [] };
+    const providers = Array.isArray(catConfig.providers) ? catConfig.providers : [];
+
+    const section = document.createElement('div');
+    section.className = 'settings-section';
+
+    const h3 = document.createElement('h3');
+    h3.textContent = `${label} Providers`;
+    section.appendChild(h3);
+
+    // Provider list
+    const listDiv = document.createElement('div');
+    listDiv.className = 'instance-list';
+    listDiv.id = `voice-list-${category}`;
+
+    for (const p of providers) {
+      const item = document.createElement('div');
+      item.className = 'instance-item';
+
+      const info = document.createElement('div');
+      info.className = 'instance-info';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'instance-name';
+      nameSpan.textContent = p.name;
+      info.appendChild(nameSpan);
+
+      const typeSpan = document.createElement('span');
+      typeSpan.className = 'instance-model';
+      typeSpan.textContent = p.type;
+      info.appendChild(typeSpan);
+
+      const hostSpan = document.createElement('span');
+      hostSpan.className = 'instance-host';
+      hostSpan.textContent = CLOUD_TYPES.has(p.type) ? 'cloud' : (p.host || '');
+      info.appendChild(hostSpan);
+
+      item.appendChild(info);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'instance-delete-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.addEventListener('click', () => handleDeleteVoiceProvider(category, p.name));
+      item.appendChild(deleteBtn);
+
+      listDiv.appendChild(item);
+    }
+
+    if (providers.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'instance-empty';
+      empty.textContent = 'No providers configured';
+      listDiv.appendChild(empty);
+    }
+
+    section.appendChild(listDiv);
+
+    // Add form
+    const addForm = document.createElement('div');
+    addForm.className = 'instance-add-form';
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Name';
+    nameInput.className = 'instance-input';
+    addForm.appendChild(nameInput);
+
+    const typeSelect = document.createElement('select');
+    typeSelect.className = 'instance-input';
+    typeSelect.style.minWidth = '120px';
+    for (const t of types) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      typeSelect.appendChild(opt);
+    }
+    addForm.appendChild(typeSelect);
+
+    const hostInput = document.createElement('input');
+    hostInput.type = 'text';
+    hostInput.placeholder = 'Host URL';
+    hostInput.className = 'instance-input';
+    addForm.appendChild(hostInput);
+
+    const apiKeyInput = document.createElement('input');
+    apiKeyInput.type = 'password';
+    apiKeyInput.placeholder = 'API Key';
+    apiKeyInput.className = 'instance-input';
+    apiKeyInput.style.display = 'none';
+    addForm.appendChild(apiKeyInput);
+
+    // Toggle host/apikey based on type
+    function updateFieldVisibility() {
+      const isCloud = CLOUD_TYPES.has(typeSelect.value);
+      hostInput.style.display = isCloud ? 'none' : '';
+      apiKeyInput.style.display = isCloud ? '' : 'none';
+    }
+    typeSelect.addEventListener('change', updateFieldVisibility);
+    updateFieldVisibility();
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'instance-add-btn';
+    addBtn.textContent = 'Add';
+    addBtn.addEventListener('click', () => {
+      const name = nameInput.value.trim();
+      const type = typeSelect.value;
+      const isCloud = CLOUD_TYPES.has(type);
+      const host = hostInput.value.trim();
+      const apiKey = apiKeyInput.value.trim();
+
+      if (!name) { alert('Name is required.'); return; }
+      if (!isCloud && !host) { alert('Host URL is required.'); return; }
+      if (isCloud && !apiKey) { alert('API Key is required for cloud providers.'); return; }
+
+      if (providers.some(p => p.name === name)) {
+        alert(`A provider named "${name}" already exists.`);
+        return;
+      }
+
+      const newProvider = { name, type };
+      if (isCloud) {
+        newProvider.api_key = apiKey;
+      } else {
+        newProvider.host = host;
+      }
+
+      providers.push(newProvider);
+      saveVoiceConfig(voiceConfig);
+    });
+    addForm.appendChild(addBtn);
+
+    section.appendChild(addForm);
+
+    // Active provider selector
+    const activeItem = document.createElement('div');
+    activeItem.className = 'config-item';
+    activeItem.style.marginTop = '12px';
+
+    const activeLabel = document.createElement('label');
+    activeLabel.textContent = 'Active';
+    activeItem.appendChild(activeLabel);
+
+    const activeSelect = document.createElement('select');
+    activeSelect.className = 'instance-input';
+    activeSelect.style.maxWidth = '220px';
+    activeSelect.dataset.voiceCategory = category;
+    activeSelect.dataset.voiceField = 'active';
+
+    for (const p of providers) {
+      const opt = document.createElement('option');
+      opt.value = `${p.type}:${p.name}`;
+      const typeLabel = p.type.charAt(0).toUpperCase() + p.type.slice(1);
+      opt.textContent = `${typeLabel} — ${p.name}`;
+      if (`${p.type}:${p.name}` === catConfig.active) opt.selected = true;
+      activeSelect.appendChild(opt);
+    }
+
+    if (providers.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No providers available';
+      activeSelect.appendChild(opt);
+    }
+
+    activeItem.appendChild(activeSelect);
+    section.appendChild(activeItem);
+
+    return section;
+  }
+
+  container.appendChild(buildProviderSection('stt', 'STT', STT_TYPES));
+  container.appendChild(buildProviderSection('tts', 'TTS', TTS_TYPES));
+}
+
+async function saveVoiceConfig(voiceConfig) {
+  try {
+    const res = await fetch('/api/voice/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(voiceConfig)
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert('Failed to save: ' + (err.error || 'Unknown error'));
+      return;
+    }
+    // Reload the tab
+    settingsTabsLoaded.delete('voice');
+    loadSettingsVoiceTab();
+  } catch (e) {
+    alert('Failed to save: ' + e.message);
+  }
+}
+
+async function handleDeleteVoiceProvider(category, name) {
+  if (!confirm(`Delete voice provider "${name}"?`)) return;
+
+  try {
+    const res = await fetch('/api/voice/providers');
+    if (!res.ok) throw new Error('Failed to load');
+    const voiceConfig = await res.json();
+
+    const cat = voiceConfig[category];
+    if (!cat || !Array.isArray(cat.providers)) return;
+
+    cat.providers = cat.providers.filter(p => p.name !== name);
+
+    // If the deleted provider was active, clear or set to first remaining
+    const [activeType, ...activeNameParts] = (cat.active || '').split(':');
+    const activeName = activeNameParts.join(':');
+    if (activeName === name) {
+      cat.active = cat.providers.length > 0
+        ? `${cat.providers[0].type}:${cat.providers[0].name}`
+        : '';
+    }
+
+    await saveVoiceConfig(voiceConfig);
+  } catch (e) {
+    alert('Failed to delete: ' + e.message);
+  }
 }
 
 async function loadSettingsToolsTab() {
@@ -1685,9 +1908,7 @@ async function saveSettingsHandler() {
     'settings-openaiApiKey': 'openaiApiKey',
     'settings-grokApiKey': 'grokApiKey',
     'settings-squatchserveHost': 'squatchserveHost',
-    'settings-searxngHost': 'searxngHost',
-    'settings-ttsHost': 'ttsHost',
-    'settings-sttHost': 'sttHost'
+    'settings-searxngHost': 'searxngHost'
   };
 
   for (const [elId, storageKey] of Object.entries(localStorageMap)) {
@@ -1739,6 +1960,14 @@ async function saveSettingsHandler() {
     if (!partial.models) partial.models = {};
     if (!partial.models[role]) partial.models[role] = {};
     partial.models[role].model = input.value;
+  });
+
+  // Voice active selections
+  document.querySelectorAll('#settingsTabVoice [data-voice-category][data-voice-field="active"]').forEach(select => {
+    const category = select.dataset.voiceCategory;
+    if (!partial.voice) partial.voice = {};
+    if (!partial.voice[category]) partial.voice[category] = {};
+    partial.voice[category].active = select.value;
   });
 
   // Save to config.json if there is anything to save

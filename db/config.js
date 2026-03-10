@@ -35,6 +35,20 @@ const DEFAULTS = {
   },
   tools: {
     searxng: { enabled: false }
+  },
+  voice: {
+    stt: {
+      active: 'whisper:Local',
+      providers: [
+        { name: 'Local', type: 'whisper', host: 'http://localhost:5051' }
+      ]
+    },
+    tts: {
+      active: 'kokoro:Local',
+      providers: [
+        { name: 'Local', type: 'kokoro', host: 'http://localhost:5050' }
+      ]
+    }
   }
 };
 
@@ -71,27 +85,27 @@ function deepMerge(target, source) {
  * Called before deepMerge so the file data is in the right shape.
  */
 function migrateConfig(fileConfig) {
-  if (!fileConfig.providers) return fileConfig;
-
   const p = fileConfig.providers;
 
-  // Migrate ollama: { host: '...' } → ollama: [{ name: 'Local', host: '...' }]
-  if (p.ollama && !Array.isArray(p.ollama) && p.ollama.host) {
-    p.ollama = [{ name: 'Local', host: p.ollama.host }];
-  }
+  if (p) {
+    // Migrate ollama: { host: '...' } → ollama: [{ name: 'Local', host: '...' }]
+    if (p.ollama && !Array.isArray(p.ollama) && p.ollama.host) {
+      p.ollama = [{ name: 'Local', host: p.ollama.host }];
+    }
 
-  // Migrate llamacpp: { host: '...' } → llamacpp: [{ name: 'Local', host: '...', model: '...' }]
-  if (p.llamacpp && !Array.isArray(p.llamacpp) && p.llamacpp.host) {
-    const chatModel = fileConfig.models?.chat?.model || 'scout';
-    p.llamacpp = [{ name: 'Local', host: p.llamacpp.host, model: chatModel }];
-  }
+    // Migrate llamacpp: { host: '...' } → llamacpp: [{ name: 'Local', host: '...', model: '...' }]
+    if (p.llamacpp && !Array.isArray(p.llamacpp) && p.llamacpp.host) {
+      const chatModel = fileConfig.models?.chat?.model || 'scout';
+      p.llamacpp = [{ name: 'Local', host: p.llamacpp.host, model: chatModel }];
+    }
 
-  // Migrate vllm: { host: '...' } → vllm: [{ name: 'Local', host: '...', model: '...' }]
-  if (p.vllm && !Array.isArray(p.vllm) && p.vllm.host) {
-    p.vllm = [{ name: 'Local', host: p.vllm.host, model: p.vllm.model || '' }];
+    // Migrate vllm: { host: '...' } → vllm: [{ name: 'Local', host: '...', model: '...' }]
+    if (p.vllm && !Array.isArray(p.vllm) && p.vllm.host) {
+      p.vllm = [{ name: 'Local', host: p.vllm.host, model: p.vllm.model || '' }];
+    }
+    // Ensure vllm array exists
+    if (!p.vllm) p.vllm = [];
   }
-  // Ensure vllm array exists
-  if (!p.vllm) p.vllm = [];
 
   // Migrate model role assignments to include instance: 'Local'
   if (fileConfig.models) {
@@ -99,6 +113,24 @@ function migrateConfig(fileConfig) {
       if (fileConfig.models[role] && !fileConfig.models[role].instance) {
         fileConfig.models[role].instance = 'Local';
       }
+    }
+  }
+
+  // Migrate old flat voice config to new provider-based format
+  if (fileConfig.voice) {
+    const v = fileConfig.voice;
+    // Old format: voice.tts.host / voice.stt.host as flat strings
+    if (v.tts && typeof v.tts.host === 'string' && !v.tts.providers) {
+      v.tts = {
+        active: 'kokoro:Local',
+        providers: [{ name: 'Local', type: 'kokoro', host: v.tts.host }]
+      };
+    }
+    if (v.stt && typeof v.stt.host === 'string' && !v.stt.providers) {
+      v.stt = {
+        active: 'whisper:Local',
+        providers: [{ name: 'Local', type: 'whisper', host: v.stt.host }]
+      };
     }
   }
 
@@ -207,4 +239,19 @@ function getProviderInstance(providerType, instanceName) {
   return instances.find(i => i.name === instanceName) || null;
 }
 
-module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance };
+/**
+ * Look up a voice provider by category and active string.
+ * @param {string} category - 'tts' or 'stt'
+ * @returns {{ name: string, type: string, host?: string, api_key?: string } | null}
+ */
+function getVoiceProvider(category) {
+  const config = getConfig();
+  const voiceCat = config.voice?.[category];
+  if (!voiceCat || !voiceCat.active || !Array.isArray(voiceCat.providers)) return null;
+
+  const [type, ...nameParts] = voiceCat.active.split(':');
+  const name = nameParts.join(':');
+  return voiceCat.providers.find(p => p.name === name && p.type === type) || null;
+}
+
+module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance, getVoiceProvider };
