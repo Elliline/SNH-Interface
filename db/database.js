@@ -8,7 +8,7 @@ const lancedb = require('vectordb');
 const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
-const { getConfig } = require('./config');
+const { getConfig, getProviderInstance } = require('./config');
 
 // Database paths
 const DATA_DIR = path.join(__dirname, '../data');
@@ -424,7 +424,8 @@ async function initVectorStore() {
 async function generateEmbedding(text) {
   try {
     const config = getConfig();
-    const embeddingHost = config.providers[config.models.embedding.provider].host;
+    const embInst = getProviderInstance(config.models.embedding.provider, config.models.embedding.instance);
+    const embeddingHost = embInst ? embInst.host : 'http://localhost:11434';
     const embeddingModel = config.models.embedding.model;
     const response = await fetch(`${embeddingHost}/api/embeddings`, {
       method: 'POST',

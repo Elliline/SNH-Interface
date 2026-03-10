@@ -11,21 +11,30 @@ const CONFIG_PATH = path.join(__dirname, '../data/config.json');
 
 const DEFAULTS = {
   providers: {
-    ollama: { host: 'http://localhost:11434' },
-    llamacpp: { host: 'http://localhost:8080' }
+    ollama: [
+      { name: 'Local', host: 'http://localhost:11434' }
+    ],
+    vllm: [],
+    llamacpp: [
+      { name: 'Local', host: 'http://localhost:8080', model: 'scout' }
+    ]
   },
   models: {
-    chat: { provider: 'llamacpp', model: 'scout' },
-    extraction: { provider: 'ollama', model: 'gemma3:4b' },
-    heartbeat: { provider: 'ollama', model: 'qwen3:14b' },
-    embedding: { provider: 'ollama', model: 'nomic-embed-text' }
+    chat: { provider: 'llamacpp', instance: 'Local', model: 'scout' },
+    extraction: { provider: 'ollama', instance: 'Local', model: 'gemma3:4b' },
+    heartbeat: { provider: 'ollama', instance: 'Local', model: 'qwen3:14b' },
+    embedding: { provider: 'ollama', instance: 'Local', model: 'nomic-embed-text' }
   },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
   memory: {
     similarityThreshold: 0.55,
     clusterLinkThreshold: 0.50,
+    maxFactsPerCluster: 10,
     dailyLogRetentionDays: 7,
     hybridSearchWeights: { vector: 0.6, bm25: 0.4 }
+  },
+  tools: {
+    searxng: { enabled: false }
   }
 };
 
@@ -35,9 +44,12 @@ let currentConfig = null;
  * Recursively deep-merge source into target.
  * Objects merge, primitives and arrays replace.
  */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function deepMerge(target, source) {
   const result = { ...target };
   for (const key of Object.keys(source)) {
+    if (UNSAFE_KEYS.has(key)) continue;
     if (
       source[key] &&
       typeof source[key] === 'object' &&
@@ -52,6 +64,45 @@ function deepMerge(target, source) {
     }
   }
   return result;
+}
+
+/**
+ * Migrate old single-host config format to new array-based instance format.
+ * Called before deepMerge so the file data is in the right shape.
+ */
+function migrateConfig(fileConfig) {
+  if (!fileConfig.providers) return fileConfig;
+
+  const p = fileConfig.providers;
+
+  // Migrate ollama: { host: '...' } → ollama: [{ name: 'Local', host: '...' }]
+  if (p.ollama && !Array.isArray(p.ollama) && p.ollama.host) {
+    p.ollama = [{ name: 'Local', host: p.ollama.host }];
+  }
+
+  // Migrate llamacpp: { host: '...' } → llamacpp: [{ name: 'Local', host: '...', model: '...' }]
+  if (p.llamacpp && !Array.isArray(p.llamacpp) && p.llamacpp.host) {
+    const chatModel = fileConfig.models?.chat?.model || 'scout';
+    p.llamacpp = [{ name: 'Local', host: p.llamacpp.host, model: chatModel }];
+  }
+
+  // Migrate vllm: { host: '...' } → vllm: [{ name: 'Local', host: '...', model: '...' }]
+  if (p.vllm && !Array.isArray(p.vllm) && p.vllm.host) {
+    p.vllm = [{ name: 'Local', host: p.vllm.host, model: p.vllm.model || '' }];
+  }
+  // Ensure vllm array exists
+  if (!p.vllm) p.vllm = [];
+
+  // Migrate model role assignments to include instance: 'Local'
+  if (fileConfig.models) {
+    for (const role of ['chat', 'extraction', 'heartbeat', 'embedding']) {
+      if (fileConfig.models[role] && !fileConfig.models[role].instance) {
+        fileConfig.models[role].instance = 'Local';
+      }
+    }
+  }
+
+  return fileConfig;
 }
 
 /**
@@ -78,13 +129,15 @@ function loadConfig() {
     console.error('[Config] Error reading config file:', err.message);
   }
 
+  fileConfig = migrateConfig(fileConfig);
   currentConfig = deepMerge(DEFAULTS, fileConfig);
   return currentConfig;
 }
 
 /**
  * Get the current config with env var overrides applied.
- * Env vars OLLAMA_HOST and LLAMACPP_HOST win over file values.
+ * Env vars OLLAMA_HOST and LLAMACPP_HOST update the 'Local' instance host,
+ * or prepend a new 'Local' instance if none exists.
  */
 function getConfig() {
   if (!currentConfig) {
@@ -95,10 +148,23 @@ function getConfig() {
   const config = JSON.parse(JSON.stringify(currentConfig));
 
   if (process.env.OLLAMA_HOST) {
-    config.providers.ollama.host = process.env.OLLAMA_HOST;
+    if (!Array.isArray(config.providers.ollama)) config.providers.ollama = [];
+    const local = config.providers.ollama.find(i => i.name === 'Local');
+    if (local) {
+      local.host = process.env.OLLAMA_HOST;
+    } else {
+      config.providers.ollama.unshift({ name: 'Local', host: process.env.OLLAMA_HOST });
+    }
   }
+
   if (process.env.LLAMACPP_HOST) {
-    config.providers.llamacpp.host = process.env.LLAMACPP_HOST;
+    if (!Array.isArray(config.providers.llamacpp)) config.providers.llamacpp = [];
+    const local = config.providers.llamacpp.find(i => i.name === 'Local');
+    if (local) {
+      local.host = process.env.LLAMACPP_HOST;
+    } else {
+      config.providers.llamacpp.unshift({ name: 'Local', host: process.env.LLAMACPP_HOST, model: 'scout' });
+    }
   }
 
   return config;
@@ -130,4 +196,15 @@ function updateConfig(partial) {
   return getConfig();
 }
 
-module.exports = { getConfig, updateConfig, loadConfig };
+/**
+ * Look up a provider instance by type and name.
+ * Returns { name, host, model? } or null.
+ */
+function getProviderInstance(providerType, instanceName) {
+  const config = getConfig();
+  const instances = config.providers[providerType];
+  if (!Array.isArray(instances)) return null;
+  return instances.find(i => i.name === instanceName) || null;
+}
+
+module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance };

@@ -4,14 +4,22 @@
  */
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 
+// Strict rate limiter for expensive LLM-driven operations
+const heavyLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 1,
+  message: { error: 'Too many requests — this operation can only run once per 10 minutes' }
+});
+
 const db = require('../db/database');
 const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
-const { getConfig } = require('../db/config');
+const { getConfig, getProviderInstance } = require('../db/config');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 
@@ -147,7 +155,8 @@ router.post('/add', async (req, res) => {
     const config = getConfig();
     const embeddingProvider = config.models.embedding.provider;
     const embeddingModel = config.models.embedding.model;
-    const embeddingHost = config.providers[embeddingProvider].host;
+    const embInst = getProviderInstance(embeddingProvider, config.models.embedding.instance);
+    const embeddingHost = embInst ? embInst.host : 'http://localhost:11434';
     const clusterResult = await memoryClusters.assignToCluster(
       cleanFact, embeddingProvider, embeddingModel, '', embeddingHost, 'manual'
     );
@@ -286,7 +295,7 @@ router.delete('/fact/:id', async (req, res) => {
  * POST /api/memory/maintain
  * Manually trigger a full maintenance cycle
  */
-router.post('/maintain', async (req, res) => {
+router.post('/maintain', heavyLimiter, async (req, res) => {
   try {
     const memoryManager = require('../db/memory-manager');
     const result = await memoryManager.runMaintenance();
@@ -294,6 +303,21 @@ router.post('/maintain', async (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error running maintenance:', error.message);
     res.status(500).json({ error: 'Failed to run maintenance' });
+  }
+});
+
+/**
+ * POST /api/memory/rebuild
+ * Trigger a full intelligent cluster rebuild
+ */
+router.post('/rebuild', heavyLimiter, async (req, res) => {
+  try {
+    const memoryManager = require('../db/memory-manager');
+    const result = await memoryManager.rebuildClusters();
+    res.json(result);
+  } catch (error) {
+    console.error('[MemoryAPI] Error rebuilding clusters:', error.message);
+    res.status(500).json({ error: 'Failed to rebuild clusters' });
   }
 });
 

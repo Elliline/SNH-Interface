@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { getConfig } = require('./config');
+const { getConfig, getProviderInstance } = require('./config');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -15,7 +15,8 @@ const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 async function generateFactEmbedding(text) {
   try {
     const config = getConfig();
-    const embeddingHost = config.providers[config.models.embedding.provider].host;
+    const embInst = getProviderInstance(config.models.embedding.provider, config.models.embedding.instance);
+    const embeddingHost = embInst ? embInst.host : 'http://localhost:11434';
     const embeddingModel = config.models.embedding.model;
     const response = await fetch(`${embeddingHost}/api/embeddings`, {
       method: 'POST',
@@ -133,9 +134,11 @@ Every extracted fact must be something the USER told you, not something you told
     try {
       const config = getConfig();
       switch (provider.toLowerCase()) {
-        case 'ollama':
-          response = await extractFromOllama(systemPrompt, exchange, model, ollamaHost || config.providers.ollama.host, controller.signal);
+        case 'ollama': {
+          const inst = getProviderInstance('ollama', config.models.extraction.instance);
+          response = await extractFromOllama(systemPrompt, exchange, model, (inst && inst.host) || ollamaHost || 'http://localhost:11434', controller.signal);
           break;
+        }
         case 'claude':
           response = await extractFromClaude(systemPrompt, exchange, model, apiKey, controller.signal);
           break;
@@ -145,12 +148,21 @@ Every extracted fact must be something the USER told you, not something you told
         case 'openai':
           response = await extractFromOpenAI(systemPrompt, exchange, model, apiKey, controller.signal);
           break;
-        case 'llamacpp':
-          response = await extractFromLlamacpp(systemPrompt, exchange, model, ollamaHost || config.providers.llamacpp.host, controller.signal);
+        case 'llamacpp': {
+          const inst = getProviderInstance('llamacpp', config.models.extraction.instance);
+          response = await extractFromLlamacpp(systemPrompt, exchange, model, (inst && inst.host) || ollamaHost || 'http://localhost:8080', controller.signal);
           break;
-        case 'squatchserve':
-          response = await extractFromSquatchServe(systemPrompt, exchange, model, ollamaHost || config.providers.llamacpp.host, controller.signal);
+        }
+        case 'squatchserve': {
+          const inst = getProviderInstance('squatchserve', config.models.extraction.instance);
+          response = await extractFromSquatchServe(systemPrompt, exchange, model, (inst && inst.host) || ollamaHost || 'http://localhost:8080', controller.signal);
           break;
+        }
+        case 'vllm': {
+          const inst = getProviderInstance('vllm', config.models.extraction.instance);
+          response = await extractFromLlamacpp(systemPrompt, exchange, model, (inst && inst.host) || ollamaHost || 'http://localhost:8000', controller.signal);
+          break;
+        }
         default:
           console.log(`[FactExtractor] Unsupported provider: ${provider}`);
           return [];
@@ -694,7 +706,8 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
     const config = getConfig();
     const extractionProvider = config.models.extraction.provider;
     const extractionModel = config.models.extraction.model;
-    const extractionHost = config.providers[extractionProvider]?.host || ollamaHost;
+    const extInst = getProviderInstance(extractionProvider, config.models.extraction.instance);
+    const extractionHost = extInst ? extInst.host : ollamaHost;
     console.log(`[FactExtractor] Using extraction model: ${extractionProvider}/${extractionModel}`);
 
     // Extract facts using the configured extraction model

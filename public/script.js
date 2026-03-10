@@ -14,12 +14,11 @@ const sendBtn = document.getElementById('sendBtn');
 const typingIndicator = document.getElementById('typingIndicator');
 const micBtn = document.getElementById('micBtn');
 const convoModeBtn = document.getElementById('convoModeBtn');
-const searchToggleBtn = document.getElementById('searchToggleBtn');
 const speakerToggle = document.getElementById('speakerToggle');
 const settingsBtn = document.getElementById('settingsBtn');
 const settingsModal = document.getElementById('settingsModal');
 const closeModal = document.getElementById('closeModal');
-const saveSettings = document.getElementById('saveSettings');
+const saveSettingsBtn = document.getElementById('saveSettings');
 
 // SquatchServe model status elements
 const modelStatusBar = document.getElementById('modelStatusBar');
@@ -43,7 +42,6 @@ let isRecording = false;
 let mediaRecorder = null;
 let audioChunks = [];
 let conversationMode = false;
-let toolsEnabled = false;
 let silenceTimer = null;
 let audioContext = null;
 let analyser = null;
@@ -124,34 +122,24 @@ async function loadModelsForProvider(providerId) {
 
     // Check if API key is required but missing
     if (provider.requiresKey && !provider.hasKey) {
-      const keyName = providerId === 'claude' ? 'Claude' : providerId === 'openai' ? 'OpenAI' : 'Grok';
+      const keyName = provider.type === 'claude' ? 'Claude' : provider.type === 'openai' ? 'OpenAI' : 'Grok';
       addMessage('system', `${keyName} requires an API key. Click the ⚙️ Settings button to add your API key.`);
       return;
     }
 
-    if (providerId === 'ollama') {
-      // Fetch Ollama models dynamically
-      const ollamaHost = localStorage.getItem('ollamaHost') || undefined;
-      const response = await fetch('/api/tags', {
+    let models = [];
+
+    // Instance-based providers (ollama, vllm, llamacpp) use the instance/models endpoint
+    if (provider.instanceName) {
+      const response = await fetch('/api/instance/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ollamaHost })
+        body: JSON.stringify({ providerType: provider.type, instanceName: provider.instanceName })
       });
-
-      if (!response.ok) {
-        throw new Error('Ollama not available');
-      }
-
+      if (!response.ok) throw new Error(`${provider.name} not available`);
       const data = await response.json();
-      const models = data.models || [];
-
-      models.forEach(model => {
-        const option = document.createElement('option');
-        option.value = model.name;
-        option.textContent = model.name;
-        modelSelect.appendChild(option);
-      });
-    } else if (providerId === 'openai') {
+      models = data.models || [];
+    } else if (provider.type === 'openai') {
       // Fetch OpenAI models dynamically
       const apiKey = localStorage.getItem('openaiApiKey');
       const response = await fetch('/api/openai/models', {
@@ -159,67 +147,30 @@ async function loadModelsForProvider(providerId) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey })
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to fetch OpenAI models');
-      }
-
+      if (!response.ok) throw new Error('Failed to fetch OpenAI models');
       const data = await response.json();
-      const models = data.models || [];
-
-      models.forEach(model => {
-        const option = document.createElement('option');
-        option.value = model.id;
-        option.textContent = model.name;
-        modelSelect.appendChild(option);
-      });
-    } else if (providerId === 'squatchserve') {
+      models = data.models || [];
+    } else if (provider.type === 'squatchserve') {
       // Fetch SquatchServe models dynamically
       const squatchserveHost = localStorage.getItem('squatchserveHost') || '';
       const url = squatchserveHost
         ? `/api/squatchserve/models?host=${encodeURIComponent(squatchserveHost)}`
         : '/api/squatchserve/models';
       const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error('SquatchServe not available');
-      }
-
+      if (!response.ok) throw new Error('SquatchServe not available');
       const data = await response.json();
-      const models = data.models || [];
-
-      models.forEach(model => {
-        const option = document.createElement('option');
-        option.value = model.id;
-        option.textContent = model.name;
-        modelSelect.appendChild(option);
-      });
-    } else if (providerId === 'llamacpp') {
-      // Fetch Llama.cpp models dynamically
-      const response = await fetch('/api/llamacpp/models');
-
-      if (!response.ok) {
-        throw new Error('Llama.cpp not available');
-      }
-
-      const data = await response.json();
-      const models = data.models || [];
-
-      models.forEach(model => {
-        const option = document.createElement('option');
-        option.value = model.id;
-        option.textContent = model.name;
-        modelSelect.appendChild(option);
-      });
+      models = data.models || [];
     } else {
-      // Use pre-defined models for Claude and Grok
-      provider.models.forEach(model => {
-        const option = document.createElement('option');
-        option.value = model.id;
-        option.textContent = model.name;
-        modelSelect.appendChild(option);
-      });
+      // Use pre-defined models (Claude, Grok)
+      models = provider.models || [];
     }
+
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.name;
+      modelSelect.appendChild(option);
+    });
 
     // Restore saved model
     const savedModel = localStorage.getItem('selectedModel');
@@ -229,11 +180,7 @@ async function loadModelsForProvider(providerId) {
     }
   } catch (error) {
     console.error('Error loading models:', error);
-    const errorHint = providerId === 'ollama' ? 'Make sure Ollama is running.' :
-                      providerId === 'squatchserve' ? 'Make sure SquatchServe is running (default: localhost:8111).' :
-                      providerId === 'llamacpp' ? 'Make sure llama.cpp server is running (default: localhost:8080).' :
-                      'Check your API key in settings.';
-    addMessage('error', `Failed to load models for ${providerId}. ${errorHint}`);
+    addMessage('error', `Failed to load models for ${providerId}. Check that the server is running.`);
   }
 }
 
@@ -274,17 +221,16 @@ function setupEventListeners() {
   messageInput.addEventListener('input', autoResizeInput);
   micBtn.addEventListener('mousedown', startRecording);
   convoModeBtn.addEventListener('click', toggleConversationMode);
-  searchToggleBtn.addEventListener('click', toggleTools);
   micBtn.addEventListener('mouseup', stopRecording);
   micBtn.addEventListener('mouseleave', stopRecording);
   speakerToggle.addEventListener('click', toggleTTS);
   settingsBtn.addEventListener('click', openSettings);
   closeModal.addEventListener('click', closeSettings);
-  saveSettings.addEventListener('click', saveSettingsHandler);
+  saveSettingsBtn.addEventListener('click', saveSettingsHandler);
 
-  // Toggle password visibility
-  document.querySelectorAll('.toggle-visibility-btn').forEach(btn => {
-    btn.addEventListener('click', togglePasswordVisibility);
+  // Settings nav tab switching
+  document.querySelectorAll('.settings-nav-item').forEach(tab => {
+    tab.addEventListener('click', () => switchSettingsTab(tab.dataset.settingsTab));
   });
 
   // SquatchServe unload button
@@ -334,6 +280,10 @@ async function sendMessage() {
     return;
   }
 
+  // Fix 6: Disable send button during streaming
+  sendBtn.disabled = true;
+  sendBtn.classList.add('btn-disabled');
+
   // Add user message to conversation
   addMessage('user', message);
   messageInput.value = '';
@@ -351,31 +301,36 @@ async function sendMessage() {
         content: msg.content
       }));
 
+    // Resolve provider type and instance name from current selection
+    const selectedProvider = providers.find(p => p.id === currentProvider);
+    const providerType = selectedProvider?.type || currentProvider;
+    const instanceName = selectedProvider?.instanceName || undefined;
+
     // Use memory-enhanced chat endpoint
     const ollamaHost = localStorage.getItem('ollamaHost') || undefined;
     const squatchserveHost = localStorage.getItem('squatchserveHost') || undefined;
     const llamacppHost = localStorage.getItem('llamacppHost') || undefined;
-    const apiKey = currentProvider === 'claude'
+    const apiKey = providerType === 'claude'
       ? localStorage.getItem('claudeApiKey')
-      : currentProvider === 'openai'
+      : providerType === 'openai'
         ? localStorage.getItem('openaiApiKey')
-        : currentProvider === 'grok'
+        : providerType === 'grok'
           ? localStorage.getItem('grokApiKey')
           : undefined;
 
     const requestBody = {
       model: currentModel,
       messages: conversationMessages,
-      provider: currentProvider,
+      provider: providerType,
+      instanceName,
       conversation_id: currentConversationId,
       ollamaHost,
       squatchserveHost,
       llamacppHost,
       apiKey,
-      toolsEnabled,
       searxngHost: localStorage.getItem('searxngHost') || undefined
     };
-    console.log('[sendMessage] Provider:', currentProvider, '| toolsEnabled:', toolsEnabled, '(type:', typeof toolsEnabled, ')');
+    console.log('[sendMessage] Provider:', providerType, 'Instance:', instanceName);
 
     response = await fetch('/api/chat/memory', {
       method: 'POST',
@@ -429,14 +384,15 @@ async function sendMessage() {
     messagesContainer.appendChild(streamingMessageElement);
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
-    // Process stream based on provider
-    if (currentProvider === 'ollama' || currentProvider === 'squatchserve') {
+    // Process stream based on provider type
+    const streamType = selectedProvider?.type || currentProvider;
+    if (streamType === 'ollama' || streamType === 'squatchserve') {
       // Ollama and SquatchServe use NDJSON streaming format
       fullResponse = await processOllamaStream(response);
-    } else if (currentProvider === 'claude') {
+    } else if (streamType === 'claude') {
       fullResponse = await processClaudeStream(response);
-    } else if (currentProvider === 'grok' || currentProvider === 'openai' || currentProvider === 'llamacpp') {
-      // Grok, OpenAI, and Llama.cpp use OpenAI-compatible SSE streaming format
+    } else if (streamType === 'grok' || streamType === 'openai' || streamType === 'llamacpp' || streamType === 'vllm') {
+      // Grok, OpenAI, Llama.cpp, and vLLM use OpenAI-compatible SSE streaming format
       fullResponse = await processGrokStream(response);
     }
 
@@ -474,6 +430,9 @@ async function sendMessage() {
     addMessage('error', `Failed to send message: ${error.message}`);
   } finally {
     hideTypingIndicator();
+    // Fix 6: Re-enable send button on all exit paths
+    sendBtn.disabled = false;
+    sendBtn.classList.remove('btn-disabled');
   }
 }
 
@@ -513,16 +472,12 @@ function showMemoryIndicator(response) {
   messagesContainer.appendChild(indicator);
 }
 
-// Show tools usage indicator
+// Show tools usage indicator (persistent — matches memory indicator behavior)
 function showToolsIndicator() {
   const indicator = document.createElement('div');
   indicator.className = 'search-results-indicator';
   indicator.textContent = 'Enhanced with tool results';
   messagesContainer.appendChild(indicator);
-
-  setTimeout(() => {
-    indicator.remove();
-  }, 5000);
 }
 
 // Process Ollama streaming response
@@ -893,12 +848,6 @@ function toggleTTS() {
   }
 }
 
-// Tools Toggle (enables AI tool use like web search)
-function toggleTools() {
-  toolsEnabled = !toolsEnabled;
-  searchToggleBtn.textContent = toolsEnabled ? '🔧' : '🔍';
-  searchToggleBtn.classList.toggle('enabled', toolsEnabled);
-}
 
 // Recording functions
 async function startRecording() {
@@ -1100,97 +1049,736 @@ function toggleConversationMode() {
 }
 
 // Settings Modal Functions
+
+// Track which tabs have been loaded this session to avoid re-rendering and losing edits
+const settingsTabsLoaded = new Set();
+
 function openSettings() {
+  // Clear loaded state so tabs re-fetch fresh data each time the modal opens
+  settingsTabsLoaded.clear();
   settingsModal.style.display = 'flex';
+  const activeTab = document.querySelector('.settings-nav-item.active');
+  const tabName = activeTab ? activeTab.dataset.settingsTab : 'chat';
+  switchSettingsTab(tabName);
 }
 
 function closeSettings() {
   settingsModal.style.display = 'none';
 }
 
+// loadSettings is called at init — just a no-op now since tabs load on demand
 function loadSettings() {
+  // Values are loaded per-tab when each tab is opened
+}
+
+// Fix 8: Escape key — close settings modal or memory panel (single listener)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (settingsModal.style.display !== 'none') {
+      closeSettings();
+    } else if (memoryPanel?.classList.contains('open')) {
+      closeMemoryPanel();
+    }
+  }
+});
+
+function switchSettingsTab(name) {
+  document.querySelectorAll('.settings-nav-item').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.settings-nav-item[data-settings-tab="${name}"]`)?.classList.add('active');
+  document.querySelectorAll('.settings-tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById(`settingsTab${name.charAt(0).toUpperCase() + name.slice(1)}`)?.classList.add('active');
+
+  // Only load tab content if not already loaded this modal session
+  if (!settingsTabsLoaded.has(name)) {
+    settingsTabsLoaded.add(name);
+    if (name === 'chat') loadSettingsChatTab();
+    else if (name === 'brain') loadSettingsBrainTab();
+    else if (name === 'voice') loadSettingsVoiceTab();
+    else if (name === 'tools') loadSettingsToolsTab();
+    else if (name === 'about') loadSettingsAboutTab();
+  }
+}
+
+let chatTabLoadGeneration = 0;
+let toolsTabLoadGeneration = 0;
+
+async function loadSettingsChatTab() {
+  const container = document.getElementById('settingsTabChat');
+  if (!container) return;
+
+  const generation = ++chatTabLoadGeneration;
+
   const claudeKey = localStorage.getItem('claudeApiKey') || '';
   const openaiKey = localStorage.getItem('openaiApiKey') || '';
   const grokKey = localStorage.getItem('grokApiKey') || '';
-  const ollamaHost = localStorage.getItem('ollamaHost') || '';
   const squatchserveHost = localStorage.getItem('squatchserveHost') || '';
-  const llamacppHost = localStorage.getItem('llamacppHost') || '';
+
+  // Load instances from config via providers endpoint
+  let instances = { ollama: [], vllm: [], llamacpp: [] };
+  try {
+    const res = await fetch('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hasClaudeKey: !!claudeKey,
+        hasGrokKey: !!localStorage.getItem('grokApiKey'),
+        hasOpenAIKey: !!localStorage.getItem('openaiApiKey')
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      instances = data.instances || instances;
+    }
+  } catch (e) {
+    console.error('[Settings] Failed to load instances:', e);
+  }
+
+  if (generation !== chatTabLoadGeneration) return;
+
+  container.innerHTML = '';
+
+  // Instance managers for each provider type
+  const providerTypes = [
+    { key: 'ollama', label: 'Ollama', hasModel: false },
+    { key: 'vllm', label: 'vLLM', hasModel: true },
+    { key: 'llamacpp', label: 'Llama.cpp', hasModel: true }
+  ];
+
+  for (const pt of providerTypes) {
+    const section = document.createElement('div');
+    section.className = 'settings-section';
+
+    const h3 = document.createElement('h3');
+    h3.textContent = `${pt.label} Instances`;
+    section.appendChild(h3);
+
+    const hint = document.createElement('p');
+    hint.className = 'settings-hint';
+    hint.textContent = pt.hasModel
+      ? `Named ${pt.label} server connections with model name`
+      : `Named ${pt.label} server connections (models fetched live)`;
+    section.appendChild(hint);
+
+    // Instance list
+    const listDiv = document.createElement('div');
+    listDiv.className = 'instance-list';
+    listDiv.id = `instance-list-${pt.key}`;
+
+    const currentInstances = instances[pt.key] || [];
+    for (const inst of currentInstances) {
+      listDiv.appendChild(createInstanceItem(pt.key, inst, pt.hasModel));
+    }
+
+    if (currentInstances.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'instance-empty';
+      empty.textContent = 'No instances configured';
+      listDiv.appendChild(empty);
+    }
+
+    section.appendChild(listDiv);
+
+    // Add form
+    const addForm = document.createElement('div');
+    addForm.className = 'instance-add-form';
+    addForm.innerHTML = `
+      <input type="text" placeholder="Name" class="instance-input instance-name-input" data-provider="${pt.key}">
+      <input type="text" placeholder="Host URL" class="instance-input instance-host-input" data-provider="${pt.key}">
+      ${pt.hasModel ? `<input type="text" placeholder="Model" class="instance-input instance-model-input" data-provider="${pt.key}">` : ''}
+      <button class="instance-add-btn" data-provider="${pt.key}" data-has-model="${pt.hasModel}">Add</button>
+    `;
+    section.appendChild(addForm);
+
+    // Wire up Add button
+    addForm.querySelector('.instance-add-btn').addEventListener('click', (e) => {
+      handleAddInstance(e, pt.key, pt.hasModel);
+    });
+
+    container.appendChild(section);
+  }
+
+  // SquatchServe host (single instance, not converted to instance manager)
+  const sqSection = document.createElement('div');
+  sqSection.className = 'settings-section';
+  sqSection.innerHTML = `
+    <h3>SquatchServe</h3>
+    <p class="settings-hint">Single SquatchServe server connection</p>
+    <div class="setting-item">
+      <label for="settings-squatchserveHost">Host</label>
+      <input type="text" id="settings-squatchserveHost" class="api-key-input" placeholder="http://localhost:8111" value="${escapeHtml(squatchserveHost)}">
+    </div>
+  `;
+  container.appendChild(sqSection);
+
+  // API Keys section
+  const keysSection = document.createElement('div');
+  keysSection.className = 'settings-section';
+  keysSection.innerHTML = `
+    <h3>API Keys</h3>
+    <p class="settings-hint">API keys are stored locally in your browser and never sent to our servers</p>
+    <div class="setting-item">
+      <label for="settings-claudeApiKey">Claude API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-claudeApiKey" class="api-key-input" placeholder="sk-ant-..." value="${escapeHtml(claudeKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-claudeApiKey">👁️</button>
+      </div>
+    </div>
+    <div class="setting-item">
+      <label for="settings-openaiApiKey">OpenAI API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-openaiApiKey" class="api-key-input" placeholder="sk-..." value="${escapeHtml(openaiKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-openaiApiKey">👁️</button>
+      </div>
+    </div>
+    <div class="setting-item">
+      <label for="settings-grokApiKey">Grok API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-grokApiKey" class="api-key-input" placeholder="xai-..." value="${escapeHtml(grokKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-grokApiKey">👁️</button>
+      </div>
+    </div>
+  `;
+  container.appendChild(keysSection);
+
+  // Wire up visibility toggles
+  container.querySelectorAll('.toggle-visibility-btn').forEach(btn => {
+    btn.addEventListener('click', togglePasswordVisibility);
+  });
+}
+
+function createInstanceItem(providerType, inst, hasModel) {
+  const item = document.createElement('div');
+  item.className = 'instance-item';
+
+  const info = document.createElement('div');
+  info.className = 'instance-info';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'instance-name';
+  nameSpan.textContent = inst.name;
+  info.appendChild(nameSpan);
+
+  const hostSpan = document.createElement('span');
+  hostSpan.className = 'instance-host';
+  hostSpan.textContent = inst.host;
+  info.appendChild(hostSpan);
+
+  if (hasModel && inst.model) {
+    const modelSpan = document.createElement('span');
+    modelSpan.className = 'instance-model';
+    modelSpan.textContent = inst.model;
+    info.appendChild(modelSpan);
+  }
+
+  item.appendChild(info);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'instance-delete-btn';
+  deleteBtn.textContent = 'Delete';
+  deleteBtn.addEventListener('click', () => {
+    handleDeleteInstance(providerType, inst.name);
+  });
+  item.appendChild(deleteBtn);
+
+  return item;
+}
+
+async function handleAddInstance(event, providerType, hasModel) {
+  const form = event.target.closest('.instance-add-form');
+  const nameInput = form.querySelector('.instance-name-input');
+  const hostInput = form.querySelector('.instance-host-input');
+  const modelInput = hasModel ? form.querySelector('.instance-model-input') : null;
+
+  const name = nameInput.value.trim();
+  const host = hostInput.value.trim();
+  const model = modelInput ? modelInput.value.trim() : undefined;
+
+  if (!name || !host) {
+    alert('Name and Host are required.');
+    return;
+  }
+  if (hasModel && !model) {
+    alert('Model is required for this provider type.');
+    return;
+  }
+
+  const newInst = { name, host };
+  if (hasModel) newInst.model = model;
+
+  try {
+    const configRes = await fetch('/api/config');
+    if (!configRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+
+    const currentInstances = Array.isArray(config.providers?.[providerType]) ? config.providers[providerType] : [];
+
+    if (currentInstances.some(i => i.name === name)) {
+      alert(`An instance named "${name}" already exists for this provider.`);
+      return;
+    }
+
+    currentInstances.push(newInst);
+    const partial = { providers: { [providerType]: currentInstances } };
+
+    const saveRes = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(partial)
+    });
+    if (!saveRes.ok) throw new Error('Failed to save');
+
+    // Clear inputs
+    nameInput.value = '';
+    hostInput.value = '';
+    if (modelInput) modelInput.value = '';
+
+    // Clear tab cache and reload
+    settingsTabsLoaded.delete('chat');
+    loadSettingsChatTab();
+    loadProviders();
+  } catch (error) {
+    console.error('[Settings] Error adding instance:', error);
+    alert('Failed to add instance: ' + error.message);
+  }
+}
+
+async function handleDeleteInstance(providerType, instanceName) {
+  if (!confirm(`Delete instance "${instanceName}"?`)) return;
+
+  try {
+    const configRes = await fetch('/api/config');
+    if (!configRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+
+    const currentInstances = Array.isArray(config.providers?.[providerType]) ? config.providers[providerType] : [];
+    const filtered = currentInstances.filter(i => i.name !== instanceName);
+
+    const partial = { providers: { [providerType]: filtered } };
+
+    const saveRes = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(partial)
+    });
+    if (!saveRes.ok) throw new Error('Failed to save');
+
+    // Clear tab cache and reload
+    settingsTabsLoaded.delete('chat');
+    loadSettingsChatTab();
+    loadProviders();
+  } catch (error) {
+    console.error('[Settings] Error deleting instance:', error);
+    alert('Failed to delete instance: ' + error.message);
+  }
+}
+
+async function loadSettingsBrainTab() {
+  const container = document.getElementById('settingsTabBrain');
+  if (!container) return;
+  container.innerHTML = '<div class="config-loading">Loading configuration...</div>';
+
+  try {
+    // Load config and provider instances in parallel
+    const [configRes, providersRes] = await Promise.all([
+      fetch('/api/config'),
+      fetch('/api/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hasClaudeKey: !!localStorage.getItem('claudeApiKey'),
+          hasGrokKey: !!localStorage.getItem('grokApiKey'),
+          hasOpenAIKey: !!localStorage.getItem('openaiApiKey')
+        })
+      })
+    ]);
+
+    if (!configRes.ok || !providersRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+    const providersData = await providersRes.json();
+
+    container.innerHTML = '';
+
+    // Memory Thresholds
+    container.appendChild(createConfigSection('Memory Thresholds', [
+      { key: 'memory.similarityThreshold', label: 'Similarity Threshold', type: 'number', value: config.memory?.similarityThreshold, step: '0.05' },
+      { key: 'memory.clusterLinkThreshold', label: 'Cluster Link Threshold', type: 'number', value: config.memory?.clusterLinkThreshold, step: '0.05' },
+      { key: 'memory.maxFactsPerCluster', label: 'Max Facts Per Cluster (triggers audit)', type: 'number', value: config.memory?.maxFactsPerCluster, step: '1' },
+      { key: 'memory.dailyLogRetentionDays', label: 'Daily Log Retention (days)', type: 'number', value: config.memory?.dailyLogRetentionDays, step: '1' },
+      { key: 'memory.hybridSearchWeights.vector', label: 'Vector Weight', type: 'number', value: config.memory?.hybridSearchWeights?.vector, step: '0.1' },
+      { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
+    ]));
+
+    // Build instance options for select dropdowns (only local instance-based providers)
+    const instanceOptions = [];
+    const instances = providersData.instances || {};
+    for (const providerType of ['ollama', 'vllm', 'llamacpp']) {
+      const typeLabel = providerType === 'ollama' ? 'Ollama' : providerType === 'vllm' ? 'vLLM' : 'Llama.cpp';
+      for (const inst of (instances[providerType] || [])) {
+        instanceOptions.push({
+          value: `${providerType}:${inst.name}`,
+          label: `${typeLabel} — ${inst.name}`
+        });
+      }
+    }
+
+    // Role assignment sections
+    const roles = [
+      { key: 'chat', label: 'Chat Default' },
+      { key: 'extraction', label: 'Fact Extraction' },
+      { key: 'heartbeat', label: 'Heartbeat' },
+      { key: 'embedding', label: 'Embedding' }
+    ];
+
+    for (const role of roles) {
+      const roleConfig = config.models?.[role.key] || {};
+      const currentValue = roleConfig.provider && roleConfig.instance
+        ? `${roleConfig.provider}:${roleConfig.instance}`
+        : roleConfig.provider ? `${roleConfig.provider}:Local` : '';
+
+      const section = document.createElement('div');
+      section.className = 'config-section';
+      const h3 = document.createElement('h3');
+      h3.textContent = role.label;
+      section.appendChild(h3);
+
+      // Instance selector
+      const instanceItem = document.createElement('div');
+      instanceItem.className = 'config-item';
+      const instanceLabel = document.createElement('label');
+      instanceLabel.textContent = 'Instance';
+      const instanceLabelId = `brain-${role.key}-instance`;
+      instanceLabel.setAttribute('for', instanceLabelId);
+      instanceItem.appendChild(instanceLabel);
+
+      const instanceSelect = document.createElement('select');
+      instanceSelect.id = instanceLabelId;
+      instanceSelect.dataset.brainRole = role.key;
+      instanceSelect.dataset.brainField = 'instance';
+
+      for (const opt of instanceOptions) {
+        const option = document.createElement('option');
+        option.value = opt.value;
+        option.textContent = opt.label;
+        if (opt.value === currentValue) option.selected = true;
+        instanceSelect.appendChild(option);
+      }
+      instanceItem.appendChild(instanceSelect);
+      section.appendChild(instanceItem);
+
+      // Model dropdown (populated dynamically from instance)
+      const modelItem = document.createElement('div');
+      modelItem.className = 'config-item';
+      const modelLabel = document.createElement('label');
+      modelLabel.textContent = 'Model';
+      const modelLabelId = `brain-${role.key}-model`;
+      modelLabel.setAttribute('for', modelLabelId);
+      modelItem.appendChild(modelLabel);
+
+      const modelSelect = document.createElement('select');
+      modelSelect.id = modelLabelId;
+      modelSelect.dataset.brainRole = role.key;
+      modelSelect.dataset.brainField = 'model';
+      modelItem.appendChild(modelSelect);
+      section.appendChild(modelItem);
+
+      // Load models for the current instance selection
+      const savedModel = roleConfig.model || '';
+      loadBrainRoleModels(instanceSelect.value, modelSelect, savedModel);
+
+      // Refresh models when instance changes
+      instanceSelect.addEventListener('change', () => {
+        loadBrainRoleModels(instanceSelect.value, modelSelect, '');
+      });
+
+      container.appendChild(section);
+    }
+
+    // Heartbeat scheduling (separate section)
+    container.appendChild(createConfigSection('Heartbeat Schedule', [
+      { key: 'heartbeat.enabled', label: 'Enabled', type: 'checkbox', value: config.heartbeat?.enabled },
+      { key: 'heartbeat.intervalHours', label: 'Interval (hours)', type: 'number', value: config.heartbeat?.intervalHours, step: '0.5' },
+      { key: 'heartbeat.warmupMinutes', label: 'Warmup (minutes)', type: 'number', value: config.heartbeat?.warmupMinutes, step: '1' }
+    ]));
+
+    const notice = document.createElement('div');
+    notice.className = 'config-notice';
+    notice.textContent = 'Heartbeat interval changes require a server restart.';
+    container.appendChild(notice);
+
+    // Rebuild Clusters button
+    const rebuildSection = document.createElement('div');
+    rebuildSection.className = 'config-section';
+    const rebuildH3 = document.createElement('h3');
+    rebuildH3.textContent = 'Cluster Maintenance';
+    rebuildSection.appendChild(rebuildH3);
+
+    const rebuildBtn = document.createElement('button');
+    rebuildBtn.className = 'config-btn';
+    rebuildBtn.textContent = 'Rebuild Clusters';
+    rebuildBtn.title = 'Run a full intelligent audit and reorganization of all memory clusters';
+    rebuildBtn.addEventListener('click', async () => {
+      if (!confirm('This will run a full LLM-driven audit of all clusters. This may take several minutes. Continue?')) return;
+      rebuildBtn.disabled = true;
+      rebuildBtn.textContent = 'Rebuilding...';
+      try {
+        const res = await fetch('/api/memory/rebuild', { method: 'POST' });
+        const result = await res.json();
+        if (result.skipped) {
+          alert('A heartbeat cycle is already running. Try again later.');
+        } else if (result.error) {
+          alert('Rebuild failed: ' + result.error);
+        } else {
+          alert(`Rebuild complete!\n\nClusters audited: ${result.report?.clustersAudited || 0}\nClusters split: ${result.report?.clustersSplit || 0}\nLinks updated: ${result.report?.linksUpdated || 0}\nDuration: ${result.report?.totalDuration || 'unknown'}`);
+        }
+      } catch (err) {
+        alert('Rebuild failed: ' + err.message);
+      } finally {
+        rebuildBtn.disabled = false;
+        rebuildBtn.textContent = 'Rebuild Clusters';
+      }
+    });
+    rebuildSection.appendChild(rebuildBtn);
+    container.appendChild(rebuildSection);
+  } catch (error) {
+    console.error('[Settings] Error loading brain config:', error);
+    container.innerHTML = '<div class="config-loading">Failed to load configuration.</div>';
+  }
+}
+
+async function loadBrainRoleModels(instanceValue, modelSelect, preselectModel) {
+  modelSelect.innerHTML = '<option value="">Loading...</option>';
+
+  if (!instanceValue || !instanceValue.includes(':')) {
+    modelSelect.innerHTML = '<option value="">Select an instance first</option>';
+    return;
+  }
+
+  const colonIdx = instanceValue.indexOf(':');
+  const providerType = instanceValue.substring(0, colonIdx);
+  const instanceName = instanceValue.substring(colonIdx + 1);
+
+  try {
+    const res = await fetch('/api/instance/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerType, instanceName })
+    });
+
+    if (!res.ok) throw new Error('Failed to fetch models');
+    const data = await res.json();
+    const models = data.models || [];
+
+    modelSelect.innerHTML = '';
+
+    if (models.length === 0) {
+      modelSelect.innerHTML = '<option value="">No models available</option>';
+      return;
+    }
+
+    for (const m of models) {
+      const option = document.createElement('option');
+      option.value = m.id;
+      option.textContent = m.name;
+      if (m.id === preselectModel) option.selected = true;
+      modelSelect.appendChild(option);
+    }
+
+    // If no preselect matched, just keep the first option selected
+  } catch (error) {
+    console.error('[Settings] Error loading models for brain role:', error);
+    modelSelect.innerHTML = '<option value="">Failed to load models</option>';
+  }
+}
+
+function loadSettingsVoiceTab() {
+  const container = document.getElementById('settingsTabVoice');
+  if (!container) return;
+
+  const ttsHost = localStorage.getItem('ttsHost') || '';
+  const sttHost = localStorage.getItem('sttHost') || '';
+
+  container.innerHTML = `
+    <div class="settings-section">
+      <h3>Voice Hosts</h3>
+      <p class="settings-hint">Override default TTS and STT service endpoints</p>
+      <div class="setting-item">
+        <label for="settings-ttsHost">TTS Host</label>
+        <input type="text" id="settings-ttsHost" class="api-key-input" placeholder="http://localhost:5500" value="${escapeHtml(ttsHost)}">
+      </div>
+      <div class="setting-item">
+        <label for="settings-sttHost">STT Host</label>
+        <input type="text" id="settings-sttHost" class="api-key-input" placeholder="http://localhost:5600" value="${escapeHtml(sttHost)}">
+      </div>
+    </div>
+  `;
+}
+
+async function loadSettingsToolsTab() {
+  const container = document.getElementById('settingsTabTools');
+  if (!container) return;
+
+  const generation = ++toolsTabLoadGeneration;
   const searxngHost = localStorage.getItem('searxngHost') || '';
 
-  document.getElementById('claudeApiKey').value = claudeKey;
-  document.getElementById('openaiApiKey').value = openaiKey;
-  document.getElementById('grokApiKey').value = grokKey;
-  document.getElementById('ollamaHost').value = ollamaHost;
-  document.getElementById('squatchserveHost').value = squatchserveHost;
-  document.getElementById('llamacppHost').value = llamacppHost;
-  document.getElementById('searxngHost').value = searxngHost;
+  // Fetch current tools config
+  let searxngEnabled = false;
+  try {
+    const resp = await fetch('/api/config');
+    if (generation !== toolsTabLoadGeneration) return;
+    if (resp.ok) {
+      const config = await resp.json();
+      searxngEnabled = !!(config.tools && config.tools.searxng && config.tools.searxng.enabled);
+    }
+  } catch (e) { /* use default */ }
+  if (generation !== toolsTabLoadGeneration) return;
+
+  container.innerHTML = `
+    <div class="settings-section">
+      <h3>Web Search</h3>
+      <p class="settings-hint">SearXNG is used for AI-powered web search</p>
+      <div class="setting-item toggle-row">
+        <label for="settings-searxngEnabled">Enabled</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="settings-searxngEnabled" data-config-key="tools.searxng.enabled" ${searxngEnabled ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-item">
+        <label for="settings-searxngHost">SearXNG Host</label>
+        <input type="text" id="settings-searxngHost" class="api-key-input" placeholder="http://192.168.4.97:8888" value="${escapeHtml(searxngHost)}">
+      </div>
+    </div>
+    <div class="settings-section">
+      <h3>MCP Connections</h3>
+      <p class="settings-hint">Model Context Protocol tool connections — coming soon</p>
+    </div>
+  `;
+}
+
+function loadSettingsAboutTab() {
+  const container = document.getElementById('settingsTabAbout');
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="settings-section">
+      <h3>Squatch Neuro Hub</h3>
+      <dl class="about-info">
+        <dt>Version</dt>
+        <dd>1.0.0</dd>
+        <dt>Author</dt>
+        <dd>MettaSphere LLC</dd>
+        <dt>Description</dt>
+        <dd>Neural-linked AI assistant with associative cluster memory and multi-provider support</dd>
+        <dt>License</dt>
+        <dd>MIT</dd>
+      </dl>
+    </div>
+  `;
 }
 
 async function saveSettingsHandler() {
-  const claudeKey = document.getElementById('claudeApiKey').value.trim();
-  const openaiKey = document.getElementById('openaiApiKey').value.trim();
-  const grokKey = document.getElementById('grokApiKey').value.trim();
-  const ollamaHost = document.getElementById('ollamaHost').value.trim();
-  const squatchserveHost = document.getElementById('squatchserveHost').value.trim();
-  const llamacppHost = document.getElementById('llamacppHost').value.trim();
-  const searxngHost = document.getElementById('searxngHost').value.trim();
+  const statusEl = document.getElementById('settingsStatus');
 
-  // Save to localStorage
-  if (claudeKey) {
-    localStorage.setItem('claudeApiKey', claudeKey);
-  } else {
-    localStorage.removeItem('claudeApiKey');
+  // Collect localStorage values (instance management is done via add/delete, not save)
+  const localStorageMap = {
+    'settings-claudeApiKey': 'claudeApiKey',
+    'settings-openaiApiKey': 'openaiApiKey',
+    'settings-grokApiKey': 'grokApiKey',
+    'settings-squatchserveHost': 'squatchserveHost',
+    'settings-searxngHost': 'searxngHost',
+    'settings-ttsHost': 'ttsHost',
+    'settings-sttHost': 'sttHost'
+  };
+
+  for (const [elId, storageKey] of Object.entries(localStorageMap)) {
+    const el = document.getElementById(elId);
+    if (el) {
+      const val = el.value.trim();
+      if (val) localStorage.setItem(storageKey, val);
+      else localStorage.removeItem(storageKey);
+    }
   }
 
-  if (openaiKey) {
-    localStorage.setItem('openaiApiKey', openaiKey);
-  } else {
-    localStorage.removeItem('openaiApiKey');
+  // Collect config.json values from all tabs into one partial object
+  const partial = {};
+
+  // Standard config-key inputs (Brain memory thresholds, heartbeat schedule)
+  document.querySelectorAll('#settingsTabBrain [data-config-key], #settingsTabChat [data-config-key], #settingsTabTools [data-config-key]').forEach(input => {
+    const keys = input.dataset.configKey.split('.');
+    let obj = partial;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (!obj[keys[i]]) obj[keys[i]] = {};
+      obj = obj[keys[i]];
+    }
+    const lastKey = keys[keys.length - 1];
+    if (input.type === 'checkbox') obj[lastKey] = input.checked;
+    else if (input.type === 'number') {
+      const num = parseFloat(input.value);
+      if (!isNaN(num)) obj[lastKey] = num;
+    } else obj[lastKey] = input.value;
+  });
+
+  // Brain role assignments (instance + model)
+  const brainSelects = document.querySelectorAll('#settingsTabBrain [data-brain-role][data-brain-field="instance"]');
+  const brainModels = document.querySelectorAll('#settingsTabBrain [data-brain-role][data-brain-field="model"]');
+
+  brainSelects.forEach(select => {
+    const role = select.dataset.brainRole;
+    const value = select.value;
+    const colonIdx = value.indexOf(':');
+    const provider = colonIdx >= 0 ? value.substring(0, colonIdx) : value;
+    const instance = colonIdx >= 0 ? value.substring(colonIdx + 1) : 'Local';
+    if (!partial.models) partial.models = {};
+    if (!partial.models[role]) partial.models[role] = {};
+    partial.models[role].provider = provider;
+    partial.models[role].instance = instance;
+  });
+
+  brainModels.forEach(input => {
+    const role = input.dataset.brainRole;
+    if (!partial.models) partial.models = {};
+    if (!partial.models[role]) partial.models[role] = {};
+    partial.models[role].model = input.value;
+  });
+
+  // Save to config.json if there is anything to save
+  const hasConfigChanges = Object.keys(partial).length > 0;
+  if (hasConfigChanges) {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(partial)
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to save config');
+      }
+    } catch (error) {
+      console.error('[Settings] Error saving config:', error);
+      if (statusEl) {
+        statusEl.className = 'config-status error';
+        statusEl.textContent = 'Failed to save: ' + error.message;
+        setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 5000);
+      }
+      return;
+    }
   }
 
-  if (grokKey) {
-    localStorage.setItem('grokApiKey', grokKey);
-  } else {
-    localStorage.removeItem('grokApiKey');
+  if (statusEl) {
+    statusEl.className = 'config-status success';
+    statusEl.textContent = 'Settings saved.';
+    setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 3000);
   }
 
-  if (ollamaHost) {
-    localStorage.setItem('ollamaHost', ollamaHost);
-  } else {
-    localStorage.removeItem('ollamaHost');
-  }
-
-  if (squatchserveHost) {
-    localStorage.setItem('squatchserveHost', squatchserveHost);
-  } else {
-    localStorage.removeItem('squatchserveHost');
-  }
-
-  if (llamacppHost) {
-    localStorage.setItem('llamacppHost', llamacppHost);
-  } else {
-    localStorage.removeItem('llamacppHost');
-  }
-
-  if (searxngHost) {
-    localStorage.setItem('searxngHost', searxngHost);
-  } else {
-    localStorage.removeItem('searxngHost');
-  }
-
-  // Close modal
-  closeSettings();
-
-  // Reload providers to update available options
   await loadProviders();
-
-  addMessage('system', 'Settings saved successfully!');
 }
 
 function togglePasswordVisibility(event) {
   const button = event.currentTarget;
   const targetId = button.getAttribute('data-target');
   const input = document.getElementById(targetId);
+  if (!input) return;
 
   if (input.type === 'password') {
     input.type = 'text';
@@ -1675,7 +2263,6 @@ function switchMemoryTab(name) {
   if (name === 'facts') loadFactsTab();
   else if (name === 'clusters') loadClustersTab();
   else if (name === 'daily') loadDailyTab();
-  else if (name === 'settings') loadSettingsTab();
 }
 
 // ---- Facts Tab ----
@@ -1978,19 +2565,27 @@ async function deleteFact(memberId) {
   }
 }
 
-// ---- Settings Tab ----
+// ---- Config Section Builder (shared by unified settings tabs) ----
 
 function createConfigSection(title, fields) {
   const section = document.createElement('div');
   section.className = 'config-section';
-  section.innerHTML = `<h3>${title}</h3>`;
+  if (title) {
+    const h3 = document.createElement('h3');
+    h3.textContent = title;
+    section.appendChild(h3);
+  }
 
   for (const field of fields) {
     const item = document.createElement('div');
     item.className = 'config-item';
 
+    // Fix 7: Generate unique ID and connect label to input
+    const inputId = `settings-field-${field.key.replace(/\./g, '-')}`;
+
     const label = document.createElement('label');
     label.textContent = field.label;
+    label.setAttribute('for', inputId);
     item.appendChild(label);
 
     let input;
@@ -2017,6 +2612,9 @@ function createConfigSection(title, fields) {
       input.dataset.configKey = field.key;
     }
 
+    // Fix 7: Set the matching ID on the input element
+    input.id = inputId;
+
     item.appendChild(input);
     section.appendChild(item);
   }
@@ -2024,125 +2622,3 @@ function createConfigSection(title, fields) {
   return section;
 }
 
-async function loadSettingsTab() {
-  const container = document.querySelector('.config-settings');
-  if (!container) return;
-  container.innerHTML = '<div class="config-loading">Loading configuration...</div>';
-
-  try {
-    const res = await fetch('/api/config');
-    if (!res.ok) throw new Error('Failed to load config');
-    const config = await res.json();
-
-    container.innerHTML = '';
-
-    // Providers section
-    container.appendChild(createConfigSection('Providers', [
-      { key: 'providers.ollama.host', label: 'Ollama Host', value: config.providers?.ollama?.host },
-      { key: 'providers.llamacpp.host', label: 'Llama.cpp Host', value: config.providers?.llamacpp?.host }
-    ]));
-
-    // Models section
-    container.appendChild(createConfigSection('Models', [
-      { key: 'models.chat.provider', label: 'Chat Provider', type: 'select', value: config.models?.chat?.provider, options: ['ollama', 'llamacpp'] },
-      { key: 'models.chat.model', label: 'Chat Model', value: config.models?.chat?.model },
-      { key: 'models.extraction.provider', label: 'Extraction Provider', type: 'select', value: config.models?.extraction?.provider, options: ['ollama', 'llamacpp'] },
-      { key: 'models.extraction.model', label: 'Extraction Model', value: config.models?.extraction?.model },
-      { key: 'models.heartbeat.provider', label: 'Heartbeat Provider', type: 'select', value: config.models?.heartbeat?.provider, options: ['ollama', 'llamacpp'] },
-      { key: 'models.heartbeat.model', label: 'Heartbeat Model', value: config.models?.heartbeat?.model },
-      { key: 'models.embedding.provider', label: 'Embedding Provider', type: 'select', value: config.models?.embedding?.provider, options: ['ollama', 'llamacpp'] },
-      { key: 'models.embedding.model', label: 'Embedding Model', value: config.models?.embedding?.model }
-    ]));
-
-    // Heartbeat section
-    container.appendChild(createConfigSection('Heartbeat', [
-      { key: 'heartbeat.enabled', label: 'Enabled', type: 'checkbox', value: config.heartbeat?.enabled },
-      { key: 'heartbeat.intervalHours', label: 'Interval (hours)', type: 'number', value: config.heartbeat?.intervalHours, step: '0.5' },
-      { key: 'heartbeat.warmupMinutes', label: 'Warmup (minutes)', type: 'number', value: config.heartbeat?.warmupMinutes, step: '1' }
-    ]));
-
-    // Memory thresholds section
-    container.appendChild(createConfigSection('Memory Thresholds', [
-      { key: 'memory.similarityThreshold', label: 'Similarity Threshold', type: 'number', value: config.memory?.similarityThreshold, step: '0.05' },
-      { key: 'memory.clusterLinkThreshold', label: 'Cluster Link Threshold', type: 'number', value: config.memory?.clusterLinkThreshold, step: '0.05' },
-      { key: 'memory.dailyLogRetentionDays', label: 'Daily Log Retention (days)', type: 'number', value: config.memory?.dailyLogRetentionDays, step: '1' },
-      { key: 'memory.hybridSearchWeights.vector', label: 'Vector Weight', type: 'number', value: config.memory?.hybridSearchWeights?.vector, step: '0.1' },
-      { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
-    ]));
-
-    // Save button
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'config-save-btn';
-    saveBtn.textContent = 'Save Settings';
-    saveBtn.addEventListener('click', saveConfigSettings);
-    container.appendChild(saveBtn);
-
-    // Status area
-    const status = document.createElement('div');
-    status.id = 'configStatus';
-    container.appendChild(status);
-
-    // Notice
-    const notice = document.createElement('div');
-    notice.className = 'config-notice';
-    notice.textContent = 'Heartbeat interval changes require a server restart.';
-    container.appendChild(notice);
-
-  } catch (error) {
-    console.error('[Settings] Error loading config:', error);
-    container.innerHTML = '<div class="config-loading">Failed to load configuration.</div>';
-  }
-}
-
-async function saveConfigSettings() {
-  const container = document.querySelector('.config-settings');
-  if (!container) return;
-
-  // Collect all inputs by data-config-key and build nested object
-  const partial = {};
-  container.querySelectorAll('[data-config-key]').forEach(input => {
-    const keys = input.dataset.configKey.split('.');
-    let obj = partial;
-    for (let i = 0; i < keys.length - 1; i++) {
-      if (!obj[keys[i]]) obj[keys[i]] = {};
-      obj = obj[keys[i]];
-    }
-    const lastKey = keys[keys.length - 1];
-    if (input.type === 'checkbox') {
-      obj[lastKey] = input.checked;
-    } else if (input.type === 'number') {
-      const num = parseFloat(input.value);
-      if (!isNaN(num)) obj[lastKey] = num;
-    } else {
-      obj[lastKey] = input.value;
-    }
-  });
-
-  const statusEl = document.getElementById('configStatus');
-
-  try {
-    const res = await fetch('/api/config', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(partial)
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to save');
-    }
-
-    if (statusEl) {
-      statusEl.className = 'config-status success';
-      statusEl.textContent = 'Settings saved successfully.';
-      setTimeout(() => { statusEl.textContent = ''; statusEl.className = ''; }, 3000);
-    }
-  } catch (error) {
-    console.error('[Settings] Error saving config:', error);
-    if (statusEl) {
-      statusEl.className = 'config-status error';
-      statusEl.textContent = 'Failed to save: ' + error.message;
-      setTimeout(() => { statusEl.textContent = ''; statusEl.className = ''; }, 5000);
-    }
-  }
-}

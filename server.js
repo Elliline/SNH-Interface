@@ -26,7 +26,7 @@ const memoryManager = require('./db/memory-manager');
 const MCPClient = require('./mcp/mcp-client');
 
 // Configuration
-const { getConfig, updateConfig } = require('./db/config');
+const { getConfig, updateConfig, getProviderInstance } = require('./db/config');
 
 // Routes
 const conversationsRouter = require('./routes/conversations');
@@ -162,9 +162,10 @@ function isValidOllamaHost(host) {
 function isValidModelName(model) {
   if (!model || typeof model !== 'string') return false;
 
-  // Allow alphanumeric, hyphens, underscores, dots, colons (for model versions)
+  // Allow alphanumeric, hyphens, underscores, dots, colons (for model versions),
+  // and forward slashes (for vLLM HuggingFace-style names like Qwen/Qwen3-Coder)
   // Limit length to prevent abuse
-  return /^[a-zA-Z0-9._:-]{1,100}$/.test(model);
+  return /^[a-zA-Z0-9._:\-\/]{1,200}$/.test(model);
 }
 
 // SECURITY: Validate message array
@@ -242,64 +243,84 @@ const PROVIDERS = {
     name: 'Llama.cpp (Local)',
     requiresKey: false,
     models: [] // Dynamically loaded from /api/llamacpp/models
+  },
+  vllm: {
+    id: 'vllm',
+    name: 'vLLM',
+    requiresKey: false,
+    models: []
   }
 };
 
 // ============ Provider Endpoints ============
 
-// Get available providers - always return all providers
-// API key validation happens at usage time, not listing time
+// Get available providers — cloud providers as single entries, local providers as named instances
 app.post('/api/providers', (req, res) => {
   const { hasClaudeKey, hasGrokKey, hasOpenAIKey } = req.body;
+  const config = getConfig();
 
-  // Return all providers - they're always visible
-  // Include info about whether keys are configured (server or client)
-  const availableProviders = [
-    {
-      id: PROVIDERS.ollama.id,
-      name: PROVIDERS.ollama.name,
-      requiresKey: false,
-      hasKey: true, // Ollama doesn't need a key
-      models: []
-    },
-    {
-      id: PROVIDERS.claude.id,
-      name: PROVIDERS.claude.name,
-      requiresKey: true,
-      hasKey: !!(CLAUDE_API_KEY || hasClaudeKey),
-      models: PROVIDERS.claude.models
-    },
-    {
-      id: PROVIDERS.openai.id,
-      name: PROVIDERS.openai.name,
-      requiresKey: true,
-      hasKey: !!(OPENAI_API_KEY || hasOpenAIKey),
-      models: [] // Loaded dynamically
-    },
-    {
-      id: PROVIDERS.grok.id,
-      name: PROVIDERS.grok.name,
-      requiresKey: true,
-      hasKey: !!(GROK_API_KEY || hasGrokKey),
-      models: PROVIDERS.grok.models
-    },
-    {
-      id: PROVIDERS.squatchserve.id,
-      name: PROVIDERS.squatchserve.name,
-      requiresKey: false,
-      hasKey: true, // SquatchServe doesn't need a key
-      models: [] // Loaded dynamically
-    },
-    {
-      id: PROVIDERS.llamacpp.id,
-      name: PROVIDERS.llamacpp.name,
-      requiresKey: false,
-      hasKey: true, // Llama.cpp doesn't need a key
-      models: [] // Loaded dynamically
+  const providerList = [];
+
+  // Cloud providers (single entry each)
+  providerList.push({
+    id: 'claude',
+    type: 'claude',
+    name: 'Claude',
+    requiresKey: true,
+    hasKey: !!(CLAUDE_API_KEY || hasClaudeKey),
+    models: PROVIDERS.claude.models
+  });
+  providerList.push({
+    id: 'openai',
+    type: 'openai',
+    name: 'OpenAI',
+    requiresKey: true,
+    hasKey: !!(OPENAI_API_KEY || hasOpenAIKey),
+    models: []
+  });
+  providerList.push({
+    id: 'grok',
+    type: 'grok',
+    name: 'Grok',
+    requiresKey: true,
+    hasKey: !!(GROK_API_KEY || hasGrokKey),
+    models: PROVIDERS.grok.models
+  });
+
+  // SquatchServe (single entry, unchanged)
+  providerList.push({
+    id: 'squatchserve',
+    type: 'squatchserve',
+    name: 'SquatchServe',
+    requiresKey: false,
+    hasKey: true,
+    models: []
+  });
+
+  // Instance-based local providers
+  const typeLabels = { ollama: 'Ollama', vllm: 'vLLM', llamacpp: 'Llama.cpp' };
+  for (const providerType of ['ollama', 'vllm', 'llamacpp']) {
+    const instances = config.providers[providerType] || [];
+    for (const inst of instances) {
+      const typeLabel = typeLabels[providerType] || providerType;
+      providerList.push({
+        id: `${providerType}:${inst.name}`,
+        type: providerType,
+        name: `${typeLabel} — ${inst.name}`,
+        instanceName: inst.name,
+        host: inst.host,
+        model: inst.model || null,
+        requiresKey: false,
+        hasKey: true,
+        models: inst.model ? [{ id: inst.model, name: inst.model }] : []
+      });
     }
-  ];
+  }
 
-  res.json({ providers: availableProviders });
+  res.json({
+    providers: providerList,
+    instances: config.providers
+  });
 });
 
 // Legacy GET endpoint for backwards compatibility
@@ -333,10 +354,23 @@ function getOllamaHost(requestBody) {
   return requestedHost;
 }
 
-// Proxy Ollama tags (model list) - POST to accept custom host
+// Proxy Ollama tags (model list) - POST to accept custom host or named instance
 app.post('/api/tags', async (req, res) => {
   try {
-    const host = getOllamaHost(req.body);
+    const { providerType, instanceName } = req.body;
+    let host;
+
+    if (providerType && instanceName) {
+      const inst = getProviderInstance(providerType, instanceName);
+      if (!inst) return res.status(404).json({ error: 'Instance not found', models: [] });
+      host = inst.host;
+      if (!isValidOllamaHost(host)) {
+        return res.status(400).json({ error: 'Invalid host address', models: [] });
+      }
+    } else {
+      host = getOllamaHost(req.body);
+    }
+
     const response = await fetch(`${host}/api/tags`);
     if (!response.ok) {
       throw new Error(`Ollama returned ${response.status}`);
@@ -752,6 +786,9 @@ mcpClient.loadConfig();
 app.get('/api/squatchserve/models', async (req, res) => {
   try {
     const squatchserveHost = req.query.host || SQUATCHSERVE_HOST;
+    if (!isValidOllamaHost(squatchserveHost)) {
+      return res.status(400).json({ error: 'Invalid SquatchServe host address' });
+    }
     const response = await fetch(`${squatchserveHost}/api/tags`, {
       method: 'GET',
       headers: {
@@ -794,6 +831,9 @@ app.post('/api/squatchserve/chat', chatLimiter, async (req, res) => {
   }
 
   const host = squatchserveHost || SQUATCHSERVE_HOST;
+  if (!isValidOllamaHost(host)) {
+    return res.status(400).json({ error: 'Invalid SquatchServe host address' });
+  }
 
   try {
     const response = await fetch(`${host}/api/chat`, {
@@ -841,6 +881,9 @@ app.post('/api/squatchserve/chat', chatLimiter, async (req, res) => {
 app.get('/api/squatchserve/ps', async (req, res) => {
   try {
     const squatchserveHost = req.query.host || SQUATCHSERVE_HOST;
+    if (!isValidOllamaHost(squatchserveHost)) {
+      return res.status(400).json({ error: 'Invalid SquatchServe host address' });
+    }
     const response = await fetch(`${squatchserveHost}/api/ps`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' }
@@ -869,6 +912,9 @@ app.post('/api/squatchserve/unload', async (req, res) => {
   }
 
   const host = squatchserveHost || SQUATCHSERVE_HOST;
+  if (!isValidOllamaHost(host)) {
+    return res.status(400).json({ error: 'Invalid SquatchServe host address' });
+  }
 
   try {
     const response = await fetch(`${host}/api/unload`, {
@@ -893,7 +939,7 @@ app.post('/api/squatchserve/unload', async (req, res) => {
 
 // ============ Llama.cpp API Proxy ============
 
-// Fetch Llama.cpp models (hardcoded list)
+// Fetch Llama.cpp models (hardcoded list, kept for backward compatibility)
 app.get('/api/llamacpp/models', (req, res) => {
   const models = [
     { id: 'qwen3-coder', name: 'Qwen3 Coder Next' },
@@ -901,6 +947,47 @@ app.get('/api/llamacpp/models', (req, res) => {
     { id: 'scout', name: 'Llama 4 Scout 109B' }
   ];
   res.json({ models });
+});
+
+// Fetch models for a named provider instance
+// Ollama: fetches live from /api/tags; vLLM and llama.cpp: returns the configured model name
+app.post('/api/instance/models', async (req, res) => {
+  try {
+    const { providerType, instanceName } = req.body;
+
+    if (!providerType || !instanceName) {
+      return res.status(400).json({ error: 'providerType and instanceName are required' });
+    }
+
+    const inst = getProviderInstance(providerType, instanceName);
+    if (!inst) return res.status(404).json({ error: 'Instance not found' });
+
+    if (providerType === 'ollama') {
+      if (!isValidOllamaHost(inst.host)) {
+        return res.status(400).json({ error: 'Invalid host address' });
+      }
+      const response = await fetch(`${inst.host}/api/tags`);
+      if (!response.ok) throw new Error(`Ollama returned ${response.status}`);
+      const data = await response.json();
+      const models = (data.models || []).map(m => ({ id: m.name, name: m.name }));
+      return res.json({ models });
+    }
+
+    if (providerType === 'vllm' || providerType === 'llamacpp') {
+      if (!isValidOllamaHost(inst.host)) {
+        return res.status(400).json({ error: 'Invalid host address' });
+      }
+      if (inst.model) {
+        return res.json({ models: [{ id: inst.model, name: inst.model }] });
+      }
+      return res.json({ models: [] });
+    }
+
+    res.status(400).json({ error: 'Unsupported provider type' });
+  } catch (error) {
+    console.error('[Models] Error fetching instance models:', error.message);
+    res.status(500).json({ error: 'Failed to fetch models', details: error.message });
+  }
 });
 
 // ============ SearXNG Web Search ============
@@ -1084,7 +1171,11 @@ app.post('/api/stt/upload', express.raw({ type: 'audio/*', limit: '10mb' }), asy
  */
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   try {
-    const { model, messages, ollamaHost, conversation_id, provider, apiKey, toolsEnabled, searxngHost } = req.body;
+    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost } = req.body;
+
+    // Read tool enabled state from config instead of per-request flag
+    const appConfig = getConfig();
+    const toolsEnabled = !!(appConfig.tools && appConfig.tools.searxng && appConfig.tools.searxng.enabled);
 
     // SECURITY: Validate inputs
     if (!isValidModelName(model)) {
@@ -1239,9 +1330,32 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // === UPGRADE 3: Memory flush before context overflow ===
     const providerType = provider || 'ollama';
-    const providerHost = providerType === 'llamacpp' ? (req.body.llamacppHost || LLAMACPP_HOST)
-      : providerType === 'squatchserve' ? (req.body.squatchserveHost || SQUATCHSERVE_HOST)
-      : (ollamaHost || OLLAMA_HOST);
+    const instanceName = req.body.instanceName;
+
+    let providerHost;
+    if (instanceName && ['ollama', 'vllm', 'llamacpp'].includes(providerType)) {
+      const inst = getProviderInstance(providerType, instanceName);
+      if (!inst) {
+        return res.status(400).json({ error: `Unknown ${providerType} instance: ${instanceName}` });
+      }
+      if (!isValidOllamaHost(inst.host)) {
+        return res.status(400).json({ error: `Invalid host address for instance: ${instanceName}` });
+      }
+      providerHost = inst.host;
+    } else if (providerType === 'llamacpp') {
+      providerHost = req.body.llamacppHost || LLAMACPP_HOST;
+      if (!isValidOllamaHost(providerHost)) {
+        return res.status(400).json({ error: 'Invalid Llama.cpp host address' });
+      }
+    } else if (providerType === 'squatchserve') {
+      providerHost = req.body.squatchserveHost || SQUATCHSERVE_HOST;
+      if (!isValidOllamaHost(providerHost)) {
+        return res.status(400).json({ error: 'Invalid SquatchServe host address' });
+      }
+    } else {
+      providerHost = ollamaHost || OLLAMA_HOST;
+    }
+
     const providerKey = apiKey || (providerType === 'claude' ? CLAUDE_API_KEY : providerType === 'grok' ? GROK_API_KEY : providerType === 'openai' ? OPENAI_API_KEY : '');
 
     try {
@@ -1260,7 +1374,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log(`=== Routing to provider: ${providerType} ===`);
 
     if (providerType === 'ollama') {
-      const host = getOllamaHost({ ollamaHost });
+      // providerHost was already resolved (instance lookup or env fallback); validate it
+      const host = instanceName ? providerHost : getOllamaHost({ ollamaHost });
       let ollamaMessages = [...enhancedMessages];
 
       // Ollama tool calling is strict about message format — consolidate
@@ -1418,7 +1533,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         })
       });
     } else if (providerType === 'squatchserve') {
-      const squatchHost = req.body.squatchserveHost || SQUATCHSERVE_HOST;
+      const squatchHost = providerHost; // Already validated above
       response = await fetch(`${squatchHost}/api/chat`, {
         method: 'POST',
         headers: {
@@ -1430,12 +1545,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           messages: enhancedMessages
         })
       });
-    } else if (providerType === 'llamacpp') {
-      const llamacppHost = req.body.llamacppHost || LLAMACPP_HOST;
+    } else if (providerType === 'llamacpp' || providerType === 'vllm') {
+      const llamacppHost = providerHost;
       let llamacppMessages = [...enhancedMessages];
 
       // MCP tool calling loop (only when tools are enabled)
-      console.log(`MCP [llamacpp]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
+      const providerLabel = providerType === 'vllm' ? 'vllm' : 'llamacpp';
+      console.log(`MCP [${providerLabel}]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
       if (toolsEnabled && mcpClient.hasTools()) {
         const tools = mcpClient.getToolsForOpenAI();
         const toolSearxngHost = searxngHost
@@ -1444,10 +1560,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const toolContext = { searxngHost: toolSearxngHost };
         const MAX_TOOL_ROUNDS = 3;
 
-        console.log('MCP [llamacpp]: Starting tool loop, tools:', JSON.stringify(tools.map(t => t.function.name)));
+        console.log(`MCP [${providerLabel}]: Starting tool loop, tools:`, JSON.stringify(tools.map(t => t.function.name)));
 
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-          console.log(`MCP [llamacpp]: Tool call round ${round + 1}/${MAX_TOOL_ROUNDS}`);
+          console.log(`MCP [${providerLabel}]: Tool call round ${round + 1}/${MAX_TOOL_ROUNDS}`);
 
           const toolResponse = await fetch(`${llamacppHost}/v1/chat/completions`, {
             method: 'POST',
@@ -1463,35 +1579,35 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
           if (!toolResponse.ok) {
             const errBody = await toolResponse.text().catch(() => '');
-            console.error(`MCP [llamacpp]: Tool call request failed with ${toolResponse.status}:`, errBody.substring(0, 200));
+            console.error(`MCP [${providerLabel}]: Tool call request failed with ${toolResponse.status}:`, errBody.substring(0, 200));
             break;
           }
 
           const toolData = await toolResponse.json();
-          console.log('MCP [llamacpp]: Response keys:', Object.keys(toolData));
+          console.log(`MCP [${providerLabel}]: Response keys:`, Object.keys(toolData));
           const choice = toolData.choices?.[0];
-          console.log('MCP [llamacpp]: finish_reason:', choice?.finish_reason);
-          console.log('MCP [llamacpp]: message.role:', choice?.message?.role);
-          console.log('MCP [llamacpp]: message.tool_calls:', JSON.stringify(choice?.message?.tool_calls || 'none'));
-          console.log('MCP [llamacpp]: message.content (first 100):', (choice?.message?.content || '').substring(0, 100));
+          console.log(`MCP [${providerLabel}]: finish_reason:`, choice?.finish_reason);
+          console.log(`MCP [${providerLabel}]: message.role:`, choice?.message?.role);
+          console.log(`MCP [${providerLabel}]: message.tool_calls:`, JSON.stringify(choice?.message?.tool_calls || 'none'));
+          console.log(`MCP [${providerLabel}]: message.content (first 100):`, (choice?.message?.content || '').substring(0, 100));
 
           if (!choice?.message?.tool_calls?.length) {
-            console.log('MCP [llamacpp]: No tool calls requested, proceeding to final response');
+            console.log(`MCP [${providerLabel}]: No tool calls requested, proceeding to final response`);
             break;
           }
 
           toolsUsed = true;
           const assistantMsg = choice.message;
-          console.log(`MCP [llamacpp]: Model requested ${assistantMsg.tool_calls.length} tool call(s)`);
+          console.log(`MCP [${providerLabel}]: Model requested ${assistantMsg.tool_calls.length} tool call(s)`);
 
           // Add assistant message with tool_calls to conversation
-          // Preserve the exact message structure from llama-server
+          // Preserve the exact message structure from the server response
           llamacppMessages.push(assistantMsg);
 
           // Execute each tool call
           for (const toolCall of assistantMsg.tool_calls) {
             const fnName = toolCall.function.name;
-            console.log(`MCP [llamacpp]: Executing tool "${fnName}", raw arguments:`, toolCall.function.arguments);
+            console.log(`MCP [${providerLabel}]: Executing tool "${fnName}", raw arguments:`, toolCall.function.arguments);
 
             let args;
             try {
@@ -1499,13 +1615,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
                 ? JSON.parse(toolCall.function.arguments)
                 : toolCall.function.arguments;
             } catch (e) {
-              console.warn(`MCP [llamacpp]: Failed to parse tool arguments: ${e.message}`);
+              console.warn(`MCP [${providerLabel}]: Failed to parse tool arguments: ${e.message}`);
               args = {};
             }
-            console.log(`MCP [llamacpp]: Parsed args:`, JSON.stringify(args));
+            console.log(`MCP [${providerLabel}]: Parsed args:`, JSON.stringify(args));
 
             const result = await mcpClient.executeTool(fnName, args, toolContext);
-            console.log(`MCP [llamacpp]: Tool "${fnName}" result:`, JSON.stringify(result).substring(0, 200));
+            console.log(`MCP [${providerLabel}]: Tool "${fnName}" result:`, JSON.stringify(result).substring(0, 200));
 
             llamacppMessages.push({
               role: 'tool',
@@ -1516,8 +1632,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         }
 
         if (toolsUsed) {
-          console.log('MCP [llamacpp]: Tools were used, making final streaming request');
-          console.log('MCP [llamacpp]: Final messages array (' + llamacppMessages.length + ' messages):');
+          console.log(`MCP [${providerLabel}]: Tools were used, making final streaming request`);
+          console.log(`MCP [${providerLabel}]: Final messages array (${llamacppMessages.length} messages):`);
           llamacppMessages.forEach((m, i) => {
             const contentStr = typeof m.content === 'string' ? m.content : String(m.content);
             const preview = contentStr.substring(0, 200);
@@ -1530,10 +1646,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
 
       // Final streaming request
-      // Tools must stay in the request body so llama-server's Jinja
-      // template can handle tool_calls/tool messages in the history.
-      // Append a nudge so the model responds with text instead of
-      // attempting more tool calls.
+      // Tools must stay in the request body so the server's Jinja template
+      // can handle tool_calls/tool messages in the history.
+      // Append a nudge so the model responds with text instead of attempting more tool calls.
       if (toolsUsed) {
         llamacppMessages.push({
           role: 'system',
@@ -1550,7 +1665,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         finalBody.tools = mcpClient.getToolsForOpenAI();
       }
 
-      console.log('MCP [llamacpp]: Final request body keys:', Object.keys(finalBody), 'tools included:', !!finalBody.tools);
+      console.log(`MCP [${providerLabel}]: Final request body keys:`, Object.keys(finalBody), 'tools included:', !!finalBody.tools);
 
       response = await fetch(`${llamacppHost}/v1/chat/completions`, {
         method: 'POST',
@@ -1569,6 +1684,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     }
 
     // Set up streaming response
+    // Ollama and SquatchServe use NDJSON; everything else (Claude, Grok, OpenAI, llamacpp, vllm) uses SSE
     const contentType = (providerType === 'ollama' || providerType === 'squatchserve') ? 'application/x-ndjson' : 'text/event-stream';
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Conversation-Id', convoId);

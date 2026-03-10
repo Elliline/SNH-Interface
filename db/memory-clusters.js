@@ -1,6 +1,6 @@
 const { randomUUID } = require('crypto');
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
-const { getConfig } = require('./config');
+const { getConfig, getProviderInstance } = require('./config');
 
 // Stop words filtered out during cluster naming
 const STOP_WORDS = new Set([
@@ -35,7 +35,8 @@ async function generateEmbedding(text) {
     const timeout = setTimeout(() => controller.abort(), 10000);
 
     const config = getConfig();
-    const embeddingHost = config.providers[config.models.embedding.provider].host;
+    const embInst = getProviderInstance(config.models.embedding.provider, config.models.embedding.instance);
+    const embeddingHost = embInst ? embInst.host : 'http://localhost:11434';
     const embeddingModel = config.models.embedding.model;
     const response = await fetch(`${embeddingHost}/api/embeddings`, {
       method: 'POST',

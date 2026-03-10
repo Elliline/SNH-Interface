@@ -28,7 +28,6 @@
     <div class="header">
       <h1>Squatch Neuro Hub</h1>
       <div class="controls">
-        <button id="speakerToggle" class="speaker-btn" title="Toggle voice responses">🔇</button>
         <select id="providerSelect" class="provider-select">
           <option value="">Select a provider</option>
         </select>
@@ -59,7 +58,7 @@
       <textarea id="messageInput" class="message-input" placeholder="Type your message..." rows="1"></textarea>
       <button id="micBtn" class="mic-btn" title="Hold to talk">🎤</button>
       <button id="convoModeBtn" class="convo-btn" title="Toggle conversation mode">💬</button>
-      <button id="searchToggleBtn" class="search-btn" title="Toggle AI tools (web search, etc.)">🔍</button>
+      <button id="speakerToggle" class="speaker-btn" title="Toggle voice responses">🔇</button>
       <button id="sendBtn" class="send-btn">Send</button>
     </div>
   </div>
@@ -75,7 +74,6 @@
       <button class="memory-tab" data-tab="clusters">Clusters</button>
       <button class="memory-tab" data-tab="daily">Daily</button>
       <button class="memory-tab" data-tab="search">Search</button>
-      <button class="memory-tab" data-tab="settings">Settings</button>
     </div>
     <div class="memory-panel-content">
       <!-- Facts Tab -->
@@ -108,74 +106,35 @@
         </div>
         <div id="memorySearchResults" class="memory-search-results"></div>
       </div>
-      <!-- Settings Tab -->
-      <div id="memoryTabSettings" class="memory-tab-content">
-        <div class="config-settings">
-          <div class="config-loading">Loading configuration...</div>
-        </div>
-      </div>
     </div>
   </div>
   <div id="memoryPanelOverlay" class="memory-panel-overlay"></div>
 
-  <!-- Settings Modal -->
+  <!-- Unified Settings Modal -->
   <div id="settingsModal" class="modal" style="display: none;">
-    <div class="modal-content">
-      <div class="modal-header">
+    <div class="unified-settings">
+      <div class="unified-settings-header">
         <h2>Settings</h2>
         <button id="closeModal" class="close-btn">&times;</button>
       </div>
-      <div class="modal-body">
-        <div class="settings-section">
-          <h3>API Keys</h3>
-          <p class="settings-hint">API keys are stored locally in your browser</p>
-
-          <div class="setting-item">
-            <label for="claudeApiKey">Claude API Key</label>
-            <div class="api-key-input-wrapper">
-              <input type="password" id="claudeApiKey" class="api-key-input" placeholder="sk-ant-...">
-              <button class="toggle-visibility-btn" data-target="claudeApiKey">👁️</button>
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <label for="openaiApiKey">OpenAI API Key</label>
-            <div class="api-key-input-wrapper">
-              <input type="password" id="openaiApiKey" class="api-key-input" placeholder="sk-...">
-              <button class="toggle-visibility-btn" data-target="openaiApiKey">👁️</button>
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <label for="grokApiKey">Grok API Key</label>
-            <div class="api-key-input-wrapper">
-              <input type="password" id="grokApiKey" class="api-key-input" placeholder="xai-...">
-              <button class="toggle-visibility-btn" data-target="grokApiKey">👁️</button>
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <label for="ollamaHost">Ollama Host (optional)</label>
-            <input type="text" id="ollamaHost" class="api-key-input" placeholder="http://localhost:11434">
-          </div>
-
-          <div class="setting-item">
-            <label for="squatchserveHost">SquatchServe Host (optional)</label>
-            <input type="text" id="squatchserveHost" class="api-key-input" placeholder="http://localhost:8111">
-          </div>
-
-          <div class="setting-item">
-            <label for="llamacppHost">Llama.cpp Server URL (optional)</label>
-            <input type="text" id="llamacppHost" class="api-key-input" placeholder="http://localhost:8080">
-          </div>
-
-          <div class="setting-item">
-            <label for="searxngHost">SearXNG Host (optional)</label>
-            <input type="text" id="searxngHost" class="api-key-input" placeholder="http://192.168.4.97:8888">
-          </div>
+      <div class="unified-settings-body">
+        <nav class="settings-nav">
+          <button class="settings-nav-item active" data-settings-tab="chat">Chat</button>
+          <button class="settings-nav-item" data-settings-tab="brain">Brain</button>
+          <button class="settings-nav-item" data-settings-tab="voice">Voice</button>
+          <button class="settings-nav-item" data-settings-tab="tools">Tools</button>
+          <button class="settings-nav-item" data-settings-tab="about">About</button>
+        </nav>
+        <div class="settings-content">
+          <div id="settingsTabChat" class="settings-tab-content active"></div>
+          <div id="settingsTabBrain" class="settings-tab-content"></div>
+          <div id="settingsTabVoice" class="settings-tab-content"></div>
+          <div id="settingsTabTools" class="settings-tab-content"></div>
+          <div id="settingsTabAbout" class="settings-tab-content"></div>
         </div>
       </div>
-      <div class="modal-footer">
+      <div class="unified-settings-footer">
+        <div id="settingsStatus" class="config-status"></div>
         <button id="saveSettings" class="save-btn">Save</button>
       </div>
     </div>
