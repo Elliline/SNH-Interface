@@ -1327,7 +1327,7 @@ app.post('/api/stt/upload', express.raw({ type: 'audio/*', limit: '10mb' }), asy
  */
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   try {
-    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost } = req.body;
+    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled } = req.body;
 
     // Read tool enabled state from config instead of per-request flag
     const appConfig = getConfig();
@@ -1467,6 +1467,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       enhancedMessages = [memorySystemMessage, ...enhancedMessages];
     } else {
       console.log('No memory context to inject');
+    }
+
+    // TTS-aware system prompt: instruct the model to avoid markdown/emojis when TTS is active
+    if (ttsEnabled) {
+      const ttsInstruction = {
+        role: 'system',
+        content: 'The user has text-to-speech enabled. Avoid using emojis, markdown formatting, bullet points, or special characters in your response as these will be read aloud literally. Write in natural spoken language. Do not limit your response length.'
+      };
+      enhancedMessages.push(ttsInstruction);
     }
 
     // Auto-generate title from first user message if needed

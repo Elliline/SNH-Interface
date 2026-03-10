@@ -49,6 +49,182 @@ let audioUnlocked = false;
 const TTS_URL = '/api/tts';
 const STT_URL = '/api/stt';
 
+// TTS chunked pipeline — sends text to TTS as sentences complete during streaming
+const ttsChunker = {
+  sentIndex: 0,
+  chunkIndex: 0,
+  active: false,
+  flushed: false,
+  queue: [],          // { index, state: 'loading'|'ready'|'error', audio, url }
+  playing: false,
+  currentAudio: null,
+  abortController: null,
+
+  start() {
+    this.cancel();
+    this.sentIndex = 0;
+    this.chunkIndex = 0;
+    this.active = true;
+    this.flushed = false;
+    this.queue = [];
+    this.playing = false;
+    this.currentAudio = null;
+    this.abortController = new AbortController();
+  },
+
+  feed(fullText) {
+    if (!this.active) return;
+
+    while (true) {
+      const unsent = fullText.slice(this.sentIndex);
+      if (unsent.length < 80) break;
+
+      // Find first sentence boundary (. ! ? followed by whitespace, or paragraph break) at >= 80 chars
+      const re = /[.!?](?=\s)|\n\n+/g;
+      let found = false;
+      let m;
+      while ((m = re.exec(unsent)) !== null) {
+        const textEnd = m[0].startsWith('\n') ? m.index : m.index + 1;
+        if (textEnd >= 80) {
+          const chunk = unsent.slice(0, textEnd).trim();
+          // Advance past the boundary and any trailing whitespace
+          this.sentIndex += m.index + m[0].length;
+          if (chunk) this._sendChunk(chunk);
+          found = true;
+          break;
+        }
+      }
+      if (!found) break;
+    }
+  },
+
+  flush(fullText) {
+    if (!this.active) return;
+    const remaining = fullText.slice(this.sentIndex).trim();
+    if (remaining) {
+      this._sendChunk(remaining);
+    }
+    this.flushed = true;
+    this.active = false;
+    // If no chunks were queued at all, trigger conversation mode immediately
+    if (this.queue.length === 0 && conversationMode && !isRecording) {
+      startRecording();
+    }
+  },
+
+  cancel() {
+    this.active = false;
+    this.flushed = false;
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio.currentTime = 0;
+      this.currentAudio = null;
+    }
+    for (const entry of this.queue) {
+      if (entry.url) URL.revokeObjectURL(entry.url);
+    }
+    this.queue = [];
+    this.playing = false;
+    this.sentIndex = 0;
+    this.chunkIndex = 0;
+  },
+
+  _sendChunk(text) {
+    const index = this.chunkIndex++;
+    const signal = this.abortController?.signal;
+
+    // Clean markdown for TTS
+    text = text
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`(.*?)`/g, '$1')
+      .replace(/#{1,6}\s?/g, '')
+      .replace(/\n/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!text) return;
+
+    const entry = { index, state: 'loading', audio: null, url: null };
+    this.queue.push(entry);
+
+    fetch(TTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal
+    })
+    .then(res => {
+      if (!res.ok) throw new Error(`TTS ${res.status}`);
+      return res.blob();
+    })
+    .then(blob => {
+      if (blob.size === 0) throw new Error('Empty audio');
+      entry.url = URL.createObjectURL(blob);
+      entry.audio = new Audio(entry.url);
+      entry.state = 'ready';
+      this._playNext();
+    })
+    .catch(err => {
+      if (err.name === 'AbortError') return;
+      console.error(`TTS chunk ${index} error:`, err);
+      entry.state = 'error';
+      this._playNext();
+    });
+  },
+
+  _playNext() {
+    if (this.playing || this.queue.length === 0) {
+      // Check if all done
+      if (!this.playing && this.queue.length === 0 && this.flushed) {
+        if (conversationMode && !isRecording) {
+          startRecording();
+        }
+      }
+      return;
+    }
+
+    const next = this.queue[0];
+
+    // Wait for in-order playback — if first chunk is still loading, wait
+    if (next.state === 'loading') return;
+
+    if (next.state === 'error') {
+      this.queue.shift();
+      this._playNext();
+      return;
+    }
+
+    // state === 'ready'
+    this.playing = true;
+    this.currentAudio = next.audio;
+
+    // Guard against double-fire (play() rejection + onerror can both trigger)
+    const cleanup = () => {
+      if (!this.playing) return;
+      next.audio.onended = null;
+      next.audio.onerror = null;
+      URL.revokeObjectURL(next.url);
+      this.queue.shift();
+      this.playing = false;
+      this.currentAudio = null;
+      this._playNext();
+    };
+
+    next.audio.onended = cleanup;
+    next.audio.onerror = cleanup;
+
+    next.audio.play().catch(e => {
+      console.error('TTS chunk play failed:', e);
+      cleanup();
+    });
+  }
+};
+
 // Conversation history state
 let currentConversationId = null;
 let conversations = [];
@@ -273,6 +449,8 @@ function handleModelChange() {
 // Handle sending a message
 async function sendMessage() {
   const message = messageInput.value.trim();
+  // Cancel any pending TTS from previous message
+  ttsChunker.cancel();
   if (!message || !currentModel || !currentProvider) {
     if (!currentProvider || !currentModel) {
       addMessage('error', 'Please select a provider and model first.');
@@ -328,7 +506,8 @@ async function sendMessage() {
       squatchserveHost,
       llamacppHost,
       apiKey,
-      searxngHost: localStorage.getItem('searxngHost') || undefined
+      searxngHost: localStorage.getItem('searxngHost') || undefined,
+      ttsEnabled
     };
     console.log('[sendMessage] Provider:', providerType, 'Instance:', instanceName);
 
@@ -384,6 +563,9 @@ async function sendMessage() {
     messagesContainer.appendChild(streamingMessageElement);
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
+    // Start chunked TTS pipeline if TTS is active
+    if (ttsEnabled) ttsChunker.start();
+
     // Process stream based on provider type
     const streamType = selectedProvider?.type || currentProvider;
     if (streamType === 'ollama' || streamType === 'squatchserve') {
@@ -420,13 +602,16 @@ async function sendMessage() {
     // This guarantees the response is displayed even if streaming updates failed
     renderMessages();
 
-    speakText(fullResponse);
+    if (ttsEnabled) {
+      ttsChunker.flush(fullResponse);
+    }
 
     // Refresh conversation list to show the new/updated conversation
     loadConversations();
 
   } catch (error) {
     console.error('Error sending message:', error);
+    ttsChunker.cancel();
     addMessage('error', `Failed to send message: ${error.message}`);
   } finally {
     hideTypingIndicator();
@@ -757,6 +942,7 @@ function addMessage(role, content) {
 
 // Update the last message (for streaming responses)
 function updateLastMessage(content) {
+  if (ttsEnabled) ttsChunker.feed(content);
   if (streamingMessageElement) {
     pendingContent = content;
     
