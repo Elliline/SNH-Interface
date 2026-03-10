@@ -56,24 +56,30 @@ const ttsChunker = {
   active: false,
   flushed: false,
   queue: [],          // { index, state: 'loading'|'ready'|'error', audio, url }
+  fetchChain: Promise.resolve(),  // sequential fetch pipeline
   playing: false,
   currentAudio: null,
   abortController: null,
 
   start() {
+    console.log('[ttsChunker] start() called, ttsEnabled:', ttsEnabled);
     this.cancel();
     this.sentIndex = 0;
     this.chunkIndex = 0;
     this.active = true;
     this.flushed = false;
     this.queue = [];
+    this.fetchChain = Promise.resolve();
     this.playing = false;
     this.currentAudio = null;
     this.abortController = new AbortController();
   },
 
   feed(fullText) {
-    if (!this.active) return;
+    if (!this.active) {
+      console.log('[ttsChunker] feed() skipped — not active');
+      return;
+    }
 
     while (true) {
       const unsent = fullText.slice(this.sentIndex);
@@ -99,8 +105,10 @@ const ttsChunker = {
   },
 
   flush(fullText) {
+    console.log('[ttsChunker] flush() called, active:', this.active, 'sentIndex:', this.sentIndex, 'fullText length:', fullText.length);
     if (!this.active) return;
     const remaining = fullText.slice(this.sentIndex).trim();
+    console.log('[ttsChunker] flush() remaining text length:', remaining.length);
     if (remaining) {
       this._sendChunk(remaining);
     }
@@ -128,6 +136,7 @@ const ttsChunker = {
       if (entry.url) URL.revokeObjectURL(entry.url);
     }
     this.queue = [];
+    this.fetchChain = Promise.resolve();
     this.playing = false;
     this.sentIndex = 0;
     this.chunkIndex = 0;
@@ -135,7 +144,7 @@ const ttsChunker = {
 
   _sendChunk(text) {
     const index = this.chunkIndex++;
-    const signal = this.abortController?.signal;
+    console.log(`[ttsChunker] _sendChunk(${index}) text length:`, text.length, 'preview:', text.substring(0, 60));
 
     // Clean markdown for TTS
     text = text
@@ -152,17 +161,26 @@ const ttsChunker = {
     const entry = { index, state: 'loading', audio: null, url: null };
     this.queue.push(entry);
 
-    fetch(TTS_URL, {
+    // Chain fetches sequentially: each chunk waits for the previous fetch to complete.
+    // This gives 1-chunk lookahead — while chunk N plays, chunk N+1 fetch is in flight.
+    this.fetchChain = this.fetchChain.then(() => this._fetchChunk(entry, text, index));
+  },
+
+  _fetchChunk(entry, text, index) {
+    const signal = this.abortController?.signal;
+    return fetch(TTS_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
       signal
     })
     .then(res => {
+      console.log(`[ttsChunker] chunk ${index} TTS response:`, res.status);
       if (!res.ok) throw new Error(`TTS ${res.status}`);
       return res.blob();
     })
     .then(blob => {
+      console.log(`[ttsChunker] chunk ${index} audio blob size:`, blob.size);
       if (blob.size === 0) throw new Error('Empty audio');
       entry.url = URL.createObjectURL(blob);
       entry.audio = new Audio(entry.url);
@@ -564,6 +582,7 @@ async function sendMessage() {
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
     // Start chunked TTS pipeline if TTS is active
+    console.log('[ttsChunker] Pre-stream check: ttsEnabled:', ttsEnabled);
     if (ttsEnabled) ttsChunker.start();
 
     // Process stream based on provider type
@@ -602,6 +621,7 @@ async function sendMessage() {
     // This guarantees the response is displayed even if streaming updates failed
     renderMessages();
 
+    console.log('[ttsChunker] Post-stream: ttsEnabled:', ttsEnabled, 'fullResponse length:', fullResponse.length);
     if (ttsEnabled) {
       ttsChunker.flush(fullResponse);
     }
@@ -942,7 +962,10 @@ function addMessage(role, content) {
 
 // Update the last message (for streaming responses)
 function updateLastMessage(content) {
-  if (ttsEnabled) ttsChunker.feed(content);
+  if (ttsEnabled) {
+    console.log('[ttsChunker] updateLastMessage feeding, content length:', content.length, 'active:', ttsChunker.active);
+    ttsChunker.feed(content);
+  }
   if (streamingMessageElement) {
     pendingContent = content;
     

@@ -1361,6 +1361,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log('Provider:', provider || 'ollama', '| Model:', model);
     console.log('User message:', userMessage.content.substring(0, 80));
     console.log('Tools enabled:', toolsEnabled, '(type:', typeof toolsEnabled, ') | MCP has tools:', mcpClient.hasTools(), '| Tool names:', mcpClient.getToolNames());
+    console.log('TTS enabled:', ttsEnabled, '(type:', typeof ttsEnabled, ')');
 
     // Save user message to database
     const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model);
