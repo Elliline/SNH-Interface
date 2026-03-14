@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const SearXNGTool = require('./tools/searxng');
+const WebFetchTool = require('./tools/web-fetch');
 
 class MCPClient {
   constructor() {
@@ -43,9 +44,14 @@ class MCPClient {
         this.tools.set(tool.name, tool);
         console.log(`MCP: Registered tool "${tool.name}" -> endpoint ${toolConfig.endpoint}`);
       }
-      // Future tool types:
-      // else if (toolConfig.name === 'home_assistant') { ... }
-      // else if (toolConfig.name === 'n8n') { ... }
+      // web_fetch is always available when tools are enabled
+    }
+
+    // web_fetch is always available when any tool is enabled
+    if (this.tools.size > 0 && !this.tools.has('web_fetch')) {
+      const webFetch = new WebFetchTool();
+      this.tools.set(webFetch.name, webFetch);
+      console.log('MCP: Registered built-in tool "web_fetch"');
     }
 
     console.log(`MCP: ${this.tools.size} tool(s) ready: [${this.getToolNames().join(', ')}]`);

@@ -450,6 +450,27 @@ body {
   border-color: var(--success-color);
 }
 
+.search-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 8px 12px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-color);
+}
+
+.search-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.search-btn.active {
+  background-color: var(--success-color);
+  border-color: var(--success-color);
+}
+
 /* Modal styles */
 .modal {
   display: none;

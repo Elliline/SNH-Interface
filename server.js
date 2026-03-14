@@ -1327,7 +1327,7 @@ app.post('/api/stt/upload', express.raw({ type: 'audio/*', limit: '10mb' }), asy
  */
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   try {
-    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled } = req.body;
+    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled, superSearch } = req.body;
 
     // Read tool enabled state from config instead of per-request flag
     const appConfig = getConfig();
@@ -1362,6 +1362,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log('User message:', userMessage.content.substring(0, 80));
     console.log('Tools enabled:', toolsEnabled, '(type:', typeof toolsEnabled, ') | MCP has tools:', mcpClient.hasTools(), '| Tool names:', mcpClient.getToolNames());
     console.log('TTS enabled:', ttsEnabled, '(type:', typeof ttsEnabled, ')');
+    console.log('Super Search:', !!superSearch);
 
     // Save user message to database
     const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model);
@@ -1479,6 +1480,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       enhancedMessages.push(ttsInstruction);
     }
 
+    // Super Search system prompt: instruct the model to research thoroughly
+    if (superSearch) {
+      const superSearchInstruction = {
+        role: 'system',
+        content: 'Super Search is enabled. You have an expanded search and fetch budget. Research the topic thoroughly using multiple searches and page fetches before responding.'
+      };
+      enhancedMessages.push(superSearchInstruction);
+    }
+
     // Auto-generate title from first user message if needed
     const conversation = db.getConversation(convoId);
     if (!conversation.title && userMessage.content) {
@@ -1566,7 +1576,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
           : SEARXNG_HOST;
         const toolContext = { searxngHost: toolSearxngHost };
-        const MAX_TOOL_ROUNDS = 3;
+        const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
+        const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
+        const MAX_WEB_FETCHES = superSearch ? 5 : 3;
+        let webSearchCount = 0;
+        let webFetchCount = 0;
 
         console.log('MCP [ollama]: Starting tool loop, tools:', JSON.stringify(tools.map(t => t.function.name)));
 
@@ -1617,7 +1631,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               : toolCall.function.arguments;
             console.log(`MCP [ollama]: Executing tool "${fnName}" with args:`, JSON.stringify(args));
 
-            const result = await mcpClient.executeTool(fnName, args, toolContext);
+            let result;
+            if (fnName === 'web_search' && ++webSearchCount > MAX_WEB_SEARCHES) {
+              console.log(`MCP [ollama]: web_search limit reached (${webSearchCount}/${MAX_WEB_SEARCHES})`);
+              result = { error: `Search limit reached. You have used your ${MAX_WEB_SEARCHES} searches. You must now synthesize the results you have and provide a response to the user.` };
+            } else if (fnName === 'web_fetch' && ++webFetchCount > MAX_WEB_FETCHES) {
+              console.log(`MCP [ollama]: web_fetch limit reached (${webFetchCount}/${MAX_WEB_FETCHES})`);
+              result = { error: `Fetch limit reached. You have used your ${MAX_WEB_FETCHES} page fetches. You must now synthesize the results you have and provide a response to the user.` };
+            } else {
+              result = await mcpClient.executeTool(fnName, args, toolContext);
+            }
             console.log(`MCP [ollama]: Tool "${fnName}" result:`, JSON.stringify(result).substring(0, 200));
 
             ollamaMessages.push({
@@ -1724,7 +1747,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
           : SEARXNG_HOST;
         const toolContext = { searxngHost: toolSearxngHost };
-        const MAX_TOOL_ROUNDS = 3;
+        const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
+        const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
+        const MAX_WEB_FETCHES = superSearch ? 5 : 3;
+        let webSearchCount = 0;
+        let webFetchCount = 0;
 
         console.log(`MCP [${providerLabel}]: Starting tool loop, tools:`, JSON.stringify(tools.map(t => t.function.name)));
 
@@ -1786,7 +1813,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             }
             console.log(`MCP [${providerLabel}]: Parsed args:`, JSON.stringify(args));
 
-            const result = await mcpClient.executeTool(fnName, args, toolContext);
+            let result;
+            if (fnName === 'web_search' && ++webSearchCount > MAX_WEB_SEARCHES) {
+              console.log(`MCP [${providerLabel}]: web_search limit reached (${webSearchCount}/${MAX_WEB_SEARCHES})`);
+              result = { error: `Search limit reached. You have used your ${MAX_WEB_SEARCHES} searches. You must now synthesize the results you have and provide a response to the user.` };
+            } else if (fnName === 'web_fetch' && ++webFetchCount > MAX_WEB_FETCHES) {
+              console.log(`MCP [${providerLabel}]: web_fetch limit reached (${webFetchCount}/${MAX_WEB_FETCHES})`);
+              result = { error: `Fetch limit reached. You have used your ${MAX_WEB_FETCHES} page fetches. You must now synthesize the results you have and provide a response to the user.` };
+            } else {
+              result = await mcpClient.executeTool(fnName, args, toolContext);
+            }
             console.log(`MCP [${providerLabel}]: Tool "${fnName}" result:`, JSON.stringify(result).substring(0, 200));
 
             llamacppMessages.push({

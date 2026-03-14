@@ -15,6 +15,7 @@ const typingIndicator = document.getElementById('typingIndicator');
 const micBtn = document.getElementById('micBtn');
 const convoModeBtn = document.getElementById('convoModeBtn');
 const speakerToggle = document.getElementById('speakerToggle');
+const superSearchBtn = document.getElementById('superSearchBtn');
 const settingsBtn = document.getElementById('settingsBtn');
 const settingsModal = document.getElementById('settingsModal');
 const closeModal = document.getElementById('closeModal');
@@ -46,6 +47,7 @@ let silenceTimer = null;
 let audioContext = null;
 let analyser = null;
 let audioUnlocked = false;
+let superSearch = false;
 const TTS_URL = '/api/tts';
 const STT_URL = '/api/stt';
 
@@ -418,6 +420,7 @@ function setupEventListeners() {
   micBtn.addEventListener('mouseup', stopRecording);
   micBtn.addEventListener('mouseleave', stopRecording);
   speakerToggle.addEventListener('click', toggleTTS);
+  superSearchBtn.addEventListener('click', toggleSuperSearch);
   settingsBtn.addEventListener('click', openSettings);
   closeModal.addEventListener('click', closeSettings);
   saveSettingsBtn.addEventListener('click', saveSettingsHandler);
@@ -525,7 +528,8 @@ async function sendMessage() {
       llamacppHost,
       apiKey,
       searxngHost: localStorage.getItem('searxngHost') || undefined,
-      ttsEnabled
+      ttsEnabled,
+      superSearch
     };
     console.log('[sendMessage] Provider:', providerType, 'Instance:', instanceName);
 
@@ -1055,6 +1059,12 @@ function toggleTTS() {
     const silence = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
     silence.play().then(() => audioUnlocked = true).catch(() => {});
   }
+}
+
+// Super Search Toggle
+function toggleSuperSearch() {
+  superSearch = !superSearch;
+  superSearchBtn.classList.toggle('active', superSearch);
 }
 
 

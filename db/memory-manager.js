@@ -44,11 +44,12 @@ function memberIdFilter(id) {
  * @param {string} userPrompt
  * @returns {Promise<{content: string, provider: string}>}
  */
-async function callLLM(systemPrompt, userPrompt) {
+async function callLLM(systemPrompt, userPrompt, options = {}) {
   const config = getConfig();
   const heartbeatModel = config.models.heartbeat;
   const inst = getProviderInstance(heartbeatModel.provider, heartbeatModel.instance);
   const host = inst ? inst.host : 'http://localhost:11434';
+  const maxTokens = options.maxTokens ?? 1024;
   const messages = [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: userPrompt }
@@ -58,11 +59,11 @@ async function callLLM(systemPrompt, userPrompt) {
   let url, body, extract;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
     url = `${host}/v1/chat/completions`;
-    body = { messages, stream: false };
+    body = { messages, stream: false, max_tokens: maxTokens };
     extract = (data) => data.choices?.[0]?.message?.content || '';
   } else {
     url = `${host}/api/chat`;
-    body = { model: heartbeatModel.model, messages, stream: false };
+    body = { model: heartbeatModel.model, messages, stream: false, options: { num_predict: maxTokens } };
     extract = (data) => data.message?.content || '';
   }
 
@@ -380,18 +381,21 @@ async function auditCrossLinks() {
   }
 
   // Build brief summaries for each cluster (first 5 facts, truncated)
+  // label disambiguates duplicate cluster names by appending the cluster's index
   const clusterSummaries = {};
-  for (const cluster of clusters) {
+  for (let i = 0; i < clusters.length; i++) {
+    const cluster = clusters[i];
     try {
       const detail = memoryClusters.getCluster(cluster.id);
+      const label = cluster.name + '#' + i;
       if (!detail || !Array.isArray(detail.members)) {
-        clusterSummaries[cluster.id] = { name: cluster.name, summary: '(no members)' };
+        clusterSummaries[cluster.id] = { name: cluster.name, label, summary: '(no members)' };
         continue;
       }
       const snippets = detail.members.slice(0, 5).map(m => m.content.slice(0, 120)).join('; ');
-      clusterSummaries[cluster.id] = { name: cluster.name, summary: snippets || '(empty)' };
+      clusterSummaries[cluster.id] = { name: cluster.name, label, summary: snippets || '(empty)' };
     } catch (err) {
-      clusterSummaries[cluster.id] = { name: cluster.name, summary: '(error loading)' };
+      clusterSummaries[cluster.id] = { name: cluster.name, label: cluster.name + '#' + i, summary: '(error loading)' };
     }
   }
 
@@ -418,7 +422,7 @@ Return ONLY valid JSON in this exact format:
 }
 
 Rules:
-- Use the pipe character | to separate cluster names in the "pair" field, exactly as given.
+- Use the pipe character | to separate cluster labels in the "pair" field, exactly as given.
 - strength 0.0–0.3: unrelated or barely connected.
 - strength 0.4–0.6: loosely related, share some context.
 - strength 0.7–1.0: closely related, topics naturally co-occur.
@@ -431,7 +435,7 @@ Rules:
     const pairDescriptions = batch.map(([a, b]) => {
       const sa = clusterSummaries[a.id];
       const sb = clusterSummaries[b.id];
-      return `Pair "${sa.name}|${sb.name}":\n  ${sa.name}: ${sa.summary}\n  ${sb.name}: ${sb.summary}`;
+      return `Pair "${sa.label}|${sb.label}":\n  ${sa.label}: ${sa.summary}\n  ${sb.label}: ${sb.summary}`;
     }).join('\n\n');
 
     let parsed = null;
@@ -455,15 +459,21 @@ Rules:
       if (typeof entry.pair === 'string') {
         linkMap[entry.pair] = entry;
         // Also store reversed key so lookup is order-independent
-        const [left, right] = entry.pair.split('|');
-        if (right) linkMap[`${right}|${left}`] = entry;
+        const pipeIdx = entry.pair.lastIndexOf('|');
+        if (pipeIdx > 0) {
+          const left = entry.pair.slice(0, pipeIdx);
+          const right = entry.pair.slice(pipeIdx + 1);
+          linkMap[`${right}|${left}`] = entry;
+        }
       }
     }
 
     for (const [a, b] of batch) {
       const nameA = clusterSummaries[a.id].name;
       const nameB = clusterSummaries[b.id].name;
-      const key = `${nameA}|${nameB}`;
+      const labelA = clusterSummaries[a.id].label;
+      const labelB = clusterSummaries[b.id].label;
+      const key = `${labelA}|${labelB}`;
       const entry = linkMap[key];
 
       if (!entry || typeof entry.strength !== 'number') {
