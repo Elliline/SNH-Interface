@@ -1363,13 +1363,17 @@ function classifyToolNeed(messageText, superSearchEnabled) {
   if (codingPatterns.some(r => r.test(text))) return false;
 
   // Conceptual / educational questions
-  const conceptualPatterns = [
-    /^(explain|describe|what is|what are|what does|how does|why (is|does|do|are)|define)\b/,
-    /\bcan you explain\b/,
-    /\btell me about\b/,
-    /\bwhat (is|are) (the )?(difference|meaning|definition|concept|purpose|point)\b/,
-  ];
-  if (conceptualPatterns.some(r => r.test(text))) return false;
+  // Guard: skip this shortcut when the message contains real-time keywords
+  const realtimeKeywords = /\b(weather|forecast|stock|price|latest|current|today|score|version|release|update|news)\b/;
+  if (!realtimeKeywords.test(text)) {
+    const conceptualPatterns = [
+      /^(explain|describe|what is|what are|what does|how does|why (is|does|do|are)|define)\b/,
+      /\bcan you explain\b/,
+      /\btell me about\b/,
+      /\bwhat (is|are) (the )?(difference|meaning|definition|concept|purpose|point)\b/,
+    ];
+    if (conceptualPatterns.some(r => r.test(text))) return false;
+  }
 
   // Creative writing
   const creativePatterns = [
@@ -1455,8 +1459,19 @@ function classifyToolNeed(messageText, superSearchEnabled) {
   ];
   if (productPatterns.some(r => r.test(text))) return true;
 
-  // Default: include tools when uncertain
-  return true;
+  // --- Factual / encyclopedic lookups ---
+  const factualPatterns = [
+    /\bwho is\b.{0,30}\b(the|a)\b/,
+    /\bhow (much|many|long|far|old)\b/,
+    /\bwhere (is|are|can|do)\b.{0,20}\b(the|a|i)\b/,
+    /\bpopulation\b/,
+    /\bcapital (of|city)\b/,
+  ];
+  if (factualPatterns.some(r => r.test(text))) return true;
+
+  // Default: no tools needed — conversational, descriptive, or planning messages
+  // don't require web search. Only explicit patterns above should trigger tools.
+  return false;
 }
 
 /**
