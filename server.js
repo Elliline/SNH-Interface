@@ -1318,6 +1318,148 @@ app.post('/api/stt/upload', express.raw({ type: 'audio/*', limit: '10mb' }), asy
 // ============ Memory-Enhanced Chat Endpoint ============
 
 /**
+ * Classifies whether a user message likely requires web search/fetch tools.
+ * Returns true if tools should be invoked, false if the request can be
+ * answered directly from the model's knowledge or memory system.
+ *
+ * Errs on the side of including tools — false negatives (missed searches)
+ * are worse than false positives (an unnecessary tool round).
+ */
+function classifyToolNeed(messageText, superSearchEnabled) {
+  if (superSearchEnabled) return true;
+
+  const text = messageText.toLowerCase();
+
+  // === "No tools needed" patterns checked FIRST — short-circuit before ===
+  // === positive-match patterns that contain overly broad keywords.     ===
+
+  // Memory / personal notes references — answer from memory system, not web
+  const memoryPhrases = [
+    'what do you remember', 'my notes', 'my memories', 'my clusters',
+    'what have i told you', 'from our conversation', 'from memory',
+    'you told me', 'we talked about', 'previous conversation',
+  ];
+  if (memoryPhrases.some(p => text.includes(p))) return false;
+
+  // Pure conversational openers
+  const conversationalPatterns = [
+    /^(hi|hello|hey|howdy|sup|yo|good (morning|afternoon|evening|night))[\s!?.]*$/,
+    /^(thanks?|thank you|thx|ty|appreciate it|cheers)[\s!.]*$/,
+    /^(bye|goodbye|see you|later|cya)[\s!.]*$/,
+    /^how are you[\s!?]*$/,
+    /^what('s| is) up[\s!?]*$/,
+    /^(ok|okay|got it|sounds good|sure|alright|cool|nice|great|perfect|wonderful)[\s!.]*$/,
+  ];
+  if (conversationalPatterns.some(r => r.test(text.trim()))) return false;
+
+  // Coding / programming questions — model knowledge is sufficient
+  const codingPatterns = [
+    /\b(write|create|generate|implement|code|program|script|function|class|method)\b.{0,30}\b(in|using|with)\b.{0,20}\b(python|javascript|typescript|rust|go|java|c\+\+|sql|bash|ruby|php)\b/,
+    /\b(debug|fix|refactor|optimize|explain)\b.{0,30}\b(this|the|my)\b.{0,20}\b(code|function|script|bug|error)\b/,
+    /\bhow (do|does|to)\b.{0,40}\b(function|work|implement|use|call|declare|define)\b/,
+    /\bsyntax (for|of)\b/,
+    /\bexample (of|for)\b.{0,30}\b(code|function|class|pattern)\b/,
+  ];
+  if (codingPatterns.some(r => r.test(text))) return false;
+
+  // Conceptual / educational questions
+  const conceptualPatterns = [
+    /^(explain|describe|what is|what are|what does|how does|why (is|does|do|are)|define)\b/,
+    /\bcan you explain\b/,
+    /\btell me about\b/,
+    /\bwhat (is|are) (the )?(difference|meaning|definition|concept|purpose|point)\b/,
+  ];
+  if (conceptualPatterns.some(r => r.test(text))) return false;
+
+  // Creative writing
+  const creativePatterns = [
+    /\b(write|compose|draft|create)\b.{0,30}\b(story|poem|essay|letter|email|haiku|sonnet|blog|fiction|narrative)\b/,
+    /\b(continue|finish|extend)\b.{0,30}\b(story|poem|narrative|text)\b/,
+    /\bonce upon a time\b/,
+  ];
+  if (creativePatterns.some(r => r.test(text))) return false;
+
+  // Questions about the model itself
+  const modelPatterns = [
+    /\b(you|your)\b.{0,20}\b(model|training|knowledge|cutoff|capabilities|limitations|version)\b/,
+    /\bwhat (model|llm|ai) are you\b/,
+    /\bwho (made|created|built|trained) you\b/,
+  ];
+  if (modelPatterns.some(r => r.test(text))) return false;
+
+  // === Positive-match patterns: message likely needs web tools ===
+
+  // --- Explicit search/lookup intent ---
+  const searchPhrases = [
+    'search for', 'look up', 'lookup', 'google', 'find me', 'find out',
+    'search the web', 'search online',
+    'what\'s happening with', "what's happening with",
+  ];
+  if (searchPhrases.some(p => text.includes(p))) return true;
+
+  // --- Current events / news ---
+  const currentEventsPhrases = [
+    'latest news', 'breaking news', 'headline', 'recent events',
+    'what happened', 'what\'s happening', "what's happening",
+    'who won', 'election results', 'sports score', 'game result',
+  ];
+  if (currentEventsPhrases.some(p => text.includes(p))) return true;
+
+  // --- Real-time / time-sensitive data ---
+  const realtimePatterns = [
+    /\bweather\b/,
+    /\bforecast\b/,
+    /\bstock price\b/,
+    /\bstock market\b/,
+    /\bcrypto(currency)?\s+(price|value|market)/,
+    /\bbitcoin\s+(price|value|worth)/,
+    /\betherei?um\s+(price|value|worth)/,
+    /\bright now\b/,
+    /\bat the moment\b/,
+    /\bcurrently\b.{0,30}\b(price|cost|rate|status|available)\b/,
+    /\btoday('s)?\b.{0,40}\b(price|rate|score|news|update|status)\b/,
+    /\blatest\b.{0,40}\b(version|release|update|news|patch)\b/,
+    /\bcurrent\b.{0,40}\b(price|rate|status|version|leader|president|ceo)\b/,
+    /\b202[5-9]\b/,  // years in the near-future range suggesting current info
+    /\b203\d\b/,
+  ];
+  if (realtimePatterns.some(r => r.test(text))) return true;
+
+  // --- URL / website requests ---
+  const urlPatterns = [
+    /\burl\b/,
+    /\blink\b.{0,20}\b(to|for)\b/,
+    /\bwebsite\b/,
+    /\bhomepage\b/,
+    /https?:\/\//,
+    /\bwww\./,
+    /\bdownload\b.{0,30}\b(from|link|url)\b/,
+  ];
+  if (urlPatterns.some(r => r.test(text))) return true;
+
+  // --- "Is X still Y" / state-change questions ---
+  const stateChangePatterns = [
+    /\bis\b.{0,40}\bstill\b/,
+    /\bhas\b.{0,30}\bchanged\b/,
+    /\bdid\b.{0,30}\b(release|launch|announce|update|merge|fix)\b/,
+    /\bwhen (did|will|is)\b/,
+    /\bwhat (version|release)\b/,
+  ];
+  if (stateChangePatterns.some(r => r.test(text))) return true;
+
+  // --- Specific products / releases that change frequently ---
+  const productPatterns = [
+    /\b(new|latest|recent|upcoming)\b.{0,30}\b(iphone|android|macbook|windows|ubuntu|debian|firefox|chrome|edge)\b/,
+    /\b(changelog|patch notes|roadmap)\b/,
+    /\bgithub\b.{0,30}\b(issue|pr|pull request|release|commit)\b/,
+  ];
+  if (productPatterns.some(r => r.test(text))) return true;
+
+  // Default: include tools when uncertain
+  return true;
+}
+
+/**
  * POST /api/chat/memory
  * Enhanced chat endpoint that:
  * 1. Saves user message to SQLite
@@ -1363,6 +1505,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log('Tools enabled:', toolsEnabled, '(type:', typeof toolsEnabled, ') | MCP has tools:', mcpClient.hasTools(), '| Tool names:', mcpClient.getToolNames());
     console.log('TTS enabled:', ttsEnabled, '(type:', typeof ttsEnabled, ')');
     console.log('Super Search:', !!superSearch);
+
+    // Smart tool routing: classify if this message needs web tools
+    const needsTools = toolsEnabled && mcpClient.hasTools() && classifyToolNeed(userMessage.content, !!superSearch);
+    console.log('Tool routing:', needsTools ? 'TOOLS (search/fetch likely needed)' : 'DIRECT (conversational, skipping tool loop)');
 
     // Save user message to database
     const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model);
@@ -1557,7 +1703,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // Ollama tool calling is strict about message format — consolidate
       // all system messages into a single one at position 0 so the memory
       // context doesn't create extra messages that break the tool schema
-      if (toolsEnabled) {
+      if (needsTools) {
         const systemMsgs = ollamaMessages.filter(m => m.role === 'system');
         const nonSystemMsgs = ollamaMessages.filter(m => m.role !== 'system');
         if (systemMsgs.length > 0) {
@@ -1570,7 +1716,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
       // MCP tool calling loop for Ollama
       console.log(`MCP [ollama]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
-      if (toolsEnabled && mcpClient.hasTools()) {
+      if (needsTools) {
         const tools = mcpClient.getToolsForOpenAI();
         const toolSearxngHost = searxngHost
           ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
@@ -1741,7 +1887,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // MCP tool calling loop (only when tools are enabled)
       const providerLabel = providerType === 'vllm' ? 'vllm' : 'llamacpp';
       console.log(`MCP [${providerLabel}]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
-      if (toolsEnabled && mcpClient.hasTools()) {
+      if (needsTools) {
         const tools = mcpClient.getToolsForOpenAI();
         const toolSearxngHost = searxngHost
           ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
