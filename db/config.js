@@ -27,7 +27,7 @@ const DEFAULTS = {
   },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
   memory: {
-    similarityThreshold: 0.55,
+    similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,
     maxFactsPerCluster: 10,
     dailyLogRetentionDays: 7,

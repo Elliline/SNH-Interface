@@ -2,6 +2,13 @@ const { randomUUID } = require('crypto');
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const { getConfig, getProviderInstance } = require('./config');
 
+// UUID validation for safe LanceDB filter interpolation
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function safeId(id) {
+  if (!UUID_RE.test(id)) throw new Error(`Invalid UUID for LanceDB filter: ${id}`);
+  return id;
+}
+
 // Stop words filtered out during cluster naming
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
@@ -105,10 +112,44 @@ function cosineSimilarity(a, b) {
  * @param {string} host - Host URL
  * @returns {Promise<string>} - Generated cluster name
  */
+// Verbs that indicate a garbage cluster name (sentence fragment, not a category)
+const REJECT_VERBS = new Set([
+  'needs', 'avoid', 'having', 'doing', 'working', 'being', 'getting',
+  'making', 'going', 'running', 'using', 'wants', 'takes', 'trying', 'looking'
+]);
+
+function isValidClusterName(name) {
+  if (!name || name.trim().length < 3) return false;
+  const words = name.trim().split(/\s+/);
+  if (words.length > 4) return false;
+  for (const word of words) {
+    if (REJECT_VERBS.has(word.toLowerCase())) return false;
+  }
+  return true;
+}
+
 async function generateClusterName(fact, provider, model, apiKey, host) {
-  const prompt = `Given this fact, generate a short 1-3 word category name for it. Return ONLY the category name, nothing else. Fact: ${fact}`;
+  // 1. Try curated category first — fast, deterministic, no LLM needed
+  const curatedName = matchCuratedCategory(fact);
+  if (curatedName) return curatedName;
+
+  // 2. Try LLM with few-shot examples and constraints
+  const prompt = `You are a category labeler. Given a fact about a user, return a short 1-3 word category name (like a folder label). Use nouns only, no verbs or sentences.
+
+Examples:
+- "User has two cats" → Pets & Animals
+- "User runs an MSP business" → Business & MSP
+- "User has an RTX 4090 GPU" → Hardware & Infrastructure
+- "User plays Stellaris" → Gaming
+- "User is building a memory system for their AI assistant" → AI & Projects
+
+Return ONLY the category name, nothing else.
+
+Fact: ${fact}`;
 
   try {
+    let llmName = null;
+
     if (provider === 'ollama') {
       const response = await fetch(`${host}/api/generate`, {
         method: 'POST',
@@ -125,7 +166,7 @@ async function generateClusterName(fact, provider, model, apiKey, host) {
       }
 
       const data = await response.json();
-      return data.response?.trim()?.substring(0, 50) || extractNameFromFact(fact);
+      llmName = data.response?.trim()?.substring(0, 50);
     } else if (provider === 'llamacpp') {
       const response = await fetch(`${host}/completion`, {
         method: 'POST',
@@ -143,11 +184,16 @@ async function generateClusterName(fact, provider, model, apiKey, host) {
       }
 
       const data = await response.json();
-      return data.content?.trim()?.substring(0, 50) || extractNameFromFact(fact);
-    } else {
-      // For other providers, extract from fact text
-      return extractNameFromFact(fact);
+      llmName = data.content?.trim()?.substring(0, 50);
     }
+
+    // 3. Post-LLM validation: reject names with >4 words or containing verbs
+    if (llmName && isValidClusterName(llmName)) {
+      return llmName;
+    }
+
+    // 4. Fall back to word-frequency extraction
+    return extractNameFromFact(fact);
   } catch (error) {
     console.error('[Clusters] Cluster name generation error:', error.message);
     return extractNameFromFact(fact);
@@ -460,11 +506,13 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         }
       }
 
-      // Find cluster with highest average similarity
+      // Find cluster with highest max similarity (max is a better signal than
+      // average — large clusters with some marginal members would otherwise
+      // have their averages dragged down, causing duplicate cluster creation)
       for (const [clusterId, similarities] of Object.entries(clusterScores)) {
-        const avgSimilarity = similarities.reduce((a, b) => a + b, 0) / similarities.length;
-        if (avgSimilarity > bestSimilarity) {
-          bestSimilarity = avgSimilarity;
+        const maxSimilarity = Math.max(...similarities);
+        if (maxSimilarity > bestSimilarity) {
+          bestSimilarity = maxSimilarity;
           bestClusterId = clusterId;
         }
       }
@@ -476,21 +524,56 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     let clusterName = null;
     let isNew = false;
 
-    // Create new cluster if no good match
-    if (!bestClusterId || bestSimilarity <= config.memory.similarityThreshold) {
-      console.log('[Clusters] Creating new cluster');
-      clusterId = randomUUID();
+    // Soft match band: if similarity is between clusterLinkThreshold (0.50) and
+    // similarityThreshold (0.60), check whether the fact and the best cluster
+    // share a curated category — if so, merge instead of creating a duplicate.
+    const softMatchThreshold = config.memory.clusterLinkThreshold; // 0.50
+
+    if (bestClusterId && bestSimilarity > softMatchThreshold && bestSimilarity <= config.memory.similarityThreshold) {
+      const factCategory = matchCuratedCategory(fact);
+      if (factCategory && bestClusterId) {
+        const bestCluster = db.prepare('SELECT name FROM memory_clusters WHERE id = ?').get(bestClusterId);
+        if (bestCluster && bestCluster.name === factCategory) {
+          // Curated categories match — treat as a merge
+          clusterId = bestClusterId;
+          clusterName = bestCluster.name;
+          console.log(`[Clusters] Soft match: "${factCategory}" category match (similarity: ${bestSimilarity.toFixed(3)}) → merging`);
+
+          db.prepare('UPDATE memory_clusters SET updated_at = ? WHERE id = ?')
+            .run(new Date().toISOString(), clusterId);
+        }
+      }
+    }
+
+    // Create new cluster if no match (hard or soft)
+    if (!clusterId || (!clusterName && bestSimilarity <= config.memory.similarityThreshold)) {
       clusterName = await generateClusterName(fact, provider, model, apiKey, host);
-      const now = new Date().toISOString();
 
-      db.prepare(`
-        INSERT INTO memory_clusters (id, name, description, created_at, updated_at)
-        VALUES (?, ?, '', ?, ?)
-      `).run(clusterId, clusterName, now, now);
+      // Name-collision check: if a cluster with this name already exists, route there instead
+      const existingByName = db.prepare(
+        'SELECT id, name FROM memory_clusters WHERE name = ?'
+      ).get(clusterName);
 
-      isNew = true;
-      console.log(`[Clusters] Created cluster: ${clusterName}`);
-    } else {
+      if (existingByName) {
+        clusterId = existingByName.id;
+        console.log(`[Clusters] Routing to existing cluster "${clusterName}" (name collision avoided)`);
+
+        db.prepare('UPDATE memory_clusters SET updated_at = ? WHERE id = ?')
+          .run(new Date().toISOString(), clusterId);
+      } else {
+        console.log('[Clusters] Creating new cluster');
+        clusterId = randomUUID();
+        const now = new Date().toISOString();
+
+        db.prepare(`
+          INSERT INTO memory_clusters (id, name, description, created_at, updated_at)
+          VALUES (?, ?, '', ?, ?)
+        `).run(clusterId, clusterName, now, now);
+
+        isNew = true;
+        console.log(`[Clusters] Created cluster: ${clusterName}`);
+      }
+    } else if (!clusterName) {
       // Get existing cluster name
       const cluster = db.prepare('SELECT name FROM memory_clusters WHERE id = ?').get(clusterId);
       clusterName = cluster?.name || 'Unknown';
@@ -596,11 +679,11 @@ async function searchClusters(query, limit = 3) {
       score.count++;
     }
 
-    // Calculate averages and sort
+    // Rank by max similarity (consistent with assignToCluster scoring)
     const rankedClusters = Object.entries(clusterScores)
       .map(([clusterId, score]) => ({
         clusterId,
-        score: score.avgSimilarity / score.count
+        score: score.maxSimilarity
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
@@ -872,7 +955,7 @@ async function mergeSingletons(threshold) {
 
         if (vectorArray) {
           try {
-            await clusterTable.delete(`member_id = "${singleton.member_id}"`);
+            await clusterTable.delete(`member_id = "${safeId(singleton.member_id)}"`);
             await clusterTable.add([{
               id: randomUUID(),
               member_id: singleton.member_id,
@@ -938,7 +1021,7 @@ async function mergeSingletons(threshold) {
 
       // Update LanceDB: delete old entry, add with new cluster_id
       try {
-        await clusterTable.delete(`member_id = "${singleton.member_id}"`);
+        await clusterTable.delete(`member_id = "${safeId(singleton.member_id)}"`);
         await clusterTable.add([{
           id: randomUUID(),
           member_id: singleton.member_id,
@@ -1014,7 +1097,8 @@ async function mergeSingletons(threshold) {
           if (embedding) {
             const vectorArray = Array.from(embedding);
             try {
-              await clusterTable.delete(`member_id = "${s.member_id}"`);
+              await clusterTable.delete(`member_id = "${safeId(s.member_id)}"`)
+;
               await clusterTable.add([{ id: randomUUID(), member_id: s.member_id, cluster_id: targetId, content: s.content, vector: vectorArray }]);
             } catch (e) { console.error('[Clusters] LanceDB error:', e.message); }
           }
@@ -1032,7 +1116,8 @@ async function mergeSingletons(threshold) {
             if (embedding) {
               const vectorArray = Array.from(embedding);
               try {
-                await clusterTable.delete(`member_id = "${s.member_id}"`);
+                await clusterTable.delete(`member_id = "${safeId(s.member_id)}"`)
+;
                 await clusterTable.add([{ id: randomUUID(), member_id: s.member_id, cluster_id: target.cluster_id, content: s.content, vector: vectorArray }]);
               } catch (e) { console.error('[Clusters] LanceDB error:', e.message); }
             }
@@ -1052,6 +1137,111 @@ async function mergeSingletons(threshold) {
   }
 }
 
+/**
+ * Merge clusters that share the same name (post-rename duplicates).
+ * For each duplicate name group, keeps the cluster with the most members
+ * and moves all members from the others into it. Updates LanceDB cluster_id
+ * metadata in-place (no re-embedding).
+ * @returns {Promise<number>} - Number of source clusters merged away
+ */
+async function mergeByName() {
+  try {
+    const db = getSqliteDb();
+    if (!db) return 0;
+
+    const rows = db.prepare(`
+      SELECT mc.id, mc.name, COUNT(cm.id) AS member_count
+      FROM memory_clusters mc
+      LEFT JOIN cluster_members cm ON cm.cluster_id = mc.id
+      GROUP BY mc.id
+      ORDER BY mc.name ASC, member_count DESC
+    `).all();
+
+    // Group by name
+    const byName = {};
+    for (const row of rows) {
+      if (!byName[row.name]) byName[row.name] = [];
+      byName[row.name].push(row);
+    }
+
+    const clusterTable = await getClusterEmbeddingsTable();
+    let merged = 0;
+
+    for (const [name, group] of Object.entries(byName)) {
+      if (group.length <= 1) continue;
+
+      const [target, ...sources] = group; // sorted DESC by member_count
+
+      for (const source of sources) {
+        // Get member IDs before moving
+        const members = db.prepare(
+          'SELECT id FROM cluster_members WHERE cluster_id = ?'
+        ).all(source.id);
+
+        // Move members to target
+        db.prepare('UPDATE cluster_members SET cluster_id = ? WHERE cluster_id = ?')
+          .run(target.id, source.id);
+
+        // Re-point links (skip self-links and duplicates)
+        const links = db.prepare(
+          'SELECT * FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?'
+        ).all(source.id, source.id);
+
+        for (const link of links) {
+          const newA = link.cluster_a === source.id ? target.id : link.cluster_a;
+          const newB = link.cluster_b === source.id ? target.id : link.cluster_b;
+
+          if (newA === newB) {
+            db.prepare('DELETE FROM cluster_links WHERE id = ?').run(link.id);
+            continue;
+          }
+
+          const existing = db.prepare(`
+            SELECT id FROM cluster_links
+            WHERE ((cluster_a = ? AND cluster_b = ?) OR (cluster_a = ? AND cluster_b = ?))
+              AND id != ?
+          `).get(newA, newB, newB, newA, link.id);
+
+          if (existing) {
+            db.prepare('DELETE FROM cluster_links WHERE id = ?').run(link.id);
+          } else {
+            db.prepare('UPDATE cluster_links SET cluster_a = ?, cluster_b = ? WHERE id = ?')
+              .run(newA, newB, link.id);
+          }
+        }
+
+        // Delete source cluster
+        db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(source.id);
+
+        // Update LanceDB cluster_id in-place for moved members
+        if (clusterTable) {
+          for (const m of members) {
+            try {
+              await clusterTable.update({
+                where: `member_id = "${safeId(m.id)}"`,
+                valuesSql: { cluster_id: `'${safeId(target.id)}'` }
+              });
+            } catch (e) {
+              console.error(`[Clusters] LanceDB update error during mergeByName: ${e.message}`);
+            }
+          }
+        }
+
+        console.log(`[Clusters] mergeByName: "${name}" (${source.member_count} members) → target (${target.member_count} members)`);
+        merged++;
+      }
+    }
+
+    if (merged > 0) {
+      console.log(`[Clusters] mergeByName: merged ${merged} duplicate-name cluster(s)`);
+    }
+    return merged;
+  } catch (error) {
+    console.error('[Clusters] Error in mergeByName:', error.message);
+    return 0;
+  }
+}
+
 module.exports = {
   assignToCluster,
   searchClusters,
@@ -1060,6 +1250,9 @@ module.exports = {
   generateEmbedding,
   cosineSimilarity,
   generateClusterNameFromMembers,
+  matchCuratedCategory,
+  isValidClusterName,
   renameAllClusters,
+  mergeByName,
   mergeSingletons
 };

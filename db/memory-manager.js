@@ -346,6 +346,17 @@ async function executeSplits(auditResults) {
       console.error('[Heartbeat] renameAllClusters error:', err.message);
       results.anomalies.push(`renameAllClusters failed: ${err.message}`);
     }
+
+    // Merge any clusters that ended up with the same name after renaming
+    try {
+      const mergedByName = await memoryClusters.mergeByName();
+      if (mergedByName > 0) {
+        console.log(`[Heartbeat] Merged ${mergedByName} duplicate-name cluster(s) after rename`);
+      }
+    } catch (err) {
+      console.error('[Heartbeat] mergeByName error:', err.message);
+      results.anomalies.push(`mergeByName failed: ${err.message}`);
+    }
   }
 
   console.log(`[Heartbeat] Split execution complete: ${results.clustersSplit} cluster(s) split`);
@@ -973,6 +984,17 @@ async function runMaintenance() {
       console.log('[Heartbeat] No oversized clusters to audit — skipping steps 1–3');
       // Still run cross-link audit to keep link table healthy
       crossLinkResults = await auditCrossLinks();
+    }
+
+    // Merge any clusters sharing the same name (catches duplicates from
+    // assignToCluster creating clusters that later get renamed identically)
+    try {
+      const mergedByName = await memoryClusters.mergeByName();
+      if (mergedByName > 0) {
+        console.log(`[Heartbeat] Merged ${mergedByName} duplicate-name cluster(s)`);
+      }
+    } catch (err) {
+      console.error('[Heartbeat] mergeByName error:', err.message);
     }
 
     // Task B & C unchanged
