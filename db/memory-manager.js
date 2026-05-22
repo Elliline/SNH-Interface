@@ -42,7 +42,7 @@ function memberIdFilter(id) {
  * Uses the heartbeat model/provider from config.
  * @param {string} systemPrompt
  * @param {string} userPrompt
- * @returns {Promise<{content: string, provider: string}>}
+ * @returns {Promise<{content: string, provider: string, truncated: boolean}>}
  */
 async function callLLM(systemPrompt, userPrompt, options = {}) {
   const config = getConfig();
@@ -55,16 +55,21 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
     { role: 'user', content: userPrompt }
   ];
 
+  // Scale fetch timeout to token budget: max_tokens / 45 tok/s * 1000ms * 2x safety margin
+  const timeoutMs = Math.max(60000, Math.ceil(maxTokens / 45 * 1000 * 2));
+
   // Build provider call based on config
-  let url, body, extract;
+  let url, body, extract, extractFinishReason;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
     url = `${host}/v1/chat/completions`;
     body = { messages, stream: false, max_tokens: maxTokens };
     extract = (data) => data.choices?.[0]?.message?.content || '';
+    extractFinishReason = (data) => data.choices?.[0]?.finish_reason || '';
   } else {
     url = `${host}/api/chat`;
     body = { model: heartbeatModel.model, messages, stream: false, options: { num_predict: maxTokens } };
     extract = (data) => data.message?.content || '';
+    extractFinishReason = (data) => data.done_reason || '';
   }
 
   const providers = [
@@ -72,7 +77,8 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
       name: `${heartbeatModel.provider}/${heartbeatModel.model}`,
       url,
       body,
-      extract
+      extract,
+      extractFinishReason
     }
   ];
 
@@ -80,12 +86,12 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
   for (const provider of providers) {
     try {
-      console.log(`[Heartbeat] Trying ${provider.name} → ${provider.url}`);
+      console.log(`[Heartbeat] Trying ${provider.name} → ${provider.url} (max_tokens: ${maxTokens}, timeout: ${timeoutMs}ms)`);
       const response = await fetch(provider.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(provider.body),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(timeoutMs)
       });
 
       if (!response.ok) {
@@ -94,9 +100,16 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
       const data = await response.json();
       const content = provider.extract(data);
+      const finishReason = provider.extractFinishReason(data);
+      const truncated = finishReason === 'length';
+
+      if (truncated) {
+        console.warn(`[Heartbeat] WARNING: ${provider.name} finish_reason: "length" — response truncated at max_tokens (${maxTokens}). Response: ${content.length} chars`);
+      }
+
       if (content) {
-        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars)`);
-        return { content, provider: provider.name };
+        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars, finish_reason: ${finishReason || 'n/a'})`);
+        return { content, provider: provider.name, truncated };
       }
       throw new Error('Empty response');
     } catch (err) {
@@ -109,23 +122,39 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 }
 
 /**
- * Parse a JSON object from LLM response text (handles markdown code blocks)
+ * Parse a JSON object from LLM response text.
+ * Finds the last balanced JSON object (or array) in the text to avoid
+ * capturing chain-of-thought braces like "the {Hardware} cluster".
  * @param {string} text - LLM response
  * @returns {Object|null}
  */
 function parseJSON(text) {
-  try {
-    // Try to find JSON object or array in the response
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) return JSON.parse(match[0]);
+  // Strip markdown code fences if present
+  const stripped = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '');
 
-    const arrMatch = text.match(/\[[\s\S]*\]/);
-    if (arrMatch) return JSON.parse(arrMatch[0]);
-
-    return null;
-  } catch {
-    return null;
+  // Find the last top-level '{' that starts a parseable JSON object (max 20 attempts)
+  let attempts = 0;
+  for (let i = stripped.lastIndexOf('{'); i >= 0 && attempts < 20; i = stripped.lastIndexOf('{', i - 1)) {
+    attempts++;
+    const candidate = stripped.slice(i);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === 'object' && parsed !== null) return parsed;
+    } catch { /* try earlier brace */ }
   }
+
+  // Fallback: try last top-level '[' for array responses (max 10 attempts)
+  attempts = 0;
+  for (let i = stripped.lastIndexOf('['); i >= 0 && attempts < 10; i = stripped.lastIndexOf('[', i - 1)) {
+    attempts++;
+    const candidate = stripped.slice(i);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* try earlier bracket */ }
+  }
+
+  return null;
 }
 
 // ============ Step 1: Audit Cluster Coherence ============
@@ -184,12 +213,15 @@ Rules:
 - Split names should be concise noun phrases (2-4 words).
 - If in doubt, return coherent: true.`;
 
-    const { content } = await callLLM(systemPrompt, `Facts in cluster "${cluster.name}":\n${factLines}`);
+    // Scale max_tokens: ~100 tokens per fact (40 visible JSON + ~60 model reasoning overhead) + 500 buffer
+    const estOutputTokens = Math.min(12288, Math.max(1024, detail.members.length * 100 + 500));
+    const { content, truncated } = await callLLM(systemPrompt, `Facts in cluster "${cluster.name}":\n${factLines}`, { maxTokens: estOutputTokens });
     const parsed = parseJSON(content);
 
     if (!parsed) {
+      console.warn(`[Heartbeat] Parse failure for cluster "${cluster.name}": ${content.length} chars, truncated: ${truncated}, last 200: ...${content.slice(-200)}`);
       base.durationMs = Date.now() - startMs;
-      return { ...base, error: 'LLM returned unparseable JSON' };
+      return { ...base, error: `LLM returned unparseable JSON (${content.length} chars, truncated: ${truncated})` };
     }
 
     base.coherent = parsed.coherent !== false;
@@ -450,9 +482,15 @@ Rules:
     }).join('\n\n');
 
     let parsed = null;
+    let rawContent = '';
+    let wasTruncated = false;
     try {
-      const { content } = await callLLM(systemPrompt, pairDescriptions);
-      parsed = parseJSON(content);
+      // Scale max_tokens: ~200 tokens per pair (80 visible + model reasoning overhead) + 300 buffer
+      const batchMaxTokens = Math.min(8192, Math.max(1024, batch.length * 200 + 300));
+      const result = await callLLM(systemPrompt, pairDescriptions, { maxTokens: batchMaxTokens });
+      rawContent = result.content;
+      wasTruncated = result.truncated;
+      parsed = parseJSON(rawContent);
     } catch (err) {
       console.error(`[Heartbeat] Cross-link batch ${batchStart / BATCH_SIZE + 1} LLM call failed:`, err.message);
       results.anomalies.push(`Cross-link batch LLM failed (pairs ${batchStart}–${batchStart + batch.length - 1}): ${err.message}`);
@@ -460,7 +498,8 @@ Rules:
     }
 
     if (!parsed || !Array.isArray(parsed.links)) {
-      results.anomalies.push(`Cross-link batch ${batchStart / BATCH_SIZE + 1} returned unparseable JSON`);
+      console.warn(`[Heartbeat] Parse failure for cross-link batch ${batchStart / BATCH_SIZE + 1}: ${rawContent.length} chars, truncated: ${wasTruncated}, last 200: ...${rawContent.slice(-200)}`);
+      results.anomalies.push(`Cross-link batch ${batchStart / BATCH_SIZE + 1} returned unparseable JSON (${rawContent.length} chars, truncated: ${wasTruncated})`);
       continue;
     }
 
@@ -679,10 +718,15 @@ Rules:
 - If the facts look clean, return {"actions":[]}.`;
 
     const numberedFacts = facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
-    const { content: llmResponse } = await callLLM(systemPrompt, numberedFacts);
+    // Scale max_tokens: ~75 tokens per fact (30 visible + model reasoning overhead) + 512 buffer
+    const cleanupMaxTokens = Math.min(8192, Math.max(1024, facts.length * 75 + 512));
+    const { content: llmResponse, truncated: cleanupTruncated } = await callLLM(systemPrompt, numberedFacts, { maxTokens: cleanupMaxTokens });
     const parsed = parseJSON(llmResponse);
 
     if (!parsed || !Array.isArray(parsed.actions) || parsed.actions.length === 0) {
+      if (!parsed) {
+        console.warn(`[Heartbeat] Parse failure for cleanupFacts: ${llmResponse.length} chars, truncated: ${cleanupTruncated}, last 200: ...${llmResponse.slice(-200)}`);
+      }
       console.log('[Heartbeat] No fact cleanup actions suggested');
       return results;
     }
@@ -696,12 +740,14 @@ Rules:
     // Process actions in reverse order of line position to preserve indices
     // Build a list of line operations first
     const lineOps = []; // { lineIndex, op: 'delete' | 'replace', newText? }
+    const claimedLines = new Set(); // prevent duplicate ops on the same line
 
     for (const action of parsed.actions) {
       try {
         if (action.type === 'remove' && action.fact) {
           const lineIdx = lines.findIndex(l => l === `- ${action.fact}`);
-          if (lineIdx >= 0) {
+          if (lineIdx >= 0 && !claimedLines.has(lineIdx)) {
+            claimedLines.add(lineIdx);
             lineOps.push({ lineIndex: lineIdx, op: 'delete' });
             console.log(`[Heartbeat] Removing fact: "${action.fact}" — ${action.reason}`);
             results.removed++;
@@ -709,7 +755,8 @@ Rules:
 
         } else if (action.type === 'reword' && action.original && action.replacement) {
           const lineIdx = lines.findIndex(l => l === `- ${action.original}`);
-          if (lineIdx >= 0) {
+          if (lineIdx >= 0 && !claimedLines.has(lineIdx)) {
+            claimedLines.add(lineIdx);
             lineOps.push({ lineIndex: lineIdx, op: 'replace', newText: `- ${action.replacement}` });
             console.log(`[Heartbeat] Rewording: "${action.original}" → "${action.replacement}"`);
             results.reworded++;
@@ -745,14 +792,16 @@ Rules:
         } else if (action.type === 'merge' && Array.isArray(action.originals) && action.replacement) {
           const lineIndices = [];
           for (const orig of action.originals) {
-            const idx = lines.findIndex(l => l === `- ${orig}`);
+            const idx = lines.findIndex((l, li) => l === `- ${orig}` && !claimedLines.has(li));
             if (idx >= 0) lineIndices.push({ idx, text: orig });
           }
           if (lineIndices.length < 2) continue;
 
           // Replace first occurrence, delete the rest
+          claimedLines.add(lineIndices[0].idx);
           lineOps.push({ lineIndex: lineIndices[0].idx, op: 'replace', newText: `- ${action.replacement}` });
           for (let i = 1; i < lineIndices.length; i++) {
+            claimedLines.add(lineIndices[i].idx);
             lineOps.push({ lineIndex: lineIndices[i].idx, op: 'delete' });
           }
 
@@ -884,8 +933,14 @@ Rules:
 - Skip routine entries like "Chat exchange with model - 0 facts extracted".
 - If nothing is worth keeping, return {"summary":"...","remainingFacts":[]}.`;
 
-        const { content: llmResponse } = await callLLM(systemPrompt, content);
+        // Scale max_tokens on expected output: summary + extracted facts, proportional to input
+        const archiveMaxTokens = Math.min(8192, Math.max(1024, Math.ceil(content.length / 4) + 512));
+        const { content: llmResponse, truncated: archiveTruncated } = await callLLM(systemPrompt, content, { maxTokens: archiveMaxTokens });
         const parsed = parseJSON(llmResponse);
+
+        if (!parsed) {
+          console.warn(`[Heartbeat] Parse failure for daily log ${file}: ${llmResponse.length} chars, truncated: ${archiveTruncated}, last 200: ...${llmResponse.slice(-200)}`);
+        }
 
         if (parsed && Array.isArray(parsed.remainingFacts) && parsed.remainingFacts.length > 0) {
           const validFacts = parsed.remainingFacts.filter(f => typeof f === 'string' && f.trim().length > 0);
