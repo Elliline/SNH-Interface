@@ -109,6 +109,9 @@ function initDatabase() {
         source TEXT,
         importance REAL DEFAULT 0.5,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'active',
+        superseded_by TEXT,
         FOREIGN KEY (cluster_id) REFERENCES memory_clusters(id)
       )
     `);
@@ -141,6 +144,19 @@ function initDatabase() {
         "UPDATE cluster_members SET updated_at = COALESCE(created_at, ?) WHERE updated_at IS NULL"
       ).run(new Date().toISOString());
       console.log('Migration: added updated_at to cluster_members and backfilled from created_at');
+    }
+
+    // Migration: fact supersession — status (active/superseded) + superseded_by.
+    // Existing rows are all active (no contradiction history recorded yet).
+    if (!memberCols.some(c => c.name === 'status')) {
+      sqliteDb.exec("ALTER TABLE cluster_members ADD COLUMN status TEXT DEFAULT 'active'");
+      sqliteDb.exec("UPDATE cluster_members SET status = 'active' WHERE status IS NULL");
+      console.log('Migration: added status to cluster_members (all existing rows active)');
+    }
+    if (!memberCols.some(c => c.name === 'superseded_by')) {
+      // Nullable pointer to the fact that replaced this one.
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN superseded_by TEXT');
+      console.log('Migration: added superseded_by to cluster_members');
     }
 
     console.log('SQLite database initialized successfully');

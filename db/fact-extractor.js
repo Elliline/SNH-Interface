@@ -694,6 +694,68 @@ function loadMemoryContext(memoryDir) {
 }
 
 /**
+ * Ask the local reasoning model whether a new user statement contradicts an
+ * existing stored fact. The user is always the authority on their own life, so
+ * a contradiction means the new statement wins and the old fact is superseded.
+ * @param {string} newFact - The fact just extracted from the user
+ * @param {string} oldFact - An existing active stored fact
+ * @returns {Promise<{contradicts: boolean, reasoning: string}>}
+ */
+async function judgeContradiction(newFact, oldFact) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You are a fact contradiction detector for a personal memory system. You are given an EXISTING stored fact about the user and a NEW statement the user just made about themselves.
+
+Decide whether the NEW statement contradicts the EXISTING fact — i.e. they cannot both be true of the user at the same time.
+- Corrections and replacements ARE contradictions ("Actually my MSP is X, not Y", "I moved to Z", "I no longer use Q").
+- Additional detail, refinement, or an unrelated fact is NOT a contradiction.
+
+Respond with exactly YES or NO on the first line, then one short line of reasoning.`;
+    const userPrompt = `EXISTING fact: "${oldFact}"\nNEW statement: "${newFact}"\n\nDoes the NEW statement contradict the EXISTING fact?`;
+
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
+    const firstWord = (content.trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    const contradicts = firstWord === 'yes';
+    const reasoning = content.trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Contradiction judge: ${contradicts ? 'YES' : 'NO'} — "${newFact}" vs "${oldFact}" (${reasoning})`);
+    return { contradicts, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] Contradiction judge error:', error.message);
+    return { contradicts: false, reasoning: '' };
+  }
+}
+
+/**
+ * Remove a superseded fact's line from MEMORY.md so it stops entering model
+ * context. The SQLite row is kept for history; only the injected markdown copy
+ * is pruned. Matches the `- <fact>` bullet by trimmed content.
+ * @param {string} factContent - The exact fact text to remove
+ * @param {string} memoryFilePath - Path to MEMORY.md
+ * @returns {boolean} - true if a line was removed
+ */
+function removeFactLineFromMemory(factContent, memoryFilePath) {
+  try {
+    if (!fs.existsSync(memoryFilePath)) return false;
+    const target = factContent.trim().toLowerCase();
+    const lines = fs.readFileSync(memoryFilePath, 'utf8').split('\n');
+    const kept = lines.filter(line => {
+      const m = line.match(/^\s*-\s+(.*)$/);
+      if (!m) return true;
+      return m[1].trim().toLowerCase() !== target;
+    });
+    if (kept.length !== lines.length) {
+      fs.writeFileSync(memoryFilePath, kept.join('\n'), 'utf8');
+      console.log(`[FactExtractor] Removed superseded fact line from MEMORY.md: "${factContent}"`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('[FactExtractor] Error removing fact line from memory:', error.message);
+    return false;
+  }
+}
+
+/**
  * Process fact extraction for a chat exchange (high-level orchestrator)
  * @param {string} userMessage - The user's message
  * @param {string} assistantMessage - The assistant's response
@@ -716,26 +778,69 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
     // Extract facts using the configured extraction model
     const facts = await extractFacts(userMessage, assistantMessage, extractionProvider, extractionModel, apiKey, extractionHost);
 
+    const memoryFile = path.join(memoryDir, 'MEMORY.md');
+    const dailyDir = path.join(memoryDir, 'daily');
+
     // Append to memory if facts found
     if (facts.length > 0) {
-      const memoryFile = path.join(memoryDir, 'MEMORY.md');
+      const memoryClusters = require('./memory-clusters');
+
+      // === Contradiction detection (before storing) ===
+      // For each new fact, find nearby ACTIVE facts and ask the model whether
+      // they contradict. A confirmed contradiction means the old fact will be
+      // superseded once the new fact is stored. The user is the authority on
+      // their own life, so their latest statement always wins.
+      const supersessions = []; // {oldMemberId, oldContent, newFact}
+      const seenOld = new Set();
+      try {
+        for (const fact of facts) {
+          const candidates = await memoryClusters.findContradictionCandidates(fact);
+          for (const candidate of candidates) {
+            if (seenOld.has(candidate.memberId)) continue;
+            const { contradicts } = await judgeContradiction(fact, candidate.content);
+            if (contradicts) {
+              seenOld.add(candidate.memberId);
+              supersessions.push({
+                oldMemberId: candidate.memberId,
+                oldContent: candidate.content,
+                newFact: fact
+              });
+            }
+          }
+        }
+      } catch (contradictionError) {
+        console.error('[FactExtractor] Contradiction detection error:', contradictionError.message);
+      }
+
       await appendToMemory(facts, memoryFile);
 
       // === UPGRADE 4: Assign facts to memory clusters ===
+      const factToMemberId = new Map();
       try {
-        const memoryClusters = require('./memory-clusters');
         for (const fact of facts) {
-          await memoryClusters.assignToCluster(fact, extractionProvider, extractionModel, apiKey, extractionHost, 'fact-extraction');
+          const res = await memoryClusters.assignToCluster(fact, extractionProvider, extractionModel, apiKey, extractionHost, 'fact-extraction');
+          if (res && res.memberId) factToMemberId.set(fact, res.memberId);
         }
         console.log(`[FactExtractor] Assigned ${facts.length} facts to clusters`);
       } catch (clusterError) {
         console.error('[FactExtractor] Cluster assignment error:', clusterError.message);
       }
+
+      // === Apply supersessions (after the replacing facts exist) ===
+      for (const s of supersessions) {
+        const newMemberId = factToMemberId.get(s.newFact);
+        if (!newMemberId) continue; // replacing fact wasn't stored — skip
+        const marked = memoryClusters.supersedeFact(s.oldMemberId, newMemberId);
+        if (marked) {
+          removeFactLineFromMemory(s.oldContent, memoryFile);
+          appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (user correction)`, dailyDir);
+          console.log(`[FactExtractor] Supersession: "${s.oldContent}" → "${s.newFact}"`);
+        }
+      }
     }
 
     // Create daily log summary
     const summary = `Chat exchange with ${extractionProvider}/${extractionModel} - ${facts.length} facts extracted`;
-    const dailyDir = path.join(memoryDir, 'daily');
     appendToDailyLog(summary, dailyDir);
 
     console.log('[FactExtractor] Fact extraction complete');
@@ -750,6 +855,8 @@ module.exports = {
   extractAllFactLines,
   appendToMemory,
   appendToDailyLog,
+  judgeContradiction,
+  removeFactLineFromMemory,
   loadMemoryContext,
   processFactExtraction,
   MEMORY_DIR,

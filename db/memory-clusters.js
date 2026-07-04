@@ -619,10 +619,104 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
       }
     }
 
-    return { clusterId, clusterName, isNew };
+    return { clusterId, clusterName, isNew, memberId };
   } catch (error) {
     console.error('[Clusters] Error in assignToCluster:', error);
-    return { clusterId: null, clusterName: null, isNew: false };
+    return { clusterId: null, clusterName: null, isNew: false, memberId: null };
+  }
+}
+
+/**
+ * Find existing ACTIVE facts that are semantically close to a candidate fact.
+ * Used by the extraction pipeline to surface potential contradictions before
+ * an LLM makes the final yes/no call. Superseded facts are excluded — we only
+ * contradict against what is currently believed true.
+ * @param {string} factText - The new candidate fact
+ * @param {Object} [opts]
+ * @param {number} [opts.threshold=0.45] - Min cosine similarity to consider
+ * @param {number} [opts.limit=5] - Max candidates to return
+ * @returns {Promise<Array<{memberId,content,clusterId,similarity}>>}
+ */
+async function findContradictionCandidates(factText, opts = {}) {
+  const threshold = opts.threshold ?? 0.45;
+  const limit = opts.limit ?? 5;
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+
+    const embedding = await generateEmbedding(factText);
+    if (!embedding) return [];
+
+    const clusterTable = await getClusterEmbeddingsTable();
+    if (!clusterTable) return [];
+
+    const vectorArray = Array.from(embedding);
+    const results = await clusterTable
+      .search(vectorArray)
+      .metricType('cosine')
+      .limit(15)
+      .execute();
+
+    const normalizedNew = factText.trim().toLowerCase();
+    const seen = new Set();
+    const candidates = [];
+
+    for (const result of results) {
+      const similarity = 1 - (result._distance || 0);
+      if (similarity < threshold) continue;
+      const memberId = result.member_id;
+      if (!memberId || seen.has(memberId)) continue;
+
+      // Confirm the member still exists and is ACTIVE (LanceDB retains
+      // embeddings of superseded facts for history; SQLite is the truth).
+      const row = db.prepare(
+        'SELECT id, content, cluster_id, status FROM cluster_members WHERE id = ?'
+      ).get(memberId);
+      if (!row) continue;
+      if (row.status && row.status !== 'active') continue;
+
+      // A verbatim duplicate is not a contradiction — skip the judge call.
+      if (row.content.trim().toLowerCase() === normalizedNew) continue;
+
+      seen.add(memberId);
+      candidates.push({
+        memberId: row.id,
+        content: row.content,
+        clusterId: row.cluster_id,
+        similarity
+      });
+      if (candidates.length >= limit) break;
+    }
+
+    return candidates;
+  } catch (error) {
+    console.error('[Clusters] Error in findContradictionCandidates:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Supersede an existing fact: mark it superseded and point it at the fact that
+ * replaced it. History is preserved — the row is kept, never deleted.
+ * @param {string} oldMemberId - Fact being replaced
+ * @param {string} newMemberId - Fact that replaces it
+ * @returns {boolean} - true if a row was updated
+ */
+function supersedeFact(oldMemberId, newMemberId) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return false;
+    const info = db.prepare(
+      "UPDATE cluster_members SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ? AND status = 'active'"
+    ).run(newMemberId, new Date().toISOString(), oldMemberId);
+    if (info.changes > 0) {
+      console.log(`[Clusters] Superseded fact ${oldMemberId} → ${newMemberId}`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('[Clusters] Error in supersedeFact:', error.message);
+    return false;
   }
 }
 
@@ -703,13 +797,17 @@ async function searchClusters(query, limit = 3) {
 
       if (!cluster) continue;
 
-      // Get all members
+      // Get all members (active only — superseded facts never enter model context)
       const members = db.prepare(`
         SELECT content, importance
         FROM cluster_members
         WHERE cluster_id = ?
+          AND (status = 'active' OR status IS NULL)
         ORDER BY importance DESC, created_at DESC
       `).all(clusterId);
+
+      // A cluster whose facts have all been superseded contributes nothing
+      if (members.length === 0) continue;
 
       // Get linked clusters
       const linkedClusters = db.prepare(`
@@ -735,6 +833,7 @@ async function searchClusters(query, limit = 3) {
           SELECT content
           FROM cluster_members
           WHERE cluster_id = ?
+            AND (status = 'active' OR status IS NULL)
           ORDER BY importance DESC, created_at DESC
           LIMIT 3
         `).all(link.linked_cluster_id);
@@ -1245,6 +1344,8 @@ async function mergeByName() {
 
 module.exports = {
   assignToCluster,
+  findContradictionCandidates,
+  supersedeFact,
   searchClusters,
   getClusters,
   getCluster,

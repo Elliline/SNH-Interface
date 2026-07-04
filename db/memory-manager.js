@@ -1172,4 +1172,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM };
