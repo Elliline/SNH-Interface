@@ -21,6 +21,7 @@ const factExtractor = require('./db/fact-extractor');
 const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
+const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString } = require('./db/datetime');
 
 // MCP tool calling
@@ -1622,6 +1623,23 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       memoryParts.push(`=== Associated Memory Clusters ===\n${clusterText}`);
     }
 
+    // === Question queue: surface at most one pending question ===
+    // If a retrieved cluster has a pending question and none has been asked in
+    // this conversation yet, tell the model it MAY ask it if the moment fits.
+    let surfacedQuestion = null;
+    try {
+      if (clusterContext.length > 0 && !questionQueue.hasAskedInConversation(convoId)) {
+        const clusterIds = clusterContext.map(c => c.cluster.id).filter(Boolean);
+        const pending = questionQueue.getPendingForClusters(clusterIds);
+        if (pending) {
+          surfacedQuestion = pending;
+          memoryParts.push(`=== Open Question You May Ask ===\nThere is one thing you could naturally clarify with the user, if — and only if — it fits the flow of the conversation: "${pending.question}"\nYou may weave this single question in conversationally at a natural moment. Do not ask more than this one question, do not interrogate, and skip it entirely if it does not fit.`);
+        }
+      }
+    } catch (qErr) {
+      console.error('[Questions] Surfacing error:', qErr.message);
+    }
+
     if (memoryParts.length > 0) {
       console.log('Injecting memory context:', memoryParts.length, 'sections');
       const memorySystemMessage = {
@@ -1631,6 +1649,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       enhancedMessages = [memorySystemMessage, ...enhancedMessages];
     } else {
       console.log('No memory context to inject');
+    }
+
+    // Mark the surfaced question as asked (asked_at set on surfacing).
+    if (surfacedQuestion) {
+      questionQueue.markAsked(surfacedQuestion.id, convoId);
+      console.log(`[Questions] Surfaced to model (convo ${convoId}): "${surfacedQuestion.question}"`);
     }
 
     // TTS-aware system prompt: instruct the model to avoid markdown/emojis when TTS is active
@@ -2183,7 +2207,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         providerType,
         model,
         providerKey,
-        providerHost
+        providerHost,
+        convoId
       ).catch(err => {
         console.warn('[FactExtractor] Background extraction error:', err.message);
       });

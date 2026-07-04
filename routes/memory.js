@@ -19,6 +19,7 @@ const heavyLimiter = rateLimit({
 const db = require('../db/database');
 const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
+const questionQueue = require('../db/questions');
 const { getConfig, getProviderInstance } = require('../db/config');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
@@ -51,6 +52,20 @@ router.get('/', (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error loading memory files:', error.message);
     res.status(500).json({ error: 'Failed to load memory files' });
+  }
+});
+
+/**
+ * GET /api/memory/questions
+ * List pending questions in the queue (for a future frontend to surface).
+ */
+router.get('/questions', (req, res) => {
+  try {
+    const questions = questionQueue.listPending();
+    res.json({ questions });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading questions:', error.message);
+    res.status(500).json({ error: 'Failed to load questions' });
   }
 });
 

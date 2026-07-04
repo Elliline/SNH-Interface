@@ -454,7 +454,7 @@ function createOrStrengthenLink(clusterA, clusterB, db) {
  * @param {string} source - Source of the fact
  * @returns {Promise<Object>} - {clusterId, clusterName, isNew}
  */
-async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation') {
+async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5) {
   try {
     const config = getConfig();
     const db = getSqliteDb();
@@ -586,10 +586,11 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     // Insert into cluster_members
     const memberId = randomUUID();
     const nowIso = new Date().toISOString();
+    const salienceValue = Number.isFinite(salience) ? Math.max(1, Math.min(10, Math.round(salience))) : 5;
     db.prepare(`
-      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 0.5, ?, ?)
-    `).run(memberId, clusterId, fact, source, nowIso, nowIso);
+      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?)
+    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue);
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 
@@ -619,10 +620,32 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
       }
     }
 
-    return { clusterId, clusterName, isNew, memberId };
+    return { clusterId, clusterName, isNew, memberId, salience: salienceValue };
   } catch (error) {
     console.error('[Clusters] Error in assignToCluster:', error);
     return { clusterId: null, clusterName: null, isNew: false, memberId: null };
+  }
+}
+
+/**
+ * Update a fact's salience (1–10). Used when a superseding fact must inherit
+ * at least the salience of the fact it replaced.
+ * @param {string} memberId
+ * @param {number} salience
+ * @returns {boolean}
+ */
+function updateFactSalience(memberId, salience) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return false;
+    const value = Math.max(1, Math.min(10, Math.round(salience)));
+    const info = db.prepare(
+      'UPDATE cluster_members SET salience = ?, updated_at = ? WHERE id = ?'
+    ).run(value, new Date().toISOString(), memberId);
+    return info.changes > 0;
+  } catch (error) {
+    console.error('[Clusters] updateFactSalience error:', error.message);
+    return false;
   }
 }
 
@@ -670,7 +693,7 @@ async function findContradictionCandidates(factText, opts = {}) {
       // Confirm the member still exists and is ACTIVE (LanceDB retains
       // embeddings of superseded facts for history; SQLite is the truth).
       const row = db.prepare(
-        'SELECT id, content, cluster_id, status FROM cluster_members WHERE id = ?'
+        'SELECT id, content, cluster_id, status, salience FROM cluster_members WHERE id = ?'
       ).get(memberId);
       if (!row) continue;
       if (row.status && row.status !== 'active') continue;
@@ -683,6 +706,7 @@ async function findContradictionCandidates(factText, opts = {}) {
         memberId: row.id,
         content: row.content,
         clusterId: row.cluster_id,
+        salience: row.salience ?? 5,
         similarity
       });
       if (candidates.length >= limit) break;
@@ -797,13 +821,15 @@ async function searchClusters(query, limit = 3) {
 
       if (!cluster) continue;
 
-      // Get all members (active only — superseded facts never enter model context)
+      // Get all members (active only — superseded facts never enter model context).
+      // Order by salience so that if the injected context has to be trimmed for
+      // budget, the highest-salience facts survive.
       const members = db.prepare(`
-        SELECT content, importance
+        SELECT content, importance, salience
         FROM cluster_members
         WHERE cluster_id = ?
           AND (status = 'active' OR status IS NULL)
-        ORDER BY importance DESC, created_at DESC
+        ORDER BY salience DESC, importance DESC, created_at DESC
       `).all(clusterId);
 
       // A cluster whose facts have all been superseded contributes nothing
@@ -834,7 +860,7 @@ async function searchClusters(query, limit = 3) {
           FROM cluster_members
           WHERE cluster_id = ?
             AND (status = 'active' OR status IS NULL)
-          ORDER BY importance DESC, created_at DESC
+          ORDER BY salience DESC, importance DESC, created_at DESC
           LIMIT 3
         `).all(link.linked_cluster_id);
 
@@ -855,7 +881,8 @@ async function searchClusters(query, limit = 3) {
         },
         members: members.map(m => ({
           content: m.content,
-          importance: m.importance
+          importance: m.importance,
+          salience: m.salience ?? 5
         })),
         linkedMembers: linkedMembers
       });
@@ -1346,6 +1373,7 @@ module.exports = {
   assignToCluster,
   findContradictionCandidates,
   supersedeFact,
+  updateFactSalience,
   searchClusters,
   getClusters,
   getCluster,

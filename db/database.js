@@ -112,6 +112,7 @@ function initDatabase() {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         status TEXT DEFAULT 'active',
         superseded_by TEXT,
+        salience INTEGER DEFAULT 5,
         FOREIGN KEY (cluster_id) REFERENCES memory_clusters(id)
       )
     `);
@@ -130,6 +131,28 @@ function initDatabase() {
     sqliteDb.exec(`
       CREATE INDEX IF NOT EXISTS idx_cluster_members_cluster_id
       ON cluster_members(cluster_id)
+    `);
+
+    // Question queue: gaps/oddities in the facts become questions the model
+    // may ask the user at a natural moment. cluster_id/member_id are the
+    // fact/cluster the question is about; reason is why it was raised.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS questions (
+        id TEXT PRIMARY KEY,
+        question TEXT NOT NULL,
+        cluster_id TEXT,
+        member_id TEXT,
+        reason TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        asked_at DATETIME,
+        origin_conversation_id TEXT,
+        asked_conversation_id TEXT
+      )
+    `);
+
+    sqliteDb.exec(`
+      CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status)
     `);
 
     // Migration: ensure facts (cluster_members) carry an updated_at timestamp.
@@ -157,6 +180,14 @@ function initDatabase() {
       // Nullable pointer to the fact that replaced this one.
       sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN superseded_by TEXT');
       console.log('Migration: added superseded_by to cluster_members');
+    }
+
+    // Migration: salience (1–10, how much a fact matters). Existing rows
+    // backfill to the neutral midpoint 5.
+    if (!memberCols.some(c => c.name === 'salience')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN salience INTEGER DEFAULT 5');
+      sqliteDb.exec('UPDATE cluster_members SET salience = 5 WHERE salience IS NULL');
+      console.log('Migration: added salience to cluster_members (existing rows backfilled to 5)');
     }
 
     console.log('SQLite database initialized successfully');

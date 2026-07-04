@@ -696,32 +696,156 @@ function loadMemoryContext(memoryDir) {
 /**
  * Ask the local reasoning model whether a new user statement contradicts an
  * existing stored fact. The user is always the authority on their own life, so
- * a contradiction means the new statement wins and the old fact is superseded.
+ * a clear contradiction means the new statement wins and the old fact is
+ * superseded. When it is genuinely ambiguous, the judge returns UNCERTAIN
+ * rather than guessing — the caller queues a clarifying question instead.
  * @param {string} newFact - The fact just extracted from the user
  * @param {string} oldFact - An existing active stored fact
- * @returns {Promise<{contradicts: boolean, reasoning: string}>}
+ * @returns {Promise<{verdict: 'yes'|'no'|'uncertain', reasoning: string}>}
  */
 async function judgeContradiction(newFact, oldFact) {
   try {
     const memoryManager = require('./memory-manager');
     const systemPrompt = `You are a fact contradiction detector for a personal memory system. You are given an EXISTING stored fact about the user and a NEW statement the user just made about themselves.
 
-Decide whether the NEW statement contradicts the EXISTING fact — i.e. they cannot both be true of the user at the same time.
-- Corrections and replacements ARE contradictions ("Actually my MSP is X, not Y", "I moved to Z", "I no longer use Q").
-- Additional detail, refinement, or an unrelated fact is NOT a contradiction.
+Decide the relationship between them:
+- YES — they contradict: they cannot both be true of the user at the same time. Corrections and replacements count ("Actually my MSP is X, not Y", "I moved to Z", "I no longer use Q").
+- NO — no contradiction: additional detail, refinement, or an unrelated fact.
+- UNCERTAIN — you genuinely cannot tell whether they conflict without more information (e.g. they might refer to two different things, or one might update the other, but it is ambiguous).
 
-Respond with exactly YES or NO on the first line, then one short line of reasoning.`;
+Prefer UNCERTAIN over guessing when it is truly ambiguous.
+
+Respond with exactly YES, NO, or UNCERTAIN on the first line, then one short line of reasoning.`;
     const userPrompt = `EXISTING fact: "${oldFact}"\nNEW statement: "${newFact}"\n\nDoes the NEW statement contradict the EXISTING fact?`;
 
     const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
     const firstWord = (content.trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
-    const contradicts = firstWord === 'yes';
+    let verdict = 'no';
+    if (firstWord === 'yes') verdict = 'yes';
+    else if (firstWord === 'uncertain') verdict = 'uncertain';
     const reasoning = content.trim().split('\n').slice(0, 2).join(' ').trim();
-    console.log(`[FactExtractor] Contradiction judge: ${contradicts ? 'YES' : 'NO'} — "${newFact}" vs "${oldFact}" (${reasoning})`);
-    return { contradicts, reasoning };
+    console.log(`[FactExtractor] Contradiction judge: ${verdict.toUpperCase()} — "${newFact}" vs "${oldFact}" (${reasoning})`);
+    return { verdict, reasoning };
   } catch (error) {
     console.error('[FactExtractor] Contradiction judge error:', error.message);
-    return { contradicts: false, reasoning: '' };
+    return { verdict: 'no', reasoning: '' };
+  }
+}
+
+/**
+ * Score how much a fact matters (salience, 1–10) with a judgment call to the
+ * local model. Higher = durable and decision-relevant; lower = trivia/ephemeral.
+ * @param {string} fact - The new fact to score
+ * @param {string} nearbyContext - Short summary of related existing facts/clusters
+ * @returns {Promise<{salience: number, reasoning: string}>}
+ */
+async function scoreSalience(fact, nearbyContext = '') {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You score how much a fact about a user matters, for a long-term memory system. Return an integer salience from 1 (trivial/ephemeral) to 10 (defining/durable).
+
+Judge using these criteria:
+- Does this fact connect to or change existing memory clusters? Connected/changing → higher.
+- Does it affect the user's decisions, projects, or work (high), or is it passing trivia (low)?
+- Is it durable — a name, business, relationship, long-term preference (high) — or ephemeral, like today's mood or weather (low)?
+
+Guidance: names/business/relationships/major projects = 8–10; stable preferences/tools/hardware = 5–7; incidental details = 3–4; momentary state ("tired today") = 1–2.
+
+Respond with the integer on the first line, then one short line of reasoning.`;
+    const userPrompt = `${nearbyContext ? `Related existing memory:\n${nearbyContext}\n\n` : ''}Fact to score: "${fact}"\n\nSalience (1-10)?`;
+
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
+    const match = content.match(/\d+/);
+    let salience = match ? parseInt(match[0], 10) : 5;
+    if (!Number.isFinite(salience)) salience = 5;
+    salience = Math.max(1, Math.min(10, salience));
+    const reasoning = content.trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Salience ${salience}/10 — "${fact}" (${reasoning})`);
+    return { salience, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] Salience scoring error:', error.message);
+    return { salience: 5, reasoning: '' };
+  }
+}
+
+/**
+ * Given newly learned facts and their surrounding cluster context, decide
+ * whether there is a single worthwhile clarifying question to ask the user —
+ * a gap, something incomplete, or an odd inconsistency. Quality over quantity:
+ * returns at most one question, or null if nothing is worth asking.
+ * @param {string[]} facts - The new facts from this exchange
+ * @param {string} nearbyContext - Related existing facts/clusters
+ * @returns {Promise<{question: string}|null>}
+ */
+async function detectGapQuestion(facts, nearbyContext = '') {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You maintain a personal memory system for a user. Given facts just learned and related existing memory, decide whether there is ONE natural clarifying question worth asking the user — because something is unclear, incomplete, or oddly inconsistent (e.g. a project mentioned with no client, a tool with no purpose, two facts that don't quite line up).
+
+Rules:
+- Only propose a question if it would genuinely improve the memory and a person would find it natural to be asked.
+- At most ONE question. Keep it short, specific, and conversational — never interrogation-style.
+- If nothing is worth asking, respond with exactly NONE.
+
+Respond with either NONE, or the single question text on one line (no preamble).`;
+    const userPrompt = `Newly learned facts:\n${facts.map(f => `- ${f}`).join('\n')}\n\n${nearbyContext ? `Related existing memory:\n${nearbyContext}\n\n` : ''}Is there ONE clarifying question worth asking? If so, give just the question; otherwise NONE.`;
+
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 100 });
+    const text = content.trim().split('\n')[0].trim();
+    if (!text || /^none\b/i.test(text)) return null;
+    // Strip leading list markers/quotes the model might add.
+    const question = text.replace(/^[-*\d.\s"]+/, '').replace(/"$/, '').trim();
+    if (!question || question.length < 5) return null;
+    console.log(`[FactExtractor] Gap question proposed: "${question}"`);
+    return { question };
+  } catch (error) {
+    console.error('[FactExtractor] Gap detection error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Judge whether a user's message answers a previously asked question.
+ * @param {string} question - The question that was asked
+ * @param {string} userMessage - The user's latest message
+ * @returns {Promise<boolean>}
+ */
+async function judgeAnswered(question, userMessage) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You decide whether a user's message answers a specific question that was previously asked. Respond with exactly YES or NO on the first line.`;
+    const userPrompt = `Question that was asked: "${question}"\nUser's message: "${userMessage}"\n\nDoes the user's message answer that question (even partially)?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 30 });
+    const firstWord = (content.trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    return firstWord === 'yes';
+  } catch (error) {
+    console.error('[FactExtractor] Answer judge error:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Build a short context string of existing facts related to the new facts,
+ * used to inform salience scoring and gap detection. Returns cluster name +
+ * a few member facts. Also returns the ids of the clusters consulted.
+ * @param {string[]} facts
+ * @returns {Promise<{text: string, clusterIds: string[]}>}
+ */
+async function buildNearbyContext(facts) {
+  try {
+    const memoryClusters = require('./memory-clusters');
+    const query = facts.join('. ');
+    const clusters = await memoryClusters.searchClusters(query, 2);
+    if (!clusters || clusters.length === 0) return { text: '', clusterIds: [] };
+    const text = clusters.map(c => {
+      const members = c.members.slice(0, 5).map(m => `  - ${m.content}`).join('\n');
+      return `[${c.cluster.name}]\n${members}`;
+    }).join('\n');
+    const clusterIds = clusters.map(c => c.cluster.id).filter(Boolean);
+    return { text, clusterIds };
+  } catch (error) {
+    console.error('[FactExtractor] buildNearbyContext error:', error.message);
+    return { text: '', clusterIds: [] };
   }
 }
 
@@ -763,9 +887,10 @@ function removeFactLineFromMemory(factContent, memoryFilePath) {
  * @param {string} model - Model name
  * @param {string} apiKey - API key
  * @param {string} ollamaHost - Ollama/llamacpp/squatchserve host
+ * @param {string} conversationId - Conversation this exchange belongs to
  * @param {string} memoryDir - Memory directory path
  */
-async function processFactExtraction(userMessage, assistantMessage, provider, model, apiKey, ollamaHost, memoryDir = MEMORY_DIR) {
+async function processFactExtraction(userMessage, assistantMessage, provider, model, apiKey, ollamaHost, conversationId = null, memoryDir = MEMORY_DIR) {
   try {
     // Always use the configured extraction model, independent of chat model
     const config = getConfig();
@@ -780,31 +905,64 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
 
     const memoryFile = path.join(memoryDir, 'MEMORY.md');
     const dailyDir = path.join(memoryDir, 'daily');
+    const memoryClusters = require('./memory-clusters');
+    const questions = require('./questions');
+
+    // === Answer detection ===
+    // If this conversation had an outstanding asked question, check whether the
+    // user's message answers it (the answer itself is caught as facts normally).
+    if (conversationId) {
+      try {
+        for (const q of questions.getAskedForConversation(conversationId)) {
+          if (await judgeAnswered(q.question, userMessage)) {
+            questions.markAnswered(q.id);
+            appendToDailyLog(`Question answered: "${q.question}"`, dailyDir);
+          }
+        }
+      } catch (answerErr) {
+        console.error('[FactExtractor] Answer detection error:', answerErr.message);
+      }
+    }
+
+    // At most ONE question per chat session, shared by contradiction-uncertainty
+    // (higher priority) and gap detection.
+    let questionQueued = false;
 
     // Append to memory if facts found
     if (facts.length > 0) {
-      const memoryClusters = require('./memory-clusters');
+      // Surrounding cluster context — informs salience scoring and gap detection.
+      const nearby = await buildNearbyContext(facts);
 
-      // === Contradiction detection (before storing) ===
-      // For each new fact, find nearby ACTIVE facts and ask the model whether
-      // they contradict. A confirmed contradiction means the old fact will be
-      // superseded once the new fact is stored. The user is the authority on
-      // their own life, so their latest statement always wins.
-      const supersessions = []; // {oldMemberId, oldContent, newFact}
+      // === Contradiction detection (3-way: yes / no / uncertain) ===
+      const supersessions = []; // {oldMemberId, oldContent, oldSalience, newFact}
       const seenOld = new Set();
       try {
         for (const fact of facts) {
           const candidates = await memoryClusters.findContradictionCandidates(fact);
           for (const candidate of candidates) {
             if (seenOld.has(candidate.memberId)) continue;
-            const { contradicts } = await judgeContradiction(fact, candidate.content);
-            if (contradicts) {
+            const { verdict } = await judgeContradiction(fact, candidate.content);
+            if (verdict === 'yes') {
               seenOld.add(candidate.memberId);
               supersessions.push({
                 oldMemberId: candidate.memberId,
                 oldContent: candidate.content,
+                oldSalience: candidate.salience ?? 5,
                 newFact: fact
               });
+            } else if (verdict === 'uncertain' && !questionQueued) {
+              // Ambiguous conflict — ask the user rather than guess; both facts stay active.
+              const q = `I have two things noted that might not line up: "${candidate.content}" and now "${fact}". Which is correct?`;
+              if (questions.addQuestion({
+                question: q,
+                reason: 'contradiction-uncertainty',
+                clusterId: candidate.clusterId,
+                memberId: candidate.memberId,
+                conversationId
+              })) {
+                questionQueued = true;
+                appendToDailyLog(`Queued clarifying question (contradiction-uncertainty): "${q}"`, dailyDir);
+              }
             }
           }
         }
@@ -812,14 +970,35 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
         console.error('[FactExtractor] Contradiction detection error:', contradictionError.message);
       }
 
+      // === Salience scoring (after contradiction checking) ===
+      const factToSalience = new Map();
+      for (const fact of facts) {
+        const { salience, reasoning } = await scoreSalience(fact, nearby.text);
+        factToSalience.set(fact, salience);
+        appendToDailyLog(`Scored fact salience ${salience}/10: "${fact}" — ${reasoning}`, dailyDir);
+      }
+      // A superseding fact inherits at least the salience of the fact it replaces.
+      for (const s of supersessions) {
+        const cur = factToSalience.get(s.newFact) ?? 5;
+        if (s.oldSalience > cur) {
+          factToSalience.set(s.newFact, s.oldSalience);
+          console.log(`[FactExtractor] "${s.newFact}" inherits salience ${s.oldSalience} from superseded fact`);
+        }
+      }
+
       await appendToMemory(facts, memoryFile);
 
-      // === UPGRADE 4: Assign facts to memory clusters ===
+      // === Assign facts to clusters (carrying salience) ===
       const factToMemberId = new Map();
+      const factToClusterId = new Map();
       try {
         for (const fact of facts) {
-          const res = await memoryClusters.assignToCluster(fact, extractionProvider, extractionModel, apiKey, extractionHost, 'fact-extraction');
+          const res = await memoryClusters.assignToCluster(
+            fact, extractionProvider, extractionModel, apiKey, extractionHost,
+            'fact-extraction', factToSalience.get(fact) ?? 5
+          );
           if (res && res.memberId) factToMemberId.set(fact, res.memberId);
+          if (res && res.clusterId) factToClusterId.set(fact, res.clusterId);
         }
         console.log(`[FactExtractor] Assigned ${facts.length} facts to clusters`);
       } catch (clusterError) {
@@ -835,6 +1014,31 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
           removeFactLineFromMemory(s.oldContent, memoryFile);
           appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (user correction)`, dailyDir);
           console.log(`[FactExtractor] Supersession: "${s.oldContent}" → "${s.newFact}"`);
+        }
+      }
+
+      // === Gap detection (only if no question queued yet this session) ===
+      if (!questionQueued) {
+        try {
+          const gap = await detectGapQuestion(facts, nearby.text);
+          if (gap && gap.question) {
+            // Anchor to the cluster the new facts landed in, so the question
+            // surfaces when the user next chats about that topic.
+            const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
+            const anchorMemberId = factToMemberId.get(facts[0]) || null;
+            if (questions.addQuestion({
+              question: gap.question,
+              reason: 'gap',
+              clusterId: anchorClusterId,
+              memberId: anchorMemberId,
+              conversationId
+            })) {
+              questionQueued = true;
+              appendToDailyLog(`Queued clarifying question (gap): "${gap.question}"`, dailyDir);
+            }
+          }
+        } catch (gapErr) {
+          console.error('[FactExtractor] Gap detection error:', gapErr.message);
         }
       }
     }
@@ -856,6 +1060,9 @@ module.exports = {
   appendToMemory,
   appendToDailyLog,
   judgeContradiction,
+  scoreSalience,
+  detectGapQuestion,
+  judgeAnswered,
   removeFactLineFromMemory,
   loadMemoryContext,
   processFactExtraction,
