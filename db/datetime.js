@@ -56,8 +56,25 @@ function withDateTime(systemPrompt) {
   return `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
 }
 
+/**
+ * Format a stored timestamp (ISO string, usually UTC) as a compact
+ * "learned" annotation in the system's local (Pacific) timezone.
+ * Example: "2026-07-04 6:51 AM". Returns null for missing/invalid input.
+ * @param {string} iso
+ * @returns {string|null}
+ */
+function formatFactTimestamp(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const date = d.toLocaleDateString('en-CA'); // YYYY-MM-DD in local tz
+  const time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  return `${date} ${time}`;
+}
+
 module.exports = {
   getCurrentDateTimeString,
   withDateTime,
-  friendlyTimezone
+  friendlyTimezone,
+  formatFactTimestamp
 };

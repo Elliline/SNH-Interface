@@ -825,7 +825,7 @@ async function searchClusters(query, limit = 3) {
       // Order by salience so that if the injected context has to be trimmed for
       // budget, the highest-salience facts survive.
       const members = db.prepare(`
-        SELECT content, importance, salience
+        SELECT content, importance, salience, created_at
         FROM cluster_members
         WHERE cluster_id = ?
           AND (status = 'active' OR status IS NULL)
@@ -856,7 +856,7 @@ async function searchClusters(query, limit = 3) {
           .get(link.linked_cluster_id);
 
         const linkMembers = db.prepare(`
-          SELECT content
+          SELECT content, created_at
           FROM cluster_members
           WHERE cluster_id = ?
             AND (status = 'active' OR status IS NULL)
@@ -867,6 +867,7 @@ async function searchClusters(query, limit = 3) {
         for (const member of linkMembers) {
           linkedMembers.push({
             content: member.content,
+            created_at: member.created_at,
             clusterName: linkCluster?.name || 'Unknown',
             linkStrength: link.strength
           });
@@ -882,7 +883,8 @@ async function searchClusters(query, limit = 3) {
         members: members.map(m => ({
           content: m.content,
           importance: m.importance,
-          salience: m.salience ?? 5
+          salience: m.salience ?? 5,
+          created_at: m.created_at
         })),
         linkedMembers: linkedMembers
       });

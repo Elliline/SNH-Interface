@@ -22,7 +22,7 @@ const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
 const questionQueue = require('./db/questions');
-const { getCurrentDateTimeString } = require('./db/datetime');
+const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1609,12 +1609,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // Add cluster-aware memory context
     if (clusterContext.length > 0) {
+      const withLearned = (content, createdAt) => {
+        const ts = formatFactTimestamp(createdAt);
+        return ts ? `${content} (learned ${ts})` : content;
+      };
       const clusterText = clusterContext.map(c => {
-        const memberText = c.members.map(m => `- ${m.content}`).join('\n');
+        const memberText = c.members.map(m => `- ${withLearned(m.content, m.created_at)}`).join('\n');
         let text = `[${c.cluster.name}]\n${memberText}`;
         if (c.linkedMembers.length > 0) {
           const linkedText = c.linkedMembers
-            .map(lm => `- (from ${lm.clusterName}) ${lm.content}`)
+            .map(lm => `- (from ${lm.clusterName}) ${withLearned(lm.content, lm.created_at)}`)
             .join('\n');
           text += `\nRelated:\n${linkedText}`;
         }
@@ -1644,7 +1648,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.log('Injecting memory context:', memoryParts.length, 'sections');
       const memorySystemMessage = {
         role: 'system',
-        content: `You have access to the following memory and context:\n\n${memoryParts.join('\n\n')}\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked.`
+        content: `You have access to the following memory and context:\n\n${memoryParts.join('\n\n')}\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked. A "(learned ...)" annotation on a fact shows when you first learned that fact. If the user asks when they told you something or when a fact was learned, only answer with a time that is shown in a "(learned ...)" annotation; if no such timestamp is present for that fact, say you don't know rather than estimating or inventing one.`
       };
       enhancedMessages = [memorySystemMessage, ...enhancedMessages];
     } else {

@@ -1,7 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig, getProviderInstance } = require('./config');
-const { getCurrentDateTimeString } = require('./datetime');
+const { getCurrentDateTimeString, formatFactTimestamp } = require('./datetime');
+
+// A fact line written to MEMORY.md may carry a "(learned YYYY-MM-DD H:MM AM/PM)"
+// annotation so the model can answer "when did I tell you this". Strip it when
+// comparing/deduping/matching fact text so only the bare fact is considered.
+function stripLearnedAnnotation(text) {
+  return text.replace(/\s*\(learned\s+[^)]*\)\s*$/i, '').trim();
+}
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -72,7 +79,7 @@ function parseMemorySections(content) {
         factLines: []
       };
     } else if (currentSection && line.startsWith('- ')) {
-      currentSection.factLines.push(line.substring(2).trim());
+      currentSection.factLines.push(stripLearnedAnnotation(line.substring(2).trim()));
     }
   }
   if (currentSection) {
@@ -89,7 +96,7 @@ function parseMemorySections(content) {
 function extractAllFactLines(content) {
   return content.split('\n')
     .filter(line => line.startsWith('- '))
-    .map(line => line.substring(2).trim());
+    .map(line => stripLearnedAnnotation(line.substring(2).trim()));
 }
 
 /**
@@ -550,6 +557,11 @@ async function appendToMemory(facts, memoryFilePath) {
     // Rebuild content with facts inserted into their sections
     const lines = content.split('\n');
 
+    // Annotate each newly written fact with when it was learned (now), so the
+    // markdown injection path carries timestamps like the cluster path does.
+    const learnedAt = formatFactTimestamp(new Date().toISOString());
+    const factLine = f => (learnedAt ? `- ${f} (learned ${learnedAt})` : `- ${f}`);
+
     // Insert facts into existing sections (iterate in reverse to preserve line numbers)
     const sectionInserts = []; // [{lineIndex, facts}]
     for (const [sectionIdx, sectionFacts] of factsPerSection.entries()) {
@@ -566,7 +578,7 @@ async function appendToMemory(facts, memoryFilePath) {
     // Sort inserts by line index descending so earlier inserts don't shift later ones
     sectionInserts.sort((a, b) => b.lineIndex - a.lineIndex);
     for (const insert of sectionInserts) {
-      const newLines = insert.facts.map(f => `- ${f}`);
+      const newLines = insert.facts.map(f => factLine(f));
       lines.splice(insert.lineIndex + 1, 0, ...newLines);
     }
 
@@ -582,11 +594,11 @@ async function appendToMemory(facts, memoryFilePath) {
           if (lines[i].startsWith('- ')) insertAfter = i;
           if (i > otherIdx && lines[i].startsWith('## ')) break;
         }
-        const newLines = otherFacts.map(f => `- ${f}`);
+        const newLines = otherFacts.map(f => factLine(f));
         lines.splice(insertAfter + 1, 0, ...newLines);
       } else {
         lines.push('', '## Other');
-        for (const f of otherFacts) lines.push(`- ${f}`);
+        for (const f of otherFacts) lines.push(factLine(f));
       }
     }
 
@@ -865,7 +877,8 @@ function removeFactLineFromMemory(factContent, memoryFilePath) {
     const kept = lines.filter(line => {
       const m = line.match(/^\s*-\s+(.*)$/);
       if (!m) return true;
-      return m[1].trim().toLowerCase() !== target;
+      // Compare on the bare fact, ignoring any "(learned ...)" annotation.
+      return stripLearnedAnnotation(m[1].trim()).toLowerCase() !== target;
     });
     if (kept.length !== lines.length) {
       fs.writeFileSync(memoryFilePath, kept.join('\n'), 'utf8');
