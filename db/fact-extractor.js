@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig, getProviderInstance } = require('./config');
+const { getCurrentDateTimeString } = require('./datetime');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -123,7 +124,9 @@ GOOD examples (facts the user stated about themselves):
 BAD examples (AI-provided info, fragments, or general knowledge):
 ["A viral TikTok trend featuring Mini Huskies", "Constantinople fell in 1453", "RTX 3090", "The weather is nice"]
 
-Every extracted fact must be something the USER told you, not something you told the user.`;
+Every extracted fact must be something the USER told you, not something you told the user.
+
+${getCurrentDateTimeString()}. When the user's statement is time-relative ("I just bought", "last week", "recently", "starting next month"), anchor the fact to an absolute date using the current date above — e.g. "As of July 2026, User is migrating from Syncro to Kaseya".`;
 
     const exchange = `USER MESSAGE:\n${userMessage}\n\nASSISTANT RESPONSE (for context only — do NOT extract facts from this):\n${assistantMessage}`;
 

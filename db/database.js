@@ -129,6 +129,20 @@ function initDatabase() {
       ON cluster_members(cluster_id)
     `);
 
+    // Migration: ensure facts (cluster_members) carry an updated_at timestamp.
+    // Existing rows are backfilled from created_at (the closest recoverable
+    // origin date), falling back to now() if created_at is somehow missing.
+    const memberCols = sqliteDb.prepare('PRAGMA table_info(cluster_members)').all();
+    if (!memberCols.some(c => c.name === 'updated_at')) {
+      // SQLite can't add a column with a non-constant DEFAULT, so add it NULL
+      // then backfill in a follow-up UPDATE.
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN updated_at DATETIME');
+      sqliteDb.prepare(
+        "UPDATE cluster_members SET updated_at = COALESCE(created_at, ?) WHERE updated_at IS NULL"
+      ).run(new Date().toISOString());
+      console.log('Migration: added updated_at to cluster_members and backfilled from created_at');
+    }
+
     console.log('SQLite database initialized successfully');
 
     // Backfill FTS table with existing messages

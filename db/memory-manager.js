@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
+const { getCurrentDateTimeString } = require('./datetime');
 
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
@@ -50,8 +51,10 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   const inst = getProviderInstance(heartbeatModel.provider, heartbeatModel.instance);
   const host = inst ? inst.host : 'http://localhost:11434';
   const maxTokens = options.maxTokens ?? 1024;
+  // Date/time awareness for all heartbeat/audit roles (single shared injection).
+  const datedSystemPrompt = `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
   const messages = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: datedSystemPrompt },
     { role: 'user', content: userPrompt }
   ];
 

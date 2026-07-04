@@ -21,6 +21,7 @@ const factExtractor = require('./db/fact-extractor');
 const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
+const { getCurrentDateTimeString } = require('./db/datetime');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1650,6 +1651,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       enhancedMessages.push(superSearchInstruction);
     }
 
+    // Date/time awareness: give the model the current date/time so it knows
+    // what "today" is (e.g. building search queries, temporal reasoning).
+    // Placed first so it's the leading system context for every provider path.
+    enhancedMessages.unshift({
+      role: 'system',
+      content: `${getCurrentDateTimeString()}. Use this as the current date/time when the user says "today", "now", "this week", etc., and when constructing web searches for current information.`
+    });
+
     // Auto-generate title from first user message if needed
     const conversation = db.getConversation(convoId);
     if (!conversation.title && userMessage.content) {
@@ -1834,6 +1843,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       if (!claudeKey) {
         return res.status(401).json({ error: 'Claude API key not configured' });
       }
+      // Claude takes system context via the top-level `system` field, not as
+      // messages — collect all system messages (date/time, memory, etc.) there.
+      const claudeSystem = enhancedMessages
+        .filter(m => m.role === 'system')
+        .map(m => m.content)
+        .join('\n\n');
       response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -1845,6 +1860,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           model,
           max_tokens: 4096,
           stream: true,
+          ...(claudeSystem ? { system: claudeSystem } : {}),
           messages: enhancedMessages.filter(m => m.role !== 'system')
         })
       });

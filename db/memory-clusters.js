@@ -585,10 +585,11 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
 
     // Insert into cluster_members
     const memberId = randomUUID();
+    const nowIso = new Date().toISOString();
     db.prepare(`
-      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at)
-      VALUES (?, ?, ?, ?, 0.5, ?)
-    `).run(memberId, clusterId, fact, source, new Date().toISOString());
+      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?)
+    `).run(memberId, clusterId, fact, source, nowIso, nowIso);
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 

@@ -204,9 +204,9 @@ router.put('/edit', async (req, res) => {
       return res.status(404).json({ error: 'Fact not found' });
     }
 
-    // Update content in SQLite
-    sqliteDb.prepare('UPDATE cluster_members SET content = ? WHERE id = ?')
-      .run(cleanContent, memberId);
+    // Update content in SQLite (bump updated_at to reflect the edit)
+    sqliteDb.prepare('UPDATE cluster_members SET content = ?, updated_at = ? WHERE id = ?')
+      .run(cleanContent, new Date().toISOString(), memberId);
 
     // Re-embed in LanceDB
     const clusterTable = await db.getClusterEmbeddingsTable();
