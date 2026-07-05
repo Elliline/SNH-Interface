@@ -9,6 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
+const { getLocalDateStamp } = require('./datetime');
 
 // Database paths
 const DATA_DIR = path.join(__dirname, '../data');
@@ -929,15 +930,12 @@ function loadMemoryFiles(memoryDir = path.join(__dirname, '../data/memory')) {
     // Load USER.md
     result.user = readFileSafe(path.join(memoryDir, 'USER.md'), 'USER.md');
 
-    // Load today's daily note
-    const today = new Date();
-    const todayFilename = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}.md`;
+    // Load today's daily note (bucketed by local Pacific date, matching writers)
+    const todayFilename = `${getLocalDateStamp()}.md`;
     result.dailyToday = readFileSafe(path.join(memoryDir, 'daily', todayFilename), `daily/${todayFilename}`);
 
     // Load yesterday's daily note
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayFilename = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}.md`;
+    const yesterdayFilename = `${getLocalDateStamp(new Date(Date.now() - 86400000))}.md`;
     result.dailyYesterday = readFileSafe(path.join(memoryDir, 'daily', yesterdayFilename), `daily/${yesterdayFilename}`);
 
     return result;

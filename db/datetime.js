@@ -56,6 +56,27 @@ function withDateTime(systemPrompt) {
   return `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
 }
 
+// Canonical timezone for daily-log date bucketing. The host runs in Pacific;
+// pinning it here keeps writers and readers agreed on "which day" even if the
+// process's system timezone ever differs.
+const LOCAL_TIMEZONE = 'America/Los_Angeles';
+
+/**
+ * Current calendar date in local Pacific time as YYYY-MM-DD.
+ *
+ * This is the single source of truth for "which day's file" a daily-log entry
+ * belongs to. Every daily-log writer AND reader buckets by this, so an entry
+ * written at, say, 6pm Pacific lands in — and is read back from — today's local
+ * file rather than tomorrow's UTC file.
+ *
+ * @param {Date} [date=new Date()] - instant to stamp (defaults to now)
+ * @returns {string} e.g. "2026-07-04"
+ */
+function getLocalDateStamp(date = new Date()) {
+  // en-CA formats as YYYY-MM-DD; timeZone forces the Pacific calendar day.
+  return date.toLocaleDateString('en-CA', { timeZone: LOCAL_TIMEZONE });
+}
+
 /**
  * Format a stored timestamp (ISO string, usually UTC) as a compact
  * "learned" annotation in the system's local (Pacific) timezone.
@@ -76,5 +97,6 @@ module.exports = {
   getCurrentDateTimeString,
   withDateTime,
   friendlyTimezone,
+  getLocalDateStamp,
   formatFactTimestamp
 };

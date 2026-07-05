@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
-const { getCurrentDateTimeString } = require('./datetime');
+const { getCurrentDateTimeString, getLocalDateStamp } = require('./datetime');
 
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
@@ -632,7 +632,7 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
   // Prepend to daily log (newest first)
   try {
     const dailyDir = path.join(__dirname, '../data/memory/daily');
-    const today = new Date().toISOString().split('T')[0];
+    const today = getLocalDateStamp(); // local Pacific date
 
     let splitSummary = '';
     if (report.splitDetails.length > 0) {

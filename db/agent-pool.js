@@ -26,6 +26,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config');
+const { getLocalDateStamp } = require('./datetime');
 
 const DAILY_DIR = path.join(__dirname, '../data/memory/daily');
 const DEFAULT_CONCURRENCY = 6;
@@ -198,7 +199,7 @@ class AgentPool {
     try {
       if (!fs.existsSync(DAILY_DIR)) fs.mkdirSync(DAILY_DIR, { recursive: true });
       const now = new Date();
-      const date = now.toISOString().split('T')[0];
+      const date = getLocalDateStamp(now); // local Pacific date
       const time = now.toTimeString().slice(0, 5);
       const dailyFile = path.join(DAILY_DIR, `${date}.md`);
       const header = `# Daily Log - ${date}\n\n`;

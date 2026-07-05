@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig, getProviderInstance } = require('./config');
-const { getCurrentDateTimeString, formatFactTimestamp } = require('./datetime');
+const { getCurrentDateTimeString, formatFactTimestamp, getLocalDateStamp } = require('./datetime');
 const agentPool = require('./agent-pool');
 
 // A fact line written to MEMORY.md may carry a "(learned YYYY-MM-DD H:MM AM/PM)"
@@ -670,7 +670,7 @@ function appendToDailyLog(summary, dailyDir) {
     }
 
     const now = new Date();
-    const date = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const date = getLocalDateStamp(now); // local Pacific YYYY-MM-DD
     const time = now.toTimeString().slice(0, 5); // HH:MM
 
     const entry = `### ${time}\n- ${summary}\n\n`;
@@ -708,15 +708,15 @@ function loadMemoryContext(memoryDir) {
       result.user = fs.readFileSync(userFile, 'utf8');
     }
 
-    // Read today's daily log
-    const today = new Date().toISOString().split('T')[0];
+    // Read today's daily log (bucketed by local Pacific date)
+    const today = getLocalDateStamp();
     const todayFile = path.join(memoryDir, 'daily', `${today}.md`);
     if (fs.existsSync(todayFile)) {
       result.dailyToday = fs.readFileSync(todayFile, 'utf8');
     }
 
     // Read yesterday's daily log
-    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    const yesterday = getLocalDateStamp(new Date(Date.now() - 86400000));
     const yesterdayFile = path.join(memoryDir, 'daily', `${yesterday}.md`);
     if (fs.existsSync(yesterdayFile)) {
       result.dailyYesterday = fs.readFileSync(yesterdayFile, 'utf8');
