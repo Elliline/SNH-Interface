@@ -1552,6 +1552,158 @@ body {
   margin: 2px 0;
 }
 
+/* ---- Initiative bell + badge ---- */
+.initiative-btn {
+  position: relative;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: all 0.2s ease;
+}
+.initiative-btn:hover { background-color: var(--surface-hover); }
+.initiative-btn.has-initiatives {
+  border-color: var(--accent-color);
+  animation: initiative-pulse 2s ease-in-out infinite;
+}
+@keyframes initiative-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 180, 60, 0.0); }
+  50% { box-shadow: 0 0 0 3px rgba(255, 180, 60, 0.25); }
+}
+.initiative-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent-color);
+  color: #1a1a1a;
+  font-size: 0.68rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+
+/* ---- SNH-initiated conversation badge ---- */
+.conversation-item.snh-initiated {
+  border-left: 2px solid var(--accent-color);
+}
+.snh-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--accent-color);
+  letter-spacing: 0.02em;
+}
+
+/* ---- Initiative panel ---- */
+.initiative-panel {
+  position: fixed;
+  right: 0;
+  top: 0;
+  width: 360px;
+  max-width: 90vw;
+  height: 100vh;
+  background-color: var(--surface-dark);
+  border-left: 1px solid var(--border-color);
+  z-index: 210;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+  overflow: hidden;
+}
+.initiative-panel.open { transform: translateX(0); }
+.initiative-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.initiative-panel-header h2 {
+  margin: 0;
+  font-size: 1.25rem;
+  background: linear-gradient(90deg, var(--primary-color), var(--accent-color));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.initiative-panel-note {
+  padding: 10px 20px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  border-bottom: 1px solid var(--border-color);
+}
+.initiative-list {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+.initiative-panel-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 209;
+}
+.initiative-panel-overlay.active { display: block; }
+
+.initiative-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-bottom: 10px;
+}
+.initiative-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.initiative-type {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+}
+.initiative-type-alert { color: var(--error-color); }
+.initiative-type-question { color: var(--primary-color); }
+.initiative-type-reflection-insight { color: var(--accent-color); }
+.initiative-priority {
+  font-size: 0.72rem;
+  color: var(--accent-color);
+  font-weight: 600;
+}
+.initiative-content {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-color);
+  margin-bottom: 8px;
+}
+.initiative-dismiss {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.initiative-dismiss:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-color); }
+.initiative-dismiss:disabled { opacity: 0.5; cursor: default; }
+
 /* Memory panel overlay */
 .memory-panel-overlay {
   display: none;

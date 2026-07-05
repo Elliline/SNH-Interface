@@ -21,6 +21,7 @@ const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
 const questionQueue = require('../db/questions');
 const identity = require('../db/identity');
+const initiatives = require('../db/initiatives');
 const { getConfig, getProviderInstance } = require('../db/config');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
@@ -133,6 +134,45 @@ router.get('/self', (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error loading self view:', error.message);
     res.status(500).json({ error: 'Failed to load self view' });
+  }
+});
+
+/**
+ * GET /api/memory/initiatives
+ * List pending initiatives (highest priority first) plus the greeting threshold,
+ * so the frontend bell can count those worth surfacing. Read-only view.
+ */
+router.get('/initiatives', (req, res) => {
+  try {
+    const cfg = getConfig().initiative || {};
+    const threshold = Number.isFinite(cfg.greetingThreshold) ? cfg.greetingThreshold : 7;
+    const pending = initiatives.listPending({ limit: 100 });
+    res.json({
+      initiatives: pending,
+      threshold,
+      aboveThreshold: pending.filter(i => i.priority >= threshold).length
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading initiatives:', error.message);
+    res.status(500).json({ error: 'Failed to load initiatives' });
+  }
+});
+
+/**
+ * POST /api/memory/initiatives/:id/dismiss
+ * Dismiss a pending initiative (user read it / doesn't want it raised).
+ */
+router.post('/initiatives/:id/dismiss', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUUID(id)) {
+      return res.status(400).json({ error: 'Invalid initiative ID' });
+    }
+    const ok = initiatives.dismiss(id);
+    res.json({ success: ok });
+  } catch (error) {
+    console.error('[MemoryAPI] Error dismissing initiative:', error.message);
+    res.status(500).json({ error: 'Failed to dismiss initiative' });
   }
 });
 

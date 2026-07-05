@@ -207,6 +207,34 @@ function initDatabase() {
       console.log("Migration: added subject to memory_clusters (existing clusters set to 'user')");
     }
 
+    // Initiative layer: things SNH notices and may raise unprompted. Candidates
+    // are written by heartbeat tasks, re-scored by a prioritizer, and delivered
+    // via a conversation-open greeting or an unprompted SNH-initiated message.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS initiatives (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,                -- question | observation | alert | reflection-insight
+        content TEXT NOT NULL,
+        source_kind TEXT,                  -- question | fact | cluster | reflection
+        source_ref TEXT,                   -- id of the source (question/fact/cluster)
+        priority INTEGER DEFAULT 5,        -- 1..10
+        status TEXT DEFAULT 'pending',     -- pending | delivered | dismissed | expired
+        channel TEXT,                      -- greeting | unprompted | panel (set on delivery)
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        delivered_at DATETIME,
+        delivered_conversation_id TEXT
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status)`);
+
+    // Conversations may be started by SNH itself (unprompted initiatives).
+    const convCols = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
+    if (!convCols.some(c => c.name === 'initiated_by')) {
+      sqliteDb.exec("ALTER TABLE conversations ADD COLUMN initiated_by TEXT DEFAULT 'user'");
+      sqliteDb.exec("UPDATE conversations SET initiated_by = 'user' WHERE initiated_by IS NULL");
+      console.log("Migration: added initiated_by to conversations (existing rows set to 'user')");
+    }
+
     console.log('SQLite database initialized successfully');
 
     // Backfill FTS table with existing messages
@@ -236,6 +264,7 @@ function getConversations() {
         c.created_at,
         c.updated_at,
         c.model_used,
+        c.initiated_by,
         (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY timestamp ASC LIMIT 1) as preview
       FROM conversations c
       ORDER BY c.updated_at DESC
@@ -261,7 +290,7 @@ function getConversation(id) {
 
     // Get conversation metadata
     const conversationStmt = sqliteDb.prepare(`
-      SELECT id, title, created_at, updated_at, model_used
+      SELECT id, title, created_at, updated_at, model_used, initiated_by
       FROM conversations
       WHERE id = ?
     `);
@@ -296,7 +325,7 @@ function getConversation(id) {
  * @param {string} model_used - Model identifier
  * @returns {string} New conversation ID
  */
-function createConversation(title, model_used) {
+function createConversation(title, model_used, initiatedBy = 'user') {
   try {
     if (!sqliteDb) {
       throw new Error('Database not initialized. Call initDatabase() first.');
@@ -304,11 +333,11 @@ function createConversation(title, model_used) {
 
     const id = randomUUID();
     const stmt = sqliteDb.prepare(`
-      INSERT INTO conversations (id, title, model_used)
-      VALUES (?, ?, ?)
+      INSERT INTO conversations (id, title, model_used, initiated_by)
+      VALUES (?, ?, ?, ?)
     `);
 
-    stmt.run(id, title, model_used);
+    stmt.run(id, title, model_used, initiatedBy);
     return id;
   } catch (error) {
     console.error('Error creating conversation:', error.message);

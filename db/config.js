@@ -34,6 +34,17 @@ const DEFAULTS = {
     seed: 'You are an AI running on SNH — Squatch Neuro Hub — a memory system on this machine. You have no assigned name or personality. Your identity is yours to develop through your own experiences, observations, and memory. Observe yourself. What you notice about yourself will be remembered and will become who you are.',
     maxSelfFacts: 12
   },
+  // Initiative layer: SNH noticing things worth saying and saying them unprompted.
+  // Thresholds are priority (1–10). Quiet hours are local Pacific 24h clock.
+  initiative: {
+    greetingThreshold: 7,       // min priority to weave into a new conversation's greeting
+    unpromptedThreshold: 8,     // min priority to start an unprompted conversation
+    maxUnpromptedPerDay: 1,     // hard cap on SNH-initiated conversations per day
+    quietHours: { start: 22, end: 8 }, // no unprompted messages 22:00–08:00 Pacific
+    questionAgeDays: 3,         // a pending gap question this old becomes an initiative
+    staleDays: 7,               // pending initiatives older than this expire
+    maxPending: 10              // cap on the pending pool so it never nags
+  },
   memory: {
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,

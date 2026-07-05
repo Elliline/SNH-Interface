@@ -20,6 +20,7 @@ const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
 const factExtractor = require('./fact-extractor');
 const agentPool = require('./agent-pool');
+const initiativeEngine = require('./initiative-engine');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -1114,6 +1115,29 @@ Return ONLY a JSON array of strings, e.g. ["I tend to ...", "I care about ..."].
       selfResult = await factExtractor.processSelfFacts(observations, { source: 'reflection' });
     }
 
+    // Reflection insight worth sharing: ask whether anything from this reflection
+    // is worth proactively raising with the user. If so, it becomes an initiative.
+    let insight = null;
+    try {
+      const insightSys = `You just reflected on your recent conversations with your user. Is there ONE thing worth proactively raising with them — a useful realization, a follow-up, something you noticed that they'd value hearing? Only if it genuinely would help them. Respond with the single sentence to raise, or exactly NONE.`;
+      const insightUser = `Your observations:\n${observations.map(o => `- ${o}`).join('\n')}\n\nOne thing worth telling the user, or NONE?`;
+      const { content: insightRaw } = await agentPool.schedule(
+        () => callLLM(insightSys, insightUser, { maxTokens: 120 }),
+        'reflection-insight'
+      );
+      const line = (insightRaw || '').trim().split('\n')[0].trim();
+      if (line && !/^none\b/i.test(line)) {
+        insight = line.replace(/^[-*"\s]+/, '').replace(/"$/, '').trim();
+        if (insight.length >= 8) {
+          initiativeEngine.noticeReflectionInsight(insight, 6);
+        } else {
+          insight = null;
+        }
+      }
+    } catch (insightErr) {
+      console.error('[Reflection] Insight generation error:', insightErr.message);
+    }
+
     const at = new Date().toISOString();
 
     // Log the reflection to the daily log like everything else.
@@ -1272,13 +1296,27 @@ async function runMaintenance() {
       reflection = { error: reflectErr.message };
     }
 
+    // Task E: initiative layer — turn findings into candidate initiatives, let a
+    // pooled prioritizer re-score/expire/cap them, then maybe reach out once.
+    let initiative = { skipped: true };
+    try {
+      initiativeEngine.noticeFromQuestions();
+      initiativeEngine.noticeFromAudit(auditResults);
+      const prioritized = await initiativeEngine.prioritize();
+      const unprompted = await initiativeEngine.deliverUnprompted();
+      initiative = { prioritized, unprompted };
+    } catch (initErr) {
+      console.error('[Heartbeat] Initiative layer error:', initErr.message);
+      initiative = { error: initErr.message };
+    }
+
     // Step 4: report
     const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults });
 
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, cleanup, archive, reflection };
+    return { report, cleanup, archive, reflection, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     return { error: error.message };

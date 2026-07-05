@@ -23,6 +23,7 @@ const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
 const agentPool = require('./db/agent-pool');
 const identity = require('./db/identity');
+const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 
@@ -1504,7 +1505,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid messages array' });
     }
 
-    // Get or create conversation
+    // Get or create conversation. A request with no conversation_id is the
+    // opening of a new conversation — the natural moment for a greeting initiative.
+    const isConversationOpen = !conversation_id;
     let convoId = conversation_id;
     if (!convoId) {
       // Create a new conversation
@@ -1636,12 +1639,32 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       memoryParts.push(`=== Associated Memory Clusters ===\n${clusterText}`);
     }
 
+    // === Conversation-open greeting: weave in one high-priority initiative ===
+    // When the user opens a new conversation, SNH may raise the single most
+    // pressing thing it has been meaning to say — at most one, woven in naturally.
+    let deliveredInitiative = null;
+    try {
+      if (isConversationOpen) {
+        const initCfg = getConfig().initiative || {};
+        const threshold = Number.isFinite(initCfg.greetingThreshold) ? initCfg.greetingThreshold : 7;
+        const top = initiatives.getTopPending(threshold);
+        if (top) {
+          deliveredInitiative = top;
+          memoryParts.push(`=== Something On Your Mind ===\nThere is one thing you (SNH) have been meaning to raise with the user: "${top.content}"\nIf it fits the conversation, you may open with it or weave it naturally into your first response — at most this one thing, phrased warmly and conversationally, never as a list or a formal notice. If it truly does not fit what the user said, let it go for now.`);
+          console.log(`[Initiative] Greeting candidate (priority ${top.priority}): ${top.id}`);
+        }
+      }
+    } catch (initErr) {
+      console.error('[Initiative] Greeting selection error:', initErr.message);
+    }
+
     // === Question queue: surface at most one pending question ===
     // If a retrieved cluster has a pending question and none has been asked in
     // this conversation yet, tell the model it MAY ask it if the moment fits.
+    // Skipped when a greeting initiative is already in play (at most one ask).
     let surfacedQuestion = null;
     try {
-      if (clusterContext.length > 0 && !questionQueue.hasAskedInConversation(convoId)) {
+      if (!deliveredInitiative && clusterContext.length > 0 && !questionQueue.hasAskedInConversation(convoId)) {
         const clusterIds = clusterContext.map(c => c.cluster.id).filter(Boolean);
         const pending = questionQueue.getPendingForClusters(clusterIds);
         if (pending) {
@@ -1668,6 +1691,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (surfacedQuestion) {
       questionQueue.markAsked(surfacedQuestion.id, convoId);
       console.log(`[Questions] Surfaced to model (convo ${convoId}): "${surfacedQuestion.question}"`);
+    }
+
+    // Mark the greeting initiative delivered (it was woven into this response).
+    if (deliveredInitiative) {
+      initiatives.markDelivered(deliveredInitiative.id, { channel: 'greeting', conversationId: convoId });
+      console.log(`[Initiative] Delivered greeting initiative ${deliveredInitiative.id} (convo ${convoId})`);
     }
 
     // TTS-aware system prompt: instruct the model to avoid markdown/emojis when TTS is active

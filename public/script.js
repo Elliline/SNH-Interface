@@ -2322,14 +2322,15 @@ function renderConversationList() {
 
   conversationList.innerHTML = conversations.map(conv => {
     const isActive = conv.id === currentConversationId;
+    const isSnh = conv.initiated_by === 'snh';
     const title = conv.title || 'New Conversation';
     const preview = conv.preview ? conv.preview.substring(0, 40) + '...' : '';
     const timestamp = formatRelativeTime(conv.updated_at);
     const model = conv.model_used ? conv.model_used.split(':')[0] : '';
 
     return `
-      <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${conv.id}">
-        <div class="conversation-title">${escapeHtml(title)}</div>
+      <div class="conversation-item ${isActive ? 'active' : ''} ${isSnh ? 'snh-initiated' : ''}" data-id="${conv.id}">
+        <div class="conversation-title">${isSnh ? '<span class="snh-badge" title="SNH reached out">✦ SNH</span> ' : ''}${escapeHtml(title)}</div>
         <div class="conversation-meta">
           <span class="conversation-timestamp">${timestamp}</span>
           ${model ? `<span class="conversation-model">${escapeHtml(model)}</span>` : ''}
@@ -2679,6 +2680,87 @@ if (memorySearchInput) {
 document.querySelectorAll('.memory-tab').forEach(tab => {
   tab.addEventListener('click', () => switchMemoryTab(tab.dataset.tab));
 });
+
+// ---- Initiative bell + panel (things SNH wants to raise) ----
+const initiativeBtn = document.getElementById('initiativeBtn');
+const initiativeBadge = document.getElementById('initiativeBadge');
+const initiativePanel = document.getElementById('initiativePanel');
+const initiativePanelOverlay = document.getElementById('initiativePanelOverlay');
+const initiativePanelClose = document.getElementById('initiativePanelClose');
+
+if (initiativeBtn) initiativeBtn.addEventListener('click', openInitiativePanel);
+if (initiativePanelClose) initiativePanelClose.addEventListener('click', closeInitiativePanel);
+if (initiativePanelOverlay) initiativePanelOverlay.addEventListener('click', closeInitiativePanel);
+
+async function refreshInitiativeBadge() {
+  if (!initiativeBadge) return;
+  try {
+    const res = await fetch('/api/memory/initiatives');
+    const data = await res.json();
+    const n = data.aboveThreshold || 0;
+    if (n > 0) {
+      initiativeBadge.textContent = n;
+      initiativeBadge.style.display = 'inline-flex';
+      initiativeBtn?.classList.add('has-initiatives');
+    } else {
+      initiativeBadge.style.display = 'none';
+      initiativeBtn?.classList.remove('has-initiatives');
+    }
+  } catch (e) { /* silent */ }
+}
+
+function openInitiativePanel() {
+  initiativePanel?.classList.add('open');
+  initiativePanelOverlay?.classList.add('active');
+  loadInitiativeList();
+}
+
+function closeInitiativePanel() {
+  initiativePanel?.classList.remove('open');
+  initiativePanelOverlay?.classList.remove('active');
+}
+
+async function loadInitiativeList() {
+  const container = document.getElementById('initiativeList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading…</div>';
+  try {
+    const res = await fetch('/api/memory/initiatives');
+    const data = await res.json();
+    const items = data.initiatives || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">Nothing on SNH\'s mind right now.</div>';
+      return;
+    }
+    container.innerHTML = items.map(it => `
+      <div class="initiative-item" data-id="${it.id}">
+        <div class="initiative-item-head">
+          <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
+          <span class="initiative-priority" title="priority">${it.priority}/10</span>
+        </div>
+        <div class="initiative-content">${escapeHtml(it.content)}</div>
+        <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>
+      </div>
+    `).join('');
+    container.querySelectorAll('.initiative-dismiss').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await fetch(`/api/memory/initiatives/${btn.dataset.id}/dismiss`, { method: 'POST' });
+          loadInitiativeList();
+          refreshInitiativeBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+  } catch (error) {
+    console.error('[Initiatives] Error loading list:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load</div>';
+  }
+}
+
+// Keep the bell current: on load and periodically.
+refreshInitiativeBadge();
+setInterval(refreshInitiativeBadge, 60000);
 
 function openMemoryPanel() {
   memoryPanel?.classList.add('open');
