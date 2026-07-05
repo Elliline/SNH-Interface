@@ -3139,6 +3139,33 @@ let mapCy = null;               // cytoscape instance
 let mapData = null;             // last /graph payload
 let mapExpanded = new Set();    // cluster ids shown with members (collapse mode)
 const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed
+let mapLayoutName = 'cose';     // upgraded to 'fcose' once the extension registers
+
+// Register the compound-aware fcose layout once. cose/cola inflate compound
+// parents and let clusters overlap; fcose separates them and hugs parents.
+let fcoseRegistered = false;
+function ensureMapLayout() {
+  if (fcoseRegistered) return;
+  fcoseRegistered = true;
+  if (typeof cytoscape !== 'undefined' && typeof cytoscapeFcose !== 'undefined') {
+    try {
+      cytoscape.use(cytoscapeFcose);
+      mapLayoutName = 'fcose';
+    } catch (e) {
+      // Already registered, or registration failed — keep the cose fallback.
+      if (/already/i.test(e.message || '')) mapLayoutName = 'fcose';
+      else console.warn('[Map] fcose registration failed, falling back to cose:', e.message);
+    }
+  } else {
+    console.warn('[Map] fcose extension not present — falling back to cose layout.');
+  }
+}
+
+// Collapse whitespace and truncate to n chars with an ellipsis, for node labels.
+function mapTruncate(s, n) {
+  s = (s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s;
+}
 
 // Base colors per subject region (user vs self).
 const MAP_COLORS = {
@@ -3170,6 +3197,7 @@ async function loadMapTab() {
     graphEl.innerHTML = '<div class="memory-empty">Graph library failed to load.</div>';
     return;
   }
+  ensureMapLayout();
   // Already built once — just refit (panel may have been hidden/resized).
   if (mapCy) { mapRefit(); return; }
 
@@ -3212,12 +3240,15 @@ async function loadMapTab() {
 
 function mapStylesheet() {
   return [
-    // Cluster constellations (compound parents).
+    // Cluster constellations (compound parents). Small padding so the box hugs
+    // its members; label sits just above the box with an outline so it stays
+    // readable and never reads as an empty rectangle.
     { selector: 'node.cluster', style: {
-        'label': 'data(label)', 'font-size': 11, 'font-weight': 600,
-        'color': '#cbd5e1', 'text-valign': 'top', 'text-halign': 'center',
-        'text-margin-y': -2, 'shape': 'round-rectangle',
-        'background-opacity': 1, 'border-width': 1.5, 'padding': 14,
+        'label': 'data(label)', 'font-size': 13, 'font-weight': 700,
+        'color': '#e5e7eb', 'text-valign': 'top', 'text-halign': 'center',
+        'text-margin-y': -6, 'shape': 'round-rectangle',
+        'text-outline-width': 3, 'text-outline-color': '#0b1220', 'text-outline-opacity': 0.95,
+        'background-opacity': 1, 'border-width': 1.5, 'padding': 10,
         'background-color': 'data(bg)', 'border-color': 'data(border)'
     }},
     // Collapsed cluster hubs (leaf nodes standing in for a whole cluster).
@@ -3229,16 +3260,23 @@ function mapStylesheet() {
         'background-color': 'data(fill)', 'background-opacity': 0.85,
         'border-width': 2, 'border-color': 'data(border)'
     }},
-    // Fact nodes.
+    // Fact nodes — labelled with truncated fact text below the dot. Labels are
+    // always on but gated by min-zoomed-font-size so they appear only once the
+    // user is zoomed in enough for them to be legible (no clutter when far out).
     { selector: 'node.fact', style: {
         'width': 'data(size)', 'height': 'data(size)',
         'background-color': 'data(fill)', 'border-width': 1,
         'border-color': 'rgba(255,255,255,0.35)',
-        'label': 'data(short)', 'font-size': 7, 'color': '#e2e8f0',
-        'text-valign': 'bottom', 'text-margin-y': 2, 'text-opacity': 0,
-        'min-zoomed-font-size': 8
+        'label': 'data(short)', 'font-size': 9, 'color': '#e5e7eb',
+        'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 3,
+        'text-wrap': 'ellipsis', 'text-max-width': 120,
+        'text-outline-width': 2, 'text-outline-color': '#0b1220', 'text-outline-opacity': 0.9,
+        'text-opacity': 1, 'min-zoomed-font-size': 6
     }},
-    { selector: 'node.fact:selected', style: { 'text-opacity': 1, 'border-width': 2, 'border-color': '#fff' } },
+    { selector: 'node.fact:selected', style: {
+        'font-size': 11, 'min-zoomed-font-size': 0, 'z-index': 20,
+        'border-width': 2, 'border-color': '#fff'
+    }},
     // Ghost (superseded) facts — faded.
     { selector: 'node.ghost', style: {
         'background-opacity': 0.28, 'border-style': 'dashed',
@@ -3308,9 +3346,9 @@ function renderMap() {
     if (isGhost) cls += ' ghost';
     if (n.pendingQuestions > 0) cls += ' pending';
     els.push({ data: {
-      id: n.id, parent: n.clusterId, kind: 'fact',
+      id: n.id, parent: n.clusterId, kind: 'fact', subject: n.subject,
       size: mapNodeSize(n.salience), fill: col.fill,
-      short: (n.content || '').slice(0, 22)
+      short: mapTruncate(n.content, 40)
     }, classes: cls });
     shownFactIds.add(n.id);
   }
@@ -3338,13 +3376,115 @@ function renderMap() {
 }
 
 function runMapLayout() {
-  mapCy.layout({
-    name: 'cose', animate: false, randomize: false,
-    nodeRepulsion: 9000, idealEdgeLength: 60, nestingFactor: 1.1,
-    gravity: 0.6, componentSpacing: 80, padding: 30,
-    nodeOverlap: 12, coolingFactor: 0.95, numIter: 800
-  }).run();
-  mapCy.fit(undefined, 30);
+  const opts = mapLayoutName === 'fcose'
+    ? {
+        name: 'fcose',
+        quality: 'proof',       // best separation quality (offline, one-shot)
+        animate: false,
+        randomize: true,        // fresh global layout, not stuck on prior positions
+        // Repulsion + edge length give clusters clear gaps between them.
+        nodeRepulsion: 9000,
+        idealEdgeLength: 75,
+        edgeElasticity: 0.45,
+        nestingFactor: 0.1,     // members pack tightly inside their parent
+        // Compound handling: keep members close to their cluster centre.
+        gravity: 0.22,
+        gravityRange: 3.6,
+        gravityCompound: 1.4,
+        gravityRangeCompound: 1.6,
+        // Tile disconnected members and pack separate components (user vs self
+        // have no cross-links, so they land as distinct packed clusters).
+        tile: true,
+        tilingPaddingVertical: 12,
+        tilingPaddingHorizontal: 12,
+        packComponents: true,
+        nodeSeparation: 90,
+        padding: 40,
+        numIter: 2500,
+        stop: () => { resolveClusterOverlaps(); separateMapZones(); mapCy.fit(undefined, 40); }
+      }
+    : {
+        name: 'cose', animate: false, randomize: false,
+        nodeRepulsion: 9000, idealEdgeLength: 60, nestingFactor: 1.1,
+        gravity: 0.6, componentSpacing: 80, padding: 30,
+        nodeOverlap: 12, coolingFactor: 0.95, numIter: 800,
+        stop: () => { resolveClusterOverlaps(); separateMapZones(); mapCy.fit(undefined, 40); }
+      };
+  mapCy.layout(opts).run();
+  // fcose with animate:false still fires `stop` synchronously after run(); fit
+  // there. Guard with an immediate fit for the cose path too.
+  mapCy.fit(undefined, 40);
+}
+
+// Separate the self (purple) and user (blue) territories into two side-by-side
+// zones. fcose keeps each cluster coherent but can interleave the two subjects;
+// this shifts every self element left so the self zone sits entirely left of the
+// user zone with a clear gap. Uniform translation preserves the intra-zone
+// arrangement (no new overlaps) and is deterministic (verifiable from positions).
+function separateMapZones(gap = 160) {
+  if (!mapCy) return;
+  const self = mapCy.nodes('[subject = "self"]');
+  const user = mapCy.nodes('[subject = "user"]');
+  if (self.empty() || user.empty()) return;
+  const sbb = self.boundingBox();
+  const ubb = user.boundingBox();
+  // Target: self.x2 == user.x1 - gap  (self entirely left of user).
+  const dx = (ubb.x1 - gap) - sbb.x2;
+  if (Math.abs(dx) < 1) return;
+  // Move only leaves (facts + hubs); compound parents re-fit to their children.
+  const leaves = self.filter(n => n.isChildless());
+  leaves.positions(n => ({ x: n.position('x') + dx, y: n.position('y') }));
+}
+
+// Shift a whole cluster (its member leaves; the compound parent re-fits) by dx,dy.
+function mapShiftCluster(p, dx, dy) {
+  const leaves = p.isParent() ? p.children() : p;
+  leaves.positions(n => ({ x: n.position('x') + dx, y: n.position('y') + dy }));
+}
+
+// Guarantee clear gaps between cluster constellations. fcose lays them out well
+// but does not strictly forbid two compound parents from touching (e.g. two
+// clusters joined by an association edge get pulled corner-to-corner). This
+// iteratively pushes any overlapping (or closer-than-pad) parents apart along
+// their minimum-translation axis until every pair has at least `pad` px between
+// them. Deterministic and convergent for a small cluster count.
+function resolveClusterOverlaps(pad = 24, iterations = 60) {
+  if (!mapCy) return;
+  const parents = mapCy.nodes('.cluster, .hub');
+  if (parents.length < 2) return;
+  for (let it = 0; it < iterations; it++) {
+    let moved = false;
+    const boxes = parents.map(p => ({ p, bb: p.boundingBox() }));
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const A = boxes[i].bb, B = boxes[j].bb;
+        const ox = Math.min(A.x2 + pad, B.x2 + pad) - Math.max(A.x1 - pad, B.x1 - pad);
+        const oy = Math.min(A.y2, B.y2) - Math.max(A.y1, B.y1);
+        // Overlap (padded on X, raw on Y) → push apart on the shallower axis.
+        if (ox > 0 && oy > 0) {
+          const acx = (A.x1 + A.x2) / 2, bcx = (B.x1 + B.x2) / 2;
+          const acy = (A.y1 + A.y2) / 2, bcy = (B.y1 + B.y2) / 2;
+          const oxRaw = Math.min(A.x2, B.x2) - Math.max(A.x1, B.x1);
+          let dx = 0, dy = 0;
+          if (Math.max(oxRaw, 0) + pad <= oy) {
+            const push = (Math.max(oxRaw, -pad) + pad) / 2 + 1;
+            const dir = acx <= bcx ? -1 : 1;
+            dx = dir * push;
+          } else {
+            const push = oy / 2 + 1;
+            const dir = acy <= bcy ? -1 : 1;
+            dy = dir * push;
+          }
+          mapShiftCluster(boxes[i].p, dx, dy);
+          mapShiftCluster(boxes[j].p, -dx, -dy);
+          boxes[i].bb = boxes[i].p.boundingBox();
+          boxes[j].bb = boxes[j].p.boundingBox();
+          moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
 }
 
 function wireMapControls() {
