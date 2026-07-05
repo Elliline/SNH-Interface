@@ -11,6 +11,7 @@
 const { randomUUID } = require('crypto');
 const { getSqliteDb } = require('./database');
 const { getLocalDateStamp } = require('./datetime');
+const { getConfig } = require('./config');
 
 const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight']);
 
@@ -20,18 +21,41 @@ function clampPriority(p) {
   return Math.max(1, Math.min(10, n));
 }
 
+/** Cosine similarity between two equal-length vectors. */
+function cosineSim(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  const den = Math.sqrt(na) * Math.sqrt(nb);
+  return den === 0 ? 0 : dot / den;
+}
+
+/** Cosine threshold above which two same-type initiatives count as duplicates. */
+function getDedupThreshold() {
+  const cfg = getConfig();
+  const n = cfg.initiative && cfg.initiative.dedupThreshold;
+  return Number.isFinite(n) ? n : 0.85;
+}
+
 /**
- * Add a candidate initiative. Deduped against existing pending initiatives with
- * the same (source_kind, source_ref) so the same underlying thing is never
- * queued twice.
- * @returns {string|null} id (existing or new), or null on failure
+ * Add a candidate initiative. Deduped two ways so the same thing is never queued
+ * twice:
+ *   1. Exact: an existing pending item with the same (source_kind, source_ref).
+ *   2. Semantic: an existing pending item of the SAME type whose content is
+ *      cosine-similar above initiative.dedupThreshold. Successive heartbeats emit
+ *      near-identical observations that each carry a DIFFERENT source_ref (every
+ *      reorganization mints a new cluster id), so only the semantic check catches
+ *      them.
+ * @returns {Promise<string|null>} id (existing match or new), or null on failure
  */
-function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5 }) {
+async function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5 }) {
   try {
     const db = getSqliteDb();
     if (!db || !content || !content.trim()) return null;
     const safeType = VALID_TYPES.has(type) ? type : 'observation';
+    const text = content.trim();
 
+    // 1. Exact dedup by source identity.
     if (sourceRef) {
       const existing = db.prepare(
         "SELECT id FROM initiatives WHERE status = 'pending' AND source_kind IS ? AND source_ref IS ?"
@@ -39,16 +63,96 @@ function addInitiative({ type, content, sourceKind = null, sourceRef = null, pri
       if (existing) return existing.id;
     }
 
+    // 2. Semantic dedup against pending items of the same type.
+    try {
+      const pending = db.prepare(
+        "SELECT id, content FROM initiatives WHERE status = 'pending' AND type = ?"
+      ).all(safeType);
+      if (pending.length > 0) {
+        const memoryClusters = require('./memory-clusters');
+        const newEmb = await memoryClusters.generateEmbedding(text);
+        if (newEmb) {
+          const threshold = getDedupThreshold();
+          for (const p of pending) {
+            const emb = await memoryClusters.generateEmbedding(p.content);
+            if (!emb) continue;
+            const sim = cosineSim(newEmb, emb);
+            if (sim >= threshold) {
+              console.log(`[Initiatives] Skipped near-duplicate ${safeType} (sim ${sim.toFixed(3)} ≥ ${threshold}) of pending ${p.id}: "${text.slice(0, 80)}"`);
+              return p.id;
+            }
+          }
+        }
+      }
+    } catch (dedupErr) {
+      // Embedding backend down → fall through and queue rather than lose the item.
+      console.error('[Initiatives] semantic dedup skipped (continuing):', dedupErr.message);
+    }
+
     const id = randomUUID();
     db.prepare(`
       INSERT INTO initiatives (id, type, content, source_kind, source_ref, priority, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(id, safeType, content.trim(), sourceKind, sourceRef, clampPriority(priority), new Date().toISOString());
-    console.log(`[Initiatives] Queued ${safeType} (priority ${clampPriority(priority)}): "${content.trim().slice(0, 80)}"`);
+    `).run(id, safeType, text, sourceKind, sourceRef, clampPriority(priority), new Date().toISOString());
+    console.log(`[Initiatives] Queued ${safeType} (priority ${clampPriority(priority)}): "${text.slice(0, 80)}"`);
     return id;
   } catch (error) {
     console.error('[Initiatives] addInitiative error:', error.message);
     return null;
+  }
+}
+
+/**
+ * Clean the current pending pool: within each type, keep one representative per
+ * near-duplicate group (highest priority, then newest) and expire the rest.
+ * Used to retroactively collapse duplicates that were queued before semantic
+ * dedup existed. Idempotent.
+ * @param {Object} [opts]
+ * @param {number} [opts.threshold] - cosine threshold (defaults to config)
+ * @returns {Promise<{removed:number}>}
+ */
+async function dedupePending({ threshold } = {}) {
+  const db = getSqliteDb();
+  if (!db) return { removed: 0 };
+  const thr = Number.isFinite(threshold) ? threshold : getDedupThreshold();
+  const memoryClusters = require('./memory-clusters');
+  let removed = 0;
+  try {
+    // Representative-first ordering: highest priority, then newest, so the item
+    // we keep in each group is the strongest/most current one.
+    const rows = db.prepare(
+      "SELECT id, type, content, priority FROM initiatives WHERE status = 'pending' ORDER BY type, priority DESC, created_at DESC"
+    ).all();
+    const byType = new Map();
+    for (const r of rows) {
+      if (!byType.has(r.type)) byType.set(r.type, []);
+      byType.get(r.type).push(r);
+    }
+    for (const [, items] of byType) {
+      const kept = []; // { id, emb }
+      for (const it of items) {
+        const emb = await memoryClusters.generateEmbedding(it.content);
+        let dupOf = null;
+        if (emb) {
+          for (const k of kept) {
+            if (k.emb && cosineSim(emb, k.emb) >= thr) { dupOf = k; break; }
+          }
+        }
+        if (dupOf) {
+          if (expire(it.id)) {
+            removed++;
+            console.log(`[Initiatives] dedupePending: expired ${it.id} (duplicate of ${dupOf.id})`);
+          }
+        } else {
+          kept.push({ id: it.id, emb });
+        }
+      }
+    }
+    console.log(`[Initiatives] dedupePending removed ${removed} duplicate(s)`);
+    return { removed };
+  } catch (error) {
+    console.error('[Initiatives] dedupePending error:', error.message);
+    return { removed };
   }
 }
 
@@ -183,6 +287,7 @@ function countUnpromptedDeliveredToday() {
 
 module.exports = {
   addInitiative,
+  dedupePending,
   listPending,
   getTopPending,
   get,

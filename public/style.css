@@ -1844,6 +1844,13 @@ body {
 .initiative-type-alert { color: var(--error-color); }
 .initiative-type-question { color: var(--primary-color); }
 .initiative-type-reflection-insight { color: var(--accent-color); }
+.initiative-time {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  margin-left: auto;
+  margin-right: 8px;
+  white-space: nowrap;
+}
 .initiative-priority {
   font-size: 0.72rem;
   color: var(--accent-color);

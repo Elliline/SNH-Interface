@@ -47,7 +47,7 @@ function daysAgoIso(days) {
  *  - contradiction uncertainties (they block a memory decision) — no age wait
  * @returns {number} candidates added
  */
-function noticeFromQuestions() {
+async function noticeFromQuestions() {
   const sql = getSqliteDb();
   if (!sql) return 0;
   const cfg = initiativeConfig();
@@ -69,7 +69,7 @@ function noticeFromQuestions() {
       // nudged up for having gone unanswered.
       if ((q.salience ?? 5) < 6) continue;
       const priority = Math.min(10, (q.salience ?? 5) + 1);
-      if (initiatives.addInitiative({
+      if (await initiatives.addInitiative({
         type: 'question',
         content: q.question,
         sourceKind: 'question',
@@ -84,7 +84,7 @@ function noticeFromQuestions() {
       WHERE reason = 'contradiction-uncertainty' AND status = 'pending'
     `).all();
     for (const q of conflicts) {
-      if (initiatives.addInitiative({
+      if (await initiatives.addInitiative({
         type: 'alert',
         content: q.question,
         sourceKind: 'question',
@@ -102,27 +102,29 @@ function noticeFromQuestions() {
 
 /**
  * Turn cluster-audit findings that need the user into initiatives:
- *  - audit errors (SNH couldn't make sense of a cluster) → alert
  *  - clusters found incoherent (drifted into different topics) → observation
+ *
+ * Audit *errors* (an unparseable LLM response or a thrown exception on one
+ * cluster in one cycle) are deliberately NOT surfaced as user alerts: they are
+ * transient, internal, and not actionable by the user — the next heartbeat
+ * re-audits the same cluster and usually succeeds. They are already recorded in
+ * the heartbeat report's Anomalies section for operators. Raising them as alerts
+ * only produced noise like "I hit a snag making sense of my … memories".
  * @param {Array} auditResults - from runAuditPipeline
- * @returns {number} candidates added
+ * @returns {Promise<number>} candidates added
  */
-function noticeFromAudit(auditResults = []) {
-  const cfg = initiativeConfig();
+async function noticeFromAudit(auditResults = []) {
   let added = 0;
   try {
     for (const r of auditResults) {
       if (r.error) {
-        if (initiatives.addInitiative({
-          type: 'alert',
-          content: `Heads up — I hit a snag making sense of my "${r.clusterName}" memories while tidying up. You might want to take a look when you get a chance.`,
-          sourceKind: 'cluster',
-          sourceRef: r.clusterId,
-          priority: 6
-        })) added++;
-      } else if (r.coherent === false && Array.isArray(r.splits) && r.splits.length > 0) {
+        // Transient internal audit failure — log for operators, do not alert the user.
+        console.warn(`[Initiatives] Audit error on "${r.clusterName}" (not surfaced as alert): ${r.error}`);
+        continue;
+      }
+      if (r.coherent === false && Array.isArray(r.splits) && r.splits.length > 0) {
         const into = r.splits.map(s => `"${s.newClusterName}"`).join(', ');
-        if (initiatives.addInitiative({
+        if (await initiatives.addInitiative({
           type: 'observation',
           content: `Heads up — I noticed my "${r.clusterName}" memories had drifted into a couple of different topics (${into}), so I reorganized them into separate clusters.`,
           sourceKind: 'cluster',
@@ -142,7 +144,7 @@ function noticeFromAudit(auditResults = []) {
  * Record a reflection insight the model flagged as worth sharing.
  * Called from runReflection. type = 'reflection-insight'.
  */
-function noticeReflectionInsight(text, priority = 6) {
+async function noticeReflectionInsight(text, priority = 6) {
   if (!text || !text.trim()) return null;
   return initiatives.addInitiative({
     type: 'reflection-insight',

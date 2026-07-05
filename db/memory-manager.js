@@ -275,11 +275,15 @@ async function executeSplits(auditResults) {
 
     try {
       // Verify source cluster still exists
-      const sourceCluster = db.prepare('SELECT id FROM memory_clusters WHERE id = ?').get(clusterId);
+      const sourceCluster = db.prepare('SELECT id, subject FROM memory_clusters WHERE id = ?').get(clusterId);
       if (!sourceCluster) {
         results.anomalies.push(`Source cluster ${clusterId} (${clusterName}) no longer exists, skipping splits`);
         continue;
       }
+      // Split-out clusters inherit the source's subject — otherwise splitting a
+      // self-cluster would create user-subject clusters (defaulting via schema),
+      // leaking self-observations back into the user Facts/Clusters tabs.
+      const srcSubject = sourceCluster.subject || 'user';
 
       const now = new Date().toISOString();
       const movedMemberIds = new Set();
@@ -312,8 +316,8 @@ async function executeSplits(auditResults) {
 
         // Create new cluster
         const newClusterId = randomUUID();
-        db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
-          .run(newClusterId, split.newClusterName, '', now, now);
+        db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(newClusterId, split.newClusterName, '', now, now, srcSubject);
 
         console.log(`[Heartbeat] Created cluster "${split.newClusterName}" (${newClusterId}), moving ${membersToMove.length} facts`);
 
@@ -1133,7 +1137,7 @@ Respond with ONLY that message, or exactly NONE.`;
       if (line && !/^none\b/i.test(line)) {
         insight = line.replace(/^[-*"\s]+/, '').replace(/"$/, '').trim();
         if (insight.length >= 8) {
-          initiativeEngine.noticeReflectionInsight(insight, 6);
+          await initiativeEngine.noticeReflectionInsight(insight, 6);
         } else {
           insight = null;
         }
@@ -1304,8 +1308,8 @@ async function runMaintenance() {
     // pooled prioritizer re-score/expire/cap them, then maybe reach out once.
     let initiative = { skipped: true };
     try {
-      initiativeEngine.noticeFromQuestions();
-      initiativeEngine.noticeFromAudit(auditResults);
+      await initiativeEngine.noticeFromQuestions();
+      await initiativeEngine.noticeFromAudit(auditResults);
       const prioritized = await initiativeEngine.prioritize();
       const unprompted = await initiativeEngine.deliverUnprompted();
       initiative = { prioritized, unprompted };

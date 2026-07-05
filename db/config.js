@@ -43,7 +43,8 @@ const DEFAULTS = {
     quietHours: { start: 22, end: 8 }, // no unprompted messages 22:00–08:00 Pacific
     questionAgeDays: 3,         // a pending gap question this old becomes an initiative
     staleDays: 7,               // pending initiatives older than this expire
-    maxPending: 10              // cap on the pending pool so it never nags
+    maxPending: 10,             // cap on the pending pool so it never nags
+    dedupThreshold: 0.85        // skip a new initiative this cosine-similar to a pending one of the same type
   },
   memory: {
     similarityThreshold: 0.60,

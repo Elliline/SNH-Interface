@@ -2722,6 +2722,18 @@ function closeInitiativePanel() {
   initiativePanelOverlay?.classList.remove('active');
 }
 
+// Compact local timestamp for initiatives, e.g. "7/5 6:42 AM".
+function formatInitiativeTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+  if (isNaN(d.getTime())) return '';
+  let h = d.getHours();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${h}:${mm} ${ampm}`;
+}
+
 async function loadInitiativeList() {
   const container = document.getElementById('initiativeList');
   if (!container) return;
@@ -2738,6 +2750,7 @@ async function loadInitiativeList() {
       <div class="initiative-item" data-id="${it.id}">
         <div class="initiative-item-head">
           <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
+          <span class="initiative-time" title="${escapeHtml(it.created_at || '')}">${escapeHtml(formatInitiativeTime(it.created_at))}</span>
           <span class="initiative-priority" title="priority">${it.priority}/10</span>
         </div>
         <div class="initiative-content">${escapeHtml(it.content)}</div>
