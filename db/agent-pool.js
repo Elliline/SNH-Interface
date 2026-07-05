@@ -189,7 +189,11 @@ class AgentPool {
     return { ...p, wallMs };
   }
 
-  /** Append a one-line entry to today's daily log (best-effort). */
+  /**
+   * Prepend a one-line entry at the top of today's daily log (newest first,
+   * under the H1 header). Best-effort. Kept self-contained (no cross-module
+   * require) to avoid a dependency cycle with fact-extractor.
+   */
   _appendDaily(summary) {
     try {
       if (!fs.existsSync(DAILY_DIR)) fs.mkdirSync(DAILY_DIR, { recursive: true });
@@ -197,12 +201,24 @@ class AgentPool {
       const date = now.toISOString().split('T')[0];
       const time = now.toTimeString().slice(0, 5);
       const dailyFile = path.join(DAILY_DIR, `${date}.md`);
+      const header = `# Daily Log - ${date}\n\n`;
+      const entry = `### ${time}\n- ${summary}\n\n`;
+
       if (!fs.existsSync(dailyFile)) {
-        fs.writeFileSync(dailyFile, `# Daily Log - ${date}\n\n`, 'utf8');
+        fs.writeFileSync(dailyFile, header + entry, 'utf8');
+        return;
       }
-      fs.appendFileSync(dailyFile, `### ${time}\n- ${summary}\n\n`, 'utf8');
+      const content = fs.readFileSync(dailyFile, 'utf8');
+      // Match only a level-1 "# " header, not a "## Heartbeat Report" block.
+      const headerMatch = content.match(/^(# [^\n]*\r?\n(?:\r?\n)?)/);
+      if (headerMatch) {
+        const head = headerMatch[1];
+        fs.writeFileSync(dailyFile, head + entry + content.slice(head.length), 'utf8');
+      } else {
+        fs.writeFileSync(dailyFile, header + entry + content, 'utf8');
+      }
     } catch (err) {
-      console.error('[AgentPool] Failed to append pass stats to daily log:', err.message);
+      console.error('[AgentPool] Failed to write pass stats to daily log:', err.message);
     }
   }
 }

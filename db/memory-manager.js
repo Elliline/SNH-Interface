@@ -629,12 +629,10 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
   }
   console.log('[Heartbeat] === End Report ===');
 
-  // Append to daily log
+  // Prepend to daily log (newest first)
   try {
     const dailyDir = path.join(__dirname, '../data/memory/daily');
-    if (!fs.existsSync(dailyDir)) fs.mkdirSync(dailyDir, { recursive: true });
     const today = new Date().toISOString().split('T')[0];
-    const dailyFile = path.join(dailyDir, `${today}.md`);
 
     let splitSummary = '';
     if (report.splitDetails.length > 0) {
@@ -656,8 +654,8 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
       .map(t => `| ${t.clusterName} | ${t.durationMs}ms |`)
       .join('\n');
 
-    const reportText = [
-      `\n## Heartbeat Report — ${new Date().toISOString()}`,
+    const reportBlock = [
+      `## Heartbeat Report — ${new Date().toISOString()}`,
       '',
       `| Metric | Value |`,
       `|--------|-------|`,
@@ -669,12 +667,12 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
       `| Total duration | ${totalDuration} |`,
       splitSummary,
       timingRows.length > 0 ? `\n### Per-cluster audit timing (top 10)\n| Cluster | Duration |\n|---------|----------|\n${timingRows}` : '',
-      anomalySection,
-      ''
-    ].join('\n');
+      anomalySection
+    ].join('\n').replace(/\s*$/, '') + '\n\n';
 
-    fs.appendFileSync(dailyFile, reportText, 'utf8');
-    console.log(`[Heartbeat] Report appended to ${dailyFile}`);
+    // Prepend under the H1 header so the newest report is at the top.
+    const dailyFile = factExtractor.prependDailyEntry(reportBlock, dailyDir, today);
+    console.log(`[Heartbeat] Report prepended to ${dailyFile}`);
   } catch (err) {
     console.error('[Heartbeat] Failed to write daily report:', err.message);
   }

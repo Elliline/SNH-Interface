@@ -615,7 +615,51 @@ async function appendToMemory(facts, memoryFilePath) {
 }
 
 /**
- * Append summary to daily log
+ * Insert a pre-formatted entry block at the TOP of the day's log, directly
+ * under the "# Daily Log - <date>" H1 header, so the newest entry is first.
+ * The file structure is otherwise unchanged: the H1 header stays at the top,
+ * followed by "### HH:MM" / "## Heartbeat Report" blocks, newest → oldest.
+ *
+ * Shared by every daily-log writer (fact extraction, heartbeat report, agent
+ * pool) so ordering stays consistent across all of them.
+ *
+ * @param {string} entry - Fully formatted block, ending with a blank line ("\n\n")
+ * @param {string} dailyDir - Path to daily log directory
+ * @param {string} date - YYYY-MM-DD for the target file
+ * @returns {string} Path to the daily file written
+ */
+function prependDailyEntry(entry, dailyDir, date) {
+  if (!fs.existsSync(dailyDir)) {
+    fs.mkdirSync(dailyDir, { recursive: true });
+  }
+
+  const dailyFile = path.join(dailyDir, `${date}.md`);
+  const header = `# Daily Log - ${date}\n\n`;
+
+  if (!fs.existsSync(dailyFile)) {
+    fs.writeFileSync(dailyFile, header + entry, 'utf8');
+    return dailyFile;
+  }
+
+  const content = fs.readFileSync(dailyFile, 'utf8');
+  // Match ONLY a level-1 header ("# " — a single hash + space), so a leading
+  // "## Heartbeat Report" block is never mistaken for the header. Capture the
+  // header line plus its trailing blank line.
+  const headerMatch = content.match(/^(# [^\n]*\r?\n(?:\r?\n)?)/);
+  if (headerMatch) {
+    const head = headerMatch[1];
+    const body = content.slice(head.length);
+    fs.writeFileSync(dailyFile, head + entry + body, 'utf8');
+  } else {
+    // No recognizable H1 header (legacy file) — add one, then newest entry,
+    // then the existing content.
+    fs.writeFileSync(dailyFile, header + entry + content, 'utf8');
+  }
+  return dailyFile;
+}
+
+/**
+ * Append summary to daily log (inserted at the top — newest first).
  * @param {string} summary - Summary text
  * @param {string} dailyDir - Path to daily log directory
  */
@@ -625,26 +669,13 @@ function appendToDailyLog(summary, dailyDir) {
       return;
     }
 
-    // Ensure directory exists
-    if (!fs.existsSync(dailyDir)) {
-      fs.mkdirSync(dailyDir, { recursive: true });
-    }
-
     const now = new Date();
     const date = now.toISOString().split('T')[0]; // YYYY-MM-DD
     const time = now.toTimeString().slice(0, 5); // HH:MM
 
-    const dailyFile = path.join(dailyDir, `${date}.md`);
     const entry = `### ${time}\n- ${summary}\n\n`;
-
-    // Create file with header if it doesn't exist
-    if (!fs.existsSync(dailyFile)) {
-      const header = `# Daily Log - ${date}\n\n`;
-      fs.writeFileSync(dailyFile, header, 'utf8');
-    }
-
-    fs.appendFileSync(dailyFile, entry, 'utf8');
-    console.log(`[FactExtractor] Appended to daily log: ${dailyFile}`);
+    const dailyFile = prependDailyEntry(entry, dailyDir, date);
+    console.log(`[FactExtractor] Prepended to daily log: ${dailyFile}`);
 
   } catch (error) {
     console.error('[FactExtractor] Error appending to daily log:', error.message);
@@ -1118,6 +1149,7 @@ module.exports = {
   extractAllFactLines,
   appendToMemory,
   appendToDailyLog,
+  prependDailyEntry,
   judgeContradiction,
   scoreSalience,
   detectGapQuestion,
