@@ -1692,7 +1692,12 @@ body {
   color: var(--text-color);
   margin-bottom: 8px;
 }
-.initiative-dismiss {
+.initiative-actions {
+  display: flex;
+  gap: 8px;
+}
+.initiative-dismiss,
+.initiative-discuss {
   font-size: 0.72rem;
   padding: 3px 10px;
   border: 1px solid var(--border-color);
@@ -1702,7 +1707,13 @@ body {
   cursor: pointer;
 }
 .initiative-dismiss:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-color); }
-.initiative-dismiss:disabled { opacity: 0.5; cursor: default; }
+.initiative-dismiss:disabled,
+.initiative-discuss:disabled { opacity: 0.5; cursor: default; }
+.initiative-discuss {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+.initiative-discuss:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
 
 /* Memory panel overlay */
 .memory-panel-overlay {

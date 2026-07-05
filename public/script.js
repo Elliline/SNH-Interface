@@ -2697,15 +2697,17 @@ async function refreshInitiativeBadge() {
   try {
     const res = await fetch('/api/memory/initiatives');
     const data = await res.json();
-    const n = data.aboveThreshold || 0;
-    if (n > 0) {
-      initiativeBadge.textContent = n;
+    const total = (data.initiatives || []).length;
+    const above = data.aboveThreshold || 0;
+    // Badge shows a count whenever ANYTHING is pending; the bell only pulses when
+    // something crosses the greeting threshold (worth actively surfacing).
+    if (total > 0) {
+      initiativeBadge.textContent = total;
       initiativeBadge.style.display = 'inline-flex';
-      initiativeBtn?.classList.add('has-initiatives');
     } else {
       initiativeBadge.style.display = 'none';
-      initiativeBtn?.classList.remove('has-initiatives');
     }
+    initiativeBtn?.classList.toggle('has-initiatives', above > 0);
   } catch (e) { /* silent */ }
 }
 
@@ -2739,7 +2741,10 @@ async function loadInitiativeList() {
           <span class="initiative-priority" title="priority">${it.priority}/10</span>
         </div>
         <div class="initiative-content">${escapeHtml(it.content)}</div>
-        <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>
+        <div class="initiative-actions">
+          <button class="initiative-discuss" data-id="${it.id}">Discuss</button>
+          <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>
+        </div>
       </div>
     `).join('');
     container.querySelectorAll('.initiative-dismiss').forEach(btn => {
@@ -2750,6 +2755,28 @@ async function loadInitiativeList() {
           loadInitiativeList();
           refreshInitiativeBadge();
         } catch (e) { btn.disabled = false; }
+      });
+    });
+    container.querySelectorAll('.initiative-discuss').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const actions = btn.closest('.initiative-actions');
+        actions?.querySelectorAll('button').forEach(b => (b.disabled = true));
+        btn.textContent = 'Opening…';
+        try {
+          const res = await fetch(`/api/memory/initiatives/${btn.dataset.id}/discuss`, { method: 'POST' });
+          const data = await res.json();
+          if (!res.ok || !data.conversationId) throw new Error(data.error || 'failed');
+          // The initiative is now delivered; refresh sidebar + bell and open the
+          // new SNH-initiated conversation so the user can reply.
+          await loadConversations();
+          await loadConversationById(data.conversationId);
+          refreshInitiativeBadge();
+          closeInitiativePanel();
+        } catch (e) {
+          console.error('[Initiatives] Discuss failed:', e);
+          btn.textContent = 'Discuss';
+          actions?.querySelectorAll('button').forEach(b => (b.disabled = false));
+        }
       });
     });
   } catch (error) {

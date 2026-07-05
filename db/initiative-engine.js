@@ -115,7 +115,7 @@ function noticeFromAudit(auditResults = []) {
       if (r.error) {
         if (initiatives.addInitiative({
           type: 'alert',
-          content: `I had trouble making sense of your "${r.clusterName}" memory cluster while tidying up — you may want to look at it.`,
+          content: `Heads up — I hit a snag making sense of my "${r.clusterName}" memories while tidying up. You might want to take a look when you get a chance.`,
           sourceKind: 'cluster',
           sourceRef: r.clusterId,
           priority: 6
@@ -124,7 +124,7 @@ function noticeFromAudit(auditResults = []) {
         const into = r.splits.map(s => `"${s.newClusterName}"`).join(', ');
         if (initiatives.addInitiative({
           type: 'observation',
-          content: `I noticed your "${r.clusterName}" memories had drifted into distinct topics (${into}), so I reorganized them.`,
+          content: `Heads up — I noticed my "${r.clusterName}" memories had drifted into a couple of different topics (${into}), so I reorganized them into separate clusters.`,
           sourceKind: 'cluster',
           sourceRef: r.clusterId,
           priority: 5
@@ -255,37 +255,73 @@ async function deliverUnprompted() {
   }
 
   try {
-    const { callLLM } = require('./memory-manager');
-    const appConfig = getConfig();
-
-    // Phrase it as a brief, warm, unprompted opener — never a list dump.
-    const sys = `You are SNH, reaching out to your user unprompted because something is on your mind. Write a short, warm, natural opening message (1–3 sentences) that raises this ONE thing. Do not greet with "Hi" repeatedly or over-explain; sound like yourself. Return ONLY the message text.`;
-    const user = `The thing on your mind (${top.type}): "${top.content}"`;
-    const { content } = await agentPool.schedule(
-      () => callLLM(sys, user, { maxTokens: 200 }),
-      'initiative-phrase'
-    );
-    const message = (content || '').trim() || top.content;
-
-    // Create an SNH-initiated conversation and post the message.
-    const model = appConfig.models?.chat?.model || 'snh';
-    const title = message.slice(0, 48) + (message.length > 48 ? '…' : '');
-    const convId = db.createConversation(title, model, 'snh');
-    db.addMessage(convId, 'assistant', message, model);
-
-    initiatives.markDelivered(top.id, { channel: 'unprompted', conversationId: convId });
-
+    const { conversationId, message } = await openInitiativeConversation(top, 'unprompted');
     factExtractor.appendToDailyLog(
       `Reached out unprompted (${top.type}, priority ${top.priority}): "${message}"`,
       DAILY_DIR
     );
-    console.log(`[Initiatives] Delivered unprompted initiative ${top.id} → conversation ${convId}`);
-
-    return { delivered: true, conversationId: convId, initiativeId: top.id, message };
+    console.log(`[Initiatives] Delivered unprompted initiative ${top.id} → conversation ${conversationId}`);
+    return { delivered: true, conversationId, initiativeId: top.id, message };
   } catch (err) {
     console.error('[Initiatives] deliverUnprompted error:', err.message);
     return { error: err.message };
   }
+}
+
+/**
+ * Start a conversation from a specific initiative, on demand (the "Discuss"
+ * action in the initiative panel). Unlike deliverUnprompted this ignores the
+ * quiet-hours and daily-cap gates — the user explicitly asked for it. SNH opens
+ * the conversation by raising the item naturally; the user's reply then flows
+ * through the normal chat + extraction path.
+ * @param {string} id - initiative id
+ * @returns {Promise<Object>} { conversationId, initiativeId, message } or { error }
+ */
+async function startDiscussion(id) {
+  const it = initiatives.get(id);
+  if (!it) return { error: 'not found' };
+  if (it.status !== 'pending') return { error: `not pending (${it.status})` };
+  try {
+    const { conversationId, message } = await openInitiativeConversation(it, 'discuss');
+    factExtractor.appendToDailyLog(
+      `Opened a discussion on request (${it.type}, priority ${it.priority}): "${message}"`,
+      DAILY_DIR
+    );
+    console.log(`[Initiatives] Discuss initiative ${it.id} → conversation ${conversationId}`);
+    return { conversationId, initiativeId: it.id, message };
+  } catch (err) {
+    console.error('[Initiatives] startDiscussion error:', err.message);
+    return { error: err.message };
+  }
+}
+
+/**
+ * Phrase an initiative as a warm, natural opener and create the SNH-initiated
+ * conversation that raises it, marking the initiative delivered.
+ * @param {Object} it - the initiative row
+ * @param {'unprompted'|'discuss'} channel
+ * @returns {Promise<{conversationId:string, message:string}>}
+ */
+async function openInitiativeConversation(it, channel) {
+  const { callLLM } = require('./memory-manager');
+  const appConfig = getConfig();
+
+  // Phrase it as a brief, warm opener — never a list dump.
+  const sys = `You are SNH, opening a conversation with your user because something is on your mind. Write a short, warm, natural opening message (1–3 sentences) that raises this ONE thing in your own voice. Do not greet with "Hi" repeatedly or over-explain; sound like yourself. Return ONLY the message text.`;
+  const user = `The thing on your mind (${it.type}): "${it.content}"`;
+  const { content } = await agentPool.schedule(
+    () => callLLM(sys, user, { maxTokens: 200 }),
+    'initiative-phrase'
+  );
+  const message = (content || '').trim() || it.content;
+
+  const model = appConfig.models?.chat?.model || 'snh';
+  const title = message.slice(0, 48) + (message.length > 48 ? '…' : '');
+  const conversationId = db.createConversation(title, model, 'snh');
+  db.addMessage(conversationId, 'assistant', message, model);
+
+  initiatives.markDelivered(it.id, { channel, conversationId });
+  return { conversationId, message };
 }
 
 module.exports = {
@@ -294,6 +330,7 @@ module.exports = {
   noticeReflectionInsight,
   prioritize,
   deliverUnprompted,
+  startDiscussion,
   inQuietHours,
   pacificHour,
   initiativeConfig

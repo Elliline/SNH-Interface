@@ -177,6 +177,30 @@ router.post('/initiatives/:id/dismiss', (req, res) => {
 });
 
 /**
+ * POST /api/memory/initiatives/:id/discuss
+ * Start a conversation seeded with this initiative: SNH opens it by raising the
+ * item naturally, the initiative leaves the pending pool (marked delivered with
+ * the new conversation id), and the frontend navigates to it so the user can reply.
+ */
+router.post('/initiatives/:id/discuss', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUUID(id)) {
+      return res.status(400).json({ error: 'Invalid initiative ID' });
+    }
+    const initiativeEngine = require('../db/initiative-engine');
+    const result = await initiativeEngine.startDiscussion(id);
+    if (result.error || !result.conversationId) {
+      return res.status(400).json({ error: result.error || 'Could not start discussion' });
+    }
+    res.json({ success: true, conversationId: result.conversationId });
+  } catch (error) {
+    console.error('[MemoryAPI] Error starting initiative discussion:', error.message);
+    res.status(500).json({ error: 'Failed to start discussion' });
+  }
+});
+
+/**
  * POST /api/memory/reflect
  * Manually trigger a reflection pass (still requires new conversations).
  */

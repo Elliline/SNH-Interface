@@ -1119,8 +1119,12 @@ Return ONLY a JSON array of strings, e.g. ["I tend to ...", "I care about ..."].
     // is worth proactively raising with the user. If so, it becomes an initiative.
     let insight = null;
     try {
-      const insightSys = `You just reflected on your recent conversations with your user. Is there ONE thing worth proactively raising with them — a useful realization, a follow-up, something you noticed that they'd value hearing? Only if it genuinely would help them. Respond with the single sentence to raise, or exactly NONE.`;
-      const insightUser = `Your observations:\n${observations.map(o => `- ${o}`).join('\n')}\n\nOne thing worth telling the user, or NONE?`;
+      const insightSys = `You just reflected on your recent conversations. Is there ONE thing worth proactively messaging the user about — a useful realization, a follow-up, or something you noticed that they'd value hearing? Only if it genuinely would help them.
+
+If yes, write it AS A SHORT DIRECT MESSAGE to the user, in your own voice: first person from you (the AI), warm and natural, like a quick DM you're sending them — not an internal note about them. Address them generically as "you", never by name (other people may use this system). One or two sentences.
+
+Respond with ONLY that message, or exactly NONE.`;
+      const insightUser = `Your private observations:\n${observations.map(o => `- ${o}`).join('\n')}\n\nWrite the one message worth sending the user, or NONE.`;
       const { content: insightRaw } = await agentPool.schedule(
         () => callLLM(insightSys, insightUser, { maxTokens: 120 }),
         'reflection-insight'
