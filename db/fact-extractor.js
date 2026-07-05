@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./datetime');
+const agentPool = require('./agent-pool');
 
 // A fact line written to MEMORY.md may carry a "(learned YYYY-MM-DD H:MM AM/PM)"
 // annotation so the model can answer "when did I tell you this". Strip it when
@@ -947,14 +948,36 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
       const nearby = await buildNearbyContext(facts);
 
       // === Contradiction detection (3-way: yes / no / uncertain) ===
+      // Gather every (newFact, oldFact) candidate pair first — candidate lookup
+      // is a cheap read — then judge them all concurrently through the agent
+      // pool (vLLM batches them). Verdicts are applied afterward in gather
+      // order so the outcome is deterministic and identical to a sequential pass:
+      // the one-question-per-session slot still goes to the first uncertain pair,
+      // and an old member already claimed by a 'yes' is never superseded twice.
       const supersessions = []; // {oldMemberId, oldContent, oldSalience, newFact}
       const seenOld = new Set();
       try {
+        const contradictionPairs = [];
         for (const fact of facts) {
           const candidates = await memoryClusters.findContradictionCandidates(fact);
           for (const candidate of candidates) {
+            contradictionPairs.push({ fact, candidate });
+          }
+        }
+
+        if (contradictionPairs.length > 0) {
+          const judged = await agentPool.runBatch(
+            contradictionPairs.map(({ fact, candidate }) => async () => {
+              const { verdict } = await judgeContradiction(fact, candidate.content);
+              return verdict;
+            }),
+            'contradiction-judge'
+          );
+
+          for (let i = 0; i < contradictionPairs.length; i++) {
+            const { fact, candidate } = contradictionPairs[i];
             if (seenOld.has(candidate.memberId)) continue;
-            const { verdict } = await judgeContradiction(fact, candidate.content);
+            const verdict = judged[i].status === 'fulfilled' ? judged[i].value : 'no';
             if (verdict === 'yes') {
               seenOld.add(candidate.memberId);
               supersessions.push({
@@ -983,13 +1006,41 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
         console.error('[FactExtractor] Contradiction detection error:', contradictionError.message);
       }
 
-      // === Salience scoring (after contradiction checking) ===
+      // === Salience scoring + gap detection (concurrent) ===
+      // Score each new fact's salience concurrently, and run gap-question
+      // detection alongside them as one more pool task rather than after — all
+      // are independent, read-only LLM judgments over the same context. The DB
+      // writes they inform stay sequential below, so there are no write races.
       const factToSalience = new Map();
-      for (const fact of facts) {
-        const { salience, reasoning } = await scoreSalience(fact, nearby.text);
-        factToSalience.set(fact, salience);
-        appendToDailyLog(`Scored fact salience ${salience}/10: "${fact}" — ${reasoning}`, dailyDir);
+      const runGap = !questionQueued; // skip if contradiction already claimed the one-question slot
+      const [salienceSettled, gapCandidate] = await Promise.all([
+        agentPool.runBatch(
+          facts.map(fact => async () => {
+            const { salience, reasoning } = await scoreSalience(fact, nearby.text);
+            return { fact, salience, reasoning };
+          }),
+          'salience'
+        ),
+        runGap
+          ? agentPool.schedule(() => detectGapQuestion(facts, nearby.text), 'gap').catch(err => {
+              console.error('[FactExtractor] Gap detection error:', err.message);
+              return null;
+            })
+          : Promise.resolve(null)
+      ]);
+
+      // Apply salience results in fact order for a stable daily-log trail.
+      const salienceByFact = new Map();
+      for (const s of salienceSettled) {
+        if (s.status === 'fulfilled' && s.value) salienceByFact.set(s.value.fact, s.value);
       }
+      for (const fact of facts) {
+        const scored = salienceByFact.get(fact);
+        const salience = scored ? scored.salience : 5;
+        factToSalience.set(fact, salience);
+        appendToDailyLog(`Scored fact salience ${salience}/10: "${fact}" — ${scored ? scored.reasoning : 'default (scoring failed)'}`, dailyDir);
+      }
+
       // A superseding fact inherits at least the salience of the fact it replaces.
       for (const s of supersessions) {
         const cur = factToSalience.get(s.newFact) ?? 5;
@@ -1030,28 +1081,23 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
         }
       }
 
-      // === Gap detection (only if no question queued yet this session) ===
-      if (!questionQueued) {
-        try {
-          const gap = await detectGapQuestion(facts, nearby.text);
-          if (gap && gap.question) {
-            // Anchor to the cluster the new facts landed in, so the question
-            // surfaces when the user next chats about that topic.
-            const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
-            const anchorMemberId = factToMemberId.get(facts[0]) || null;
-            if (questions.addQuestion({
-              question: gap.question,
-              reason: 'gap',
-              clusterId: anchorClusterId,
-              memberId: anchorMemberId,
-              conversationId
-            })) {
-              questionQueued = true;
-              appendToDailyLog(`Queued clarifying question (gap): "${gap.question}"`, dailyDir);
-            }
-          }
-        } catch (gapErr) {
-          console.error('[FactExtractor] Gap detection error:', gapErr.message);
+      // === Gap question queuing ===
+      // The gap-detection LLM call already ran concurrently with salience scoring
+      // above; here we only queue its result, anchored to the cluster the new
+      // facts landed in so it surfaces when the user next chats about that topic.
+      // Respect the one-question-per-session slot (contradiction takes priority).
+      if (!questionQueued && gapCandidate && gapCandidate.question) {
+        const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
+        const anchorMemberId = factToMemberId.get(facts[0]) || null;
+        if (questions.addQuestion({
+          question: gapCandidate.question,
+          reason: 'gap',
+          clusterId: anchorClusterId,
+          memberId: anchorMemberId,
+          conversationId
+        })) {
+          questionQueued = true;
+          appendToDailyLog(`Queued clarifying question (gap): "${gapCandidate.question}"`, dailyDir);
         }
       }
     }

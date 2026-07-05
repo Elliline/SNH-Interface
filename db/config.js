@@ -26,6 +26,7 @@ const DEFAULTS = {
     embedding: { provider: 'ollama', instance: 'Local', model: 'nomic-embed-text' }
   },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
+  agentPool: { concurrency: 6 },
   memory: {
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,

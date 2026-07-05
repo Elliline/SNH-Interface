@@ -19,6 +19,7 @@ const { getCurrentDateTimeString } = require('./datetime');
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
 const factExtractor = require('./fact-extractor');
+const agentPool = require('./agent-pool');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -985,17 +986,43 @@ Rules:
  * @returns {Promise<{auditResults: Array, splitResults: Object, crossLinkResults: Object}>}
  */
 async function runAuditPipeline(clusters) {
-  // Step 1: per-cluster coherence audit (sequential, self-contained per cluster)
-  console.log(`[Heartbeat] Step 1: Auditing coherence of ${clusters.length} cluster(s)...`);
-  const auditResults = [];
-  for (const cluster of clusters) {
-    console.log(`[Heartbeat] Auditing cluster "${cluster.name}" (${cluster.member_count} members)`);
-    const result = await auditClusterCoherence(cluster);
-    auditResults.push(result);
-    if (!result.coherent) {
-      console.log(`[Heartbeat] Cluster "${cluster.name}" flagged for ${result.splits.length} split(s)`);
+  // Step 1: per-cluster coherence audit. Each audit is self-contained and only
+  // reads (the LLM judges one cluster's facts in isolation), so they fan out
+  // through the agent pool and run concurrently against vLLM. Error isolation:
+  // one cluster's failure is captured, not thrown, so the batch always finishes.
+  console.log(`[Heartbeat] Step 1: Auditing coherence of ${clusters.length} cluster(s) via agent pool...`);
+  agentPool.startPass('heartbeat-cluster-audit');
+  const settled = await agentPool.runBatch(
+    clusters.map(cluster => async () => {
+      console.log(`[Heartbeat] Auditing cluster "${cluster.name}" (${cluster.member_count} members)`);
+      return auditClusterCoherence(cluster);
+    }),
+    'cluster-audit'
+  );
+  agentPool.endPass();
+
+  const auditResults = settled.map((s, i) => {
+    if (s.status === 'fulfilled') {
+      const result = s.value;
+      if (!result.coherent) {
+        console.log(`[Heartbeat] Cluster "${result.clusterName}" flagged for ${result.splits.length} split(s)`);
+      }
+      return result;
     }
-  }
+    // Task itself threw (auditClusterCoherence already catches internally, so
+    // this is defensive) — synthesize an error result so downstream steps and
+    // the report still account for the cluster.
+    const cluster = clusters[i];
+    console.error(`[Heartbeat] Audit task failed for "${cluster.name}": ${s.reason?.message || s.reason}`);
+    return {
+      clusterId: cluster.id,
+      clusterName: cluster.name,
+      coherent: true,
+      splits: [],
+      durationMs: 0,
+      error: s.reason?.message || String(s.reason)
+    };
+  });
 
   // Step 2: execute splits
   const splitResults = await executeSplits(auditResults);

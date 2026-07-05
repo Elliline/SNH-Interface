@@ -21,6 +21,7 @@ const factExtractor = require('./db/fact-extractor');
 const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
+const agentPool = require('./db/agent-pool');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 
@@ -1485,6 +1486,7 @@ function classifyToolNeed(messageText, superSearchEnabled) {
  * 4. Saves assistant response and embeds it for future retrieval
  */
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
+  let chatMarked = false;
   try {
     const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled, superSearch } = req.body;
 
@@ -1513,6 +1515,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (userMessage.role !== 'user') {
       return res.status(400).json({ error: 'Last message must be from user' });
     }
+
+    // Chat is king: mark this request in flight so the background agent pool
+    // throttles to concurrency 1 and yields the GPU to the user-facing response.
+    // Cleared in the finally below (covers stream completion, errors, disconnects).
+    agentPool.beginChat();
+    chatMarked = true;
 
     // DEBUG: Log conversation and message info
     console.log('=== Memory Chat ===');
@@ -2223,6 +2231,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (!res.headersSent) {
       res.status(503).json({ error: error.message || 'Chat service unavailable' });
     }
+  } finally {
+    // Clear the chat-in-flight flag so the background pool resumes full width.
+    // The fact-extraction fired above is non-awaited, so it runs after this and
+    // is not throttled by its own chat request.
+    if (chatMarked) agentPool.endChat();
   }
 });
 
