@@ -73,7 +73,8 @@
     <div class="memory-panel-tabs">
       <button class="memory-tab active" data-tab="facts">Facts</button>
       <button class="memory-tab" data-tab="clusters">Clusters</button>
-      <button class="memory-tab" data-tab="daily">Daily</button>
+      <button class="memory-tab" data-tab="daily">Daily Logs</button>
+      <button class="memory-tab" data-tab="self">Self</button>
       <button class="memory-tab" data-tab="search">Search</button>
     </div>
     <div class="memory-panel-content">
@@ -97,6 +98,12 @@
       <div id="memoryTabDaily" class="memory-tab-content">
         <div id="memoryDailyContent" class="memory-daily-content">
           <div class="memory-loading">Loading daily logs...</div>
+        </div>
+      </div>
+      <!-- Self Tab (read-only: SNH's self-developed identity) -->
+      <div id="memoryTabSelf" class="memory-tab-content">
+        <div id="memorySelfContent" class="memory-self-content">
+          <div class="memory-loading">Loading self...</div>
         </div>
       </div>
       <!-- Search Tab -->

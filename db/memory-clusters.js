@@ -454,7 +454,7 @@ function createOrStrengthenLink(clusterA, clusterB, db) {
  * @param {string} source - Source of the fact
  * @returns {Promise<Object>} - {clusterId, clusterName, isNew}
  */
-async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5) {
+async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user') {
   try {
     const config = getConfig();
     const db = getSqliteDb();
@@ -506,6 +506,27 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         }
       }
 
+      // Restrict candidates to clusters of the SAME subject so self-observations
+      // never merge into user-fact clusters (and vice versa). Self-facts and
+      // user-facts live in separate cluster spaces.
+      const candidateIds = Object.keys(clusterScores);
+      if (candidateIds.length > 0) {
+        const placeholders = candidateIds.map(() => '?').join(',');
+        const subjRows = db.prepare(
+          `SELECT id, subject FROM memory_clusters WHERE id IN (${placeholders})`
+        ).all(...candidateIds);
+        const subjById = new Map(subjRows.map(r => [r.id, r.subject || 'user']));
+        for (const cid of candidateIds) {
+          if ((subjById.get(cid) || 'user') !== subject) delete clusterScores[cid];
+        }
+        // Drop cross-cluster link candidates that are a different subject too.
+        for (let i = crossClusterCandidates.length - 1; i >= 0; i--) {
+          if ((subjById.get(crossClusterCandidates[i].clusterId) || 'user') !== subject) {
+            crossClusterCandidates.splice(i, 1);
+          }
+        }
+      }
+
       // Find cluster with highest max similarity (max is a better signal than
       // average — large clusters with some marginal members would otherwise
       // have their averages dragged down, causing duplicate cluster creation)
@@ -549,10 +570,12 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     if (!clusterId || (!clusterName && bestSimilarity <= config.memory.similarityThreshold)) {
       clusterName = await generateClusterName(fact, provider, model, apiKey, host);
 
-      // Name-collision check: if a cluster with this name already exists, route there instead
+      // Name-collision check: if a cluster with this name AND subject already
+      // exists, route there instead (name lookups are scoped per subject so a
+      // "self" cluster and a "user" cluster may share a name harmlessly).
       const existingByName = db.prepare(
-        'SELECT id, name FROM memory_clusters WHERE name = ?'
-      ).get(clusterName);
+        'SELECT id, name FROM memory_clusters WHERE name = ? AND subject = ?'
+      ).get(clusterName, subject);
 
       if (existingByName) {
         clusterId = existingByName.id;
@@ -566,12 +589,12 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         const now = new Date().toISOString();
 
         db.prepare(`
-          INSERT INTO memory_clusters (id, name, description, created_at, updated_at)
-          VALUES (?, ?, '', ?, ?)
-        `).run(clusterId, clusterName, now, now);
+          INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject)
+          VALUES (?, ?, '', ?, ?, ?)
+        `).run(clusterId, clusterName, now, now, subject);
 
         isNew = true;
-        console.log(`[Clusters] Created cluster: ${clusterName}`);
+        console.log(`[Clusters] Created ${subject} cluster: ${clusterName}`);
       }
     } else if (!clusterName) {
       // Get existing cluster name
@@ -588,9 +611,9 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     const nowIso = new Date().toISOString();
     const salienceValue = Number.isFinite(salience) ? Math.max(1, Math.min(10, Math.round(salience))) : 5;
     db.prepare(`
-      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience)
-      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?)
-    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue);
+      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience, subject)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?)
+    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject);
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 
@@ -663,6 +686,7 @@ function updateFactSalience(memberId, salience) {
 async function findContradictionCandidates(factText, opts = {}) {
   const threshold = opts.threshold ?? 0.45;
   const limit = opts.limit ?? 5;
+  const subject = opts.subject ?? 'user';
   try {
     const db = getSqliteDb();
     if (!db) return [];
@@ -693,10 +717,13 @@ async function findContradictionCandidates(factText, opts = {}) {
       // Confirm the member still exists and is ACTIVE (LanceDB retains
       // embeddings of superseded facts for history; SQLite is the truth).
       const row = db.prepare(
-        'SELECT id, content, cluster_id, status, salience FROM cluster_members WHERE id = ?'
+        'SELECT id, content, cluster_id, status, salience, subject FROM cluster_members WHERE id = ?'
       ).get(memberId);
       if (!row) continue;
       if (row.status && row.status !== 'active') continue;
+      // Only contradict within the same subject: self-observations can only
+      // supersede other self-observations, user-facts only user-facts.
+      if ((row.subject || 'user') !== subject) continue;
 
       // A verbatim duplicate is not a contradiction — skip the judge call.
       if (row.content.trim().toLowerCase() === normalizedNew) continue;
@@ -901,24 +928,58 @@ async function searchClusters(query, limit = 3) {
  * Get all clusters with member counts
  * @returns {Array} - Array of clusters with metadata
  */
-function getClusters() {
+function getClusters(subject = null) {
   try {
     const db = getSqliteDb();
     if (!db) {
       return [];
     }
 
+    const where = subject ? 'WHERE mc.subject = ?' : '';
+    const params = subject ? [subject] : [];
     const clusters = db.prepare(`
       SELECT mc.*, COUNT(cm.id) as member_count
       FROM memory_clusters mc
       LEFT JOIN cluster_members cm ON mc.id = cm.cluster_id
+      ${where}
       GROUP BY mc.id
       ORDER BY mc.updated_at DESC
-    `).all();
+    `).all(...params);
 
     return clusters;
   } catch (error) {
     console.error('[Clusters] Error in getClusters:', error);
+    return [];
+  }
+}
+
+/**
+ * Get self-facts (SNH's observations about itself), salience-ordered.
+ * @param {Object} [opts]
+ * @param {string|null} [opts.status='active'] - 'active', 'superseded', or null for all
+ * @param {number|null} [opts.limit=null] - max rows, or null for no limit
+ * @returns {Array} cluster_member rows with cluster_name attached
+ */
+function getSelfFacts({ status = 'active', limit = null } = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+
+    let sql = `
+      SELECT cm.id, cm.content, cm.salience, cm.status, cm.superseded_by,
+             cm.created_at, cm.updated_at, cm.cluster_id, cm.source,
+             mc.name AS cluster_name
+      FROM cluster_members cm
+      LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
+      WHERE cm.subject = 'self'`;
+    const params = [];
+    if (status) { sql += ' AND cm.status = ?'; params.push(status); }
+    sql += ' ORDER BY cm.salience DESC, cm.created_at DESC';
+    if (limit) { sql += ' LIMIT ?'; params.push(limit); }
+
+    return db.prepare(sql).all(...params);
+  } catch (error) {
+    console.error('[Clusters] Error in getSelfFacts:', error.message);
     return [];
   }
 }
@@ -1379,6 +1440,7 @@ module.exports = {
   searchClusters,
   getClusters,
   getCluster,
+  getSelfFacts,
   generateEmbedding,
   cosineSimilarity,
   generateClusterNameFromMembers,

@@ -2711,6 +2711,7 @@ function switchMemoryTab(name) {
   if (name === 'facts') loadFactsTab();
   else if (name === 'clusters') loadClustersTab();
   else if (name === 'daily') loadDailyTab();
+  else if (name === 'self') loadSelfTab();
 }
 
 // ---- Facts Tab ----
@@ -2884,6 +2885,117 @@ async function loadDailyTab() {
   } catch (error) {
     console.error('[MemoryPanel] Error loading daily logs:', error);
     container.innerHTML = '<div class="memory-empty">Failed to load daily logs</div>';
+  }
+}
+
+// ---- Self Tab (read-only: SNH's self-developed identity) ----
+async function loadSelfTab() {
+  const container = document.getElementById('memorySelfContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading self...</div>';
+
+  try {
+    const res = await fetch('/api/memory/self');
+    const data = await res.json();
+
+    const active = data.activeSelfFacts || [];
+    const superseded = data.supersededSelfFacts || [];
+    const reflections = data.reflections || [];
+
+    const fmtDate = (iso) => {
+      if (!iso) return '';
+      const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+      return isNaN(d.getTime()) ? '' : d.toLocaleString();
+    };
+
+    let html = '';
+
+    // Injected identity block: seed + active self-facts
+    html += '<div class="memory-self-section">';
+    html += '<h3>Injected Identity</h3>';
+    html += '<div class="memory-self-note">This is exactly what is injected into every chat — a minimal seed plus SNH\'s highest-salience self-observations. Read-only; SNH develops this itself.</div>';
+    html += `<div class="memory-self-seed">${escapeHtml(data.seed || '')}</div>`;
+
+    if (active.length === 0) {
+      html += '<div class="memory-empty">No self-facts yet. SNH has not observed itself. Reflections build this over time.</div>';
+    } else {
+      html += '<div class="memory-self-facts">';
+      html += active.map(f => `
+        <div class="memory-self-fact">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">${escapeHtml(fmtDate(f.created_at))}</span>
+          </div>
+        </div>
+      `).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Reflections
+    html += '<div class="memory-self-section">';
+    html += '<div class="memory-self-section-head"><h3>Recent Reflections</h3><button id="memorySelfReflectBtn" class="memory-self-reflect-btn" title="Run a reflection now">Reflect now</button></div>';
+    if (reflections.length === 0) {
+      html += '<div class="memory-empty">No reflections yet.</div>';
+    } else {
+      html += reflections.map(r => {
+        const obs = (r.observations || []).map(o => `<li>${escapeHtml(o)}</li>`).join('');
+        return `
+          <div class="memory-self-reflection">
+            <div class="memory-self-reflection-meta">${escapeHtml(fmtDate(r.at))} · ${r.messageCount || 0} msgs · ${r.stored || 0} stored${r.superseded ? `, ${r.superseded} superseded` : ''}</div>
+            ${obs ? `<ul class="memory-self-reflection-obs">${obs}</ul>` : '<div class="memory-self-note">Nothing new noticed.</div>'}
+          </div>
+        `;
+      }).join('');
+    }
+    html += '</div>';
+
+    // Superseded self-facts (identity development history)
+    html += '<div class="memory-self-section">';
+    html += '<h3>Identity History <span class="memory-self-count">(superseded self-facts)</span></h3>';
+    if (superseded.length === 0) {
+      html += '<div class="memory-empty">No superseded self-facts. SNH has not revised its self-view yet.</div>';
+    } else {
+      html += superseded.map(f => `
+        <div class="memory-self-fact superseded">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">observed ${escapeHtml(fmtDate(f.created_at))} · revised ${escapeHtml(fmtDate(f.updated_at))}</span>
+          </div>
+        </div>
+      `).join('');
+    }
+    html += '</div>';
+
+    container.innerHTML = html;
+
+    // "Reflect now" action (triggers the agent; does not edit any self-fact).
+    const reflectBtn = document.getElementById('memorySelfReflectBtn');
+    if (reflectBtn) {
+      reflectBtn.addEventListener('click', async () => {
+        reflectBtn.disabled = true;
+        reflectBtn.textContent = 'Reflecting…';
+        try {
+          const r = await fetch('/api/memory/reflect', { method: 'POST' });
+          const result = await r.json();
+          if (result && result.skipped) {
+            reflectBtn.textContent = 'No new conversations';
+            setTimeout(() => { reflectBtn.disabled = false; reflectBtn.textContent = 'Reflect now'; }, 2500);
+          } else {
+            loadSelfTab(); // re-render with the new reflection + self-facts
+          }
+        } catch (err) {
+          console.error('[MemoryPanel] Reflect error:', err);
+          reflectBtn.disabled = false;
+          reflectBtn.textContent = 'Reflect now';
+        }
+      });
+    }
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading self:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load self view</div>';
   }
 }
 

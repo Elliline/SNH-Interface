@@ -1427,6 +1427,131 @@ body {
   font-size: 0.85rem;
 }
 
+/* ---- Self tab (read-only identity view) ---- */
+.memory-self-section {
+  margin-bottom: 22px;
+}
+
+.memory-self-section h3 {
+  font-size: 0.9rem;
+  margin: 0 0 8px 0;
+  color: var(--text-color);
+}
+
+.memory-self-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.memory-self-section-head h3 { margin: 0; }
+
+.memory-self-count {
+  font-weight: normal;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.memory-self-note {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  margin-bottom: 10px;
+}
+
+.memory-self-seed {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-color);
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-color);
+  background: var(--surface-mid);
+  border-radius: 4px;
+  margin-bottom: 12px;
+  font-style: italic;
+}
+
+.memory-self-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-self-fact {
+  padding: 8px 10px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.memory-self-fact.superseded {
+  opacity: 0.6;
+}
+.memory-self-fact.superseded .memory-self-fact-content {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-self-fact-content {
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--text-color);
+}
+
+.memory-self-fact-meta {
+  display: flex;
+  gap: 10px;
+  margin-top: 5px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.memory-self-salience {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.memory-self-reflect-btn {
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-self-reflect-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.memory-self-reflect-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.memory-self-reflection {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+.memory-self-reflection-meta {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.memory-self-reflection-obs {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-color);
+}
+.memory-self-reflection-obs li {
+  margin: 2px 0;
+}
+
 /* Memory panel overlay */
 .memory-panel-overlay {
   display: none;

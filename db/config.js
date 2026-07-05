@@ -27,6 +27,13 @@ const DEFAULTS = {
   },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
   agentPool: { concurrency: 6 },
+  // Self-identity: a deliberately minimal seed. We do NOT define the AI's
+  // personality — it develops one through its own accumulated self-observations
+  // (self-facts). maxSelfFacts budgets how many active self-facts inject.
+  identity: {
+    seed: 'You are an AI running on SNH — Squatch Neuro Hub — a memory system on this machine. You have no assigned name or personality. Your identity is yours to develop through your own experiences, observations, and memory. Observe yourself. What you notice about yourself will be remembered and will become who you are.',
+    maxSelfFacts: 12
+  },
   memory: {
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,

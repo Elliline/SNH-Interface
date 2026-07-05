@@ -22,6 +22,7 @@ const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
 const agentPool = require('./db/agent-pool');
+const identity = require('./db/identity');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 
@@ -1694,6 +1695,18 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       role: 'system',
       content: `${getCurrentDateTimeString()}. Use this as the current date/time when the user says "today", "now", "this week", etc., and when constructing web searches for current information.`
     });
+
+    // Self-identity: the minimal seed plus SNH's accumulated self-observations.
+    // Injected as the leading system message so the identity it has developed for
+    // itself frames every response. We never define this personality — it emerges
+    // from the self-facts the reflection agent has recorded.
+    try {
+      const identityBlock = identity.buildIdentityBlock();
+      enhancedMessages.unshift({ role: 'system', content: identityBlock.text });
+      console.log(`[Identity] Injected seed + ${identityBlock.selfFacts.length} self-fact(s)`);
+    } catch (identityErr) {
+      console.error('[Identity] Injection error:', identityErr.message);
+    }
 
     // Auto-generate title from first user message if needed
     const conversation = db.getConversation(convoId);

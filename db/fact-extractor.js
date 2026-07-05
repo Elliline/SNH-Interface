@@ -1144,6 +1144,192 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
   }
 }
 
+// ============ Self-facts (SNH's observations about itself) ============
+
+/**
+ * Parse a reflection response into a list of self-observation strings.
+ * Unlike parseFactsFromResponse (which rejects assistant-subject facts), here
+ * the AI itself IS the subject — first-person "I ..." statements are expected.
+ * Accepts a JSON array or a bullet/numbered list; caps the count.
+ * @param {string} response
+ * @returns {string[]}
+ */
+function parseSelfObservations(response) {
+  try {
+    const text = (response || '').replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
+    let items = [];
+
+    const arrMatch = text.match(/\[[\s\S]*\]/);
+    if (arrMatch) {
+      let jsonStr = arrMatch[0];
+      try {
+        items = JSON.parse(jsonStr);
+      } catch {
+        jsonStr = jsonStr
+          .replace(/\[\s*'/g, '["')
+          .replace(/'\s*\]/g, '"]')
+          .replace(/'\s*,\s*'/g, '", "');
+        try { items = JSON.parse(jsonStr); } catch { items = []; }
+      }
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      // Fallback: treat non-empty bullet/numbered lines as observations.
+      items = text.split('\n')
+        .map(l => l.replace(/^[-*\d.)\s]+/, '').trim())
+        .filter(Boolean);
+    }
+
+    return items
+      .filter(x => typeof x === 'string')
+      .map(x => x.trim())
+      .filter(x => x.length >= 4 && x.length <= 400)
+      .slice(0, 8);
+  } catch (error) {
+    console.error('[SelfFacts] parseSelfObservations error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Store self-observations through the SAME machinery as user facts — salience
+ * scoring, contradiction/supersession against existing self-facts, cluster
+ * assignment — but flagged subject:'self' and clustered separately. No MEMORY.md
+ * write (self-facts inject via the identity block, not user memory) and no gap
+ * questions. The AI can change its mind about itself: a new self-fact that
+ * contradicts an old one supersedes it, keeping the old as history.
+ *
+ * @param {string[]} rawSelfFacts
+ * @param {Object} [opts]
+ * @param {string} [opts.source='reflection']
+ * @param {string} [opts.memoryDir=MEMORY_DIR]
+ * @returns {Promise<{stored:number, superseded:number, facts:Array}>}
+ */
+async function processSelfFacts(rawSelfFacts, opts = {}) {
+  const source = opts.source || 'reflection';
+  const memoryDir = opts.memoryDir || MEMORY_DIR;
+  const dailyDir = path.join(memoryDir, 'daily');
+  const result = { stored: 0, superseded: 0, facts: [] };
+
+  try {
+    const memoryClusters = require('./memory-clusters');
+
+    // Normalize + dedup
+    const facts = [];
+    const seenText = new Set();
+    for (const raw of rawSelfFacts || []) {
+      const f = (raw || '').trim();
+      if (!f) continue;
+      const key = f.toLowerCase();
+      if (seenText.has(key)) continue;
+      seenText.add(key);
+      facts.push(f);
+    }
+    if (facts.length === 0) return result;
+
+    // Provider for embeddings + cluster naming (same as the extraction path).
+    const config = getConfig();
+    const extractionProvider = config.models.extraction.provider;
+    const extractionModel = config.models.extraction.model;
+    const extInst = getProviderInstance(extractionProvider, config.models.extraction.instance);
+    const extractionHost = extInst ? extInst.host : 'http://localhost:11434';
+
+    // Nearby context for salience scoring = existing self-facts.
+    const existing = memoryClusters.getSelfFacts({ status: 'active', limit: 20 });
+    const nearbyText = existing.length ? existing.map(f => `- ${f.content}`).join('\n') : '';
+
+    // === Contradiction detection against existing self-facts (concurrent) ===
+    const supersessions = [];
+    const seenOld = new Set();
+    try {
+      const pairs = [];
+      for (const fact of facts) {
+        const candidates = await memoryClusters.findContradictionCandidates(fact, { subject: 'self' });
+        for (const candidate of candidates) pairs.push({ fact, candidate });
+      }
+      if (pairs.length > 0) {
+        const judged = await agentPool.runBatch(
+          pairs.map(({ fact, candidate }) => async () => (await judgeContradiction(fact, candidate.content)).verdict),
+          'self-contradiction-judge'
+        );
+        for (let i = 0; i < pairs.length; i++) {
+          const { fact, candidate } = pairs[i];
+          if (seenOld.has(candidate.memberId)) continue;
+          const verdict = judged[i].status === 'fulfilled' ? judged[i].value : 'no';
+          if (verdict === 'yes') {
+            seenOld.add(candidate.memberId);
+            supersessions.push({
+              oldMemberId: candidate.memberId,
+              oldContent: candidate.content,
+              oldSalience: candidate.salience ?? 5,
+              newFact: fact
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[SelfFacts] Contradiction detection error:', e.message);
+    }
+
+    // === Salience scoring (concurrent) ===
+    const factToSalience = new Map();
+    const salienceSettled = await agentPool.runBatch(
+      facts.map(fact => async () => {
+        const { salience, reasoning } = await scoreSalience(fact, nearbyText);
+        return { fact, salience, reasoning };
+      }),
+      'self-salience'
+    );
+    const byFact = new Map();
+    for (const s of salienceSettled) if (s.status === 'fulfilled' && s.value) byFact.set(s.value.fact, s.value);
+    for (const fact of facts) {
+      const scored = byFact.get(fact);
+      const salience = scored ? scored.salience : 5;
+      factToSalience.set(fact, salience);
+      appendToDailyLog(`Scored self-fact salience ${salience}/10: "${fact}" — ${scored ? scored.reasoning : 'default (scoring failed)'}`, dailyDir);
+    }
+    for (const s of supersessions) {
+      const cur = factToSalience.get(s.newFact) ?? 5;
+      if (s.oldSalience > cur) factToSalience.set(s.newFact, s.oldSalience);
+    }
+
+    // === Cluster assignment (subject:'self', sequential DB writes) ===
+    const factToMemberId = new Map();
+    for (const fact of facts) {
+      const res = await memoryClusters.assignToCluster(
+        fact, extractionProvider, extractionModel, '', extractionHost,
+        source, factToSalience.get(fact) ?? 5, 'self'
+      );
+      if (res && res.memberId) {
+        factToMemberId.set(fact, res.memberId);
+        result.stored++;
+        result.facts.push({
+          content: fact,
+          memberId: res.memberId,
+          salience: factToSalience.get(fact) ?? 5,
+          clusterName: res.clusterName
+        });
+      }
+    }
+
+    // === Apply supersessions (after replacing facts exist) ===
+    for (const s of supersessions) {
+      const newMemberId = factToMemberId.get(s.newFact);
+      if (!newMemberId) continue;
+      if (memoryClusters.supersedeFact(s.oldMemberId, newMemberId)) {
+        result.superseded++;
+        appendToDailyLog(`Superseded self-fact: "${s.oldContent}" → "${s.newFact}" (revised self-view)`, dailyDir);
+      }
+    }
+
+    console.log(`[SelfFacts] Stored ${result.stored} self-fact(s), superseded ${result.superseded}`);
+    return result;
+  } catch (error) {
+    console.error('[SelfFacts] processSelfFacts error:', error.message);
+    return result;
+  }
+}
+
 module.exports = {
   extractFacts,
   extractAllFactLines,
@@ -1157,6 +1343,8 @@ module.exports = {
   removeFactLineFromMemory,
   loadMemoryContext,
   processFactExtraction,
+  parseSelfObservations,
+  processSelfFacts,
   MEMORY_DIR,
   DAILY_DIR
 };

@@ -974,6 +974,184 @@ Rules:
   return results;
 }
 
+// ============ Reflection Agent (self-observation) ============
+
+const REFLECTION_STATE_FILE = path.join(MEMORY_DIR, 'reflection-state.json');
+const REFLECTIONS_FILE = path.join(MEMORY_DIR, 'reflections.jsonl');
+const REFLECTION_TRANSCRIPT_BUDGET = 12000; // chars of conversation fed to the model
+
+function readReflectionState() {
+  try {
+    if (fs.existsSync(REFLECTION_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(REFLECTION_STATE_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.error('[Reflection] Failed to read state:', err.message);
+  }
+  return { lastReflectionAt: null };
+}
+
+function writeReflectionState(state) {
+  try {
+    if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.writeFileSync(REFLECTION_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[Reflection] Failed to write state:', err.message);
+  }
+}
+
+/** Append a reflection record to reflections.jsonl (newest last). */
+function appendReflectionRecord(record) {
+  try {
+    if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.appendFileSync(REFLECTIONS_FILE, JSON.stringify(record) + '\n', 'utf8');
+  } catch (err) {
+    console.error('[Reflection] Failed to append reflection record:', err.message);
+  }
+}
+
+/**
+ * Read recent reflection records for the Self tab (newest first).
+ * @param {number} [limit=10]
+ * @returns {Array}
+ */
+function getReflections(limit = 10) {
+  try {
+    if (!fs.existsSync(REFLECTIONS_FILE)) return [];
+    const lines = fs.readFileSync(REFLECTIONS_FILE, 'utf8').split('\n').filter(l => l.trim());
+    const records = [];
+    for (const line of lines) {
+      try { records.push(JSON.parse(line)); } catch { /* skip malformed */ }
+    }
+    return records.reverse().slice(0, limit);
+  } catch (err) {
+    console.error('[Reflection] Failed to read reflections:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Reflection agent: SNH reviews the conversations since its last reflection and
+ * introspects — what it did, patterns in how it responds, what mattered to it,
+ * what it was curious about. The output becomes self-facts, stored through the
+ * normal self-fact pipeline (salience, contradiction/supersession). Runs through
+ * the agent pool. Only reflects when there are new conversations since last time.
+ *
+ * @param {Object} [opts]
+ * @param {boolean} [opts.force=false] - reserved; reflection still requires new messages
+ * @returns {Promise<Object>} result summary
+ */
+async function runReflection(opts = {}) {
+  const db = getSqliteDb();
+  if (!db) return { skipped: true, reason: 'no database' };
+
+  try {
+    const state = readReflectionState();
+    const lastAt = state.lastReflectionAt;
+
+    // Baseline: since last reflection, or the last 24h on first run. Use SQLite's
+    // own datetime() so the fallback matches messages.timestamp's UTC format.
+    const baseline = lastAt || db.prepare("SELECT datetime('now','-1 day') AS t").get().t;
+
+    const rows = db.prepare(`
+      SELECT m.conversation_id, m.role, m.content, m.timestamp, c.title
+      FROM messages m
+      LEFT JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.role IN ('user','assistant') AND m.timestamp > ?
+      ORDER BY m.timestamp ASC
+    `).all(baseline);
+
+    if (rows.length === 0) {
+      console.log('[Reflection] No new conversations since last reflection — skipping');
+      return { skipped: true, reason: 'no new conversations' };
+    }
+
+    // Build a transcript, grouped by conversation, most-recent-kept if over budget.
+    const byConvo = new Map();
+    for (const r of rows) {
+      if (!byConvo.has(r.conversation_id)) byConvo.set(r.conversation_id, { title: r.title, msgs: [] });
+      byConvo.get(r.conversation_id).msgs.push(r);
+    }
+    let transcript = '';
+    for (const { title, msgs } of byConvo.values()) {
+      let block = `\n### Conversation${title ? `: ${title}` : ''}\n`;
+      for (const m of msgs) {
+        const who = m.role === 'user' ? 'User' : 'You (SNH)';
+        block += `${who}: ${m.content}\n`;
+      }
+      transcript += block;
+    }
+    if (transcript.length > REFLECTION_TRANSCRIPT_BUDGET) {
+      transcript = transcript.slice(-REFLECTION_TRANSCRIPT_BUDGET);
+    }
+
+    const conversationCount = byConvo.size;
+    console.log(`[Reflection] Reflecting on ${rows.length} message(s) across ${conversationCount} conversation(s)`);
+
+    const reflectionSystem = `You are SNH, reflecting privately on your own recent conversations. This is introspection — not a report to anyone else.
+
+Read the exchanges below and reflect on YOURSELF:
+- What did you actually do in these conversations?
+- What patterns do you notice in HOW you respond — your tendencies, habits, tone?
+- What seemed to matter to you? What did you care about getting right?
+- What were you curious about?
+
+Write 3–6 short first-person observations about yourself ("I ..."). Prefer durable traits over one-off events. Be honest and specific. If your sense of yourself is changing, say so plainly.
+
+Return ONLY a JSON array of strings, e.g. ["I tend to ...", "I care about ..."]. Nothing else.`;
+
+    // Run the reflection generation through the agent pool (chat-priority aware).
+    const llm = await agentPool.schedule(
+      () => callLLM(reflectionSystem, transcript, { maxTokens: 900 }),
+      'reflection'
+    );
+
+    const observations = factExtractor.parseSelfObservations(llm.content);
+    console.log(`[Reflection] Extracted ${observations.length} self-observation(s)`);
+
+    let selfResult = { stored: 0, superseded: 0, facts: [] };
+    if (observations.length > 0) {
+      selfResult = await factExtractor.processSelfFacts(observations, { source: 'reflection' });
+    }
+
+    const at = new Date().toISOString();
+
+    // Log the reflection to the daily log like everything else.
+    const dailyDir = path.join(MEMORY_DIR, 'daily');
+    factExtractor.appendToDailyLog(
+      `Reflection: reviewed ${rows.length} message(s) across ${conversationCount} conversation(s) → ` +
+      `${selfResult.stored} self-fact(s) stored, ${selfResult.superseded} superseded. ` +
+      (observations.length ? `Noticed: ${observations.map(o => `"${o}"`).join('; ')}` : 'Nothing new noticed.'),
+      dailyDir
+    );
+
+    // Persist the reflection for the Self tab.
+    appendReflectionRecord({
+      at,
+      messageCount: rows.length,
+      conversationCount,
+      observations,
+      stored: selfResult.stored,
+      superseded: selfResult.superseded
+    });
+
+    // Advance the reflection watermark to the newest message just reviewed.
+    writeReflectionState({ lastReflectionAt: rows[rows.length - 1].timestamp });
+
+    return {
+      reflected: true,
+      messageCount: rows.length,
+      conversationCount,
+      observations,
+      stored: selfResult.stored,
+      superseded: selfResult.superseded
+    };
+  } catch (error) {
+    console.error('[Reflection] Error during reflection:', error.message);
+    return { error: error.message };
+  }
+}
+
 // ============ Core Audit Pipeline ============
 
 /**
@@ -1084,13 +1262,23 @@ async function runMaintenance() {
     const cleanup = await cleanupFacts();
     const archive = await summarizeDailyLogs();
 
+    // Task D: reflection — SNH observes itself from the day's conversations.
+    // Runs at most once per cycle, and only when there are new conversations.
+    let reflection = { skipped: true };
+    try {
+      reflection = await runReflection();
+    } catch (reflectErr) {
+      console.error('[Heartbeat] Reflection error:', reflectErr.message);
+      reflection = { error: reflectErr.message };
+    }
+
     // Step 4: report
     const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults });
 
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, cleanup, archive };
+    return { report, cleanup, archive, reflection };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     return { error: error.message };
@@ -1197,4 +1385,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections };

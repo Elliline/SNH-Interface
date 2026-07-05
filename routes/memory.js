@@ -20,6 +20,7 @@ const db = require('../db/database');
 const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
 const questionQueue = require('../db/questions');
+const identity = require('../db/identity');
 const { getConfig, getProviderInstance } = require('../db/config');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
@@ -95,15 +96,58 @@ router.get('/daily/:date', (req, res) => {
 
 /**
  * GET /api/memory/clusters
- * Get all clusters with member counts
+ * Get clusters with member counts. Defaults to user-fact clusters so the Facts
+ * and Clusters tabs don't mix in self-observation clusters (those surface in the
+ * Self tab). Pass ?subject=self or ?subject=all to widen.
  */
 router.get('/clusters', (req, res) => {
   try {
-    const clusters = memoryClusters.getClusters();
+    const subject = req.query.subject === 'all' ? null : (req.query.subject || 'user');
+    const clusters = memoryClusters.getClusters(subject);
     res.json({ clusters });
   } catch (error) {
     console.error('[MemoryAPI] Error loading clusters:', error.message);
     res.status(500).json({ error: 'Failed to load clusters' });
+  }
+});
+
+/**
+ * GET /api/memory/self
+ * Read-only self-identity view: the injected identity block (seed + active
+ * self-facts), superseded self-facts as history, and recent reflections.
+ */
+router.get('/self', (req, res) => {
+  try {
+    const memoryManager = require('../db/memory-manager');
+    const block = identity.buildIdentityBlock();
+    const supersededSelfFacts = memoryClusters.getSelfFacts({ status: 'superseded' });
+    const reflections = memoryManager.getReflections(10);
+
+    res.json({
+      seed: block.seed,
+      identityText: block.text,
+      activeSelfFacts: block.selfFacts,
+      supersededSelfFacts,
+      reflections
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading self view:', error.message);
+    res.status(500).json({ error: 'Failed to load self view' });
+  }
+});
+
+/**
+ * POST /api/memory/reflect
+ * Manually trigger a reflection pass (still requires new conversations).
+ */
+router.post('/reflect', heavyLimiter, async (req, res) => {
+  try {
+    const memoryManager = require('../db/memory-manager');
+    const result = await memoryManager.runReflection({ force: true });
+    res.json(result);
+  } catch (error) {
+    console.error('[MemoryAPI] Error running reflection:', error.message);
+    res.status(500).json({ error: 'Failed to run reflection' });
   }
 });
 

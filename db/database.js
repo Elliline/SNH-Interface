@@ -191,6 +191,22 @@ function initDatabase() {
       console.log('Migration: added salience to cluster_members (existing rows backfilled to 5)');
     }
 
+    // Migration: subject ('user' | 'self') distinguishes facts ABOUT the user
+    // from self-observations SNH makes about itself. Self-facts cluster and
+    // inject separately. Existing rows are all facts about the user.
+    if (!memberCols.some(c => c.name === 'subject')) {
+      sqliteDb.exec("ALTER TABLE cluster_members ADD COLUMN subject TEXT DEFAULT 'user'");
+      sqliteDb.exec("UPDATE cluster_members SET subject = 'user' WHERE subject IS NULL");
+      console.log("Migration: added subject to cluster_members (existing rows set to 'user')");
+    }
+
+    const clusterCols = sqliteDb.prepare('PRAGMA table_info(memory_clusters)').all();
+    if (!clusterCols.some(c => c.name === 'subject')) {
+      sqliteDb.exec("ALTER TABLE memory_clusters ADD COLUMN subject TEXT DEFAULT 'user'");
+      sqliteDb.exec("UPDATE memory_clusters SET subject = 'user' WHERE subject IS NULL");
+      console.log("Migration: added subject to memory_clusters (existing clusters set to 'user')");
+    }
+
     console.log('SQLite database initialized successfully');
 
     // Backfill FTS table with existing messages
