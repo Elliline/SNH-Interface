@@ -3131,18 +3131,25 @@ async function loadSelfTab() {
   }
 }
 
-// ---- Map Tab (interactive memory graph) ----
-// Renders clusters as compound "constellations", facts as salience-sized nodes
-// within them, superseded facts as ghosts linked to their replacement, and
-// user vs self as distinct color regions. Built on vendored cytoscape.js.
+// ---- Map Tab (interactive memory constellation) ----
+// Renders each cluster as a glowing HUB node (sized by member count, labelled
+// with the cluster name); its facts are smaller dots joined to the hub by short
+// "spoke" edges, so each cluster reads as a free-floating starburst on dark
+// space. Hub-to-hub association links join neighborhoods and light up by link
+// strength when a hub is selected. No compound containers — membership is shown
+// purely by proximity + spokes. user vs self stay distinct color territories.
+// Built on vendored cytoscape.js + fcose.
 let mapCy = null;               // cytoscape instance
 let mapData = null;             // last /graph payload
-let mapExpanded = new Set();    // cluster ids shown with members (collapse mode)
-const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed
+let mapSelectedHub = null;      // cluster id of the currently selected hub (or null)
+let mapLinkRange = { min: 0.5, max: 1 }; // strength range of rendered hub links
+const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed (hubs only)
+const FACT_LABEL_MIN_ZOOM_FONT = 10; // fact labels appear only once zoomed in this far
 let mapLayoutName = 'cose';     // upgraded to 'fcose' once the extension registers
 
-// Register the compound-aware fcose layout once. cose/cola inflate compound
-// parents and let clusters overlap; fcose separates them and hugs parents.
+// Register the fcose layout once. Plain cose/cola let neighborhoods overlap;
+// fcose with per-edge ideal lengths keeps members hugging their hub while hubs
+// repel each other into distinct constellations.
 let fcoseRegistered = false;
 function ensureMapLayout() {
   if (fcoseRegistered) return;
@@ -3167,11 +3174,30 @@ function mapTruncate(s, n) {
   return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s;
 }
 
-// Base colors per subject region (user vs self).
+// Base colors per subject territory (user = blue, self = purple). `fill` is the
+// fact-dot color, `hub` a brighter shade for the hub dot, `glow` the halo, and
+// `ring` the hub border.
 const MAP_COLORS = {
-  user:  { fill: '#3b82f6', parent: 'rgba(59,130,246,0.10)', parentBorder: 'rgba(59,130,246,0.45)' },
-  self:  { fill: '#a855f7', parent: 'rgba(168,85,247,0.10)', parentBorder: 'rgba(168,85,247,0.45)' }
+  user: { fill: '#3b82f6', hub: '#60a5fa', glow: 'rgba(59,130,246,0.55)', ring: 'rgba(96,165,250,0.75)' },
+  self: { fill: '#a855f7', hub: '#c084fc', glow: 'rgba(168,85,247,0.55)', ring: 'rgba(192,132,252,0.75)' }
 };
+
+// Normalize a link strength into 0..1 across the range actually present in the
+// rendered graph (falls back to 0.5 when every link has the same weight).
+function mapNormStrength(s) {
+  const { min, max } = mapLinkRange;
+  if (!(max > min)) return 0.5;
+  return Math.max(0, Math.min(1, (s - min) / (max - min)));
+}
+
+// Map a link strength to a heat color: weak links cool (blue), strong links hot
+// (red), a continuous hue sweep between. Scaled from the live weight range so
+// the full palette is used no matter how narrow the actual strengths are.
+function mapStrengthColor(s) {
+  const t = mapNormStrength(s);
+  const hue = 210 - 210 * t; // 210° blue (weak) -> 0° red (strong), via cyan/green/amber
+  return `hsl(${Math.round(hue)}, 85%, 56%)`;
+}
 
 // The Map panel widens via a CSS transition; cytoscape reads the container size
 // at init, so resize+fit again now and after the transition settles.
@@ -3212,12 +3238,13 @@ async function loadMapTab() {
     }
     graphEl.innerHTML = '';
 
-    // Scale handling: above the cap, start collapsed to cluster hubs and let the
-    // user expand members per-cluster (click a hub) or all at once (toggle).
+    // Scale handling: above the cap, start collapsed to cluster hubs only (no
+    // member facts/spokes) so the constellation stays legible; the Collapse
+    // toggle flips the whole graph between hubs-only and full starbursts.
     const collapseBox = document.getElementById('memoryMapCollapse');
     const startCollapsed = mapData.nodes.length > MAP_AUTO_COLLAPSE_AT;
     if (collapseBox) collapseBox.checked = startCollapsed;
-    mapExpanded = new Set();
+    mapSelectedHub = null;
 
     mapCy = cytoscape({
       container: graphEl,
@@ -3240,65 +3267,75 @@ async function loadMapTab() {
 
 function mapStylesheet() {
   return [
-    // Cluster constellations (compound parents). Small padding so the box hugs
-    // its members; label sits just above the box with an outline so it stays
-    // readable and never reads as an empty rectangle.
-    { selector: 'node.cluster', style: {
-        'label': 'data(label)', 'font-size': 13, 'font-weight': 700,
-        'color': '#e5e7eb', 'text-valign': 'top', 'text-halign': 'center',
-        'text-margin-y': -6, 'shape': 'round-rectangle',
-        'text-outline-width': 3, 'text-outline-color': '#0b1220', 'text-outline-opacity': 0.95,
-        'background-opacity': 1, 'border-width': 1.5, 'padding': 10,
-        'background-color': 'data(bg)', 'border-color': 'data(border)'
-    }},
-    // Collapsed cluster hubs (leaf nodes standing in for a whole cluster).
+    // Hub nodes — the gravitational centre of each cluster. A bright filled dot
+    // with a colored halo; the cluster name always rides just below it.
     { selector: 'node.hub', style: {
-        'label': 'data(label)', 'font-size': 10, 'color': '#e2e8f0',
-        'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
-        'text-max-width': 70, 'shape': 'round-rectangle',
-        'width': 'data(size)', 'height': 'data(size)',
-        'background-color': 'data(fill)', 'background-opacity': 0.85,
-        'border-width': 2, 'border-color': 'data(border)'
+        'shape': 'ellipse', 'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(hub)', 'background-opacity': 1,
+        'border-width': 2, 'border-color': 'data(ring)',
+        'underlay-color': 'data(glow)', 'underlay-opacity': 0.5, 'underlay-padding': 10,
+        'label': 'data(label)', 'font-size': 12, 'font-weight': 700, 'color': '#f1f5f9',
+        'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4,
+        'text-wrap': 'wrap', 'text-max-width': 120,
+        'text-outline-width': 3, 'text-outline-color': '#05070d', 'text-outline-opacity': 0.95,
+        'min-zoomed-font-size': 0, 'z-index': 10
     }},
-    // Fact nodes — labelled with truncated fact text below the dot. Labels are
-    // always on but gated by min-zoomed-font-size so they appear only once the
-    // user is zoomed in enough for them to be legible (no clutter when far out).
+    // Fact nodes — glowing dots sized by salience. Labels are gated by
+    // min-zoomed-font-size so they only appear once the user is zoomed in
+    // (or on hover, below), keeping the far-out view clean.
     { selector: 'node.fact', style: {
-        'width': 'data(size)', 'height': 'data(size)',
-        'background-color': 'data(fill)', 'border-width': 1,
-        'border-color': 'rgba(255,255,255,0.35)',
+        'shape': 'ellipse', 'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(fill)', 'background-opacity': 1,
+        'border-width': 1, 'border-color': 'rgba(255,255,255,0.28)',
+        'underlay-color': 'data(glow)', 'underlay-opacity': 0.35, 'underlay-padding': 4,
         'label': 'data(short)', 'font-size': 9, 'color': '#e5e7eb',
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 3,
         'text-wrap': 'ellipsis', 'text-max-width': 120,
-        'text-outline-width': 2, 'text-outline-color': '#0b1220', 'text-outline-opacity': 0.9,
-        'text-opacity': 1, 'min-zoomed-font-size': 6
+        'text-outline-width': 2, 'text-outline-color': '#05070d', 'text-outline-opacity': 0.9,
+        'text-opacity': 1, 'min-zoomed-font-size': FACT_LABEL_MIN_ZOOM_FONT
+    }},
+    // Fact label revealed on hover regardless of zoom.
+    { selector: 'node.fact.hover', style: {
+        'min-zoomed-font-size': 0, 'font-size': 11, 'z-index': 30
     }},
     { selector: 'node.fact:selected', style: {
-        'font-size': 11, 'min-zoomed-font-size': 0, 'z-index': 20,
+        'font-size': 11, 'min-zoomed-font-size': 0, 'z-index': 30,
         'border-width': 2, 'border-color': '#fff'
     }},
-    // Ghost (superseded) facts — faded.
+    // Ghost (superseded) facts — faded, dashed border, dimmer halo.
     { selector: 'node.ghost', style: {
-        'background-opacity': 0.28, 'border-style': 'dashed',
-        'border-color': 'rgba(255,255,255,0.4)'
+        'background-opacity': 0.25, 'underlay-opacity': 0.12,
+        'border-style': 'dashed', 'border-color': 'rgba(255,255,255,0.4)'
     }},
-    // Facts with a pending question — glowing ring via underlay halo.
+    // Facts with a pending question — amber halo ring (overrides the base glow).
     { selector: 'node.pending', style: {
-        'underlay-color': '#fbbf24', 'underlay-opacity': 0.55, 'underlay-padding': 7
+        'underlay-color': '#fbbf24', 'underlay-opacity': 0.6, 'underlay-padding': 7
+    }},
+    // Selected hub — white rim + brighter halo, lifted above its neighborhood.
+    { selector: 'node.hub.hubsel', style: {
+        'border-width': 3, 'border-color': '#ffffff',
+        'underlay-opacity': 0.8, 'z-index': 40
+    }},
+    // Spoke edges (hub -> its own facts): tinted by subject, very low opacity so
+    // the dots dominate and the rays only imply membership.
+    { selector: 'edge.spoke', style: {
+        'width': 1, 'line-color': 'data(fill)', 'opacity': 0.16, 'curve-style': 'straight'
+    }},
+    // Hub-to-hub association links: neutral slate, a touch brighter than spokes.
+    // Recolored by strength on hub selection (see selectHub).
+    { selector: 'edge.clink', style: {
+        'width': 'data(w)', 'line-color': 'rgba(148,163,184,0.5)',
+        'opacity': 0.5, 'curve-style': 'bezier'
     }},
     // Supersede edges (belief history) — directed, dashed.
     { selector: 'edge.supersede', style: {
         'width': 1.5, 'line-color': '#f59e0b', 'line-style': 'dashed',
         'target-arrow-color': '#f59e0b', 'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier', 'arrow-scale': 0.8, 'opacity': 0.75
+        'curve-style': 'bezier', 'arrow-scale': 0.8, 'opacity': 0.7
     }},
-    // Cluster-association edges.
-    { selector: 'edge.clink', style: {
-        'width': 'data(w)', 'line-color': 'rgba(148,163,184,0.35)',
-        'curve-style': 'bezier'
-    }},
-    // Search dim / highlight.
-    { selector: '.dim', style: { 'opacity': 0.12 } },
+    // Dimming: `.faded` for hub-selection focus, `.dim` for search.
+    { selector: '.faded', style: { 'opacity': 0.07 } },
+    { selector: '.dim', style: { 'opacity': 0.1 } },
     { selector: 'node.match', style: {
         'border-width': 3, 'border-color': '#22d3ee', 'opacity': 1
     }},
@@ -3306,10 +3343,15 @@ function mapStylesheet() {
   ];
 }
 
-// Salience 3..10 -> node diameter.
-function mapNodeSize(sal) {
+// Salience 1..10 -> fact-dot diameter (kept smaller than hubs).
+function mapFactSize(sal) {
   const s = Math.max(1, Math.min(10, Number(sal) || 5));
-  return 14 + s * 5; // 19..64
+  return 10 + s * 2.2; // 12.2..32
+}
+
+// Member count -> hub diameter (sqrt so a 26-fact cluster stays proportionate).
+function mapHubSize(count) {
+  return 26 + Math.min(40, Math.sqrt(Math.max(1, count)) * 7); // ~33..~62
 }
 
 // Build the element set for the current mode and hand it to cytoscape.
@@ -3322,35 +3364,38 @@ function renderMap() {
   const els = [];
   const shownFactIds = new Set();
 
+  // One hub dot per cluster — always present, sized by member count.
   for (const c of mapData.clusters) {
     const col = MAP_COLORS[c.subject] || MAP_COLORS.user;
-    const expanded = !collapsed || mapExpanded.has(c.id);
-    if (expanded) {
-      els.push({ data: { id: c.id, label: c.name || 'cluster', bg: col.parent, border: col.parentBorder,
-        kind: 'cluster', subject: c.subject }, classes: 'cluster' });
-    } else {
-      const size = 34 + Math.min(46, (c.total || 1) * 4);
-      els.push({ data: { id: c.id, label: `${c.name || 'cluster'}\n(${c.total})`, size,
-        fill: col.fill, border: col.parentBorder, kind: 'hub', subject: c.subject }, classes: 'hub' });
-    }
+    els.push({ data: {
+      id: c.id, clusterId: c.id, kind: 'hub', subject: c.subject,
+      label: c.name || 'cluster', size: mapHubSize(c.total),
+      hub: col.hub, ring: col.ring, glow: col.glow
+    }, classes: 'hub' });
   }
 
-  for (const n of mapData.nodes) {
-    if (!n.clusterId || !clusterById.has(n.clusterId)) continue; // skip orphans
-    const isGhost = n.status === 'superseded' || !!n.supersededBy;
-    if (isGhost && !showGhosts) continue;
-    const clusterExpanded = !collapsed || mapExpanded.has(n.clusterId);
-    if (!clusterExpanded) continue; // hidden inside a collapsed hub
-    const col = MAP_COLORS[n.subject] || MAP_COLORS.user;
-    let cls = 'fact';
-    if (isGhost) cls += ' ghost';
-    if (n.pendingQuestions > 0) cls += ' pending';
-    els.push({ data: {
-      id: n.id, parent: n.clusterId, kind: 'fact', subject: n.subject,
-      size: mapNodeSize(n.salience), fill: col.fill,
-      short: mapTruncate(n.content, 40)
-    }, classes: cls });
-    shownFactIds.add(n.id);
+  // Facts + spokes — skipped entirely in collapsed (hubs-only) mode.
+  if (!collapsed) {
+    for (const n of mapData.nodes) {
+      if (!n.clusterId || !clusterById.has(n.clusterId)) continue; // skip orphans
+      const isGhost = n.status === 'superseded' || !!n.supersededBy;
+      if (isGhost && !showGhosts) continue;
+      const col = MAP_COLORS[n.subject] || MAP_COLORS.user;
+      let cls = 'fact';
+      if (isGhost) cls += ' ghost';
+      if (n.pendingQuestions > 0) cls += ' pending';
+      els.push({ data: {
+        id: n.id, clusterId: n.clusterId, kind: 'fact', subject: n.subject,
+        size: mapFactSize(n.salience), fill: col.fill, glow: col.glow,
+        short: mapTruncate(n.content, 40)
+      }, classes: cls });
+      shownFactIds.add(n.id);
+      // Spoke: hub -> fact. Tinted by the fact's subject.
+      els.push({ data: {
+        id: `spoke-${n.clusterId}-${n.id}`, source: n.clusterId, target: n.id,
+        kind: 'spoke', fill: col.fill
+      }, classes: 'spoke' });
+    }
   }
 
   // Supersede edges (only when both endpoints are on screen).
@@ -3360,15 +3405,29 @@ function renderMap() {
       els.push({ data: { id: `sup-${e.source}-${e.target}`, source: e.source, target: e.target }, classes: 'supersede' });
     }
   }
-  // Cluster-association edges (cluster nodes always exist as hub or parent).
+
+  // Hub-to-hub association links. Track the live strength range so link colors
+  // and widths scale across the actual weights present.
+  let mn = Infinity, mx = -Infinity;
+  const clinks = [];
   for (const e of mapData.edges) {
     if (e.type !== 'cluster-link') continue;
     if (clusterById.has(e.source) && clusterById.has(e.target)) {
-      els.push({ data: { id: `clink-${e.source}-${e.target}`, source: e.source, target: e.target,
-        w: 0.5 + Math.min(3, (e.strength || 1)) }, classes: 'clink' });
+      const s = e.strength || 0.5;
+      mn = Math.min(mn, s); mx = Math.max(mx, s);
+      clinks.push(e);
     }
   }
+  mapLinkRange = { min: isFinite(mn) ? mn : 0.5, max: isFinite(mx) ? mx : 1 };
+  for (const e of clinks) {
+    const s = e.strength || 0.5;
+    els.push({ data: {
+      id: `clink-${e.source}-${e.target}`, source: e.source, target: e.target,
+      strength: s, w: 0.6 + 2.4 * mapNormStrength(s)
+    }, classes: 'clink' });
+  }
 
+  mapSelectedHub = null;
   mapCy.elements().remove();
   mapCy.add(els);
   runMapLayout();
@@ -3382,46 +3441,88 @@ function runMapLayout() {
         quality: 'proof',       // best separation quality (offline, one-shot)
         animate: false,
         randomize: true,        // fresh global layout, not stuck on prior positions
-        // Repulsion + edge length give clusters clear gaps between them.
-        nodeRepulsion: 9000,
-        idealEdgeLength: 75,
-        edgeElasticity: 0.45,
-        nestingFactor: 0.1,     // members pack tightly inside their parent
-        // Compound handling: keep members close to their cluster centre.
-        gravity: 0.22,
-        gravityRange: 3.6,
-        gravityCompound: 1.4,
-        gravityRangeCompound: 1.6,
-        // Tile disconnected members and pack separate components (user vs self
-        // have no cross-links, so they land as distinct packed clusters).
+        // Hubs repel each other hard so neighborhoods fly apart; facts repel
+        // only mildly so a hub's members stay a tight starburst around it.
+        nodeRepulsion: node => node.hasClass('hub') ? 120000 : 6000,
+        // Short ideal length on spokes pulls members onto their hub; long on
+        // hub-to-hub links keeps associated constellations distinct but nearer
+        // than unlinked ones.
+        idealEdgeLength: edge => edge.hasClass('spoke') ? 46 : 300,
+        edgeElasticity: edge => edge.hasClass('spoke') ? 0.55 : 0.08,
+        gravity: 0.12,
+        gravityRange: 3.8,
+        // user vs self have no cross-links, so they land as separate packed
+        // components; separateMapZones then splits them left/right.
         tile: true,
-        tilingPaddingVertical: 12,
-        tilingPaddingHorizontal: 12,
         packComponents: true,
-        nodeSeparation: 90,
-        padding: 40,
-        numIter: 2500,
-        stop: () => { resolveClusterOverlaps(); separateMapZones(); mapCy.fit(undefined, 40); }
+        nodeSeparation: 120,
+        padding: 50,
+        numIter: 2600,
+        stop: () => { separateNeighbourhoods(); separateMapZones(); mapCy.fit(undefined, 45); }
       }
     : {
-        name: 'cose', animate: false, randomize: false,
-        nodeRepulsion: 9000, idealEdgeLength: 60, nestingFactor: 1.1,
-        gravity: 0.6, componentSpacing: 80, padding: 30,
-        nodeOverlap: 12, coolingFactor: 0.95, numIter: 800,
-        stop: () => { resolveClusterOverlaps(); separateMapZones(); mapCy.fit(undefined, 40); }
+        name: 'cose', animate: false, randomize: true,
+        nodeRepulsion: 16000, idealEdgeLength: 55, gravity: 0.35,
+        componentSpacing: 140, padding: 40, nodeOverlap: 14,
+        coolingFactor: 0.95, numIter: 1400,
+        stop: () => { separateNeighbourhoods(); separateMapZones(); mapCy.fit(undefined, 45); }
       };
   mapCy.layout(opts).run();
   // fcose with animate:false still fires `stop` synchronously after run(); fit
   // there. Guard with an immediate fit for the cose path too.
-  mapCy.fit(undefined, 40);
+  mapCy.fit(undefined, 45);
+}
+
+// Guarantee dark space between constellations. fcose spreads hubs well but two
+// starbursts (a hub + its member ring) can still overlap — especially a large
+// cluster next to a linked one. This treats each cluster as a group (hub + its
+// facts), models it as a circle centred on the hub, and iteratively pushes any
+// overlapping pair apart along the line between their centres until every pair
+// has at least `pad` px of gap. Deterministic and convergent for ~dozens of
+// clusters. Groups move as a whole so the intra-cluster starburst is preserved.
+function separateNeighbourhoods(pad = 28, iterations = 80) {
+  if (!mapCy) return;
+  const groups = [];
+  mapCy.nodes('.hub').forEach(h => {
+    const cid = h.data('clusterId');
+    const facts = mapCy.nodes('.fact').filter(n => n.data('clusterId') === cid);
+    const members = h.union(facts);
+    const c = h.position();
+    let r = h.width() / 2;
+    facts.forEach(f => { r = Math.max(r, Math.hypot(f.position('x') - c.x, f.position('y') - c.y) + f.width() / 2); });
+    groups.push({ members, c: { x: c.x, y: c.y }, r });
+  });
+  if (groups.length < 2) return;
+  for (let it = 0; it < iterations; it++) {
+    let moved = false;
+    for (let i = 0; i < groups.length; i++) {
+      for (let j = i + 1; j < groups.length; j++) {
+        const A = groups[i], B = groups[j];
+        let dx = B.c.x - A.c.x, dy = B.c.y - A.c.y;
+        let d = Math.hypot(dx, dy);
+        const need = A.r + B.r + pad;
+        if (d >= need) continue;
+        if (d < 0.01) { dx = 1; dy = 0; d = 1; } // coincident — pick an axis
+        const push = (need - d) / 2;
+        const ux = dx / d, uy = dy / d;
+        A.members.positions(n => ({ x: n.position('x') - ux * push, y: n.position('y') - uy * push }));
+        B.members.positions(n => ({ x: n.position('x') + ux * push, y: n.position('y') + uy * push }));
+        A.c.x -= ux * push; A.c.y -= uy * push;
+        B.c.x += ux * push; B.c.y += uy * push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
 }
 
 // Separate the self (purple) and user (blue) territories into two side-by-side
-// zones. fcose keeps each cluster coherent but can interleave the two subjects;
-// this shifts every self element left so the self zone sits entirely left of the
-// user zone with a clear gap. Uniform translation preserves the intra-zone
-// arrangement (no new overlaps) and is deterministic (verifiable from positions).
-function separateMapZones(gap = 160) {
+// zones. fcose packs each subject as its own component but can place them
+// anywhere; this shifts every self node left so the self zone sits entirely left
+// of the user zone with a clear gap. Uniform translation preserves the intra-
+// zone arrangement (no new overlaps) and is deterministic (verifiable from
+// positions). Every element is now a leaf, so we move all self nodes directly.
+function separateMapZones(gap = 200) {
   if (!mapCy) return;
   const self = mapCy.nodes('[subject = "self"]');
   const user = mapCy.nodes('[subject = "user"]');
@@ -3431,60 +3532,7 @@ function separateMapZones(gap = 160) {
   // Target: self.x2 == user.x1 - gap  (self entirely left of user).
   const dx = (ubb.x1 - gap) - sbb.x2;
   if (Math.abs(dx) < 1) return;
-  // Move only leaves (facts + hubs); compound parents re-fit to their children.
-  const leaves = self.filter(n => n.isChildless());
-  leaves.positions(n => ({ x: n.position('x') + dx, y: n.position('y') }));
-}
-
-// Shift a whole cluster (its member leaves; the compound parent re-fits) by dx,dy.
-function mapShiftCluster(p, dx, dy) {
-  const leaves = p.isParent() ? p.children() : p;
-  leaves.positions(n => ({ x: n.position('x') + dx, y: n.position('y') + dy }));
-}
-
-// Guarantee clear gaps between cluster constellations. fcose lays them out well
-// but does not strictly forbid two compound parents from touching (e.g. two
-// clusters joined by an association edge get pulled corner-to-corner). This
-// iteratively pushes any overlapping (or closer-than-pad) parents apart along
-// their minimum-translation axis until every pair has at least `pad` px between
-// them. Deterministic and convergent for a small cluster count.
-function resolveClusterOverlaps(pad = 24, iterations = 60) {
-  if (!mapCy) return;
-  const parents = mapCy.nodes('.cluster, .hub');
-  if (parents.length < 2) return;
-  for (let it = 0; it < iterations; it++) {
-    let moved = false;
-    const boxes = parents.map(p => ({ p, bb: p.boundingBox() }));
-    for (let i = 0; i < boxes.length; i++) {
-      for (let j = i + 1; j < boxes.length; j++) {
-        const A = boxes[i].bb, B = boxes[j].bb;
-        const ox = Math.min(A.x2 + pad, B.x2 + pad) - Math.max(A.x1 - pad, B.x1 - pad);
-        const oy = Math.min(A.y2, B.y2) - Math.max(A.y1, B.y1);
-        // Overlap (padded on X, raw on Y) → push apart on the shallower axis.
-        if (ox > 0 && oy > 0) {
-          const acx = (A.x1 + A.x2) / 2, bcx = (B.x1 + B.x2) / 2;
-          const acy = (A.y1 + A.y2) / 2, bcy = (B.y1 + B.y2) / 2;
-          const oxRaw = Math.min(A.x2, B.x2) - Math.max(A.x1, B.x1);
-          let dx = 0, dy = 0;
-          if (Math.max(oxRaw, 0) + pad <= oy) {
-            const push = (Math.max(oxRaw, -pad) + pad) / 2 + 1;
-            const dir = acx <= bcx ? -1 : 1;
-            dx = dir * push;
-          } else {
-            const push = oy / 2 + 1;
-            const dir = acy <= bcy ? -1 : 1;
-            dy = dir * push;
-          }
-          mapShiftCluster(boxes[i].p, dx, dy);
-          mapShiftCluster(boxes[j].p, -dx, -dy);
-          boxes[i].bb = boxes[i].p.boundingBox();
-          boxes[j].bb = boxes[j].p.boundingBox();
-          moved = true;
-        }
-      }
-    }
-    if (!moved) break;
-  }
+  self.positions(n => ({ x: n.position('x') + dx, y: n.position('y') }));
 }
 
 function wireMapControls() {
@@ -3494,31 +3542,89 @@ function wireMapControls() {
   const search = document.getElementById('memoryMapSearch');
 
   ghosts?.addEventListener('change', () => renderMap());
-  collapse?.addEventListener('change', () => {
-    mapExpanded = new Set();
-    renderMap();
-  });
+  collapse?.addEventListener('change', () => renderMap());
   fit?.addEventListener('click', () => mapCy && mapCy.fit(undefined, 30));
   search?.addEventListener('input', applyMapSearch);
 }
 
 function wireMapInteractions() {
-  // Click a fact -> detail. Click a cluster/hub -> summary (or expand if collapsed).
-  mapCy.on('tap', 'node.fact', (evt) => showFactDetail(evt.target.id()));
-  mapCy.on('tap', 'node.cluster', (evt) => showClusterDetail(evt.target.id()));
-  mapCy.on('tap', 'node.hub', (evt) => {
-    const id = evt.target.id();
-    mapExpanded.add(id); // expand this cluster's members in place
-    renderMap();
-    showClusterDetail(id);
+  // Click a fact -> detail (and drop any hub focus). Click a hub -> focus its
+  // neighborhood + light its links. Click empty space -> clear.
+  mapCy.on('tap', 'node.fact', (evt) => { clearHubSelection(); showFactDetail(evt.target.id()); });
+  mapCy.on('tap', 'node.hub', (evt) => selectHub(evt.target.data('clusterId')));
+  mapCy.on('tap', (evt) => { if (evt.target === mapCy) { clearHubSelection(); hideMapDetail(); } });
+  // Hover reveals a fact's label regardless of zoom.
+  mapCy.on('mouseover', 'node.fact', (evt) => evt.target.addClass('hover'));
+  mapCy.on('mouseout', 'node.fact', (evt) => evt.target.removeClass('hover'));
+}
+
+// The set of graph elements belonging to one cluster: its hub, its facts, and
+// the spokes joining them.
+function mapNeighbourhood(cid) {
+  const hub = mapCy.getElementById(cid);
+  const facts = mapCy.nodes('.fact').filter(n => n.data('clusterId') === cid);
+  const spokes = mapCy.edges('.spoke').filter(e => e.data('source') === cid);
+  return hub.union(facts).union(spokes);
+}
+
+// Strip any inline strength styling previously painted onto hub-hub links.
+function resetClinkStyles() {
+  if (!mapCy) return;
+  mapCy.edges('.clink').removeStyle('line-color opacity width z-index');
+}
+
+// Drop hub focus: un-dim everything and restore default link styling.
+function clearHubSelection() {
+  if (!mapCy) return;
+  mapSelectedHub = null;
+  resetClinkStyles();
+  mapCy.elements().removeClass('faded hubsel');
+}
+
+// Focus a cluster hub: dim everything, then light its own neighborhood plus each
+// linked cluster, coloring the connecting hub-hub links by strength (hot = strong,
+// cool = weak). Opens the summary sidebar with the linked clusters ranked.
+function selectHub(clusterId) {
+  if (!mapCy) return;
+  const hub = mapCy.getElementById(clusterId);
+  if (hub.empty()) return;
+
+  // Selection and search share the visual channel — clear search first.
+  const searchEl = document.getElementById('memoryMapSearch');
+  if (searchEl && searchEl.value) searchEl.value = '';
+  mapCy.elements().removeClass('dim match');
+  resetClinkStyles();
+
+  mapSelectedHub = clusterId;
+  mapCy.batch(() => {
+    mapCy.elements().addClass('faded');
+    let lit = mapNeighbourhood(clusterId);
+    hub.addClass('hubsel');
+
+    const linked = [];
+    mapCy.edges('.clink').forEach(e => {
+      const s = e.data('source'), t = e.data('target');
+      if (s !== clusterId && t !== clusterId) return;
+      const other = s === clusterId ? t : s;
+      const strength = e.data('strength');
+      const col = mapStrengthColor(strength);
+      e.style({ 'line-color': col, 'opacity': 0.95,
+        'width': 1.5 + 3 * mapNormStrength(strength), 'z-index': 25 });
+      lit = lit.union(e).union(mapNeighbourhood(other));
+      linked.push({ id: other, strength });
+    });
+
+    lit.removeClass('faded');
+    linked.sort((a, b) => b.strength - a.strength);
+    showClusterDetail(clusterId, linked);
   });
-  mapCy.on('tap', (evt) => { if (evt.target === mapCy) hideMapDetail(); });
 }
 
 function applyMapSearch() {
   if (!mapCy) return;
   const q = (document.getElementById('memoryMapSearch')?.value || '').trim().toLowerCase();
   mapCy.batch(() => {
+    if (q && mapSelectedHub) clearHubSelection(); // search overrides hub focus
     mapCy.elements().removeClass('dim match');
     if (!q) return;
     const byId = new Map(mapData.nodes.map(n => [n.id, n]));
@@ -3529,7 +3635,9 @@ function applyMapSearch() {
     if (matches.length === 0) return;
     mapCy.elements().addClass('dim');
     matches.removeClass('dim').addClass('match');
-    matches.parents().removeClass('dim'); // keep matched facts' cluster visible
+    // Keep each matched fact's hub + spoke visible for context.
+    matches.forEach(n => mapCy.getElementById(n.data('clusterId')).removeClass('dim'));
+    matches.connectedEdges('.spoke').removeClass('dim');
   });
 }
 
@@ -3558,9 +3666,22 @@ function showFactDetail(id) {
   openMapDetail(html);
 }
 
-function showClusterDetail(id) {
+// All clusters linked to `id`, sorted strongest-first.
+function mapLinkedClusters(id) {
+  const out = [];
+  for (const e of (mapData?.edges || [])) {
+    if (e.type !== 'cluster-link') continue;
+    if (e.source === id) out.push({ id: e.target, strength: e.strength || 0.5 });
+    else if (e.target === id) out.push({ id: e.source, strength: e.strength || 0.5 });
+  }
+  out.sort((a, b) => b.strength - a.strength);
+  return out;
+}
+
+function showClusterDetail(id, linked) {
   const c = mapData?.clusters.find(x => x.id === id);
   if (!c) return;
+  if (!linked) linked = mapLinkedClusters(id);
   let html = `<button class="memory-map-detail-close">&times;</button>`;
   html += `<div class="mmd-subject mmd-${mapEscape(c.subject)}">${mapEscape(c.subject)} cluster</div>`;
   html += `<div class="mmd-content">${mapEscape(c.name)}</div>`;
@@ -3570,6 +3691,20 @@ function showClusterDetail(id) {
   html += `<dt>Active</dt><dd>${c.active}</dd>`;
   html += `<dt>Superseded</dt><dd>${c.superseded}</dd>`;
   html += `</dl>`;
+  // Linked clusters, ranked by strength, color-coded to match the lit links.
+  if (linked.length) {
+    html += `<div class="mmd-links"><div class="mmd-links-title">Linked clusters</div>`;
+    for (const l of linked) {
+      const lc = mapData.clusters.find(x => x.id === l.id);
+      const col = mapStrengthColor(l.strength);
+      html += `<div class="mmd-link-row">`
+        + `<span class="mmd-link-dot" style="background:${col};color:${col}"></span>`
+        + `<span class="mmd-link-name">${mapEscape(lc ? lc.name : '—')}</span>`
+        + `<span class="mmd-link-strength" style="color:${col}">${l.strength.toFixed(2)}</span>`
+        + `</div>`;
+    }
+    html += `</div>`;
+  }
   openMapDetail(html);
 }
 
@@ -3585,6 +3720,7 @@ function hideMapDetail() {
   const box = document.getElementById('memoryMapDetail');
   if (box) { box.classList.remove('open'); box.innerHTML = ''; }
   mapCy?.$(':selected').unselect();
+  clearHubSelection();
 }
 
 // ---- Search Tab ----
