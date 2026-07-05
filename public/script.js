@@ -2816,9 +2816,13 @@ function switchMemoryTab(name) {
   const tabContent = document.getElementById(`memoryTab${name.charAt(0).toUpperCase() + name.slice(1)}`);
   tabContent?.classList.add('active');
 
+  // The Map needs far more room than the other tabs — widen the whole panel.
+  memoryPanel?.classList.toggle('map-mode', name === 'map');
+
   // Load data for the tab
   if (name === 'facts') loadFactsTab();
   else if (name === 'clusters') loadClustersTab();
+  else if (name === 'map') loadMapTab();
   else if (name === 'daily') loadDailyTab();
   else if (name === 'self') loadSelfTab();
 }
@@ -3106,6 +3110,322 @@ async function loadSelfTab() {
     console.error('[MemoryPanel] Error loading self:', error);
     container.innerHTML = '<div class="memory-empty">Failed to load self view</div>';
   }
+}
+
+// ---- Map Tab (interactive memory graph) ----
+// Renders clusters as compound "constellations", facts as salience-sized nodes
+// within them, superseded facts as ghosts linked to their replacement, and
+// user vs self as distinct color regions. Built on vendored cytoscape.js.
+let mapCy = null;               // cytoscape instance
+let mapData = null;             // last /graph payload
+let mapExpanded = new Set();    // cluster ids shown with members (collapse mode)
+const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed
+
+// Base colors per subject region (user vs self).
+const MAP_COLORS = {
+  user:  { fill: '#3b82f6', parent: 'rgba(59,130,246,0.10)', parentBorder: 'rgba(59,130,246,0.45)' },
+  self:  { fill: '#a855f7', parent: 'rgba(168,85,247,0.10)', parentBorder: 'rgba(168,85,247,0.45)' }
+};
+
+// The Map panel widens via a CSS transition; cytoscape reads the container size
+// at init, so resize+fit again now and after the transition settles.
+function mapRefit() {
+  if (!mapCy) return;
+  mapCy.resize();
+  mapCy.fit(undefined, 30);
+  setTimeout(() => { if (mapCy) { mapCy.resize(); mapCy.fit(undefined, 30); } }, 320);
+}
+
+function mapEscape(s) { return escapeHtml(String(s == null ? '' : s)); }
+
+function mapFmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+  return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
+
+async function loadMapTab() {
+  const graphEl = document.getElementById('memoryMapGraph');
+  if (!graphEl) return;
+  if (typeof cytoscape === 'undefined') {
+    graphEl.innerHTML = '<div class="memory-empty">Graph library failed to load.</div>';
+    return;
+  }
+  // Already built once — just refit (panel may have been hidden/resized).
+  if (mapCy) { mapRefit(); return; }
+
+  graphEl.innerHTML = '<div class="memory-loading">Loading map…</div>';
+  try {
+    const res = await fetch('/api/memory/graph');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    mapData = await res.json();
+    if (!mapData.nodes || mapData.nodes.length === 0) {
+      graphEl.innerHTML = '<div class="memory-empty">No memory to map yet.</div>';
+      return;
+    }
+    graphEl.innerHTML = '';
+
+    // Scale handling: above the cap, start collapsed to cluster hubs and let the
+    // user expand members per-cluster (click a hub) or all at once (toggle).
+    const collapseBox = document.getElementById('memoryMapCollapse');
+    const startCollapsed = mapData.nodes.length > MAP_AUTO_COLLAPSE_AT;
+    if (collapseBox) collapseBox.checked = startCollapsed;
+    mapExpanded = new Set();
+
+    mapCy = cytoscape({
+      container: graphEl,
+      style: mapStylesheet(),
+      wheelSensitivity: 0.25,
+      minZoom: 0.1,
+      maxZoom: 3,
+      boxSelectionEnabled: false
+    });
+
+    wireMapInteractions();
+    wireMapControls();
+    renderMap();
+    mapRefit(); // the panel widens with a CSS transition — resize once it settles
+  } catch (err) {
+    console.error('[Map] load error:', err);
+    graphEl.innerHTML = '<div class="memory-empty">Failed to load map.</div>';
+  }
+}
+
+function mapStylesheet() {
+  return [
+    // Cluster constellations (compound parents).
+    { selector: 'node.cluster', style: {
+        'label': 'data(label)', 'font-size': 11, 'font-weight': 600,
+        'color': '#cbd5e1', 'text-valign': 'top', 'text-halign': 'center',
+        'text-margin-y': -2, 'shape': 'round-rectangle',
+        'background-opacity': 1, 'border-width': 1.5, 'padding': 14,
+        'background-color': 'data(bg)', 'border-color': 'data(border)'
+    }},
+    // Collapsed cluster hubs (leaf nodes standing in for a whole cluster).
+    { selector: 'node.hub', style: {
+        'label': 'data(label)', 'font-size': 10, 'color': '#e2e8f0',
+        'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
+        'text-max-width': 70, 'shape': 'round-rectangle',
+        'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(fill)', 'background-opacity': 0.85,
+        'border-width': 2, 'border-color': 'data(border)'
+    }},
+    // Fact nodes.
+    { selector: 'node.fact', style: {
+        'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(fill)', 'border-width': 1,
+        'border-color': 'rgba(255,255,255,0.35)',
+        'label': 'data(short)', 'font-size': 7, 'color': '#e2e8f0',
+        'text-valign': 'bottom', 'text-margin-y': 2, 'text-opacity': 0,
+        'min-zoomed-font-size': 8
+    }},
+    { selector: 'node.fact:selected', style: { 'text-opacity': 1, 'border-width': 2, 'border-color': '#fff' } },
+    // Ghost (superseded) facts — faded.
+    { selector: 'node.ghost', style: {
+        'background-opacity': 0.28, 'border-style': 'dashed',
+        'border-color': 'rgba(255,255,255,0.4)'
+    }},
+    // Facts with a pending question — glowing ring via underlay halo.
+    { selector: 'node.pending', style: {
+        'underlay-color': '#fbbf24', 'underlay-opacity': 0.55, 'underlay-padding': 7
+    }},
+    // Supersede edges (belief history) — directed, dashed.
+    { selector: 'edge.supersede', style: {
+        'width': 1.5, 'line-color': '#f59e0b', 'line-style': 'dashed',
+        'target-arrow-color': '#f59e0b', 'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier', 'arrow-scale': 0.8, 'opacity': 0.75
+    }},
+    // Cluster-association edges.
+    { selector: 'edge.clink', style: {
+        'width': 'data(w)', 'line-color': 'rgba(148,163,184,0.35)',
+        'curve-style': 'bezier'
+    }},
+    // Search dim / highlight.
+    { selector: '.dim', style: { 'opacity': 0.12 } },
+    { selector: 'node.match', style: {
+        'border-width': 3, 'border-color': '#22d3ee', 'opacity': 1
+    }},
+    { selector: '.hidden', style: { 'display': 'none' } }
+  ];
+}
+
+// Salience 3..10 -> node diameter.
+function mapNodeSize(sal) {
+  const s = Math.max(1, Math.min(10, Number(sal) || 5));
+  return 14 + s * 5; // 19..64
+}
+
+// Build the element set for the current mode and hand it to cytoscape.
+function renderMap() {
+  if (!mapCy || !mapData) return;
+  const collapsed = document.getElementById('memoryMapCollapse')?.checked;
+  const showGhosts = document.getElementById('memoryMapGhosts')?.checked !== false;
+
+  const clusterById = new Map(mapData.clusters.map(c => [c.id, c]));
+  const els = [];
+  const shownFactIds = new Set();
+
+  for (const c of mapData.clusters) {
+    const col = MAP_COLORS[c.subject] || MAP_COLORS.user;
+    const expanded = !collapsed || mapExpanded.has(c.id);
+    if (expanded) {
+      els.push({ data: { id: c.id, label: c.name || 'cluster', bg: col.parent, border: col.parentBorder,
+        kind: 'cluster', subject: c.subject }, classes: 'cluster' });
+    } else {
+      const size = 34 + Math.min(46, (c.total || 1) * 4);
+      els.push({ data: { id: c.id, label: `${c.name || 'cluster'}\n(${c.total})`, size,
+        fill: col.fill, border: col.parentBorder, kind: 'hub', subject: c.subject }, classes: 'hub' });
+    }
+  }
+
+  for (const n of mapData.nodes) {
+    if (!n.clusterId || !clusterById.has(n.clusterId)) continue; // skip orphans
+    const isGhost = n.status === 'superseded' || !!n.supersededBy;
+    if (isGhost && !showGhosts) continue;
+    const clusterExpanded = !collapsed || mapExpanded.has(n.clusterId);
+    if (!clusterExpanded) continue; // hidden inside a collapsed hub
+    const col = MAP_COLORS[n.subject] || MAP_COLORS.user;
+    let cls = 'fact';
+    if (isGhost) cls += ' ghost';
+    if (n.pendingQuestions > 0) cls += ' pending';
+    els.push({ data: {
+      id: n.id, parent: n.clusterId, kind: 'fact',
+      size: mapNodeSize(n.salience), fill: col.fill,
+      short: (n.content || '').slice(0, 22)
+    }, classes: cls });
+    shownFactIds.add(n.id);
+  }
+
+  // Supersede edges (only when both endpoints are on screen).
+  for (const e of mapData.edges) {
+    if (e.type !== 'supersede') continue;
+    if (shownFactIds.has(e.source) && shownFactIds.has(e.target)) {
+      els.push({ data: { id: `sup-${e.source}-${e.target}`, source: e.source, target: e.target }, classes: 'supersede' });
+    }
+  }
+  // Cluster-association edges (cluster nodes always exist as hub or parent).
+  for (const e of mapData.edges) {
+    if (e.type !== 'cluster-link') continue;
+    if (clusterById.has(e.source) && clusterById.has(e.target)) {
+      els.push({ data: { id: `clink-${e.source}-${e.target}`, source: e.source, target: e.target,
+        w: 0.5 + Math.min(3, (e.strength || 1)) }, classes: 'clink' });
+    }
+  }
+
+  mapCy.elements().remove();
+  mapCy.add(els);
+  runMapLayout();
+  applyMapSearch();
+}
+
+function runMapLayout() {
+  mapCy.layout({
+    name: 'cose', animate: false, randomize: false,
+    nodeRepulsion: 9000, idealEdgeLength: 60, nestingFactor: 1.1,
+    gravity: 0.6, componentSpacing: 80, padding: 30,
+    nodeOverlap: 12, coolingFactor: 0.95, numIter: 800
+  }).run();
+  mapCy.fit(undefined, 30);
+}
+
+function wireMapControls() {
+  const ghosts = document.getElementById('memoryMapGhosts');
+  const collapse = document.getElementById('memoryMapCollapse');
+  const fit = document.getElementById('memoryMapFit');
+  const search = document.getElementById('memoryMapSearch');
+
+  ghosts?.addEventListener('change', () => renderMap());
+  collapse?.addEventListener('change', () => {
+    mapExpanded = new Set();
+    renderMap();
+  });
+  fit?.addEventListener('click', () => mapCy && mapCy.fit(undefined, 30));
+  search?.addEventListener('input', applyMapSearch);
+}
+
+function wireMapInteractions() {
+  // Click a fact -> detail. Click a cluster/hub -> summary (or expand if collapsed).
+  mapCy.on('tap', 'node.fact', (evt) => showFactDetail(evt.target.id()));
+  mapCy.on('tap', 'node.cluster', (evt) => showClusterDetail(evt.target.id()));
+  mapCy.on('tap', 'node.hub', (evt) => {
+    const id = evt.target.id();
+    mapExpanded.add(id); // expand this cluster's members in place
+    renderMap();
+    showClusterDetail(id);
+  });
+  mapCy.on('tap', (evt) => { if (evt.target === mapCy) hideMapDetail(); });
+}
+
+function applyMapSearch() {
+  if (!mapCy) return;
+  const q = (document.getElementById('memoryMapSearch')?.value || '').trim().toLowerCase();
+  mapCy.batch(() => {
+    mapCy.elements().removeClass('dim match');
+    if (!q) return;
+    const byId = new Map(mapData.nodes.map(n => [n.id, n]));
+    const matches = mapCy.nodes('.fact').filter(n => {
+      const rec = byId.get(n.id());
+      return rec && rec.content && rec.content.toLowerCase().includes(q);
+    });
+    if (matches.length === 0) return;
+    mapCy.elements().addClass('dim');
+    matches.removeClass('dim').addClass('match');
+    matches.parents().removeClass('dim'); // keep matched facts' cluster visible
+  });
+}
+
+function showFactDetail(id) {
+  const n = mapData?.nodes.find(x => x.id === id);
+  if (!n) return;
+  const cluster = mapData.clusters.find(c => c.id === n.clusterId);
+  const isGhost = n.status === 'superseded' || !!n.supersededBy;
+  const replacement = n.supersededBy && mapData.nodes.find(x => x.id === n.supersededBy);
+  const replaces = mapData.nodes.filter(x => x.supersededBy === n.id);
+
+  let html = `<button class="memory-map-detail-close">&times;</button>`;
+  html += `<div class="mmd-subject mmd-${mapEscape(n.subject)}">${mapEscape(n.subject)} fact</div>`;
+  html += `<div class="mmd-content">${mapEscape(n.content)}</div>`;
+  html += `<dl class="mmd-fields">`;
+  html += `<dt>Salience</dt><dd>${mapEscape(n.salience)}/10</dd>`;
+  html += `<dt>Status</dt><dd>${isGhost ? 'superseded (ghost)' : mapEscape(n.status)}</dd>`;
+  html += `<dt>Cluster</dt><dd>${mapEscape(cluster ? cluster.name : '—')}</dd>`;
+  html += `<dt>Source</dt><dd>${mapEscape(n.source || '—')}</dd>`;
+  html += `<dt>Created</dt><dd>${mapEscape(mapFmtDate(n.createdAt))}</dd>`;
+  html += `<dt>Updated</dt><dd>${mapEscape(mapFmtDate(n.updatedAt))}</dd>`;
+  if (n.pendingQuestions > 0) html += `<dt>Pending Q</dt><dd>${n.pendingQuestions} open</dd>`;
+  html += `</dl>`;
+  if (replacement) html += `<div class="mmd-rel">↳ Replaced by: “${mapEscape(replacement.content)}”</div>`;
+  if (replaces.length) html += `<div class="mmd-rel">↑ Replaces: ${replaces.map(r => `“${mapEscape(r.content)}”`).join(', ')}</div>`;
+  openMapDetail(html);
+}
+
+function showClusterDetail(id) {
+  const c = mapData?.clusters.find(x => x.id === id);
+  if (!c) return;
+  let html = `<button class="memory-map-detail-close">&times;</button>`;
+  html += `<div class="mmd-subject mmd-${mapEscape(c.subject)}">${mapEscape(c.subject)} cluster</div>`;
+  html += `<div class="mmd-content">${mapEscape(c.name)}</div>`;
+  if (c.description) html += `<div class="mmd-desc">${mapEscape(c.description)}</div>`;
+  html += `<dl class="mmd-fields">`;
+  html += `<dt>Facts</dt><dd>${c.total}</dd>`;
+  html += `<dt>Active</dt><dd>${c.active}</dd>`;
+  html += `<dt>Superseded</dt><dd>${c.superseded}</dd>`;
+  html += `</dl>`;
+  openMapDetail(html);
+}
+
+function openMapDetail(html) {
+  const box = document.getElementById('memoryMapDetail');
+  if (!box) return;
+  box.innerHTML = html;
+  box.classList.add('open');
+  box.querySelector('.memory-map-detail-close')?.addEventListener('click', hideMapDetail);
+}
+
+function hideMapDetail() {
+  const box = document.getElementById('memoryMapDetail');
+  if (box) { box.classList.remove('open'); box.innerHTML = ''; }
+  mapCy?.$(':selected').unselect();
 }
 
 // ---- Search Tab ----

@@ -201,6 +201,135 @@ router.post('/initiatives/:id/discuss', async (req, res) => {
 });
 
 /**
+ * GET /api/memory/graph
+ * Build the Memory Map graph (nodes + edges) from existing SQLite data in a
+ * small, fixed number of query passes — no per-node LLM calls, pure data.
+ *
+ * Nodes:
+ *   - clusters (memory_clusters), tagged by subject (user | self)
+ *   - facts (cluster_members), with salience, status, subject, superseded_by,
+ *     and a pendingQuestions count so the frontend can ring them
+ * Edges:
+ *   - membership: fact -> its cluster (built client-side from clusterId)
+ *   - supersede:  old fact -> the fact that replaced it (directed, belief history)
+ *   - cluster-link: cluster <-> cluster association (cluster_links, weighted)
+ *
+ * Response also includes per-cluster counts so the frontend can collapse large
+ * clusters to a hub and expand members on demand.
+ */
+router.get('/graph', (req, res) => {
+  try {
+    const sqliteDb = db.getSqliteDb();
+    if (!sqliteDb) return res.status(503).json({ error: 'Database not ready' });
+
+    const clusterRows = sqliteDb.prepare(
+      'SELECT id, name, subject, description FROM memory_clusters'
+    ).all();
+
+    const memberRows = sqliteDb.prepare(`
+      SELECT id, cluster_id, content, salience, importance, status, subject,
+             superseded_by, source, created_at, updated_at
+      FROM cluster_members
+    `).all();
+
+    // Pending questions attached to a specific fact — one pass, aggregated in JS.
+    const questionRows = sqliteDb.prepare(
+      "SELECT member_id FROM questions WHERE status = 'pending' AND member_id IS NOT NULL"
+    ).all();
+    const pendingByMember = new Map();
+    for (const q of questionRows) {
+      pendingByMember.set(q.member_id, (pendingByMember.get(q.member_id) || 0) + 1);
+    }
+
+    const linkRows = sqliteDb.prepare(
+      'SELECT cluster_a, cluster_b, strength FROM cluster_links'
+    ).all();
+
+    // Per-cluster tallies (for hub sizing + collapse decisions).
+    const counts = new Map(); // clusterId -> { total, active, superseded }
+    const bump = (cid, key) => {
+      if (!cid) return;
+      let c = counts.get(cid);
+      if (!c) counts.set(cid, (c = { total: 0, active: 0, superseded: 0 }));
+      c.total++;
+      c[key]++;
+    };
+
+    const clusterIds = new Set(clusterRows.map(c => c.id));
+
+    const nodes = memberRows.map(m => {
+      const superseded = m.status === 'superseded' || !!m.superseded_by;
+      bump(m.cluster_id, superseded ? 'superseded' : 'active');
+      const pendingQuestions = pendingByMember.get(m.id) || 0;
+      return {
+        id: m.id,
+        clusterId: clusterIds.has(m.cluster_id) ? m.cluster_id : null,
+        content: m.content,
+        salience: Number.isFinite(m.salience) ? m.salience : (Math.round((m.importance || 0.5) * 10) || 5),
+        status: m.status || 'active',
+        subject: m.subject || 'user',
+        supersededBy: m.superseded_by || null,
+        source: m.source || null,
+        createdAt: m.created_at || null,
+        updatedAt: m.updated_at || null,
+        pendingQuestions
+      };
+    });
+
+    const memberIds = new Set(memberRows.map(m => m.id));
+
+    // Directed supersede edges — only when the replacement fact still exists.
+    const supersedeEdges = [];
+    for (const m of memberRows) {
+      if (m.superseded_by && memberIds.has(m.superseded_by)) {
+        supersedeEdges.push({ source: m.id, target: m.superseded_by, type: 'supersede' });
+      }
+    }
+
+    // Undirected cluster associations — only between clusters we render.
+    const linkEdges = [];
+    for (const l of linkRows) {
+      if (clusterIds.has(l.cluster_a) && clusterIds.has(l.cluster_b)) {
+        linkEdges.push({
+          source: l.cluster_a,
+          target: l.cluster_b,
+          type: 'cluster-link',
+          strength: l.strength || 1
+        });
+      }
+    }
+
+    const clusters = clusterRows.map(c => {
+      const cc = counts.get(c.id) || { total: 0, active: 0, superseded: 0 };
+      return {
+        id: c.id,
+        name: c.name,
+        subject: c.subject || 'user',
+        description: c.description || null,
+        total: cc.total,
+        active: cc.active,
+        superseded: cc.superseded
+      };
+    });
+
+    res.json({
+      clusters,
+      nodes,
+      edges: [...supersedeEdges, ...linkEdges],
+      stats: {
+        clusters: clusters.length,
+        facts: nodes.length,
+        superseded: nodes.filter(n => n.status === 'superseded' || n.supersededBy).length,
+        pendingQuestions: questionRows.length
+      }
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error building memory graph:', error.message);
+    res.status(500).json({ error: 'Failed to build memory graph' });
+  }
+});
+
+/**
  * POST /api/memory/reflect
  * Manually trigger a reflection pass (still requires new conversations).
  */

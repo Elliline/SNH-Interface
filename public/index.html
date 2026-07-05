@@ -76,6 +76,7 @@
     <div class="memory-panel-tabs">
       <button class="memory-tab active" data-tab="facts">Facts</button>
       <button class="memory-tab" data-tab="clusters">Clusters</button>
+      <button class="memory-tab" data-tab="map">Map</button>
       <button class="memory-tab" data-tab="daily">Daily Logs</button>
       <button class="memory-tab" data-tab="self">Self</button>
       <button class="memory-tab" data-tab="search">Search</button>
@@ -95,6 +96,27 @@
       <div id="memoryTabClusters" class="memory-tab-content">
         <div id="memoryClustersList" class="memory-clusters-list">
           <div class="memory-loading">Loading clusters...</div>
+        </div>
+      </div>
+      <!-- Map Tab (interactive memory graph) -->
+      <div id="memoryTabMap" class="memory-tab-content">
+        <div class="memory-map-toolbar">
+          <input type="text" id="memoryMapSearch" class="memory-map-search" placeholder="Highlight nodes…" />
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryMapGhosts" checked /> Ghosts</label>
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryMapCollapse" /> Collapse</label>
+          <button id="memoryMapFit" class="memory-map-btn" title="Fit to view">Fit</button>
+        </div>
+        <div class="memory-map-stage">
+          <div id="memoryMapGraph" class="memory-map-graph">
+            <div class="memory-loading">Loading map…</div>
+          </div>
+          <div id="memoryMapDetail" class="memory-map-detail"></div>
+          <div class="memory-map-legend">
+            <span class="lg lg-user">User</span>
+            <span class="lg lg-self">Self</span>
+            <span class="lg lg-ghost">Superseded</span>
+            <span class="lg lg-pending">Pending Q</span>
+          </div>
         </div>
       </div>
       <!-- Daily Tab -->
@@ -166,6 +188,7 @@
 
   </div>
 
+    <script src="vendor/cytoscape.min.js"></script>
     <script>document.write('<script src="script.js?v=' + Date.now() + '"><\/script>');</script>
 </body>
 </html>
