@@ -2846,6 +2846,9 @@ async function loadFactsTab() {
       const clusterData = await clusterRes.json();
       if (clusterData.members) {
         for (const member of clusterData.members) {
+          // Facts tab is user-facts only. Skip any self-observation that may sit
+          // inside a user cluster (subject defaults to 'user' for legacy rows).
+          if ((member.subject || 'user') !== 'user') continue;
           memoryFactsCache.push({
             id: member.id,
             content: member.content,
@@ -2945,9 +2948,12 @@ async function toggleClusterExpand(clusterId) {
 
     let html = '';
     if (data.members) {
-      html += data.members.map(m =>
-        `<div class="memory-cluster-member">${escapeHtml(m.content)}</div>`
-      ).join('');
+      // Clusters tab is user-facts only — never render self-observations that
+      // may sit inside a user cluster (legacy rows before the subject guard).
+      html += data.members
+        .filter(m => (m.subject || 'user') === 'user')
+        .map(m => `<div class="memory-cluster-member">${escapeHtml(m.content)}</div>`)
+        .join('');
     }
 
     if (data.linkedClusters && data.linkedClusters.length > 0) {

@@ -121,13 +121,20 @@ router.get('/self', (req, res) => {
   try {
     const memoryManager = require('../db/memory-manager');
     const block = identity.buildIdentityBlock();
+    // The Self tab is the full read-only inventory, so it lists EVERY active
+    // self-fact — not just block.selfFacts, which is capped at the injection
+    // budget (maxSelfFacts) to keep the chat system prompt small. Using the
+    // budgeted subset here would hide genuinely-active self-facts (e.g. ones
+    // just reclassified from user territory) below the salience cutoff.
+    const activeSelfFacts = memoryClusters.getSelfFacts({ status: 'active' });
     const supersededSelfFacts = memoryClusters.getSelfFacts({ status: 'superseded' });
     const reflections = memoryManager.getReflections(10);
 
     res.json({
       seed: block.seed,
       identityText: block.text,
-      activeSelfFacts: block.selfFacts,
+      activeSelfFacts,
+      injectedSelfFactCount: block.selfFacts.length,
       supersededSelfFacts,
       reflections
     });

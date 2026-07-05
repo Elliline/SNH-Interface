@@ -126,13 +126,18 @@ RULES:
 - Do NOT include: greetings, casual chat, temporary context, questions without answers.
 - Write facts as "User has..." or "User prefers..." — never "Assistant has...".
 
-GOOD examples (facts the user stated about themselves):
-["User has 4 dogs: Casper, Cece, Calypso, and Erika", "User is migrating from Syncro to Kaseya for RMM", "User's AI server has dual RTX 3090s with 48GB total VRAM"]
+USER FACTS vs FACTS ABOUT ME (the AI) — this distinction is critical:
+- A fact about the USER, their life, their preferences, or their WORK/PROJECTS is a user fact — extract it. This INCLUDES the SNH (Squatch Neuro Hub) project the user is building: "User's SNH system uses semantic clustering" or "User is building SNH, a cluster-memory tool" are legitimate user facts about what the USER built.
+- A fact about ME — the AI/SNH's OWN nature, personality, feelings, values, self-image, or behavioral tendencies — is NOT a user fact. Never extract it. If the user says "you're really curious", "SNH tends to be verbose", or "you seem to care about accuracy", that is an observation about the AI, not a fact about the user — SKIP it. The AI records its own self-observations through a separate reflection pipeline, not here.
+- The test for every candidate: "Is this a fact about the USER (or the user's work), or a fact about ME, the AI?" Keep only the former. When phrased in the first person ("I tend to...", "I care about...") it is about the AI — skip it.
 
-BAD examples (AI-provided info, fragments, or general knowledge):
-["A viral TikTok trend featuring Mini Huskies", "Constantinople fell in 1453", "RTX 3090", "The weather is nice"]
+GOOD examples (facts the user stated about themselves or their project):
+["User has 4 dogs: Casper, Cece, Calypso, and Erika", "User is migrating from Syncro to Kaseya for RMM", "User's AI server has dual RTX 3090s with 48GB total VRAM", "User's SNH system uses salience scoring from 1-10 to prioritize facts"]
 
-Every extracted fact must be something the USER told you, not something you told the user.
+BAD examples (AI-provided info, fragments, general knowledge, or facts about the AI itself):
+["A viral TikTok trend featuring Mini Huskies", "Constantinople fell in 1453", "RTX 3090", "The weather is nice", "SNH is curious and analytical", "I tend to reflect on my own cognitive processes", "The AI cares deeply about evolving truth"]
+
+Every extracted fact must be something the USER told you about themselves or their work — not something you told the user, and not an observation about you, the AI.
 
 ${getCurrentDateTimeString()}. When the user's statement is time-relative ("I just bought", "last week", "recently", "starting next month"), anchor the fact to an absolute date using the current date above — e.g. "As of July 2026, User is migrating from Syncro to Kaseya".`;
 
@@ -417,6 +422,23 @@ function parseFactsFromResponse(response) {
       // Reject facts where the assistant is the subject — these are hallucinations
       if (/^(the )?assistant\b/i.test(t)) {
         console.log(`[FactExtractor] Filtered out assistant-subject fact: "${f}"`);
+        return false;
+      }
+
+      // Reject facts about the AI's OWN nature — first-person self-observations
+      // ("I tend to...", "My purpose is...", "As an AI...") belong to the
+      // reflection pipeline as subject:'self', never to user memory. User facts
+      // are framed "User has..." / "User's ...", so this never drops a real one.
+      if (/^(i|i'm|i am|my|as an ai|as a language model)\b/i.test(t)) {
+        console.log(`[FactExtractor] Filtered out AI self-observation (first-person): "${f}"`);
+        return false;
+      }
+
+      // Reject facts asserting the AI/SNH's own personality or feelings (as opposed
+      // to the user's SNH *project*, which is framed "User's SNH ..."). "SNH is
+      // curious" → dropped; "User's SNH system uses X" → kept (starts with "User").
+      if (/^(snh|the ai)\b[^.]*\b(is|are|feels?|thinks?|believes?|wants?|enjoys?|cares?|values?|tends? to|prefers?|likes?|considers?|strives?)\b/i.test(t)) {
+        console.log(`[FactExtractor] Filtered out AI-nature self-observation: "${f}"`);
         return false;
       }
 
