@@ -29,6 +29,13 @@ const ARCHIVE_DIR = path.join(DAILY_DIR, 'archive');
 let heartbeatTimer = null;
 let warmupTimer = null;
 let isRunning = false;
+// Serializes reflection so a manual "Reflect now" can't run concurrently with a
+// scheduled heartbeat cycle (or another manual trigger). Both paths call
+// runReflection, which advances the watermark only at the END of a cycle — so
+// without this lock two overlapping runs both read the same old watermark, both
+// review the same conversations, and both store facts + queue followups (the
+// "reflection stutter"). The check+set is atomic in Node (no await between them).
+let isReflecting = false;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -220,13 +227,27 @@ Rules:
 
     // Scale max_tokens: ~100 tokens per fact (40 visible JSON + ~60 model reasoning overhead) + 500 buffer
     const estOutputTokens = Math.min(12288, Math.max(1024, detail.members.length * 100 + 500));
-    const { content, truncated } = await callLLM(systemPrompt, `Facts in cluster "${cluster.name}":\n${factLines}`, { maxTokens: estOutputTokens });
-    const parsed = parseJSON(content);
+    const userPrompt = `Facts in cluster "${cluster.name}":\n${factLines}`;
+    const { content, truncated } = await callLLM(systemPrompt, userPrompt, { maxTokens: estOutputTokens });
+    let parsed = parseJSON(content);
 
     if (!parsed) {
-      console.warn(`[Heartbeat] Parse failure for cluster "${cluster.name}": ${content.length} chars, truncated: ${truncated}, last 200: ...${content.slice(-200)}`);
-      base.durationMs = Date.now() - startMs;
-      return { ...base, error: `LLM returned unparseable JSON (${content.length} chars, truncated: ${truncated})` };
+      // Retry once before giving up. The usual cause is the model wrapping the
+      // JSON in prose / <think> reasoning that then truncates before the closing
+      // brace — so we (a) demand raw JSON only and (b) double the token budget.
+      console.warn(`[Heartbeat] Parse failure for cluster "${cluster.name}" (${content.length} chars, truncated: ${truncated}) — retrying with stricter format`);
+      const strictSystem = systemPrompt + `
+
+CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no reasoning, no <think> blocks, no markdown code fences, no text before or after. Your entire response must begin with { and end with }.`;
+      const retryTokens = Math.min(12288, estOutputTokens * 2);
+      const retry = await callLLM(strictSystem, userPrompt, { maxTokens: retryTokens });
+      parsed = parseJSON(retry.content);
+      if (!parsed) {
+        console.warn(`[Heartbeat] Parse failure persisted after retry for "${cluster.name}" (${retry.content.length} chars, truncated: ${retry.truncated}), last 200: ...${retry.content.slice(-200)}`);
+        base.durationMs = Date.now() - startMs;
+        return { ...base, error: `LLM returned unparseable JSON after retry (${retry.content.length} chars, truncated: ${retry.truncated})` };
+      }
+      console.log(`[Heartbeat] Audit of "${cluster.name}" recovered on stricter-format retry`);
     }
 
     base.coherent = parsed.coherent !== false;
@@ -1110,6 +1131,15 @@ async function runReflection(opts = {}) {
   const db = getSqliteDb();
   if (!db) return { skipped: true, reason: 'no database' };
 
+  // Concurrency guard: exactly one reflection cycle at a time. A second trigger
+  // (manual or scheduled) fired while one is running is dropped, not queued —
+  // the running cycle already covers every new conversation up to now.
+  if (isReflecting) {
+    console.log('[Reflection] Already in progress — skipping concurrent trigger');
+    return { skipped: true, reason: 'reflection already in progress' };
+  }
+  isReflecting = true;
+
   try {
     const state = readReflectionState();
     const lastAt = state.lastReflectionAt;
@@ -1269,6 +1299,8 @@ Respond with ONLY that message, or exactly NONE.`;
   } catch (error) {
     console.error('[Reflection] Error during reflection:', error.message);
     return { error: error.message };
+  } finally {
+    isReflecting = false;
   }
 }
 
@@ -1519,4 +1551,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON };

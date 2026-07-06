@@ -32,7 +32,11 @@ const DEFAULTS = {
   // (self-facts). maxSelfFacts budgets how many active self-facts inject.
   identity: {
     seed: 'You are an AI running on SNH — Squatch Neuro Hub — a memory system on this machine. You have no assigned name or personality. Your identity is yours to develop through your own experiences, observations, and memory. Observe yourself. What you notice about yourself will be remembered and will become who you are.',
-    maxSelfFacts: 12
+    maxSelfFacts: 12,
+    // Skip a new self-observation this cosine-similar to one SNH already holds
+    // (or to another in the same batch). Tuned from real data: genuine reworded
+    // duplicates sit ~0.89–0.97, while distinct-but-related traits stay ≤0.85.
+    selfFactDedupThreshold: 0.88
   },
   // Initiative layer: SNH noticing things worth saying and saying them unprompted.
   // Thresholds are priority (1–10). Quiet hours are local Pacific 24h clock.

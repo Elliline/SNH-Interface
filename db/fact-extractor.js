@@ -14,6 +14,18 @@ function stripLearnedAnnotation(text) {
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 
+// Cosine similarity that works for BOTH plain Arrays and Float32Arrays. The
+// shared memoryClusters.cosineSimilarity guards on Array.isArray and so returns
+// 0 for the Float32Array that memoryClusters.generateEmbedding produces — this
+// index-based version avoids that trap for the self-fact dedup path.
+function embeddingCosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  const den = Math.sqrt(na) * Math.sqrt(nb);
+  return den === 0 ? 0 : dot / den;
+}
+
 // ============ Embedding Helpers ============
 
 /**
@@ -1246,6 +1258,45 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       if (seenText.has(key)) continue;
       seenText.add(key);
       facts.push(f);
+    }
+    if (facts.length === 0) return result;
+
+    // === Semantic dedup: skip a self-observation near-identical to one SNH
+    // already holds (or to another accepted in this same batch). Defends the
+    // identity against reworded-identical restamps (e.g. from a reflection
+    // stutter). Same embedding-similarity approach as the initiative dedup. ===
+    try {
+      const cfg = getConfig();
+      const threshold = Number.isFinite(cfg.identity?.selfFactDedupThreshold)
+        ? cfg.identity.selfFactDedupThreshold : 0.88;
+      const activeExisting = memoryClusters.getSelfFacts({ status: 'active' });
+      const existingEmbs = [];
+      for (const ef of activeExisting) {
+        existingEmbs.push({ content: ef.content, emb: await memoryClusters.generateEmbedding(ef.content) });
+      }
+      const acceptedEmbs = [];
+      const deduped = [];
+      for (const fact of facts) {
+        const emb = await memoryClusters.generateEmbedding(fact);
+        if (!emb) { deduped.push(fact); continue; } // embeddings down → keep, don't lose the observation
+        let dupOf = null, dupSim = 0;
+        for (const e of existingEmbs.concat(acceptedEmbs)) {
+          if (!e.emb) continue;
+          const sim = embeddingCosine(emb, e.emb);
+          if (sim >= threshold && sim > dupSim) { dupSim = sim; dupOf = e.content; }
+        }
+        if (dupOf) {
+          console.log(`[SelfFacts] Skipped near-duplicate self-fact (sim ${dupSim.toFixed(3)} ≥ ${threshold}): "${fact.slice(0, 70)}" ≈ "${dupOf.slice(0, 70)}"`);
+          appendToDailyLog(`Skipped near-duplicate self-observation (sim ${dupSim.toFixed(3)}): "${fact}"`, dailyDir);
+          continue;
+        }
+        acceptedEmbs.push({ content: fact, emb });
+        deduped.push(fact);
+      }
+      facts.length = 0;
+      facts.push(...deduped);
+    } catch (dedupErr) {
+      console.error('[SelfFacts] Semantic dedup skipped (continuing):', dedupErr.message);
     }
     if (facts.length === 0) return result;
 

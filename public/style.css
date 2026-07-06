@@ -2075,6 +2075,11 @@ body {
   font-size: 0.8rem;
   color: var(--text-color);
 }
+.thinking-sentence {
+  font-size: 0.84rem;
+  line-height: 1.5;
+  color: var(--text-color);
+}
 .thinking-anomalies { margin-top: 8px; }
 .thinking-anomaly {
   font-size: 0.76rem;

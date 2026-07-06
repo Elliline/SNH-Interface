@@ -3212,6 +3212,21 @@ async function loadSelfTab() {
 }
 
 // ---- Thinking Tab (read-only: reflection + heartbeat traces per cycle) ----
+
+// Turn a raw heartbeat anomaly string into a plain-language sentence.
+function friendlyAnomaly(raw) {
+  const s = String(raw);
+  const m = /^Audit error for "(.+?)":\s*(.+)$/s.exec(s);
+  if (m) {
+    const name = m[1], err = m[2];
+    if (/unparse|unreadable|JSON/i.test(err)) {
+      return `Had trouble auditing '${name}' — the model returned an unreadable response, will retry next cycle.`;
+    }
+    return `Had trouble auditing '${name}' (${err}).`;
+  }
+  return s;
+}
+
 async function loadThinkingTab() {
   const container = document.getElementById('memoryThinkingContent');
   if (!container) return;
@@ -3238,23 +3253,28 @@ async function loadThinkingTab() {
 
     for (const e of entries) {
       if (e.kind === 'heartbeat') {
+        const pl = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+        // Labeled plain-language sentence — every number says what it actually is.
+        const parts = [];
+        parts.push((e.clustersAudited || 0) === 0
+          ? 'Reviewed memory — no oversized clusters needed auditing'
+          : `Audited ${pl(e.clustersAudited, 'cluster')} for coherence`);
+        if (e.clustersSplit > 0) parts.push(`reorganized ${pl(e.clustersSplit, 'cluster')} into clearer topics`);
+        if (e.linksAdded > 0) parts.push(`created ${pl(e.linksAdded, 'new connection')} between topics`);
+        if (e.linksUpdated > 0) parts.push(`strengthened ${pl(e.linksUpdated, 'connection')}`);
+        if (e.linksRemoved > 0) parts.push(`dropped ${pl(e.linksRemoved, 'stale connection')}`);
+        if (e.duration) parts.push(`took ${escapeHtml(e.duration)}`);
+        const sentence = parts.join(' · ');
         const anomalies = (e.anomalies || []).length
-          ? `<div class="thinking-anomalies">${(e.anomalies || []).map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(String(a))}</div>`).join('')}</div>`
+          ? `<div class="thinking-anomalies">${(e.anomalies || []).map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(friendlyAnomaly(a))}</div>`).join('')}</div>`
           : '';
         html += `
           <div class="thinking-entry thinking-heartbeat">
             <div class="thinking-head">
-              <span class="thinking-kind thinking-kind-heartbeat">heartbeat</span>
+              <span class="thinking-kind thinking-kind-heartbeat">maintenance pass</span>
               <span class="thinking-when">${escapeHtml(fmtDate(e.at))}</span>
-              ${e.duration ? `<span class="thinking-dur">${escapeHtml(e.duration)}</span>` : ''}
             </div>
-            <div class="thinking-stats">
-              <span>${e.clustersAudited || 0} audited</span>
-              <span>${e.clustersSplit || 0} split</span>
-              <span>+${e.linksAdded || 0} links</span>
-              <span>~${e.linksUpdated || 0}</span>
-              <span>−${e.linksRemoved || 0}</span>
-            </div>
+            <div class="thinking-sentence">${sentence}</div>
             ${anomalies}
           </div>`;
         continue;

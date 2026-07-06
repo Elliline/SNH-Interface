@@ -5,6 +5,9 @@
 node_modules/
 npm-debug.log*
 
+# Runtime server log
+server.log
+
 # OS files
 .DS_Store
 Thumbs.db
