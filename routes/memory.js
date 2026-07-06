@@ -208,6 +208,23 @@ router.post('/initiatives/:id/discuss', async (req, res) => {
 });
 
 /**
+ * GET /api/memory/followup-traces
+ * Recent conversation-followup traces (newest first): what each reflection cycle
+ * reviewed, the older memory it pulled in, the candidates it weighed, and what it
+ * generated or skipped with reasoning. Read-only; consumed by the Self/Initiative UI.
+ */
+router.get('/followup-traces', (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const traces = initiatives.listFollowupTraces({ limit });
+    res.json({ traces });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading followup traces:', error.message);
+    res.status(500).json({ error: 'Failed to load followup traces' });
+  }
+});
+
+/**
  * GET /api/memory/graph
  * Build the Memory Map graph (nodes + edges) from existing SQLite data in a
  * small, fixed number of query passes — no per-node LLM calls, pure data.

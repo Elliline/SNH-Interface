@@ -13,7 +13,11 @@ const { getSqliteDb } = require('./database');
 const { getLocalDateStamp } = require('./datetime');
 const { getConfig } = require('./config');
 
-const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight']);
+const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup']);
+
+function safeParse(json, fallback) {
+  try { return JSON.parse(json); } catch { return fallback; }
+}
 
 function clampPriority(p) {
   const n = Math.round(Number(p));
@@ -179,6 +183,23 @@ function getTopPending(minPriority = 0) {
   return list.length ? list[0] : null;
 }
 
+/**
+ * The single best pending initiative eligible for a conversation-open greeting,
+ * applying a type-specific bar: most types must clear greetingThreshold, but
+ * 'followup' items (conversation follow-ups SNH has been mulling over) surface at
+ * the lower followupThreshold. Scans in priority order, so the most pressing
+ * eligible item wins regardless of type.
+ * @returns {Object|null}
+ */
+function getTopForGreeting({ greetingThreshold = 7, followupThreshold = 5 } = {}) {
+  const pending = listPending({ limit: 100 }); // priority DESC
+  for (const it of pending) {
+    const bar = it.type === 'followup' ? followupThreshold : greetingThreshold;
+    if (it.priority >= bar) return it;
+  }
+  return null;
+}
+
 function get(id) {
   try {
     const db = getSqliteDb();
@@ -285,16 +306,83 @@ function countUnpromptedDeliveredToday() {
   }
 }
 
+/**
+ * Persist a conversation-followup trace for the reflection cycle. Records what
+ * was reviewed and reasoned about even when no follow-up is produced, so the
+ * decision process is queryable (the UI reads these back).
+ * @param {Object} trace
+ * @returns {string|null} the trace id
+ */
+function recordFollowupTrace(trace = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return null;
+    const id = randomUUID();
+    const reviewed = Array.isArray(trace.conversationsReviewed) ? trace.conversationsReviewed : [];
+    db.prepare(`
+      INSERT INTO followup_traces
+        (id, created_at, conversations_reviewed, message_count, reviewed_json,
+         related_clusters_json, candidates_json, generated, skipped, reasoning, initiative_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      trace.at || new Date().toISOString(),
+      reviewed.length,
+      trace.messageCount || 0,
+      JSON.stringify(reviewed),
+      JSON.stringify(trace.relatedClusters || []),
+      JSON.stringify(trace.candidates || []),
+      trace.generated || null,
+      trace.skipped ? 1 : 0,
+      trace.reasoning || '',
+      trace.initiativeId || null
+    );
+    return id;
+  } catch (error) {
+    console.error('[Initiatives] recordFollowupTrace error:', error.message);
+    return null;
+  }
+}
+
+/** Recent conversation-followup traces (newest first), rehydrated from JSON. */
+function listFollowupTraces({ limit = 20 } = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    const rows = db.prepare(
+      'SELECT * FROM followup_traces ORDER BY created_at DESC LIMIT ?'
+    ).all(limit);
+    return rows.map(r => ({
+      id: r.id,
+      at: r.created_at,
+      conversationsReviewed: safeParse(r.reviewed_json, []),
+      messageCount: r.message_count,
+      relatedClusters: safeParse(r.related_clusters_json, []),
+      candidates: safeParse(r.candidates_json, []),
+      generated: r.generated,
+      skipped: !!r.skipped,
+      reasoning: r.reasoning,
+      initiativeId: r.initiative_id
+    }));
+  } catch (error) {
+    console.error('[Initiatives] listFollowupTraces error:', error.message);
+    return [];
+  }
+}
+
 module.exports = {
   addInitiative,
   dedupePending,
   listPending,
   getTopPending,
+  getTopForGreeting,
   get,
   countPending,
   markDelivered,
   dismiss,
   expire,
   updatePriority,
-  countUnpromptedDeliveredToday
+  countUnpromptedDeliveredToday,
+  recordFollowupTrace,
+  listFollowupTraces
 };

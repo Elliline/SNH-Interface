@@ -1146,6 +1146,25 @@ Respond with ONLY that message, or exactly NONE.`;
       console.error('[Reflection] Insight generation error:', insightErr.message);
     }
 
+    // Conversation-followup: after observing itself, SNH reviews the same recent
+    // conversations (with relevant older memory folded in) and decides whether
+    // ONE thing deserves a follow-up — "I've been thinking about what you said".
+    // Every cycle records a queryable trace whether or not a follow-up results.
+    let followup = { skipped: true };
+    try {
+      const conversationsReviewed = Array.from(byConvo.entries()).map(([id, v]) => ({
+        id, title: v.title || null, messageCount: v.msgs.length
+      }));
+      followup = await initiativeEngine.generateConversationFollowup({
+        transcript,
+        conversationsReviewed,
+        messageCount: rows.length
+      });
+    } catch (followupErr) {
+      console.error('[Reflection] Follow-up generation error:', followupErr.message);
+      followup = { skipped: true, reasoning: `error: ${followupErr.message}` };
+    }
+
     const at = new Date().toISOString();
 
     // Log the reflection to the daily log like everything else.
@@ -1154,6 +1173,14 @@ Respond with ONLY that message, or exactly NONE.`;
       `Reflection: reviewed ${rows.length} message(s) across ${conversationCount} conversation(s) → ` +
       `${selfResult.stored} self-fact(s) stored, ${selfResult.superseded} superseded. ` +
       (observations.length ? `Noticed: ${observations.map(o => `"${o}"`).join('; ')}` : 'Nothing new noticed.'),
+      dailyDir
+    );
+
+    // One-line follow-up summary to the daily log.
+    factExtractor.appendToDailyLog(
+      followup && followup.generated
+        ? `Follow-up: considered ${followup.candidates?.length || 0} candidate(s) → sending "${followup.generated}"`
+        : `Follow-up: considered ${followup?.candidates?.length || 0} candidate(s) → none (${followup?.reasoning || 'nothing cleared the bar'})`,
       dailyDir
     );
 
@@ -1176,7 +1203,8 @@ Respond with ONLY that message, or exactly NONE.`;
       conversationCount,
       observations,
       stored: selfResult.stored,
-      superseded: selfResult.superseded
+      superseded: selfResult.superseded,
+      followup
     };
   } catch (error) {
     console.error('[Reflection] Error during reflection:', error.message);

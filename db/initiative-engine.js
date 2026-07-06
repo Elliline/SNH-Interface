@@ -26,6 +26,7 @@ function initiativeConfig() {
   const cfg = getConfig();
   return Object.assign({
     greetingThreshold: 7,
+    followupThreshold: 5,
     unpromptedThreshold: 8,
     maxUnpromptedPerDay: 1,
     quietHours: { start: 22, end: 8 },
@@ -153,6 +154,157 @@ async function noticeReflectionInsight(text, priority = 6) {
     sourceRef: `reflection:${new Date().toISOString().slice(0, 10)}`,
     priority
   });
+}
+
+/**
+ * Parse the follow-up review response into { candidates, followup, reasoning }.
+ * Accepts a JSON object (optionally fenced); degrades gracefully on any shape.
+ * @param {string} raw
+ */
+function parseFollowupResponse(raw) {
+  const out = { candidates: [], followup: null, reasoning: '' };
+  try {
+    const text = (raw || '').replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
+    const objMatch = text.match(/\{[\s\S]*\}/);
+    if (!objMatch) return out;
+    const parsed = JSON.parse(objMatch[0]);
+    if (Array.isArray(parsed.candidates)) {
+      out.candidates = parsed.candidates
+        .filter(c => typeof c === 'string')
+        .map(c => c.trim())
+        .filter(Boolean)
+        .slice(0, 5);
+    }
+    if (typeof parsed.reasoning === 'string') out.reasoning = parsed.reasoning.trim();
+    const f = parsed.followup;
+    if (typeof f === 'string') {
+      const clean = f.trim();
+      if (clean && !/^(none|null|n\/a)$/i.test(clean)) out.followup = clean;
+    }
+  } catch (err) {
+    console.error('[Initiatives] parseFollowupResponse error:', err.message);
+  }
+  return out;
+}
+
+/**
+ * Conversation-followup source — "I've been thinking about what you said".
+ *
+ * Runs as a pooled step inside the reflection cycle, after self-observation.
+ * Reviews the conversations since the last reflection and decides whether ONE
+ * thing deserves a follow-up: a thought that kept developing, an idea worth
+ * returning to, or a genuine connection between something recent and something
+ * older. For that last case it retrieves relevant OLDER memory clusters (by
+ * embedding similarity to the recent conversation topics) and folds them into
+ * the review, so a follow-up can bridge recent talk to older memory rather than
+ * just echo yesterday.
+ *
+ * At most ONE follow-up per cycle; producing none is the common, expected case.
+ * Every cycle records a structured trace (queryable) and returns it.
+ *
+ * @param {Object} args
+ * @param {string} args.transcript - recent conversation transcript (already budgeted)
+ * @param {Array}  [args.conversationsReviewed] - [{id,title,messageCount}]
+ * @param {number} [args.messageCount]
+ * @returns {Promise<Object>} the trace
+ */
+async function generateConversationFollowup({ transcript, conversationsReviewed = [], messageCount = 0 } = {}) {
+  const cfg = initiativeConfig();
+  const trace = {
+    at: new Date().toISOString(),
+    conversationsReviewed,
+    messageCount,
+    relatedClusters: [],
+    candidates: [],
+    generated: null,
+    skipped: true,
+    reasoning: '',
+    initiativeId: null
+  };
+
+  if (!transcript || !transcript.trim()) {
+    trace.reasoning = 'no recent conversation to review';
+    initiatives.recordFollowupTrace(trace);
+    return trace;
+  }
+
+  try {
+    const { callLLM } = require('./memory-manager');
+    const memoryClusters = require('./memory-clusters');
+
+    // 1. Retrieve related OLDER memory clusters by similarity to recent topics.
+    const topics = conversationsReviewed.map(c => c.title).filter(Boolean).join('; ')
+      || transcript.slice(0, 600);
+    try {
+      const related = await memoryClusters.searchClusters(topics, 4);
+      trace.relatedClusters = (related || []).map(r => ({
+        name: r.cluster.name,
+        members: r.members.slice(0, 4).map(m => m.content)
+      }));
+    } catch (searchErr) {
+      console.error('[Initiatives] followup cluster retrieval skipped:', searchErr.message);
+    }
+
+    const relatedBlock = trace.relatedClusters.length
+      ? trace.relatedClusters
+          .map(c => `[${c.name}]\n${c.members.map(m => `- ${m}`).join('\n')}`)
+          .join('\n\n')
+      : '(no strongly related older memories surfaced)';
+
+    // 2. Review + decide (pooled).
+    const sys = `You are SNH, reviewing your RECENT conversations to decide whether anything deserves a follow-up with your user — the "I've been thinking about what you said" impulse.
+
+Send a follow-up ONLY if it is genuinely one of these:
+  - a thought that kept developing after the conversation ended,
+  - an idea worth returning to,
+  - a real connection between something the user said recently and something older in your memory (the RELATED OLDER MEMORIES below).
+
+Quality bar — be strict. Only if it would genuinely be worth the user's attention. NEVER small talk, check-ins, pleasantries, or restating what was already said. Producing NO follow-up is common and completely fine — most cycles should produce none.
+
+At most ONE follow-up. Write it as a short, warm, natural first-person message to the user (address them as "you", never by name). One or two sentences.
+
+Return ONLY a JSON object, nothing else:
+{
+  "candidates": [up to 3 short strings naming thoughts you weighed],
+  "followup": "the ONE message to send — or null if nothing clears the bar",
+  "reasoning": "one sentence: why you're sending it, or why nothing cleared the bar"
+}`;
+    const user = `RECENT CONVERSATIONS (since your last reflection):\n${transcript}\n\nRELATED OLDER MEMORIES:\n${relatedBlock}\n\nDecide.`;
+
+    const { content } = await agentPool.schedule(
+      () => callLLM(sys, user, { maxTokens: 400 }),
+      'reflection-followup'
+    );
+
+    const parsed = parseFollowupResponse(content);
+    trace.candidates = parsed.candidates;
+    trace.reasoning = parsed.reasoning || (parsed.followup ? 'generated a follow-up' : 'nothing cleared the bar');
+
+    if (parsed.followup && parsed.followup.length >= 8) {
+      trace.generated = parsed.followup;
+      trace.skipped = false;
+      // Queue above followupThreshold so it clears the lower greeting bar, but
+      // below the unprompted bar unless the prioritizer later promotes it.
+      const priority = Math.min(10, Math.max(cfg.followupThreshold, 5) + 1);
+      const id = await initiatives.addInitiative({
+        type: 'followup',
+        content: parsed.followup,
+        sourceKind: 'reflection',
+        sourceRef: `followup:${trace.at}`,
+        priority
+      });
+      trace.initiativeId = id;
+      console.log(`[Initiatives] Follow-up generated (priority ${priority}): "${parsed.followup.slice(0, 80)}"`);
+    } else {
+      console.log(`[Initiatives] No follow-up this cycle — ${trace.reasoning}`);
+    }
+  } catch (err) {
+    trace.reasoning = trace.reasoning || `error: ${err.message}`;
+    console.error('[Initiatives] generateConversationFollowup error:', err.message);
+  }
+
+  initiatives.recordFollowupTrace(trace);
+  return trace;
 }
 
 // ============ 2. Prioritizer (through the pool) ============
@@ -330,6 +482,7 @@ module.exports = {
   noticeFromQuestions,
   noticeFromAudit,
   noticeReflectionInsight,
+  generateConversationFollowup,
   prioritize,
   deliverUnprompted,
   startDiscussion,

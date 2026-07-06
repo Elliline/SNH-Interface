@@ -1480,6 +1480,29 @@ function classifyToolNeed(messageText, superSearchEnabled) {
 }
 
 /**
+ * Detect a "what's on your mind?" style prompt — the user inviting SNH to share
+ * whatever it has been thinking about. When this fires, pending initiatives (any
+ * priority) are surfaced conversationally for this turn instead of the normal
+ * single-greeting path.
+ * @param {string} messageText
+ * @returns {boolean}
+ */
+function isMindQuery(messageText) {
+  const text = (messageText || '').toLowerCase().trim();
+  if (!text || text.length > 140) return false;
+  const patterns = [
+    /what('?s| is| has| have)?\s*(been\s+)?on your mind/,
+    /anything (on your mind|you('?ve| have)? been (thinking|mulling|pondering)|you want(ed)? to (bring up|share|tell me|say)|you'?d like to (bring up|share|raise))/,
+    /(what|anything).{0,20}\byou('?ve| have)? been thinking about/,
+    /have you been thinking about (anything|something)/,
+    /what are you thinking about/,
+    /got anything (on your mind|you want to say)/,
+    /anything you'?ve been meaning to (say|tell me|bring up|mention)/,
+  ];
+  return patterns.some(r => r.test(text));
+}
+
+/**
  * POST /api/chat/memory
  * Enhanced chat endpoint that:
  * 1. Saves user message to SQLite
@@ -1639,19 +1662,41 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       memoryParts.push(`=== Associated Memory Clusters ===\n${clusterText}`);
     }
 
+    // === Conversational nudge: "what's on your mind?" ===
+    // When the user explicitly invites SNH to share, surface ALL pending
+    // initiatives (any priority) for this turn with an instruction to raise them
+    // naturally. Takes precedence over the single-greeting path below.
+    let deliveredInitiative = null;
+    let nudgeItems = null;
+    try {
+      if (isMindQuery(userMessage.content)) {
+        const pend = initiatives.listPending({ limit: 5 });
+        if (pend.length > 0) {
+          nudgeItems = pend;
+          const list = pend.map(it => `- (${it.type}) ${it.content}`).join('\n');
+          memoryParts.push(`=== On Your Mind (the user is asking) ===\nThe user just invited you to share what's on your mind. These are the things you (SNH) have genuinely been sitting with:\n${list}\nShare what feels worth sharing, in your own voice and conversationally — you don't have to raise every one, and lead with whatever matters most. Do not present them as a bulleted list or a formal report; talk to them.`);
+          console.log(`[Initiative] Nudge surfaced ${pend.length} pending item(s) (convo ${convoId})`);
+        }
+      }
+    } catch (nudgeErr) {
+      console.error('[Initiative] Nudge selection error:', nudgeErr.message);
+    }
+
     // === Conversation-open greeting: weave in one high-priority initiative ===
     // When the user opens a new conversation, SNH may raise the single most
     // pressing thing it has been meaning to say — at most one, woven in naturally.
-    let deliveredInitiative = null;
+    // Followups surface here at a lower bar (followupThreshold). Skipped when the
+    // nudge already surfaced pending items this turn.
     try {
-      if (isConversationOpen) {
+      if (isConversationOpen && !nudgeItems) {
         const initCfg = getConfig().initiative || {};
-        const threshold = Number.isFinite(initCfg.greetingThreshold) ? initCfg.greetingThreshold : 7;
-        const top = initiatives.getTopPending(threshold);
+        const greetingThreshold = Number.isFinite(initCfg.greetingThreshold) ? initCfg.greetingThreshold : 7;
+        const followupThreshold = Number.isFinite(initCfg.followupThreshold) ? initCfg.followupThreshold : 5;
+        const top = initiatives.getTopForGreeting({ greetingThreshold, followupThreshold });
         if (top) {
           deliveredInitiative = top;
           memoryParts.push(`=== Something On Your Mind ===\nThere is one thing you (SNH) have been meaning to raise with the user: "${top.content}"\nIf it fits the conversation, you may open with it or weave it naturally into your first response — at most this one thing, phrased warmly and conversationally, never as a list or a formal notice. If it truly does not fit what the user said, let it go for now.`);
-          console.log(`[Initiative] Greeting candidate (priority ${top.priority}): ${top.id}`);
+          console.log(`[Initiative] Greeting candidate (${top.type}, priority ${top.priority}): ${top.id}`);
         }
       }
     } catch (initErr) {
@@ -1664,7 +1709,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Skipped when a greeting initiative is already in play (at most one ask).
     let surfacedQuestion = null;
     try {
-      if (!deliveredInitiative && clusterContext.length > 0 && !questionQueue.hasAskedInConversation(convoId)) {
+      if (!deliveredInitiative && !nudgeItems && clusterContext.length > 0 && !questionQueue.hasAskedInConversation(convoId)) {
         const clusterIds = clusterContext.map(c => c.cluster.id).filter(Boolean);
         const pending = questionQueue.getPendingForClusters(clusterIds);
         if (pending) {
@@ -1697,6 +1742,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (deliveredInitiative) {
       initiatives.markDelivered(deliveredInitiative.id, { channel: 'greeting', conversationId: convoId });
       console.log(`[Initiative] Delivered greeting initiative ${deliveredInitiative.id} (convo ${convoId})`);
+    }
+
+    // Mark nudge-surfaced initiatives delivered (SNH shared them this turn).
+    if (nudgeItems) {
+      for (const it of nudgeItems) {
+        initiatives.markDelivered(it.id, { channel: 'nudge', conversationId: convoId });
+      }
+      console.log(`[Initiative] Delivered ${nudgeItems.length} nudge initiative(s) (convo ${convoId})`);
     }
 
     // TTS-aware system prompt: instruct the model to avoid markdown/emojis when TTS is active

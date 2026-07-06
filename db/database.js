@@ -213,19 +213,40 @@ function initDatabase() {
     sqliteDb.exec(`
       CREATE TABLE IF NOT EXISTS initiatives (
         id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,                -- question | observation | alert | reflection-insight
+        type TEXT NOT NULL,                -- question | observation | alert | reflection-insight | followup
         content TEXT NOT NULL,
         source_kind TEXT,                  -- question | fact | cluster | reflection
         source_ref TEXT,                   -- id of the source (question/fact/cluster)
         priority INTEGER DEFAULT 5,        -- 1..10
         status TEXT DEFAULT 'pending',     -- pending | delivered | dismissed | expired
-        channel TEXT,                      -- greeting | unprompted | panel (set on delivery)
+        channel TEXT,                      -- greeting | unprompted | panel | nudge (set on delivery)
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         delivered_at DATETIME,
         delivered_conversation_id TEXT
       )
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status)`);
+
+    // Conversation-followup traces: every reflection cycle records what it
+    // reviewed, which older memory clusters it pulled in, the follow-up
+    // candidates it weighed, and what it generated or skipped (with reasoning).
+    // Stored queryably so the UI can surface the reasoning behind each follow-up.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS followup_traces (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        conversations_reviewed INTEGER DEFAULT 0,  -- count of conversations reviewed
+        message_count INTEGER DEFAULT 0,
+        reviewed_json TEXT,                 -- JSON [{id,title,messageCount}]
+        related_clusters_json TEXT,         -- JSON [{name,members:[...]}] pulled by similarity
+        candidates_json TEXT,               -- JSON [string] follow-up candidates weighed
+        generated TEXT,                     -- the follow-up message produced, or NULL
+        skipped INTEGER DEFAULT 1,          -- 1 = no follow-up produced this cycle
+        reasoning TEXT,                     -- why it generated or skipped
+        initiative_id TEXT                  -- the queued initiative id, if any
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_followup_traces_created ON followup_traces(created_at)`);
 
     // Conversations may be started by SNH itself (unprompted initiatives).
     const convCols = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
