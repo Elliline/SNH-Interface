@@ -177,6 +177,28 @@ function listPending({ minPriority = 0, limit = 100 } = {}) {
   }
 }
 
+/**
+ * Every initiative ever minted, newest first — the full lifecycle
+ * (pending/delivered/dismissed/expired) for the history view.
+ * @param {Object} [opts]
+ * @param {number} [opts.limit=200]
+ * @returns {Array}
+ */
+function listAll({ limit = 200 } = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    return db.prepare(`
+      SELECT * FROM initiatives
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(limit);
+  } catch (error) {
+    console.error('[Initiatives] listAll error:', error.message);
+    return [];
+  }
+}
+
 /** The single highest-priority pending initiative at or above minPriority. */
 function getTopPending(minPriority = 0) {
   const list = listPending({ minPriority, limit: 1 });
@@ -374,6 +396,7 @@ module.exports = {
   addInitiative,
   dedupePending,
   listPending,
+  listAll,
   getTopPending,
   getTopForGreeting,
   get,

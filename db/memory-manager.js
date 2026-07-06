@@ -682,7 +682,67 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
     console.error('[Heartbeat] Failed to write daily report:', err.message);
   }
 
+  // Persist the pass stats so the Thinking view can render them per cycle.
+  recordHeartbeatReport(report);
+
   return report;
+}
+
+/** Persist one heartbeat pass's stats to the heartbeat_reports table. */
+function recordHeartbeatReport(report) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    db.prepare(`
+      INSERT INTO heartbeat_reports
+        (id, created_at, clusters_audited, clusters_split, links_added, links_updated,
+         links_removed, duration, anomaly_count, report_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      new Date().toISOString(),
+      report.clustersAudited || 0,
+      report.clustersSplit || 0,
+      report.linksAdded || 0,
+      report.linksUpdated || 0,
+      report.linksRemoved || 0,
+      report.totalDuration || null,
+      (report.anomalies || []).length,
+      JSON.stringify(report)
+    );
+  } catch (err) {
+    console.error('[Heartbeat] Failed to persist heartbeat report:', err.message);
+  }
+}
+
+/** Recent heartbeat pass stats (newest first) for the Thinking view. */
+function getHeartbeatReports(limit = 30) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    const rows = db.prepare(
+      'SELECT * FROM heartbeat_reports ORDER BY created_at DESC LIMIT ?'
+    ).all(limit);
+    return rows.map(r => {
+      let full = {};
+      try { full = JSON.parse(r.report_json || '{}'); } catch { /* ignore */ }
+      return {
+        id: r.id,
+        at: r.created_at,
+        clustersAudited: r.clusters_audited,
+        clustersSplit: r.clusters_split,
+        linksAdded: r.links_added,
+        linksUpdated: r.links_updated,
+        linksRemoved: r.links_removed,
+        duration: r.duration,
+        anomalies: full.anomalies || [],
+        splitDetails: full.splitDetails || []
+      };
+    });
+  } catch (err) {
+    console.error('[Heartbeat] Failed to read heartbeat reports:', err.message);
+    return [];
+  }
 }
 
 // ============ Task B: Cleanup Facts ============
@@ -1459,4 +1519,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports };

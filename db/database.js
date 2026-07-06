@@ -248,6 +248,25 @@ function initDatabase() {
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_followup_traces_created ON followup_traces(created_at)`);
 
+    // Heartbeat pass stats: one row per maintenance/rebuild cycle so the Thinking
+    // view can show what each background pass actually did (clusters audited/split,
+    // links touched, duration, anomalies) alongside the reflection reasoning.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS heartbeat_reports (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        clusters_audited INTEGER DEFAULT 0,
+        clusters_split INTEGER DEFAULT 0,
+        links_added INTEGER DEFAULT 0,
+        links_updated INTEGER DEFAULT 0,
+        links_removed INTEGER DEFAULT 0,
+        duration TEXT,
+        anomaly_count INTEGER DEFAULT 0,
+        report_json TEXT                    -- full report object (splits, timing, anomalies)
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_heartbeat_reports_created ON heartbeat_reports(created_at)`);
+
     // Conversations may be started by SNH itself (unprompted initiatives).
     const convCols = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
     if (!convCols.some(c => c.name === 'initiated_by')) {

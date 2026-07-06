@@ -166,6 +166,21 @@ router.get('/initiatives', (req, res) => {
 });
 
 /**
+ * GET /api/memory/initiatives/history
+ * Every initiative ever minted (newest first) — the full lifecycle
+ * (pending/delivered/dismissed/expired) with timestamps and delivery channel.
+ */
+router.get('/initiatives/history', (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    res.json({ initiatives: initiatives.listAll({ limit }) });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading initiative history:', error.message);
+    res.status(500).json({ error: 'Failed to load initiative history' });
+  }
+});
+
+/**
  * POST /api/memory/initiatives/:id/dismiss
  * Dismiss a pending initiative (user read it / doesn't want it raised).
  */
@@ -365,6 +380,96 @@ router.post('/reflect', heavyLimiter, async (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error running reflection:', error.message);
     res.status(500).json({ error: 'Failed to run reflection' });
+  }
+});
+
+/**
+ * GET /api/memory/thinking
+ * Read-only "Thinking" feed: one entry per background cycle, newest first.
+ *   - reflection cycles: what conversations were reviewed, self-observations
+ *     noticed, follow-up candidates considered, and what was queued or skipped
+ *     and why (fuses reflections.jsonl with the followup_traces table).
+ *   - heartbeat passes: cluster-audit / link stats + anomalies + duration.
+ */
+router.get('/thinking', (req, res) => {
+  try {
+    const memoryManager = require('../db/memory-manager');
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 40));
+
+    const reflections = memoryManager.getReflections(80);
+    const traces = initiatives.listFollowupTraces({ limit: 80 });
+    const heartbeats = memoryManager.getHeartbeatReports(80);
+
+    const ms = (iso) => {
+      if (!iso) return 0;
+      const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+      return isNaN(d.getTime()) ? 0 : d.getTime();
+    };
+    const FUSE_WINDOW = 5 * 60 * 1000; // reflection + its follow-up trace share a cycle
+
+    // Fuse each reflection with the nearest unused follow-up trace (same cycle).
+    const usedTrace = new Set();
+    const entries = [];
+    for (const r of reflections) {
+      let best = null, bestDelta = Infinity;
+      for (let i = 0; i < traces.length; i++) {
+        if (usedTrace.has(i)) continue;
+        const delta = Math.abs(ms(traces[i].at) - ms(r.at));
+        if (delta < bestDelta) { bestDelta = delta; best = i; }
+      }
+      const followup = (best !== null && bestDelta <= FUSE_WINDOW) ? traces[best] : null;
+      if (followup) usedTrace.add(best);
+      entries.push({
+        kind: 'reflection',
+        at: r.at,
+        messageCount: r.messageCount || 0,
+        conversationCount: r.conversationCount || 0,
+        conversationsReviewed: followup ? followup.conversationsReviewed : [],
+        observations: r.observations || [],
+        stored: r.stored ?? null,
+        superseded: r.superseded ?? null,
+        followup: followup ? {
+          candidates: followup.candidates || [],
+          relatedClusters: followup.relatedClusters || [],
+          generated: followup.generated,
+          skipped: followup.skipped,
+          reasoning: followup.reasoning,
+          initiativeId: followup.initiativeId
+        } : null
+      });
+    }
+    // Orphan follow-up traces (a trace with no matching reflection record).
+    traces.forEach((t, i) => {
+      if (usedTrace.has(i)) return;
+      entries.push({
+        kind: 'reflection',
+        at: t.at,
+        messageCount: t.messageCount || 0,
+        conversationCount: (t.conversationsReviewed || []).length,
+        conversationsReviewed: t.conversationsReviewed || [],
+        observations: [],
+        stored: null,
+        superseded: null,
+        followup: {
+          candidates: t.candidates || [],
+          relatedClusters: t.relatedClusters || [],
+          generated: t.generated,
+          skipped: t.skipped,
+          reasoning: t.reasoning,
+          initiativeId: t.initiativeId
+        }
+      });
+    });
+    // Heartbeat passes.
+    for (const h of heartbeats) {
+      entries.push({ kind: 'heartbeat', ...h });
+    }
+
+    entries.sort((a, b) => ms(b.at) - ms(a.at));
+    res.json({ entries: entries.slice(0, limit) });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading thinking feed:', error.message);
+    res.status(500).json({ error: 'Failed to load thinking feed' });
   }
 });
 

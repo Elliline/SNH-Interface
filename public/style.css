@@ -1935,6 +1935,152 @@ body {
   color: var(--primary-color);
 }
 .initiative-discuss:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
+.initiative-type-observation { color: var(--secondary-color); }
+.initiative-type-followup { color: var(--success-color); }
+
+/* Config item plain-language description */
+.config-item-desc {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+  margin-top: 3px;
+}
+
+/* Initiative panel: Pending / History view toggle */
+.initiative-view-toggle {
+  display: flex;
+  gap: 6px;
+  padding: 10px 16px 0;
+}
+.initiative-view-btn {
+  font-size: 0.74rem;
+  padding: 4px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.initiative-view-btn.active {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+  color: #fff;
+}
+
+/* Initiative history rows (read-only lifecycle) */
+.initiative-status {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  margin-left: 8px;
+}
+.initiative-status-pending   { color: var(--warning-color); }
+.initiative-status-delivered { color: var(--success-color); }
+.initiative-status-dismissed { color: var(--text-secondary); }
+.initiative-status-expired   { color: var(--error-color); }
+.initiative-hist .initiative-priority { margin-left: auto; }
+.initiative-hist-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.initiative-when-muted { font-style: italic; opacity: 0.85; }
+
+/* Thinking tab — reflection + heartbeat traces per cycle */
+.memory-thinking-content { padding: 4px 2px 20px; }
+.thinking-entry {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: var(--surface-dark);
+}
+.thinking-reflection { border-left: 3px solid var(--accent-color); }
+.thinking-heartbeat  { border-left: 3px solid var(--secondary-color); }
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.thinking-kind {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  font-weight: 600;
+}
+.thinking-kind-reflection { color: var(--accent-color); }
+.thinking-kind-heartbeat  { color: var(--secondary-color); }
+.thinking-when { font-size: 0.72rem; color: var(--text-secondary); }
+.thinking-dur {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+.thinking-block { margin: 8px 0; }
+.thinking-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 3px;
+}
+.thinking-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-color);
+}
+.thinking-list li { margin-bottom: 2px; }
+.thinking-dim { color: var(--text-secondary); font-size: 0.9em; }
+.thinking-followup {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-color);
+  padding: 6px 10px;
+  border-left: 2px solid var(--success-color);
+  background: var(--surface-mid);
+  border-radius: 4px;
+}
+.thinking-reasoning {
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text-color);
+  margin-top: 6px;
+}
+.thinking-clusters { display: flex; flex-wrap: wrap; gap: 6px; }
+.thinking-cluster {
+  font-size: 0.74rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-mid);
+  color: var(--secondary-color);
+  border: 1px solid var(--border-color);
+}
+.thinking-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.8rem;
+  color: var(--text-color);
+}
+.thinking-anomalies { margin-top: 8px; }
+.thinking-anomaly {
+  font-size: 0.76rem;
+  color: var(--warning-color);
+  line-height: 1.4;
+}
 
 /* Memory panel overlay */
 .memory-panel-overlay {

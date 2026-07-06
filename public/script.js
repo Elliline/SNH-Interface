@@ -1724,6 +1724,33 @@ async function loadSettingsBrainTab() {
     notice.textContent = 'Heartbeat interval changes require a server restart.';
     container.appendChild(notice);
 
+    // Initiative & Proactivity — how eager SNH is to raise things, and when.
+    // These apply immediately on save (no restart needed).
+    const init = config.initiative || {};
+    container.appendChild(createConfigSection('Initiative & Proactivity', [
+      { key: 'initiative.greetingThreshold', label: 'Greeting threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.greetingThreshold,
+        desc: 'How important something must be (1–10) before SNH weaves it into a new conversation’s greeting.' },
+      { key: 'initiative.followupThreshold', label: 'Follow-up threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.followupThreshold,
+        desc: 'The lower bar (1–10) for follow-up thoughts — “I’ve been thinking about what you said” — to surface in a greeting.' },
+      { key: 'initiative.unpromptedThreshold', label: 'Unprompted threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.unpromptedThreshold,
+        desc: 'How important something must be (1–10) before SNH opens a conversation about it on its own.' },
+      { key: 'initiative.maxUnpromptedPerDay', label: 'Max unprompted per day', type: 'number', min: 0, max: 24, step: '1',
+        value: init.maxUnpromptedPerDay,
+        desc: 'The most conversations SNH may start on its own in a single day.' },
+      { key: 'initiative.quietHours.start', label: 'Quiet hours start', type: 'number', min: 0, max: 23, step: '1',
+        value: init.quietHours?.start,
+        desc: 'Hour (0–23, Pacific) SNH goes quiet — no unprompted messages after this.' },
+      { key: 'initiative.quietHours.end', label: 'Quiet hours end', type: 'number', min: 0, max: 23, step: '1',
+        value: init.quietHours?.end,
+        desc: 'Hour (0–23, Pacific) SNH may resume reaching out unprompted.' },
+      { key: 'initiative.dedupThreshold', label: 'Duplicate threshold', type: 'number', min: 0, max: 1, step: '0.05',
+        value: init.dedupThreshold,
+        desc: 'How similar two items must be (0–1) before SNH treats them as the same and skips the duplicate.' }
+    ]));
+
     // Rebuild Clusters button
     const rebuildSection = document.createElement('div');
     rebuildSection.className = 'config-section';
@@ -2692,6 +2719,17 @@ if (initiativeBtn) initiativeBtn.addEventListener('click', openInitiativePanel);
 if (initiativePanelClose) initiativePanelClose.addEventListener('click', closeInitiativePanel);
 if (initiativePanelOverlay) initiativePanelOverlay.addEventListener('click', closeInitiativePanel);
 
+// Pending / History view toggle inside the bell panel.
+let initiativeView = 'pending';
+document.querySelectorAll('.initiative-view-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    initiativeView = btn.dataset.initView;
+    document.querySelectorAll('.initiative-view-btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (initiativeView === 'history') loadInitiativeHistory();
+    else loadInitiativeList();
+  });
+});
+
 async function refreshInitiativeBadge() {
   if (!initiativeBadge) return;
   try {
@@ -2714,7 +2752,8 @@ async function refreshInitiativeBadge() {
 function openInitiativePanel() {
   initiativePanel?.classList.add('open');
   initiativePanelOverlay?.classList.add('active');
-  loadInitiativeList();
+  if (initiativeView === 'history') loadInitiativeHistory();
+  else loadInitiativeList();
 }
 
 function closeInitiativePanel() {
@@ -2798,6 +2837,46 @@ async function loadInitiativeList() {
   }
 }
 
+// Full initiative lifecycle — every item ever minted, with status, timestamps
+// and delivery channel. Read-only (no actions). Newest first.
+async function loadInitiativeHistory() {
+  const container = document.getElementById('initiativeList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading history…</div>';
+  try {
+    const res = await fetch('/api/memory/initiatives/history?limit=300');
+    const data = await res.json();
+    const items = data.initiatives || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">No initiatives yet.</div>';
+      return;
+    }
+    container.innerHTML = items.map(it => {
+      const delivered = it.delivered_at
+        ? `<span class="initiative-when">delivered ${escapeHtml(formatInitiativeTime(it.delivered_at))}${it.channel ? ` · ${escapeHtml(it.channel)}` : ''}</span>`
+        : (it.status === 'expired'
+            ? '<span class="initiative-when initiative-when-muted">expired without delivery</span>'
+            : (it.status === 'dismissed' ? '<span class="initiative-when initiative-when-muted">dismissed</span>' : ''));
+      return `
+      <div class="initiative-item initiative-hist" data-id="${it.id}">
+        <div class="initiative-item-head">
+          <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
+          <span class="initiative-status initiative-status-${escapeHtml(it.status)}">${escapeHtml(it.status)}</span>
+          <span class="initiative-priority" title="priority">${it.priority}/10</span>
+        </div>
+        <div class="initiative-content">${escapeHtml(it.content)}</div>
+        <div class="initiative-hist-meta">
+          <span class="initiative-when" title="${escapeHtml(it.created_at || '')}">created ${escapeHtml(formatInitiativeTime(it.created_at))}</span>
+          ${delivered}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (error) {
+    console.error('[Initiatives] Error loading history:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load history</div>';
+  }
+}
+
 // Keep the bell current: on load and periodically.
 refreshInitiativeBadge();
 setInterval(refreshInitiativeBadge, 60000);
@@ -2838,6 +2917,7 @@ function switchMemoryTab(name) {
   else if (name === 'map') loadMapTab();
   else if (name === 'daily') loadDailyTab();
   else if (name === 'self') loadSelfTab();
+  else if (name === 'thinking') loadThinkingTab();
 }
 
 // ---- Facts Tab ----
@@ -3128,6 +3208,107 @@ async function loadSelfTab() {
   } catch (error) {
     console.error('[MemoryPanel] Error loading self:', error);
     container.innerHTML = '<div class="memory-empty">Failed to load self view</div>';
+  }
+}
+
+// ---- Thinking Tab (read-only: reflection + heartbeat traces per cycle) ----
+async function loadThinkingTab() {
+  const container = document.getElementById('memoryThinkingContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading thinking…</div>';
+
+  const fmtDate = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+    return isNaN(d.getTime()) ? '' : d.toLocaleString();
+  };
+
+  try {
+    const res = await fetch('/api/memory/thinking?limit=60');
+    const data = await res.json();
+    const entries = data.entries || [];
+
+    let html = '<div class="memory-self-note">A read-only look at how SNH thinks in the background — each reflection cycle (what it reviewed, considered, and queued or skipped, and why) and each heartbeat maintenance pass. Newest first.</div>';
+
+    if (entries.length === 0) {
+      html += '<div class="memory-empty">No thinking recorded yet. Reflection and heartbeat cycles will populate this.</div>';
+      container.innerHTML = html;
+      return;
+    }
+
+    for (const e of entries) {
+      if (e.kind === 'heartbeat') {
+        const anomalies = (e.anomalies || []).length
+          ? `<div class="thinking-anomalies">${(e.anomalies || []).map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(String(a))}</div>`).join('')}</div>`
+          : '';
+        html += `
+          <div class="thinking-entry thinking-heartbeat">
+            <div class="thinking-head">
+              <span class="thinking-kind thinking-kind-heartbeat">heartbeat</span>
+              <span class="thinking-when">${escapeHtml(fmtDate(e.at))}</span>
+              ${e.duration ? `<span class="thinking-dur">${escapeHtml(e.duration)}</span>` : ''}
+            </div>
+            <div class="thinking-stats">
+              <span>${e.clustersAudited || 0} audited</span>
+              <span>${e.clustersSplit || 0} split</span>
+              <span>+${e.linksAdded || 0} links</span>
+              <span>~${e.linksUpdated || 0}</span>
+              <span>−${e.linksRemoved || 0}</span>
+            </div>
+            ${anomalies}
+          </div>`;
+        continue;
+      }
+
+      // reflection cycle
+      const reviewed = (e.conversationsReviewed || []).filter(c => c && c.title);
+      const reviewedHtml = reviewed.length
+        ? `<div class="thinking-block"><div class="thinking-label">Reviewed</div><ul class="thinking-list">${reviewed.map(c => `<li>${escapeHtml(c.title)}${c.messageCount ? ` <span class="thinking-dim">· ${c.messageCount} msgs</span>` : ''}</li>`).join('')}</ul></div>`
+        : `<div class="thinking-block"><div class="thinking-label">Reviewed</div><div class="thinking-dim">${e.messageCount || 0} message(s) across ${e.conversationCount || 0} conversation(s)</div></div>`;
+
+      const obsHtml = (e.observations || []).length
+        ? `<div class="thinking-block"><div class="thinking-label">Noticed about itself</div><ul class="thinking-list">${e.observations.map(o => `<li>${escapeHtml(o)}</li>`).join('')}</ul></div>`
+        : '';
+
+      const f = e.followup;
+      let followupHtml = '';
+      if (f) {
+        const candidates = (f.candidates || []).length
+          ? `<div class="thinking-block"><div class="thinking-label">Considered</div><ul class="thinking-list">${f.candidates.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul></div>`
+          : '';
+        const clusters = (f.relatedClusters || []).length
+          ? `<div class="thinking-block"><div class="thinking-label">Older memory pulled in</div><div class="thinking-clusters">${f.relatedClusters.map(c => `<span class="thinking-cluster">${escapeHtml(c.name)}</span>`).join('')}</div></div>`
+          : '';
+        const outcome = f.generated
+          ? `<div class="thinking-block"><div class="thinking-label">Queued a follow-up</div><div class="thinking-followup">“${escapeHtml(f.generated)}”</div></div>`
+          : `<div class="thinking-block"><div class="thinking-label">Skipped — no follow-up</div></div>`;
+        const reasoning = f.reasoning
+          ? `<div class="thinking-reasoning"><span class="thinking-dim">Why:</span> ${escapeHtml(f.reasoning)}</div>`
+          : '';
+        followupHtml = candidates + clusters + outcome + reasoning;
+      }
+
+      const storedMeta = (e.stored != null)
+        ? `<span class="thinking-dim">${e.stored} self-fact(s) stored${e.superseded ? `, ${e.superseded} superseded` : ''}</span>`
+        : '';
+
+      html += `
+        <div class="thinking-entry thinking-reflection">
+          <div class="thinking-head">
+            <span class="thinking-kind thinking-kind-reflection">reflection</span>
+            <span class="thinking-when">${escapeHtml(fmtDate(e.at))}</span>
+            ${storedMeta}
+          </div>
+          ${reviewedHtml}
+          ${obsHtml}
+          ${followupHtml}
+        </div>`;
+    }
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading thinking:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load thinking view</div>';
   }
 }
 
@@ -3892,7 +4073,11 @@ function createConfigSection(title, fields) {
       input = document.createElement('input');
       input.type = field.type || 'text';
       input.value = field.value ?? '';
-      if (field.type === 'number' && field.step) input.step = field.step;
+      if (field.type === 'number') {
+        if (field.step) input.step = field.step;
+        if (field.min !== undefined) input.min = field.min;
+        if (field.max !== undefined) input.max = field.max;
+      }
       input.dataset.configKey = field.key;
     }
 
@@ -3900,6 +4085,15 @@ function createConfigSection(title, fields) {
     input.id = inputId;
 
     item.appendChild(input);
+
+    // Optional one-line plain-language description under the control.
+    if (field.desc) {
+      const desc = document.createElement('div');
+      desc.className = 'config-item-desc';
+      desc.textContent = field.desc;
+      item.appendChild(desc);
+    }
+
     section.appendChild(item);
   }
 

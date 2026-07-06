@@ -79,6 +79,7 @@
       <button class="memory-tab" data-tab="map">Map</button>
       <button class="memory-tab" data-tab="daily">Daily Logs</button>
       <button class="memory-tab" data-tab="self">Self</button>
+      <button class="memory-tab" data-tab="thinking">Thinking</button>
       <button class="memory-tab" data-tab="search">Search</button>
     </div>
     <div class="memory-panel-content">
@@ -132,6 +133,12 @@
           <div class="memory-loading">Loading self...</div>
         </div>
       </div>
+      <!-- Thinking Tab (read-only: reflection + heartbeat traces per cycle) -->
+      <div id="memoryTabThinking" class="memory-tab-content">
+        <div id="memoryThinkingContent" class="memory-thinking-content">
+          <div class="memory-loading">Loading thinking…</div>
+        </div>
+      </div>
       <!-- Search Tab -->
       <div id="memoryTabSearch" class="memory-tab-content">
         <div class="memory-search-bar">
@@ -151,6 +158,10 @@
       <button id="initiativePanelClose" class="close-btn">&times;</button>
     </div>
     <div class="initiative-panel-note">Things SNH has noticed and may raise with you. Read or dismiss — no conversation needed.</div>
+    <div class="initiative-view-toggle">
+      <button class="initiative-view-btn active" data-init-view="pending">Pending</button>
+      <button class="initiative-view-btn" data-init-view="history">History</button>
+    </div>
     <div id="initiativeList" class="initiative-list">
       <div class="memory-loading">Loading…</div>
     </div>
