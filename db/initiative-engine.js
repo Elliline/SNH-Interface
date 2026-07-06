@@ -309,6 +309,40 @@ Return ONLY a JSON object, nothing else:
 
 // ============ 2. Prioritizer (through the pool) ============
 
+// Reflective initiatives are thoughts SNH is mulling over — never urgent by
+// nature — so scoring them on urgency/actionability (the problem-shaped rubric)
+// systematically buried good followups at 2/10. They get a thought-quality rubric.
+const REFLECTIVE_TYPES = new Set(['followup', 'reflection-insight']);
+
+/**
+ * The prioritizer system prompt for a given initiative type. Reflective items
+ * (followup, reflection-insight) are scored on thought quality; problem-shaped
+ * items (question, alert, observation) keep the urgency/actionability rubric.
+ * @param {string} type
+ * @returns {string}
+ */
+function prioritizerSystemPrompt(type) {
+  if (REFLECTIVE_TYPES.has(type)) {
+    return `You are scoring ONE reflective thought an AI assistant is considering sharing with its user — a follow-up on a conversation or a realization about itself. This is NOT a task, alert, or question, and it is NEVER urgent by nature. DO NOT score on urgency or actionability — those do not apply here. Score purely on the QUALITY of the thought:
+- Does it genuinely advance or extend an idea from a real conversation (not just restate it)?
+- Does it connect ideas across domains, or link something recent to something older in memory?
+- Does it bear meaningfully on the user's ongoing work, projects, or goals?
+
+Score 1–10:
+- 8–10: genuinely extends a conversation — a real insight, a non-obvious connection, or something that meaningfully bears on the user's work/goals. Clearly worth their attention.
+- 5–7: a solid, relevant continuation of a real thread — worth surfacing.
+- 3–4: loosely relevant but mostly restates what was already said.
+- 1–2: generic, hollow, off-topic, or pure small talk.
+Respond with ONLY the integer.`;
+  }
+  return `You are a prioritizer for an AI assistant deciding how important it is to raise something with its user, unprompted. Score 1–10:
+- 9–10: time-sensitive or blocks the assistant's memory/decisions; the user would want to know now.
+- 6–8: genuinely useful or clarifying; worth raising soon.
+- 3–5: minor, nice-to-know.
+- 1–2: trivial; probably not worth interrupting for.
+Respond with ONLY the integer.`;
+}
+
 /**
  * Review pending initiatives: expire stale ones, re-score priority with a pooled
  * agent, and cap the pending pool so it never becomes a nag queue.
@@ -334,13 +368,8 @@ async function prioritize() {
       const { callLLM } = require('./memory-manager');
       const scored = await agentPool.runBatch(
         pending.map(it => async () => {
-          const sys = `You are a prioritizer for an AI assistant deciding how important it is to raise something with its user, unprompted. Score 1–10:
-- 9–10: time-sensitive or blocks the assistant's memory/decisions; the user would want to know now.
-- 6–8: genuinely useful or clarifying; worth raising soon.
-- 3–5: minor, nice-to-know.
-- 1–2: trivial; probably not worth interrupting for.
-Respond with ONLY the integer.`;
-          const user = `Type: ${it.type}\nItem: "${it.content}"\n\nPriority (1-10)?`;
+          const sys = prioritizerSystemPrompt(it.type);
+          const user = `Item: "${it.content}"\n\nScore (1-10)?`;
           const { content } = await callLLM(sys, user, { maxTokens: 8 });
           const m = (content || '').match(/\d+/);
           return { id: it.id, priority: m ? parseInt(m[0], 10) : it.priority };
@@ -484,6 +513,7 @@ module.exports = {
   noticeReflectionInsight,
   generateConversationFollowup,
   prioritize,
+  prioritizerSystemPrompt,
   deliverUnprompted,
   startDiscussion,
   inQuietHours,
