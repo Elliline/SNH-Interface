@@ -28,6 +28,11 @@ const ARCHIVE_DIR = path.join(DAILY_DIR, 'archive');
 
 let heartbeatTimer = null;
 let warmupTimer = null;
+let livenessTimer = null;
+// Start optimistic — only write a daily-log warning on the transition from
+// answering to not-answering (and a recovery note on the way back), so a wedged
+// engine produces one alert rather than a warning every probe interval.
+let lastLivenessOk = true;
 let isRunning = false;
 // Serializes reflection so a manual "Reflect now" can't run concurrently with a
 // scheduled heartbeat cycle (or another manual trigger). Both paths call
@@ -131,6 +136,53 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   }
 
   throw new Error(`All LLM providers failed. Last error: ${lastError?.message}`);
+}
+
+/**
+ * Lightweight brain liveness probe: a single tiny chat completion against the
+ * heartbeat provider with a short timeout. Used by both the maintenance circuit
+ * breaker (preflight) and the periodic liveness timer. Deliberately NOT routed
+ * through the agent pool or callLLM's retry machinery — this is the low-level
+ * check that decides whether the engine is answering at all.
+ * @param {number} [timeoutMs=8000]
+ * @returns {Promise<{ok: boolean, ms: number, error?: string}>}
+ */
+async function probeBrainLiveness(timeoutMs = 8000) {
+  const config = getConfig();
+  const hb = config.models.heartbeat;
+  const inst = getProviderInstance(hb.provider, hb.instance);
+  const host = inst ? inst.host : 'http://localhost:11434';
+  const started = Date.now();
+
+  let url, body;
+  if (['llamacpp', 'vllm'].includes(hb.provider)) {
+    url = `${host}/v1/chat/completions`;
+    body = { model: hb.model, messages: [{ role: 'user', content: 'ping' }], stream: false, max_tokens: 1 };
+  } else {
+    url = `${host}/api/chat`;
+    body = { model: hb.model, messages: [{ role: 'user', content: 'ping' }], stream: false, options: { num_predict: 1 } };
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!response.ok) {
+      return { ok: false, ms: Date.now() - started, error: `HTTP ${response.status}` };
+    }
+    // A 200 means the engine answered; the body may be empty at max_tokens 1,
+    // which is still a live response.
+    await response.json().catch(() => ({}));
+    return { ok: true, ms: Date.now() - started };
+  } catch (err) {
+    const error = (err.name === 'TimeoutError' || err.name === 'AbortError')
+      ? `timeout after ${timeoutMs}ms`
+      : err.message;
+    return { ok: false, ms: Date.now() - started, error };
+  }
 }
 
 /**
@@ -1379,6 +1431,27 @@ async function runMaintenance() {
   console.log('[Heartbeat] === Starting maintenance cycle ===');
 
   try {
+    // Circuit breaker: before committing to a full cycle (dozens of LLM calls),
+    // probe the brain a few times. If the first calls all time out the engine is
+    // wedged or unreachable — bail now with a single plain line instead of
+    // grinding through a doomed ~40-minute pass against a dead engine.
+    const PREFLIGHT_ATTEMPTS = 3;
+    let brainLive = false;
+    let lastProbeErr = 'unknown';
+    for (let i = 0; i < PREFLIGHT_ATTEMPTS; i++) {
+      const probe = await probeBrainLiveness(8000);
+      if (probe.ok) { brainLive = true; break; }
+      lastProbeErr = probe.error || 'unknown';
+      console.log(`[Heartbeat] Preflight probe ${i + 1}/${PREFLIGHT_ATTEMPTS} failed: ${lastProbeErr}`);
+    }
+    if (!brainLive) {
+      console.log('[Heartbeat] brain unreachable, skipping cycle');
+      try {
+        factExtractor.appendToDailyLog(`Heartbeat: brain unreachable, skipping cycle (${lastProbeErr})`, DAILY_DIR);
+      } catch (e) { /* best-effort daily-log write */ }
+      return { skipped: true, reason: 'brain unreachable' };
+    }
+
     const config = getConfig();
     const maxFacts = config.memory.maxFactsPerCluster || 10;
 
@@ -1537,6 +1610,61 @@ function startHeartbeat() {
 }
 
 /**
+ * Start the periodic brain liveness probe. A tiny completion on a short timeout,
+ * fired every few minutes, that writes a daily-log warning the moment the brain
+ * stops answering — so a wedged engine is caught in minutes instead of at the
+ * next 2-hour heartbeat.
+ */
+function startLivenessProbe() {
+  const config = getConfig();
+  const lp = config.livenessProbe || {};
+  if (lp.enabled === false) {
+    console.log('[Liveness] Probe disabled by config');
+    return;
+  }
+  if (livenessTimer) {
+    console.log('[Liveness] Already running, ignoring start');
+    return;
+  }
+
+  const intervalMs = Math.max(1, lp.intervalMinutes || 5) * 60 * 1000;
+  const timeoutMs = lp.timeoutMs || 8000;
+  console.log(`[Liveness] Probing brain every ${intervalMs / 60000}min (timeout ${timeoutMs}ms)`);
+
+  livenessTimer = setInterval(async () => {
+    try {
+      const probe = await probeBrainLiveness(timeoutMs);
+      if (!probe.ok && lastLivenessOk) {
+        lastLivenessOk = false;
+        const msg = `⚠️ Brain liveness probe FAILED: ${probe.error} — engine may be wedged`;
+        console.warn(`[Liveness] ${msg}`);
+        try { factExtractor.appendToDailyLog(msg, DAILY_DIR); } catch (e) { /* best-effort */ }
+      } else if (probe.ok && !lastLivenessOk) {
+        lastLivenessOk = true;
+        const msg = `Brain liveness recovered — responded in ${probe.ms}ms`;
+        console.log(`[Liveness] ${msg}`);
+        try { factExtractor.appendToDailyLog(msg, DAILY_DIR); } catch (e) { /* best-effort */ }
+      }
+    } catch (err) {
+      console.error('[Liveness] Probe error:', err.message);
+    }
+  }, intervalMs);
+  // Don't let the probe timer hold the event loop open on shutdown.
+  if (livenessTimer.unref) livenessTimer.unref();
+}
+
+/**
+ * Stop the liveness probe timer.
+ */
+function stopLivenessProbe() {
+  if (livenessTimer) {
+    clearInterval(livenessTimer);
+    livenessTimer = null;
+  }
+  console.log('[Liveness] Stopped');
+}
+
+/**
  * Stop the heartbeat timer
  */
 function stopHeartbeat() {
@@ -1551,4 +1679,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON };

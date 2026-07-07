@@ -1845,6 +1845,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.error('[MemoryFlush] Flush check error:', flushError.message);
     }
 
+    // Abort controller for the upstream streaming request. Passed to every
+    // provider fetch below so that (a) if the client hangs up, and (b) if the
+    // engine stalls mid-stream (a wedged brain that stops emitting tokens), we
+    // tear down the underlying HTTP request instead of leaving it half-open and
+    // occupying an engine slot forever — that abandoned-request pile-up was a
+    // direct cause of the vLLM wedge.
+    const streamAbort = new AbortController();
+    res.on('close', () => streamAbort.abort());
+
     // Route to appropriate provider
     let response;
     let toolsUsed = false;
@@ -1967,7 +1976,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           model,
           messages: ollamaMessages,
           stream: true
-        })
+        }),
+        signal: streamAbort.signal
       });
     } else if (providerType === 'claude') {
       const claudeKey = apiKey || CLAUDE_API_KEY;
@@ -1993,7 +2003,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           stream: true,
           ...(claudeSystem ? { system: claudeSystem } : {}),
           messages: enhancedMessages.filter(m => m.role !== 'system')
-        })
+        }),
+        signal: streamAbort.signal
       });
     } else if (providerType === 'grok') {
       const grokKey = apiKey || GROK_API_KEY;
@@ -2010,7 +2021,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           model,
           stream: true,
           messages: enhancedMessages
-        })
+        }),
+        signal: streamAbort.signal
       });
     } else if (providerType === 'openai') {
       const openaiKey = apiKey || OPENAI_API_KEY;
@@ -2027,7 +2039,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           model,
           stream: true,
           messages: enhancedMessages
-        })
+        }),
+        signal: streamAbort.signal
       });
     } else if (providerType === 'squatchserve') {
       const squatchHost = providerHost; // Already validated above
@@ -2040,7 +2053,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           model,
           stream: true,
           messages: enhancedMessages
-        })
+        }),
+        signal: streamAbort.signal
       });
     } else if (providerType === 'llamacpp' || providerType === 'vllm') {
       const llamacppHost = providerHost;
@@ -2180,7 +2194,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       response = await fetch(`${llamacppHost}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(finalBody)
+        body: JSON.stringify(finalBody),
+        signal: streamAbort.signal
       });
     } else {
       return res.status(400).json({ error: 'Unknown provider' });
@@ -2225,10 +2240,25 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
+    // Stall watchdog: if the engine sends no bytes for this long mid-stream it's
+    // wedged, not slow — abort so we don't hold the socket (and its engine slot)
+    // open indefinitely. Reset on every chunk; a healthy long stream keeps ticking.
+    const STREAM_STALL_MS = 90000;
+    let stallTimer = null;
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        console.warn(`[Chat] Upstream ${providerType} stream stalled >${STREAM_STALL_MS}ms — aborting to free the engine`);
+        streamAbort.abort();
+      }, STREAM_STALL_MS);
+    };
+
     try {
+      armStall();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        armStall();
 
         const chunk = decoder.decode(value, { stream: true });
 
@@ -2292,6 +2322,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
       res.end();
     } finally {
+      if (stallTimer) clearTimeout(stallTimer);
       reader.releaseLock();
     }
 
@@ -2325,6 +2356,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.error('Memory chat error:', error.message);
     if (!res.headersSent) {
       res.status(503).json({ error: error.message || 'Chat service unavailable' });
+    } else if (!res.writableEnded) {
+      // Stream already started (e.g. the upstream request was aborted mid-stream
+      // by the stall watchdog or a client disconnect) — just close it out.
+      try { res.end(); } catch (e) { /* already torn down */ }
     }
   } finally {
     // Clear the chat-in-flight flag so the background pool resumes full width.
@@ -2384,4 +2419,5 @@ app.listen(PORT, () => {
     console.log(`  - Additional Ollama hosts: ${ALLOWED_OLLAMA_HOSTS.join(', ')}`);
   }
   memoryManager.startHeartbeat();
+  memoryManager.startLivenessProbe();
 });

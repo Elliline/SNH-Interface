@@ -26,7 +26,14 @@ const DEFAULTS = {
     embedding: { provider: 'ollama', instance: 'Local', model: 'nomic-embed-text' }
   },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
-  agentPool: { concurrency: 6 },
+  // Background LLM concurrency against the shared vLLM engine. Kept modest (3)
+  // so background passes never starve chat or pile abandoned requests onto the
+  // engine — over-saturation was a contributing cause of the brain wedge.
+  agentPool: { concurrency: 3 },
+  // Lightweight periodic liveness probe: a tiny completion with a short timeout
+  // that writes a daily-log warning when the brain stops answering, so a wedged
+  // engine is caught in minutes instead of at the next heartbeat.
+  livenessProbe: { enabled: true, intervalMinutes: 5, timeoutMs: 8000 },
   // Self-identity: a deliberately minimal seed. We do NOT define the AI's
   // personality — it develops one through its own accumulated self-observations
   // (self-facts). maxSelfFacts budgets how many active self-facts inject.

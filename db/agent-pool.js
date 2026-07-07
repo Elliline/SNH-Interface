@@ -29,7 +29,7 @@ const { getConfig } = require('./config');
 const { getLocalDateStamp } = require('./datetime');
 
 const DAILY_DIR = path.join(__dirname, '../data/memory/daily');
-const DEFAULT_CONCURRENCY = 6;
+const DEFAULT_CONCURRENCY = 3;
 
 class AgentPool {
   constructor() {

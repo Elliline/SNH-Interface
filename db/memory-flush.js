@@ -212,6 +212,29 @@ async function callLLMForFlush(provider, model, messages, apiKey, host) {
         return data.choices?.[0]?.message?.content || '';
       }
 
+      case 'vllm': {
+        // vLLM exposes an OpenAI-compatible /v1/chat/completions endpoint, so
+        // this mirrors the llamacpp case but points at the vLLM host (sparky-brain).
+        const vllmHost = host || 'http://localhost:8000';
+        response = await fetch(`${vllmHost}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: false
+          }),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          throw new Error(`vLLM flush failed: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || '';
+      }
+
       case 'squatchserve': {
         const squatchHost = host || 'http://localhost:8000';
         response = await fetch(`${squatchHost}/api/chat`, {
