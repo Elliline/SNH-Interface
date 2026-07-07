@@ -34,6 +34,27 @@ let livenessTimer = null;
 // engine produces one alert rather than a warning every probe interval.
 let lastLivenessOk = true;
 let isRunning = false;
+
+// Mid-cycle circuit breaker. The preflight probe in runMaintenance catches a
+// brain that's already down when a cycle starts; this catches one that wedges
+// PART WAY THROUGH. After this many consecutive callLLM timeouts the circuit
+// opens: subsequent callLLM calls fast-fail (so an in-flight pass — e.g. a
+// 231-pair cross-link audit — drains in milliseconds instead of grinding every
+// remaining task against a dead engine), and runMaintenance aborts the cycle.
+// Any successful call or a successful liveness probe closes it again.
+const CIRCUIT_TIMEOUT_THRESHOLD = 3;
+let consecutiveTimeouts = 0;
+let circuitOpen = false;
+
+function isTimeoutError(err) {
+  return !!err && (err.name === 'TimeoutError' || err.name === 'AbortError' || /abort|timeout/i.test(err.message || ''));
+}
+
+/** Reset the mid-cycle breaker — brain is reachable again. */
+function closeCircuit() {
+  consecutiveTimeouts = 0;
+  circuitOpen = false;
+}
 // Serializes reflection so a manual "Reflect now" can't run concurrently with a
 // scheduled heartbeat cycle (or another manual trigger). Both paths call
 // runReflection, which advances the watermark only at the END of a cycle — so
@@ -60,6 +81,12 @@ function memberIdFilter(id) {
  * @returns {Promise<{content: string, provider: string, truncated: boolean}>}
  */
 async function callLLM(systemPrompt, userPrompt, options = {}) {
+  // Fast-fail while the mid-cycle breaker is open — the brain is wedged, so
+  // don't spend another full timeout piling a doomed request onto a dead engine.
+  if (circuitOpen) {
+    throw new Error('Brain circuit open — skipping LLM call (engine wedged)');
+  }
+
   const config = getConfig();
   const heartbeatModel = config.models.heartbeat;
   const inst = getProviderInstance(heartbeatModel.provider, heartbeatModel.instance);
@@ -126,10 +153,23 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
       if (content) {
         console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars, finish_reason: ${finishReason || 'n/a'})`);
+        closeCircuit(); // a real response means the engine is alive
         return { content, provider: provider.name, truncated };
       }
       throw new Error('Empty response');
     } catch (err) {
+      // Track consecutive timeouts to trip the mid-cycle breaker. A non-timeout
+      // error (e.g. HTTP 4xx/5xx) means the engine is answering, so it doesn't
+      // count toward a wedge — reset the streak instead.
+      if (isTimeoutError(err)) {
+        consecutiveTimeouts++;
+        if (consecutiveTimeouts >= CIRCUIT_TIMEOUT_THRESHOLD && !circuitOpen) {
+          circuitOpen = true;
+          console.warn(`[Heartbeat] Circuit opened after ${consecutiveTimeouts} consecutive timeouts — brain appears wedged; remaining calls will fast-fail`);
+        }
+      } else {
+        consecutiveTimeouts = 0;
+      }
       console.log(`[Heartbeat] ${provider.name} failed: ${err.message}`);
       lastError = err;
     }
@@ -1451,6 +1491,8 @@ async function runMaintenance() {
       } catch (e) { /* best-effort daily-log write */ }
       return { skipped: true, reason: 'brain unreachable' };
     }
+    // Preflight passed — start the cycle with a clean breaker.
+    closeCircuit();
 
     const config = getConfig();
     const maxFacts = config.memory.maxFactsPerCluster || 10;
@@ -1470,6 +1512,18 @@ async function runMaintenance() {
       console.log('[Heartbeat] No oversized clusters to audit — skipping steps 1–3');
       // Still run cross-link audit to keep link table healthy
       crossLinkResults = await auditCrossLinks();
+    }
+
+    // Mid-cycle breaker: if the brain wedged during the audit phase (its heaviest
+    // LLM load), the circuit is now open. Abort before cleanup/reflection/
+    // initiative pile more doomed calls onto a dead engine — the exact runaway
+    // the preflight can't catch once a cycle is already underway.
+    if (circuitOpen) {
+      console.log('[Heartbeat] brain wedged mid-cycle, aborting pass');
+      try {
+        factExtractor.appendToDailyLog('Heartbeat: brain wedged mid-cycle, aborting remaining tasks', DAILY_DIR);
+      } catch (e) { /* best-effort daily-log write */ }
+      return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults, crossLinkResults };
     }
 
     // Merge any clusters sharing the same name (catches duplicates from
@@ -1645,6 +1699,10 @@ function startLivenessProbe() {
         console.log(`[Liveness] ${msg}`);
         try { factExtractor.appendToDailyLog(msg, DAILY_DIR); } catch (e) { /* best-effort */ }
       }
+      // A healthy probe also closes the mid-cycle breaker so background LLM work
+      // (initiative, salience, contradiction judging) resumes once the brain is
+      // back, without waiting for the next 2-hour heartbeat cycle to reset it.
+      if (probe.ok) closeCircuit();
     } catch (err) {
       console.error('[Liveness] Probe error:', err.message);
     }

@@ -70,7 +70,16 @@ function getModelContextLimit(model) {
  * @returns {{needsFlush: boolean, tokenCount: number, contextLimit: number, usage: number}}
  */
 function shouldFlush(messages, model) {
-  const tokenCount = estimateMessagesTokens(messages);
+  // Only user/assistant turns are compactable. A flush KEEPS the system message
+  // (the injected memory context / identity prompt) verbatim, so counting it
+  // toward the threshold made flush fire on every request once the memory prompt
+  // grew large — even when there was nothing to compact — and each firing blocks
+  // the chat on a synchronous extraction call. Measure the compactable portion
+  // only, so flush triggers on genuinely long conversations, not a big prompt.
+  const conversation = Array.isArray(messages)
+    ? messages.filter(m => m && m.role !== 'system')
+    : [];
+  const tokenCount = estimateMessagesTokens(conversation);
   const contextLimit = getModelContextLimit(model);
   const usage = contextLimit > 0 ? tokenCount / contextLimit : 0;
   const needsFlush = tokenCount > (contextLimit * 0.80);
@@ -89,7 +98,10 @@ function shouldFlush(messages, model) {
  */
 async function callLLMForFlush(provider, model, messages, apiKey, host) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  // Flush runs inline on the chat request path, so a slow/wedged brain here
+  // stalls the user's reply. Bound it tightly — on timeout the flush fails
+  // gracefully and the chat proceeds with the uncompacted messages.
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
 
   try {
     let response;
