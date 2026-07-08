@@ -47,7 +47,7 @@ const PORT = process.env.PORT || 3000;
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
-const SEARXNG_HOST = process.env.SEARXNG_HOST || 'http://192.168.4.97:8888';
+const SEARXNG_HOST = process.env.SEARXNG_HOST || 'http://localhost:8888';
 
 // Additional allowed Ollama hosts (comma-separated in .env)
 const ALLOWED_OLLAMA_HOSTS = process.env.ALLOWED_OLLAMA_HOSTS
