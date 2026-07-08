@@ -26,6 +26,7 @@ const identity = require('./db/identity');
 const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
+const injectionBudget = require('./db/injection-budget');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1615,31 +1616,49 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Build messages array with memory context injected
     let enhancedMessages = [...messages];
 
-    // Build comprehensive memory system prompt
+    // Build comprehensive memory system prompt.
+    // Each source is capped to a configured token budget so the injected system
+    // context stays small (fast prefill). Budgets live in config.memory.injection.
     const memoryParts = [];
+    const injCfg = (getConfig().memory && getConfig().memory.injection) || {};
 
-    // Add durable memory (MEMORY.md + USER.md)
+    // Add durable memory (MEMORY.md + USER.md), long-term capped.
     if (memoryFiles.memory) {
-      memoryParts.push(`=== Long-Term Memory ===\n${memoryFiles.memory}`);
+      const { text: ltm } = injectionBudget.budgetText(
+        memoryFiles.memory, injCfg.longTermTokens ?? 3000, 'long-term memory');
+      memoryParts.push(`=== Long-Term Memory ===\n${ltm}`);
     }
     if (memoryFiles.user) {
       memoryParts.push(`=== User Profile ===\n${memoryFiles.user}`);
     }
 
-    // Add daily logs for short-term continuity
-    if (memoryFiles.dailyYesterday) {
-      memoryParts.push(`=== Yesterday's Session Log ===\n${memoryFiles.dailyYesterday}`);
-    }
-    if (memoryFiles.dailyToday) {
-      memoryParts.push(`=== Today's Session Log ===\n${memoryFiles.dailyToday}`);
+    // Daily logs for short-term continuity: inject today's most-recent entries
+    // verbatim (up to dailyTodayTokens) plus a brief digest of the remainder +
+    // yesterday (up to dailySummaryTokens), instead of both files wholesale.
+    if (memoryFiles.dailyToday || memoryFiles.dailyYesterday) {
+      const { recent, summary, stats } = injectionBudget.budgetDailyLogs(
+        memoryFiles.dailyToday || '',
+        memoryFiles.dailyYesterday || '',
+        { dailyTodayTokens: injCfg.dailyTodayTokens ?? 1500,
+          dailySummaryTokens: injCfg.dailySummaryTokens ?? 400 }
+      );
+      if (recent) {
+        memoryParts.push(`=== Today's Session Log (most recent) ===\n${recent}`);
+      }
+      if (summary) {
+        memoryParts.push(`=== Earlier / Yesterday (brief) ===\n${summary}`);
+      }
+      console.log(`[Injection] Daily log budgeted: kept ${stats.todayBlocksKept}/${stats.todayBlocksTotal} today blocks (~${stats.recentTokens} tok) + digest (~${stats.summaryTokens} tok)`);
     }
 
-    // Add hybrid search results from past conversations
+    // Add hybrid search results from past conversations (token-capped).
     if (memoryContext.length > 0) {
       const contextText = memoryContext
         .map((m, i) => `[Memory ${i + 1}] ${m.role}: ${m.text.substring(0, 500)}${m.text.length > 500 ? '...' : ''}`)
         .join('\n');
-      memoryParts.push(`=== Relevant Past Conversations ===\n${contextText}`);
+      const { text: capped } = injectionBudget.budgetText(
+        contextText, injCfg.pastConvoTokens ?? 800, 'past conversations');
+      memoryParts.push(`=== Relevant Past Conversations ===\n${capped}`);
     }
 
     // Add cluster-aware memory context
@@ -1659,7 +1678,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         }
         return text;
       }).join('\n\n');
-      memoryParts.push(`=== Associated Memory Clusters ===\n${clusterText}`);
+      const { text: cappedClusters } = injectionBudget.budgetText(
+        clusterText, injCfg.clusterTokens ?? 1200, 'cluster memory');
+      memoryParts.push(`=== Associated Memory Clusters ===\n${cappedClusters}`);
     }
 
     // === Conversational nudge: "what's on your mind?" ===
@@ -1789,6 +1810,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     } catch (identityErr) {
       console.error('[Identity] Injection error:', identityErr.message);
     }
+
+    // Observability: total injected system-context size. Exposed as the
+    // X-Injected-Tokens response header and logged, so prefill cost is visible.
+    let injectedTokens = 0;
+    try {
+      injectedTokens = enhancedMessages
+        .filter(m => m.role === 'system')
+        .reduce((sum, m) => sum + injectionBudget.estTokens(m.content), 0);
+      console.log(`[Injection] Total system-context: ~${injectedTokens} tokens across ${enhancedMessages.filter(m => m.role === 'system').length} system message(s)`);
+    } catch (_) {}
 
     // Auto-generate title from first user message if needed
     const conversation = db.getConversation(convoId);
@@ -2213,6 +2244,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const contentType = (providerType === 'ollama' || providerType === 'squatchserve') ? 'application/x-ndjson' : 'text/event-stream';
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Conversation-Id', convoId);
+    res.setHeader('X-Injected-Tokens', String(injectedTokens));
     res.setHeader('X-Has-Memory-Context', (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user) ? 'true' : 'false');
     res.setHeader('X-Tools-Used', toolsUsed ? 'true' : 'false');
     // Count memory sources for the frontend

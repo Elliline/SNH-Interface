@@ -966,6 +966,9 @@ function addMessage(role, content) {
 
 // Update the last message (for streaming responses)
 function updateLastMessage(content) {
+  // First streamed token means prefill is done — retire the "thinking" timer so
+  // the visible response replaces it (and the elapsed counter reads as TTFT).
+  if (isTyping) hideTypingIndicator();
   if (ttsEnabled) {
     console.log('[ttsChunker] updateLastMessage feeding, content length:', content.length, 'active:', ttsChunker.active);
     ttsChunker.feed(content);
@@ -1030,17 +1033,42 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// Show typing indicator
+// Show typing indicator. During long prefill (the model reading a large system
+// context before emitting its first token) the UI would otherwise look frozen —
+// indistinguishable from a crash. So we count up the elapsed seconds and, past a
+// threshold, add a hint that a large context is being processed.
+let typingTimerId = null;
+let typingStartMs = 0;
+const typingStatusEl = document.getElementById('typingStatus');
+const PREFILL_HINT_AFTER_MS = 10000;
+
+function renderTypingStatus() {
+  if (!typingStatusEl) return;
+  const secs = Math.floor((Date.now() - typingStartMs) / 1000);
+  let txt = `${secs}s`;
+  if (Date.now() - typingStartMs >= PREFILL_HINT_AFTER_MS) {
+    txt += ` <span class="typing-hint">· processing large context — the first response can take a while</span>`;
+  }
+  typingStatusEl.innerHTML = txt;
+}
+
 function showTypingIndicator() {
   isTyping = true;
   typingIndicator.style.display = 'flex';
+  typingStartMs = Date.now();
+  if (typingStatusEl) typingStatusEl.innerHTML = '0s';
+  if (typingTimerId) clearInterval(typingTimerId);
+  typingTimerId = setInterval(renderTypingStatus, 1000);
   chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
-// Hide typing indicator
+// Hide typing indicator (also called on first token, so the counter reflects
+// time-to-first-token rather than total generation time).
 function hideTypingIndicator() {
   isTyping = false;
   typingIndicator.style.display = 'none';
+  if (typingTimerId) { clearInterval(typingTimerId); typingTimerId = null; }
+  if (typingStatusEl) typingStatusEl.innerHTML = '';
 }
 
 // Start a new chat
@@ -3227,6 +3255,44 @@ function friendlyAnomaly(raw) {
   return s;
 }
 
+// Operational events (errors, timeouts, liveness/circuit-breaker, maintenance
+// telemetry) live in a separate ops log that is deliberately NEVER injected into
+// chat context. Surface the most recent ones here so a wedged/slow brain stays
+// observable. Returns an HTML string (empty if no ops recorded).
+async function loadOpsSection() {
+  try {
+    const listRes = await fetch('/api/memory/ops');
+    const { dates } = await listRes.json();
+    if (!dates || dates.length === 0) return '';
+    const res = await fetch(`/api/memory/ops/${dates[0]}`);
+    if (!res.ok) return '';
+    const { date, content } = await res.json();
+    // Parse "### HH:MM\n- text" blocks (newest first), take the most recent 15.
+    const blocks = content
+      .replace(/^#\s[^\n]*\n/, '')
+      .split(/(?=^#{2,3} )/m)
+      .map(b => b.trim())
+      .filter(Boolean)
+      .slice(0, 15);
+    if (blocks.length === 0) return '';
+    const items = blocks.map(b => {
+      const timeMatch = b.match(/^#{2,3}\s*([^\n]+)/);
+      const time = timeMatch ? timeMatch[1].replace(/^Heartbeat Report.*/, 'maintenance report') : '';
+      const firstBullet = (b.split('\n').find(l => l.trim().startsWith('- ')) || '').replace(/^\s*-\s*/, '');
+      const text = firstBullet || b.split('\n').slice(1).join(' ').slice(0, 200);
+      return `<div class="thinking-anomaly">🛠 <span class="thinking-dim">${escapeHtml(time)}</span> ${escapeHtml(text)}</div>`;
+    }).join('');
+    return `
+      <details class="thinking-entry thinking-ops">
+        <summary class="thinking-head"><span class="thinking-kind thinking-kind-ops">operational events</span><span class="thinking-when">${escapeHtml(date)} · not injected into chat</span></summary>
+        <div class="thinking-anomalies">${items}</div>
+      </details>`;
+  } catch (e) {
+    console.error('[Thinking] Error loading ops section:', e);
+    return '';
+  }
+}
+
 async function loadThinkingTab() {
   const container = document.getElementById('memoryThinkingContent');
   if (!container) return;
@@ -3239,11 +3305,15 @@ async function loadThinkingTab() {
   };
 
   try {
-    const res = await fetch('/api/memory/thinking?limit=60');
+    const [res, opsHtml] = await Promise.all([
+      fetch('/api/memory/thinking?limit=60'),
+      loadOpsSection(),
+    ]);
     const data = await res.json();
     const entries = data.entries || [];
 
     let html = '<div class="memory-self-note">A read-only look at how SNH thinks in the background — each reflection cycle (what it reviewed, considered, and queued or skipped, and why) and each heartbeat maintenance pass. Newest first.</div>';
+    html += opsHtml;
 
     if (entries.length === 0) {
       html += '<div class="memory-empty">No thinking recorded yet. Reflection and heartbeat cycles will populate this.</div>';

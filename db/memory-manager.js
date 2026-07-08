@@ -24,6 +24,10 @@ const initiativeEngine = require('./initiative-engine');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
+// Operational events (liveness/heartbeat failures, circuit-breaker trips,
+// maintenance-pass telemetry) go here — surfaced in the Thinking tab, never
+// injected into chat context. Keeps the daily log cognitively meaningful.
+const OPS_DIR = path.join(MEMORY_DIR, 'ops');
 const ARCHIVE_DIR = path.join(DAILY_DIR, 'archive');
 
 let heartbeatTimer = null;
@@ -747,9 +751,11 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
   }
   console.log('[Heartbeat] === End Report ===');
 
-  // Prepend to daily log (newest first)
+  // Prepend to the OPS log (newest first) — this is maintenance telemetry, not
+  // cognitive memory, so it stays out of the injected daily log. It remains
+  // fully visible in the Thinking tab via getHeartbeatReports().
   try {
-    const dailyDir = path.join(__dirname, '../data/memory/daily');
+    const opsDir = OPS_DIR;
     const today = getLocalDateStamp(); // local Pacific date
 
     let splitSummary = '';
@@ -789,8 +795,8 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
     ].join('\n').replace(/\s*$/, '') + '\n\n';
 
     // Prepend under the H1 header so the newest report is at the top.
-    const dailyFile = factExtractor.prependDailyEntry(reportBlock, dailyDir, today);
-    console.log(`[Heartbeat] Report prepended to ${dailyFile}`);
+    const opsFile = factExtractor.prependDailyEntry(reportBlock, opsDir, today, 'Ops Log');
+    console.log(`[Heartbeat] Report prepended to ${opsFile}`);
   } catch (err) {
     console.error('[Heartbeat] Failed to write daily report:', err.message);
   }
@@ -1487,8 +1493,8 @@ async function runMaintenance() {
     if (!brainLive) {
       console.log('[Heartbeat] brain unreachable, skipping cycle');
       try {
-        factExtractor.appendToDailyLog(`Heartbeat: brain unreachable, skipping cycle (${lastProbeErr})`, DAILY_DIR);
-      } catch (e) { /* best-effort daily-log write */ }
+        factExtractor.appendToOpsLog(`Heartbeat: brain unreachable, skipping cycle (${lastProbeErr})`, OPS_DIR);
+      } catch (e) { /* best-effort ops-log write */ }
       return { skipped: true, reason: 'brain unreachable' };
     }
     // Preflight passed — start the cycle with a clean breaker.
@@ -1521,8 +1527,8 @@ async function runMaintenance() {
     if (circuitOpen) {
       console.log('[Heartbeat] brain wedged mid-cycle, aborting pass');
       try {
-        factExtractor.appendToDailyLog('Heartbeat: brain wedged mid-cycle, aborting remaining tasks', DAILY_DIR);
-      } catch (e) { /* best-effort daily-log write */ }
+        factExtractor.appendToOpsLog('Heartbeat: brain wedged mid-cycle, aborting remaining tasks', OPS_DIR);
+      } catch (e) { /* best-effort ops-log write */ }
       return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults, crossLinkResults };
     }
 
@@ -1692,12 +1698,12 @@ function startLivenessProbe() {
         lastLivenessOk = false;
         const msg = `⚠️ Brain liveness probe FAILED: ${probe.error} — engine may be wedged`;
         console.warn(`[Liveness] ${msg}`);
-        try { factExtractor.appendToDailyLog(msg, DAILY_DIR); } catch (e) { /* best-effort */ }
+        try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
       } else if (probe.ok && !lastLivenessOk) {
         lastLivenessOk = true;
         const msg = `Brain liveness recovered — responded in ${probe.ms}ms`;
         console.log(`[Liveness] ${msg}`);
-        try { factExtractor.appendToDailyLog(msg, DAILY_DIR); } catch (e) { /* best-effort */ }
+        try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
       }
       // A healthy probe also closes the mid-cycle breaker so background LLM work
       // (initiative, salience, contradiction judging) resumes once the brain is

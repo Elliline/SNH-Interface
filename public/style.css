@@ -349,6 +349,17 @@ body {
   animation: bounce 1.5s infinite;
 }
 
+.typing-status {
+  margin-left: 10px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  align-self: center;
+}
+.typing-status .typing-hint {
+  color: var(--secondary-color, var(--text-secondary));
+  opacity: 0.9;
+}
+
 .typing-dot:nth-child(2) {
   animation-delay: 0.2s;
 }
@@ -2021,6 +2032,10 @@ body {
 }
 .thinking-kind-reflection { color: var(--accent-color); }
 .thinking-kind-heartbeat  { color: var(--secondary-color); }
+.thinking-kind-ops        { color: var(--text-secondary); }
+.thinking-ops { cursor: pointer; }
+.thinking-ops summary { list-style: none; }
+.thinking-ops summary::-webkit-details-marker { display: none; }
 .thinking-when { font-size: 0.72rem; color: var(--text-secondary); }
 .thinking-dur {
   font-size: 0.7rem;

@@ -96,6 +96,49 @@ router.get('/daily/:date', (req, res) => {
 });
 
 /**
+ * GET /api/memory/ops        → list available ops-log dates (newest first)
+ * GET /api/memory/ops/:date  → load one ops log (YYYY-MM-DD)
+ *
+ * The ops log holds operational events (errors, timeouts, liveness/circuit
+ * events, heartbeat maintenance reports, background telemetry) that are
+ * deliberately kept OUT of the injected chat context. Surfaced in the Thinking
+ * tab so a wedged/slow brain stays observable.
+ */
+const OPS_DIR = path.join(MEMORY_DIR, 'ops');
+
+router.get('/ops', (req, res) => {
+  try {
+    if (!fs.existsSync(OPS_DIR)) return res.json({ dates: [] });
+    const dates = fs.readdirSync(OPS_DIR)
+      .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+      .map(f => f.replace(/\.md$/, ''))
+      .sort()
+      .reverse();
+    res.json({ dates });
+  } catch (error) {
+    console.error('[MemoryAPI] Error listing ops logs:', error.message);
+    res.status(500).json({ error: 'Failed to list ops logs' });
+  }
+});
+
+router.get('/ops/:date', (req, res) => {
+  try {
+    const { date } = req.params;
+    if (!isValidDate(date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+    const opsFile = path.join(OPS_DIR, `${date}.md`);
+    if (!fs.existsSync(opsFile)) {
+      return res.status(404).json({ error: 'Ops log not found for this date' });
+    }
+    res.json({ date, content: fs.readFileSync(opsFile, 'utf8') });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading ops log:', error.message);
+    res.status(500).json({ error: 'Failed to load ops log' });
+  }
+});
+
+/**
  * GET /api/memory/clusters
  * Get clusters with member counts. Defaults to user-fact clusters so the Facts
  * and Clusters tabs don't mix in self-observation clusters (those surface in the

@@ -662,13 +662,13 @@ async function appendToMemory(facts, memoryFilePath) {
  * @param {string} date - YYYY-MM-DD for the target file
  * @returns {string} Path to the daily file written
  */
-function prependDailyEntry(entry, dailyDir, date) {
+function prependDailyEntry(entry, dailyDir, date, headerLabel = 'Daily Log') {
   if (!fs.existsSync(dailyDir)) {
     fs.mkdirSync(dailyDir, { recursive: true });
   }
 
   const dailyFile = path.join(dailyDir, `${date}.md`);
-  const header = `# Daily Log - ${date}\n\n`;
+  const header = `# ${headerLabel} - ${date}\n\n`;
 
   if (!fs.existsSync(dailyFile)) {
     fs.writeFileSync(dailyFile, header + entry, 'utf8');
@@ -713,6 +713,30 @@ function appendToDailyLog(summary, dailyDir) {
 
   } catch (error) {
     console.error('[FactExtractor] Error appending to daily log:', error.message);
+  }
+}
+
+/**
+ * Append an OPERATIONAL event (errors, timeouts, liveness/circuit-breaker,
+ * background telemetry) to a separate ops log — NOT the daily log. The daily
+ * log stays cognitively meaningful (facts, supersessions, salience reasoning,
+ * reflections, initiatives) so it can be injected into chat context cheaply;
+ * ops events are surfaced only in the Thinking tab and are never injected.
+ * @param {string} summary - Ops event text
+ * @param {string} opsDir - Path to ops log directory (e.g. data/memory/ops)
+ */
+function appendToOpsLog(summary, opsDir) {
+  try {
+    if (!summary || summary.trim().length === 0) {
+      return;
+    }
+    const now = new Date();
+    const date = getLocalDateStamp(now);
+    const time = now.toTimeString().slice(0, 5);
+    const entry = `### ${time}\n- ${summary}\n\n`;
+    prependDailyEntry(entry, opsDir, date, 'Ops Log');
+  } catch (error) {
+    console.error('[FactExtractor] Error appending to ops log:', error.message);
   }
 }
 
@@ -984,6 +1008,7 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
 
     const memoryFile = path.join(memoryDir, 'MEMORY.md');
     const dailyDir = path.join(memoryDir, 'daily');
+    const opsDir = path.join(memoryDir, 'ops');
     const memoryClusters = require('./memory-clusters');
     const questions = require('./questions');
 
@@ -1167,9 +1192,10 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
       }
     }
 
-    // Create daily log summary
+    // Per-exchange telemetry marker → ops log (operational, not cognitive).
+    // The facts themselves land in the daily log via the salience entries above.
     const summary = `Chat exchange with ${extractionProvider}/${extractionModel} - ${facts.length} facts extracted`;
-    appendToDailyLog(summary, dailyDir);
+    appendToOpsLog(summary, opsDir);
 
     console.log('[FactExtractor] Fact extraction complete');
 
@@ -1408,6 +1434,7 @@ module.exports = {
   extractAllFactLines,
   appendToMemory,
   appendToDailyLog,
+  appendToOpsLog,
   prependDailyEntry,
   judgeContradiction,
   scoreSalience,

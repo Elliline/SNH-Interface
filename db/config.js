@@ -63,7 +63,19 @@ const DEFAULTS = {
     clusterLinkThreshold: 0.50,
     maxFactsPerCluster: 10,
     dailyLogRetentionDays: 7,
-    hybridSearchWeights: { vector: 0.6, bm25: 0.4 }
+    hybridSearchWeights: { vector: 0.6, bm25: 0.4 },
+    // Per-source token budgets for what gets injected into every chat's system
+    // context. Long prefill (60–90s TTFT) was caused by injecting whole daily
+    // logs + long-term memory wholesale (~17–27k tokens). These caps keep the
+    // total system context near ~6–8k tokens. Token counts are estimated at
+    // ~4 chars/token. Self-facts are separately budgeted by identity.maxSelfFacts.
+    injection: {
+      longTermTokens: 3000,      // MEMORY.md cap
+      dailyTodayTokens: 1500,    // today's most-recent entries injected verbatim
+      dailySummaryTokens: 400,   // brief digest of older-today + yesterday
+      clusterTokens: 1200,       // associated cluster memory cap
+      pastConvoTokens: 800       // hybrid-search past-conversation snippets cap
+    }
   },
   tools: {
     searxng: { enabled: false }

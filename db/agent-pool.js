@@ -28,7 +28,9 @@ const path = require('path');
 const { getConfig } = require('./config');
 const { getLocalDateStamp } = require('./datetime');
 
-const DAILY_DIR = path.join(__dirname, '../data/memory/daily');
+// Background-pass telemetry is operational, not cognitive, so it goes to the
+// ops log (Thinking tab) rather than the daily log that gets injected into chat.
+const OPS_DIR = path.join(__dirname, '../data/memory/ops');
 const DEFAULT_CONCURRENCY = 3;
 
 class AgentPool {
@@ -185,41 +187,42 @@ class AgentPool {
       `(${p.succeeded} ok, ${p.failed} failed), ${wallMs}ms wall-time, ` +
       `peak concurrency ${p.peakActive}${p.throttled ? ', throttled by chat' : ''}`;
     console.log(`[AgentPool] ${summary}`);
-    if (toDailyLog) this._appendDaily(summary);
+    if (toDailyLog) this._appendOps(summary);
     this._pass = null;
     return { ...p, wallMs };
   }
 
   /**
-   * Prepend a one-line entry at the top of today's daily log (newest first,
+   * Prepend a one-line entry at the top of today's OPS log (newest first,
    * under the H1 header). Best-effort. Kept self-contained (no cross-module
-   * require) to avoid a dependency cycle with fact-extractor.
+   * require) to avoid a dependency cycle with fact-extractor. Pass telemetry
+   * is operational, so it goes to the ops log — never the injected daily log.
    */
-  _appendDaily(summary) {
+  _appendOps(summary) {
     try {
-      if (!fs.existsSync(DAILY_DIR)) fs.mkdirSync(DAILY_DIR, { recursive: true });
+      if (!fs.existsSync(OPS_DIR)) fs.mkdirSync(OPS_DIR, { recursive: true });
       const now = new Date();
       const date = getLocalDateStamp(now); // local Pacific date
       const time = now.toTimeString().slice(0, 5);
-      const dailyFile = path.join(DAILY_DIR, `${date}.md`);
-      const header = `# Daily Log - ${date}\n\n`;
+      const opsFile = path.join(OPS_DIR, `${date}.md`);
+      const header = `# Ops Log - ${date}\n\n`;
       const entry = `### ${time}\n- ${summary}\n\n`;
 
-      if (!fs.existsSync(dailyFile)) {
-        fs.writeFileSync(dailyFile, header + entry, 'utf8');
+      if (!fs.existsSync(opsFile)) {
+        fs.writeFileSync(opsFile, header + entry, 'utf8');
         return;
       }
-      const content = fs.readFileSync(dailyFile, 'utf8');
+      const content = fs.readFileSync(opsFile, 'utf8');
       // Match only a level-1 "# " header, not a "## Heartbeat Report" block.
       const headerMatch = content.match(/^(# [^\n]*\r?\n(?:\r?\n)?)/);
       if (headerMatch) {
         const head = headerMatch[1];
-        fs.writeFileSync(dailyFile, head + entry + content.slice(head.length), 'utf8');
+        fs.writeFileSync(opsFile, head + entry + content.slice(head.length), 'utf8');
       } else {
-        fs.writeFileSync(dailyFile, header + entry + content, 'utf8');
+        fs.writeFileSync(opsFile, header + entry + content, 'utf8');
       }
     } catch (err) {
-      console.error('[AgentPool] Failed to write pass stats to daily log:', err.message);
+      console.error('[AgentPool] Failed to write pass stats to ops log:', err.message);
     }
   }
 }
