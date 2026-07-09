@@ -128,76 +128,120 @@ function isValidClusterName(name) {
   return true;
 }
 
+/**
+ * Normalize raw LLM output into a clean cluster label: single line, Title Case,
+ * no punctuation except "&", 2–4 words, ≤30 chars. Returns null if what's left
+ * isn't a usable name (so callers can fall back or keep the existing name).
+ * @param {string} raw
+ * @returns {string|null}
+ */
+function sanitizeClusterName(raw) {
+  if (!raw) return null;
+  // Pick the first non-empty line that isn't an obvious preamble ("Here is the
+  // label:"), so a chatty model's lead-in doesn't become the name.
+  const lines = String(raw).split('\n').map(x => x.trim()).filter(Boolean);
+  let s = lines.find(l => !/:$/.test(l) && !/^(sure|ok|okay|here|the label|category is)\b/i.test(l))
+    || lines[0] || '';
+  // Drop a leading "Label:" / "Category -" style prefix.
+  s = s.replace(/^(category|label|name|group|answer|cluster)\s*[:\-–]\s*/i, '');
+  // Keep only letters, digits, spaces and "&"; everything else → space.
+  s = s.replace(/[^A-Za-z0-9 &]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+
+  // Trim leading/trailing function words so labels don't dangle on "And"/"The".
+  const TRIM = new Set(['and', 'or', 'the', 'a', 'an', 'of', 'to', 'for', 'with', 'is', 'are', 'in', 'on']);
+  let toks = s.split(' ').filter(w => w === '&' || w.length > 0);
+  while (toks.length && (toks[0] === '&' || TRIM.has(toks[0].toLowerCase()))) toks.shift();
+  while (toks.length && (toks[toks.length - 1] === '&' || TRIM.has(toks[toks.length - 1].toLowerCase()))) toks.pop();
+  if (toks.length === 0) return null;
+
+  // Cap at 4 meaningful (non-"&") words, preserving order and any "&".
+  const out = [];
+  let count = 0;
+  for (const w of toks) {
+    if (w === '&') { out.push(w); continue; }
+    if (count >= 4) break;
+    out.push(w);
+    count++;
+  }
+  // A function word may now sit at the truncated tail ("...Users And") — trim it.
+  while (out.length && (out[out.length - 1] === '&' || TRIM.has(out[out.length - 1].toLowerCase()))) out.pop();
+  if (out.length === 0) return null;
+  // Title-case each word, but leave short acronyms (AI, AGI, MSP, RAV4) intact.
+  let words = out.map(w =>
+    w === '&' ? '&'
+      : /^[A-Z0-9]{2,4}$/.test(w) ? w
+        : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+  );
+  s = words.join(' ').replace(/\s*&\s*/g, ' & ').replace(/\s+/g, ' ').trim();
+
+  // Length cap first, then strip any "&" left dangling at either end (a trailing
+  // word may have been cut off, leaving "Foo &").
+  if (s.length > 30) {
+    s = s.slice(0, 30).replace(/\s+\S*$/, '').trim() || s.slice(0, 30).trim();
+  }
+  s = s.replace(/^&\s*/, '').replace(/\s*&\s*$/, '').trim();
+  if (s.length < 3) return null;
+  // Reject sentence fragments that slipped through (verbs, >4 words).
+  if (!isValidClusterName(s)) return null;
+  return s;
+}
+
+/**
+ * The one shared cluster namer: given a cluster's member facts, ask the LLM for
+ * a short natural-English noun-phrase label. Used by creation, the rename pass,
+ * audit splits, and the repair script so every path produces the same style of
+ * name. Returns null on failure so callers can fall back / keep the old name.
+ * @param {Array<string|{content:string}>} facts - member facts (strings or rows)
+ * @param {Object} [opts]
+ * @param {string} [opts.subject] - 'user' | 'self' (tunes the framing slightly)
+ * @returns {Promise<string|null>}
+ */
+async function generateClusterNameLLM(facts, opts = {}) {
+  try {
+    const contents = (facts || [])
+      .map(f => (typeof f === 'string' ? f : (f && f.content)) || '')
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (contents.length === 0) return null;
+
+    // Bound the prompt: at most 14 facts, each ≤200 chars.
+    const sample = contents.slice(0, 14).map(s => (s.length > 200 ? s.slice(0, 200) : s));
+    const isSelf = opts.subject === 'self';
+
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = 'You label a group of related facts with a short category name, like a folder label.';
+    const userPrompt =
+      `${isSelf ? 'These are self-observations an AI made about itself' : 'These facts belong to one group'}:\n` +
+      `${sample.map(s => `- ${s}`).join('\n')}\n\n` +
+      'Give a short, natural English noun phrase (2–4 words) that a person would use to label this group.\n\n' +
+      'Examples:\n' +
+      '- facts about a Tundra, a RAV4, and a trailer → Vehicles & Trailer\n' +
+      '- self-observations about validating others and reassurance habits → Validation Tendencies\n' +
+      '- facts about GPUs, servers, and RAM → Hardware & Infrastructure\n' +
+      '- facts about training LLMs and paths to AGI → AI Philosophy\n\n' +
+      'Rules: nouns only, no verbs, no full sentences. Join two themes with "&". ' +
+      'No quotes or punctuation other than "&". At most 4 words. Output ONLY the label, on one line.';
+
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 24 });
+    return sanitizeClusterName(content);
+  } catch (error) {
+    console.error('[Clusters] LLM name generation error:', error.message);
+    return null;
+  }
+}
+
 async function generateClusterName(fact, provider, model, apiKey, host) {
-  // 1. Try curated category first — fast, deterministic, no LLM needed
+  // 1. Try curated category first — fast, deterministic, no LLM needed.
   const curatedName = matchCuratedCategory(fact);
   if (curatedName) return curatedName;
 
-  // 2. Try LLM with few-shot examples and constraints
-  const prompt = `You are a category labeler. Given a fact about a user, return a short 1-3 word category name (like a folder label). Use nouns only, no verbs or sentences.
+  // 2. Shared LLM namer (same one used by the rename pass and audit splits).
+  const llmName = await generateClusterNameLLM([fact]);
+  if (llmName) return llmName;
 
-Examples:
-- "User has two cats" → Pets & Animals
-- "User runs an MSP business" → Business & MSP
-- "User has an RTX 4090 GPU" → Hardware & Infrastructure
-- "User plays Stellaris" → Gaming
-- "User is building a memory system for their AI assistant" → AI & Projects
-
-Return ONLY the category name, nothing else.
-
-Fact: ${fact}`;
-
-  try {
-    let llmName = null;
-
-    if (provider === 'ollama') {
-      const response = await fetch(`${host}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: model,
-          prompt: prompt,
-          stream: false
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Ollama request failed: ${response.status}`);
-      }
-
-      const data = await response.json();
-      llmName = data.response?.trim()?.substring(0, 50);
-    } else if (provider === 'llamacpp') {
-      const response = await fetch(`${host}/completion`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: prompt,
-          n_predict: 20,
-          temperature: 0.3,
-          stream: false
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Llama.cpp request failed: ${response.status}`);
-      }
-
-      const data = await response.json();
-      llmName = data.content?.trim()?.substring(0, 50);
-    }
-
-    // 3. Post-LLM validation: reject names with >4 words or containing verbs
-    if (llmName && isValidClusterName(llmName)) {
-      return llmName;
-    }
-
-    // 4. Fall back to word-frequency extraction
-    return extractNameFromFact(fact);
-  } catch (error) {
-    console.error('[Clusters] Cluster name generation error:', error.message);
-    return extractNameFromFact(fact);
-  }
+  // 3. Last resort if the LLM is unavailable: keyword extraction from the fact.
+  return extractNameFromFact(fact);
 }
 
 /**
@@ -370,25 +414,33 @@ function matchCuratedCategory(text) {
 }
 
 /**
- * Rename all clusters using word frequency analysis of their members
+ * Regenerate cluster names from their member facts using the shared LLM namer.
+ * @param {Object} [options]
+ * @param {string[]} [options.ids] - Only rename these cluster ids (default: all).
  * @returns {Promise<number>} - Number of clusters renamed
  */
-async function renameAllClusters() {
+async function renameAllClusters(options = {}) {
   try {
     const db = getSqliteDb();
     if (!db) return 0;
 
-    const clusters = db.prepare('SELECT id, name FROM memory_clusters').all();
+    const clusters = Array.isArray(options.ids)
+      ? options.ids
+          .map(id => db.prepare('SELECT id, name, subject FROM memory_clusters WHERE id = ?').get(id))
+          .filter(Boolean)
+      : db.prepare('SELECT id, name, subject FROM memory_clusters').all();
     let renamed = 0;
 
     for (const cluster of clusters) {
+      // Name from active facts only — superseded ones shouldn't shape the label.
       const members = db.prepare(
-        'SELECT content FROM cluster_members WHERE cluster_id = ?'
+        "SELECT content FROM cluster_members WHERE cluster_id = ? AND (status = 'active' OR status IS NULL)"
       ).all(cluster.id);
 
       if (members.length === 0) continue;
 
-      const newName = generateClusterNameFromMembers(members);
+      const newName = await generateClusterNameLLM(members, { subject: cluster.subject });
+      // null → LLM unavailable/garbage; keep the existing name rather than clobber it.
       if (newName && newName !== cluster.name) {
         db.prepare('UPDATE memory_clusters SET name = ? WHERE id = ?')
           .run(newName, cluster.id);
@@ -1444,6 +1496,8 @@ module.exports = {
   generateEmbedding,
   cosineSimilarity,
   generateClusterNameFromMembers,
+  generateClusterNameLLM,
+  sanitizeClusterName,
   matchCuratedCategory,
   isValidClusterName,
   renameAllClusters,

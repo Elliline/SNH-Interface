@@ -387,6 +387,10 @@ async function executeSplits(auditResults) {
 
   console.log(`[Heartbeat] Applying splits for ${incoherentResults.length} incoherent cluster(s)`);
 
+  // Clusters whose membership changed and therefore need a fresh name: every new
+  // split-out cluster, plus any source cluster that retained facts.
+  const touchedClusterIds = new Set();
+
   for (const auditResult of incoherentResults) {
     const { clusterId, clusterName, splits } = auditResult;
 
@@ -431,8 +435,11 @@ async function executeSplits(auditResults) {
           continue;
         }
 
-        // Create new cluster
+        // Create new cluster. The audit's newClusterName is a provisional label;
+        // renameAllClusters below regenerates it from the actual moved facts via
+        // the shared LLM namer, so splits get the same naming as every other path.
         const newClusterId = randomUUID();
+        touchedClusterIds.add(newClusterId);
         db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?, ?, ?, ?, ?, ?)')
           .run(newClusterId, split.newClusterName, '', now, now, srcSubject);
 
@@ -481,6 +488,7 @@ async function executeSplits(auditResults) {
         splitDetail.originalDeleted = true;
       } else {
         db.prepare('UPDATE memory_clusters SET updated_at = ? WHERE id = ?').run(now, clusterId);
+        touchedClusterIds.add(clusterId);
         splitDetail.originalRetained = true;
         splitDetail.originalRemainingFacts = remainingCount;
       }
@@ -497,9 +505,9 @@ async function executeSplits(auditResults) {
   }
 
   if (results.clustersSplit > 0) {
-    console.log(`[Heartbeat] Renaming all clusters after ${results.clustersSplit} split(s)`);
+    console.log(`[Heartbeat] Renaming ${touchedClusterIds.size} touched cluster(s) after ${results.clustersSplit} split(s)`);
     try {
-      await memoryClusters.renameAllClusters();
+      await memoryClusters.renameAllClusters({ ids: [...touchedClusterIds] });
     } catch (err) {
       console.error('[Heartbeat] renameAllClusters error:', err.message);
       results.anomalies.push(`renameAllClusters failed: ${err.message}`);
