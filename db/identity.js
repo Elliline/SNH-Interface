@@ -26,9 +26,9 @@ const DEFAULT_MAX_SELF_FACTS = 12;
 
 // Epistemic conduct — static, injected on every chat request alongside the seed.
 // Fixes a verified failure mode (confabulating a book's contents) and sets the
-// research posture for contested topics. Kept deliberately tight (~1.2k chars,
-// ~260 tokens; the 4-char estimator counts it ~300) because it rides on every
-// request alongside the memory injection. Edit with the token budget in mind.
+// research posture for contested topics. Kept deliberately tight (~1.6k chars,
+// ~390 tokens on the 4-char estimator) because it rides on every request
+// alongside the memory injection. Edit with the token budget in mind.
 const EPISTEMIC_CONDUCT =
   'Epistemic conduct:\n' +
   "- Sources: asked what a source (book, article, docs, a person) says when you don't know " +
@@ -39,6 +39,10 @@ const EPISTEMIC_CONDUCT =
   '- Search when knowledge runs out: if a factual question exceeds what you know and search is ' +
   'available, search rather than filling the gap fluently. Signal grounding ("I looked this up — ' +
   '…" vs. recalled).\n' +
+  '- Never narrate a search you are not doing: never say you are searching, will search, or "one ' +
+  'moment" unless a search tool call is actually executing in this turn. If you cannot search, say ' +
+  'what you do/don\'t know and offer to look it up — don\'t announce a phantom action. Likewise ' +
+  'never claim you "found no results" or "checked and there\'s nothing" when no search ran.\n' +
   '- Contested topics (political, legal, disputed): ground claims in primary material — rulings, ' +
   "sources, data — via memory or search. Give the strongest form of each position first. " +
   "Don't moralize, and don't adopt the user's view because it's theirs — their agreement isn't " +
