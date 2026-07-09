@@ -927,6 +927,112 @@ async function judgeAnswered(question, userMessage) {
 }
 
 /**
+ * Answer-aware gap check (Layer 2): before queueing a gap question, see whether
+ * memory already answers it. Searches clusters for the question's topic and asks
+ * the LLM whether the known facts make the question redundant. A gap question is
+ * always topically similar to its own source facts, so a pure similarity gate
+ * would suppress everything — the LLM judge is what distinguishes "the answer is
+ * already here" from "this is a genuine open question about a known topic".
+ * @param {string} question - The candidate gap question
+ * @returns {Promise<{evidence: string}|null>} evidence fact if already answered, else null
+ */
+async function gapAlreadyAnswered(question) {
+  try {
+    const memoryClusters = require('./memory-clusters');
+    // Member-level semantic search (not cluster-aggregated) so we actually pull
+    // the individual facts most similar to the question. Restricted to active
+    // user-facts, which also keeps self-observations out of the judge context.
+    const candidates = await memoryClusters.findContradictionCandidates(question, {
+      subject: 'user', limit: 8, threshold: 0.4
+    });
+    const facts = (candidates || []).map(c => c.content).filter(Boolean);
+    if (facts.length === 0) return null;
+
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You decide whether a set of already-known facts sufficiently answers a clarifying question, so it need NOT be asked. Line 1: exactly YES or NO. If YES, line 2: the single known fact that best answers it, verbatim.`;
+    const userPrompt = `Clarifying question under consideration:\n"${question}"\n\nAlready-known facts:\n${facts.map(f => `- ${f}`).join('\n')}\n\nDo these facts already answer the question well enough that asking would be redundant?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
+    const lines = content.trim().split('\n');
+    if (!/^\s*yes\b/i.test(lines[0] || '')) return null;
+    const evidence = (lines[1] || '').replace(/^[-*\d.\s"]+/, '').replace(/"$/, '').trim() || facts[0];
+    return { evidence };
+  } catch (error) {
+    console.error('[FactExtractor] gapAlreadyAnswered error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Answer detection (Layer 3): retire questions the user's latest message
+ * answers. Two passes:
+ *  (a) precise — questions surfaced (asked) in THIS conversation, judged
+ *      unconditionally (cheap, and the original narrow behavior).
+ *  (b) broad — ANY outstanding question (pending or asked, in ANY conversation)
+ *      whose topic matches this message, embedding-gated so only the few
+ *      topically-close ones reach the LLM judge. This is the actual bug fix: a
+ *      question answered in a different conversation, or before it was ever
+ *      surfaced, now gets flipped to answered instead of lingering and re-asking.
+ * @param {string} userMessage
+ * @param {string} conversationId
+ * @param {string} dailyDir - for the audit trail (optional)
+ * @returns {Promise<string[]>} ids of questions marked answered
+ */
+async function detectAnswers(userMessage, conversationId = null, dailyDir = DAILY_DIR) {
+  const questions = require('./questions');
+  const answered = [];
+  if (!userMessage || !userMessage.trim()) return answered;
+
+  const markIt = (q, note) => {
+    if (questions.markAnswered(q.id)) {
+      answered.push(q.id);
+      if (dailyDir) appendToDailyLog(`Question answered${note ? ` (${note})` : ''}: "${q.question}"`, dailyDir);
+    }
+  };
+
+  // (a) Precise: questions asked in this conversation.
+  if (conversationId) {
+    try {
+      for (const q of questions.getAskedForConversation(conversationId)) {
+        if (await judgeAnswered(q.question, userMessage)) markIt(q);
+      }
+    } catch (err) {
+      console.error('[FactExtractor] Answer detection (this-convo) error:', err.message);
+    }
+  }
+
+  // (b) Broad: topic-matched outstanding questions across all conversations.
+  try {
+    const outstanding = questions.getOutstanding();
+    if (outstanding.length > 0) {
+      const memoryClusters = require('./memory-clusters');
+      const msgEmb = await memoryClusters.generateEmbedding(userMessage);
+      if (msgEmb) {
+        const cfg = getConfig();
+        const floor = Number.isFinite(cfg.questions?.answerMatchFloor) ? cfg.questions.answerMatchFloor : 0.40;
+        const maxJudge = Number.isInteger(cfg.questions?.answerMaxJudge) ? cfg.questions.answerMaxJudge : 6;
+        const scored = [];
+        for (const q of outstanding) {
+          const emb = questions.parseEmbedding(q.embedding) || await memoryClusters.generateEmbedding(q.question);
+          if (!emb) continue;
+          const sim = questions.cosineSim(msgEmb, emb);
+          if (sim >= floor) scored.push({ q, sim });
+        }
+        scored.sort((a, b) => b.sim - a.sim);
+        for (const { q, sim } of scored.slice(0, maxJudge)) {
+          if (await judgeAnswered(q.question, userMessage)) {
+            markIt(q, `topic match, sim ${sim.toFixed(2)}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[FactExtractor] Answer detection (broad) error:', err.message);
+  }
+
+  return answered;
+}
+
+/**
  * Build a short context string of existing facts related to the new facts,
  * used to inform salience scoring and gap detection. Returns cluster name +
  * a few member facts. Also returns the ids of the clusters consulted.
@@ -1013,20 +1119,9 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
     const questions = require('./questions');
 
     // === Answer detection ===
-    // If this conversation had an outstanding asked question, check whether the
-    // user's message answers it (the answer itself is caught as facts normally).
-    if (conversationId) {
-      try {
-        for (const q of questions.getAskedForConversation(conversationId)) {
-          if (await judgeAnswered(q.question, userMessage)) {
-            questions.markAnswered(q.id);
-            appendToDailyLog(`Question answered: "${q.question}"`, dailyDir);
-          }
-        }
-      } catch (answerErr) {
-        console.error('[FactExtractor] Answer detection error:', answerErr.message);
-      }
-    }
+    // Retire any question this message answers — asked in this conversation, or
+    // any outstanding one across conversations whose topic matches (Layer 3).
+    await detectAnswers(userMessage, conversationId, dailyDir);
 
     // At most ONE question per chat session, shared by contradiction-uncertainty
     // (higher priority) and gap detection.
@@ -1079,7 +1174,7 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
             } else if (verdict === 'uncertain' && !questionQueued) {
               // Ambiguous conflict — ask the user rather than guess; both facts stay active.
               const q = `I have two things noted that might not line up: "${candidate.content}" and now "${fact}". Which is correct?`;
-              if (questions.addQuestion({
+              if (await questions.addQuestion({
                 question: q,
                 reason: 'contradiction-uncertainty',
                 clusterId: candidate.clusterId,
@@ -1177,17 +1272,25 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
       // facts landed in so it surfaces when the user next chats about that topic.
       // Respect the one-question-per-session slot (contradiction takes priority).
       if (!questionQueued && gapCandidate && gapCandidate.question) {
-        const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
-        const anchorMemberId = factToMemberId.get(facts[0]) || null;
-        if (questions.addQuestion({
-          question: gapCandidate.question,
-          reason: 'gap',
-          clusterId: anchorClusterId,
-          memberId: anchorMemberId,
-          conversationId
-        })) {
-          questionQueued = true;
-          appendToDailyLog(`Queued clarifying question (gap): "${gapCandidate.question}"`, dailyDir);
+        // Layer 2: don't queue a gap the memory can already answer.
+        const already = await gapAlreadyAnswered(gapCandidate.question);
+        if (already) {
+          appendToDailyLog(`Skipped gap question (already answered by memory): "${gapCandidate.question}" ← "${already.evidence}"`, dailyDir);
+          console.log(`[FactExtractor] Gap already answered by fact "${already.evidence}" — not queuing: "${gapCandidate.question}"`);
+        } else {
+          const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
+          const anchorMemberId = factToMemberId.get(facts[0]) || null;
+          // addQuestion also does semantic dedup vs all existing questions (Layer 1).
+          if (await questions.addQuestion({
+            question: gapCandidate.question,
+            reason: 'gap',
+            clusterId: anchorClusterId,
+            memberId: anchorMemberId,
+            conversationId
+          })) {
+            questionQueued = true;
+            appendToDailyLog(`Queued clarifying question (gap): "${gapCandidate.question}"`, dailyDir);
+          }
         }
       }
     }
@@ -1440,6 +1543,8 @@ module.exports = {
   scoreSalience,
   detectGapQuestion,
   judgeAnswered,
+  gapAlreadyAnswered,
+  detectAnswers,
   removeFactLineFromMemory,
   loadMemoryContext,
   processFactExtraction,

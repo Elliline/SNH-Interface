@@ -156,6 +156,21 @@ function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status)
     `);
 
+    // Migration: question dedup + answer auditing.
+    //  - embedding: cached vector of the question text, so dedup and topic-match
+    //    answer-detection don't re-embed every existing question each pass.
+    //  - answered_at: audit trail for when a question was retired (was missing,
+    //    which made re-ask bugs hard to trace).
+    const questionCols = sqliteDb.prepare('PRAGMA table_info(questions)').all();
+    if (!questionCols.some(c => c.name === 'embedding')) {
+      sqliteDb.exec('ALTER TABLE questions ADD COLUMN embedding TEXT');
+      console.log('Migration: added embedding to questions (backfilled lazily on next dedup/answer pass)');
+    }
+    if (!questionCols.some(c => c.name === 'answered_at')) {
+      sqliteDb.exec('ALTER TABLE questions ADD COLUMN answered_at DATETIME');
+      console.log('Migration: added answered_at to questions');
+    }
+
     // Migration: ensure facts (cluster_members) carry an updated_at timestamp.
     // Existing rows are backfilled from created_at (the closest recoverable
     // origin date), falling back to now() if created_at is somehow missing.

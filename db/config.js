@@ -58,6 +58,13 @@ const DEFAULTS = {
     maxPending: 10,             // cap on the pending pool so it never nags
     dedupThreshold: 0.85        // skip a new initiative this cosine-similar to a pending one of the same type
   },
+  // Question queue: gaps/oddities SNH may ask the user about. These guards keep
+  // it from re-asking things already asked or already answered.
+  questions: {
+    dedupThreshold: 0.85,       // don't queue a question this cosine-similar to ANY existing one (pending/asked/answered)
+    answerMatchFloor: 0.40,     // min cosine(user message, question) to bother LLM-judging "did this answer it"
+    answerMaxJudge: 6           // cap on how many topically-close outstanding questions we LLM-judge per message
+  },
   memory: {
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,
