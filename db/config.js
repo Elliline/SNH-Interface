@@ -68,6 +68,12 @@ const DEFAULTS = {
   memory: {
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,
+    // Hysteresis deadband for the cross-link auditor: an EXISTING link is only
+    // torn down when the LLM scores a pair strictly below this floor, while a NEW
+    // link still needs to reach clusterLinkThreshold. Pairs scoring in the
+    // [drop, link) band keep whatever link state they already have, so verdicts
+    // that jitter around 0.50 between passes stop flip-flopping create↔drop.
+    clusterLinkDropThreshold: 0.40,
     maxFactsPerCluster: 10,
     dailyLogRetentionDays: 7,
     hybridSearchWeights: { vector: 0.6, bm25: 0.4 },

@@ -59,10 +59,15 @@ async function addInitiative({ type, content, sourceKind = null, sourceRef = nul
     const safeType = VALID_TYPES.has(type) ? type : 'observation';
     const text = content.trim();
 
-    // 1. Exact dedup by source identity.
+    // 1. Exact dedup by source identity — against pending AND already-delivered
+    // items. Checking 'delivered' too closes the re-mint loop that re-asked the
+    // same question every heartbeat: the noticing pass re-proposes a still-open
+    // source each cycle, and once the prior initiative had been delivered a
+    // pending-only check no longer matched it, so a fresh duplicate was minted
+    // and surfaced again. A source we've already surfaced once is not re-queued.
     if (sourceRef) {
       const existing = db.prepare(
-        "SELECT id FROM initiatives WHERE status = 'pending' AND source_kind IS ? AND source_ref IS ?"
+        "SELECT id FROM initiatives WHERE status IN ('pending','delivered') AND source_kind IS ? AND source_ref IS ?"
       ).get(sourceKind, sourceRef);
       if (existing) return existing.id;
     }
@@ -281,6 +286,25 @@ function dismiss(id) {
   }
 }
 
+/**
+ * Dismiss every PENDING initiative that points at a given source (e.g. a
+ * question that has since been answered). Delivered ones are left as history.
+ * @returns {number} count dismissed
+ */
+function dismissForSource(sourceKind, sourceRef) {
+  try {
+    const db = getSqliteDb();
+    if (!db || !sourceRef) return 0;
+    const info = db.prepare(
+      "UPDATE initiatives SET status = 'dismissed' WHERE status = 'pending' AND source_kind IS ? AND source_ref IS ?"
+    ).run(sourceKind, sourceRef);
+    return info.changes;
+  } catch (error) {
+    console.error('[Initiatives] dismissForSource error:', error.message);
+    return 0;
+  }
+}
+
 function expire(id) {
   try {
     const db = getSqliteDb();
@@ -403,6 +427,7 @@ module.exports = {
   countPending,
   markDelivered,
   dismiss,
+  dismissForSource,
   expire,
   updatePriority,
   countUnpromptedDeliveredToday,

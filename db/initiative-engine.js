@@ -55,6 +55,26 @@ async function noticeFromQuestions() {
   let added = 0;
 
   try {
+    // Self-heal: retract any pending initiative whose backing question has since
+    // been answered (or otherwise left 'pending'). Answer-detection retires the
+    // question row, but a question/alert initiative already minted from it would
+    // otherwise linger in the pending pool and get re-surfaced — this is how the
+    // security-audit question resurfaced after the question-dedup fix landed.
+    const orphaned = sql.prepare(`
+      SELECT i.id, i.source_ref
+      FROM initiatives i
+      JOIN questions q ON q.id = i.source_ref
+      WHERE i.status = 'pending'
+        AND i.source_kind = 'question'
+        AND i.type IN ('question', 'alert')
+        AND q.status <> 'pending'
+    `).all();
+    for (const o of orphaned) {
+      if (initiatives.dismiss(o.id)) {
+        console.log(`[Initiatives] Dismissed pending initiative ${o.id} — backing question ${o.source_ref} is no longer pending`);
+      }
+    }
+
     // Stale gap questions, joined to their fact's salience.
     const cutoff = daysAgoIso(cfg.questionAgeDays);
     const staleGaps = sql.prepare(`

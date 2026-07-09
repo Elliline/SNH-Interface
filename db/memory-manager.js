@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, getLocalDateStamp } = require('./datetime');
 
@@ -550,6 +550,12 @@ async function auditCrossLinks() {
 
   const config = getConfig();
   const linkThreshold = config.memory.clusterLinkThreshold || 0.50;
+  // Hysteresis: only tear down an existing link when the score drops clearly
+  // below the create threshold. Scores in [dropThreshold, linkThreshold) leave
+  // the current link state untouched.
+  const dropThreshold = Number.isFinite(config.memory.clusterLinkDropThreshold)
+    ? config.memory.clusterLinkDropThreshold
+    : Math.max(0, linkThreshold - 0.10);
 
   const clusters = memoryClusters.getClusters();
   if (clusters.length < 2) {
@@ -576,15 +582,44 @@ async function auditCrossLinks() {
     }
   }
 
-  // Generate all unique pairs
+  // Generate all unique pairs, tagging each with the id-ordered key and a hash of
+  // the exact summaries we would feed the LLM. The hash lets us skip pairs whose
+  // content is unchanged since they were last judged.
   const pairs = [];
   for (let i = 0; i < clusters.length; i++) {
     for (let j = i + 1; j < clusters.length; j++) {
-      pairs.push([clusters[i], clusters[j]]);
+      const a = clusters[i];
+      const b = clusters[j];
+      const [lowId, highId] = a.id < b.id ? [a.id, b.id] : [b.id, a.id];
+      const sLow = clusterSummaries[lowId].summary;
+      const sHigh = clusterSummaries[highId].summary;
+      const hash = createHash('sha1').update(`${sLow} ${sHigh}`).digest('hex');
+      pairs.push({ a, b, lowId, highId, hash });
     }
   }
 
-  console.log(`[Heartbeat] Evaluating ${pairs.length} cluster pair(s) in batches of 10`);
+  // Skip pairs whose content hash matches the last stored judgment — the verdict
+  // would be identical, so the existing link state is already correct. Only new
+  // or content-changed pairs go to the LLM. This removes the flip-flop churn and
+  // the O(n²) LLM cost on an idle system.
+  const toJudge = [];
+  let reused = 0;
+  for (const p of pairs) {
+    const prior = db.prepare(
+      'SELECT content_hash FROM cluster_link_judgments WHERE cluster_a = ? AND cluster_b = ?'
+    ).get(p.lowId, p.highId);
+    if (prior && prior.content_hash === p.hash) {
+      reused++;
+    } else {
+      toJudge.push(p);
+    }
+  }
+
+  console.log(`[Heartbeat] ${pairs.length} cluster pair(s): ${reused} unchanged (skipped), ${toJudge.length} to (re)evaluate in batches of 10`);
+  if (toJudge.length === 0) {
+    console.log('[Heartbeat] Cross-link audit complete: no content changes, nothing re-judged');
+    return results;
+  }
 
   const BATCH_SIZE = 10;
 
@@ -606,10 +641,23 @@ Rules:
 - Return one entry per pair, in the same order as input.
 - Keep "reason" under 15 words.`;
 
-  for (let batchStart = 0; batchStart < pairs.length; batchStart += BATCH_SIZE) {
-    const batch = pairs.slice(batchStart, batchStart + BATCH_SIZE);
+  // Persist a fresh judgment for a pair (order-independent key).
+  const recordJudgment = (p, strength) => {
+    db.prepare(`
+      INSERT INTO cluster_link_judgments (cluster_a, cluster_b, content_hash, strength, judged_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(cluster_a, cluster_b) DO UPDATE SET
+        content_hash = excluded.content_hash,
+        strength = excluded.strength,
+        judged_at = excluded.judged_at
+    `).run(p.lowId, p.highId, p.hash, strength, new Date().toISOString());
+  };
 
-    const pairDescriptions = batch.map(([a, b]) => {
+  for (let batchStart = 0; batchStart < toJudge.length; batchStart += BATCH_SIZE) {
+    const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+    const batch = toJudge.slice(batchStart, batchStart + BATCH_SIZE);
+
+    const pairDescriptions = batch.map(({ a, b }) => {
       const sa = clusterSummaries[a.id];
       const sb = clusterSummaries[b.id];
       return `Pair "${sa.label}|${sb.label}":\n  ${sa.label}: ${sa.summary}\n  ${sb.label}: ${sb.summary}`;
@@ -625,15 +673,33 @@ Rules:
       rawContent = result.content;
       wasTruncated = result.truncated;
       parsed = parseJSON(rawContent);
+
+      if (!parsed || !Array.isArray(parsed.links)) {
+        // Retry once with the same strict-format recovery auditClusterCoherence
+        // uses: the usual cause is the model wrapping the JSON in prose / <think>
+        // reasoning, so (a) demand raw JSON only and (b) double the token budget.
+        console.warn(`[Heartbeat] Parse failure for cross-link batch ${batchNum} (${rawContent.length} chars, truncated: ${wasTruncated}) — retrying with stricter format. Raw tail: ...${rawContent.slice(-300)}`);
+        const strictSystem = systemPrompt + `
+
+CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no reasoning, no <think> blocks, no markdown code fences, no text before or after. Your entire response must begin with { and end with }.`;
+        const retryTokens = Math.min(12288, batchMaxTokens * 2);
+        const retry = await callLLM(strictSystem, pairDescriptions, { maxTokens: retryTokens });
+        rawContent = retry.content;
+        wasTruncated = retry.truncated;
+        parsed = parseJSON(rawContent);
+        if (parsed && Array.isArray(parsed.links)) {
+          console.log(`[Heartbeat] Cross-link batch ${batchNum} recovered on stricter-format retry`);
+        }
+      }
     } catch (err) {
-      console.error(`[Heartbeat] Cross-link batch ${batchStart / BATCH_SIZE + 1} LLM call failed:`, err.message);
-      results.anomalies.push(`Cross-link batch LLM failed (pairs ${batchStart}–${batchStart + batch.length - 1}): ${err.message}`);
+      console.error(`[Heartbeat] Cross-link batch ${batchNum} LLM call failed:`, err.message);
+      results.anomalies.push(`Cross-link batch LLM failed (${batch.length} pairs): ${err.message}`);
       continue;
     }
 
     if (!parsed || !Array.isArray(parsed.links)) {
-      console.warn(`[Heartbeat] Parse failure for cross-link batch ${batchStart / BATCH_SIZE + 1}: ${rawContent.length} chars, truncated: ${wasTruncated}, last 200: ...${rawContent.slice(-200)}`);
-      results.anomalies.push(`Cross-link batch ${batchStart / BATCH_SIZE + 1} returned unparseable JSON (${rawContent.length} chars, truncated: ${wasTruncated})`);
+      console.warn(`[Heartbeat] Parse failure persisted after retry for cross-link batch ${batchNum}: ${rawContent.length} chars, truncated: ${wasTruncated}. Raw tail: ...${rawContent.slice(-500)}`);
+      results.anomalies.push(`Cross-link batch ${batchNum} returned unparseable JSON after retry (${rawContent.length} chars, truncated: ${wasTruncated})`);
       continue;
     }
 
@@ -652,7 +718,8 @@ Rules:
       }
     }
 
-    for (const [a, b] of batch) {
+    for (const p of batch) {
+      const { a, b } = p;
       const nameA = clusterSummaries[a.id].name;
       const nameB = clusterSummaries[b.id].name;
       const labelA = clusterSummaries[a.id].label;
@@ -674,32 +741,30 @@ Rules:
            OR (cluster_a = ? AND cluster_b = ?)
       `).get(a.id, b.id, b.id, a.id);
 
-      if (strength < linkThreshold) {
-        if (existing) {
+      if (existing) {
+        if (strength < dropThreshold) {
           db.prepare('DELETE FROM cluster_links WHERE id = ?').run(existing.id);
           results.linksRemoved++;
-          console.log(`[Heartbeat] Removed link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)} below threshold)`);
+          console.log(`[Heartbeat] Removed link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)} below drop threshold ${dropThreshold})`);
+        } else if (strength >= linkThreshold && Math.abs(existing.strength - strength) >= 0.01) {
+          db.prepare('UPDATE cluster_links SET strength = ? WHERE id = ?')
+            .run(strength, existing.id);
+          results.linksUpdated++;
         }
-        // No existing link and below threshold — nothing to do
-      } else {
-        if (existing) {
-          if (Math.abs(existing.strength - strength) >= 0.01) {
-            db.prepare('UPDATE cluster_links SET strength = ? WHERE id = ?')
-              .run(strength, existing.id);
-            results.linksUpdated++;
-          }
-        } else {
-          const [orderedA, orderedB] = a.id < b.id ? [a.id, b.id] : [b.id, a.id];
-          db.prepare('INSERT INTO cluster_links (id, cluster_a, cluster_b, strength) VALUES (?, ?, ?, ?)')
-            .run(randomUUID(), orderedA, orderedB, strength);
-          results.linksAdded++;
-          console.log(`[Heartbeat] Added link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)})`);
-        }
+        // Deadband [dropThreshold, linkThreshold): keep the existing link as-is.
+      } else if (strength >= linkThreshold) {
+        db.prepare('INSERT INTO cluster_links (id, cluster_a, cluster_b, strength) VALUES (?, ?, ?, ?)')
+          .run(randomUUID(), p.lowId, p.highId, strength);
+        results.linksAdded++;
+        console.log(`[Heartbeat] Added link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)})`);
       }
+      // No existing link and below threshold — nothing to do.
+
+      recordJudgment(p, strength);
     }
   }
 
-  console.log(`[Heartbeat] Cross-link audit complete: ${results.linksAdded} added, ${results.linksUpdated} updated, ${results.linksRemoved} removed`);
+  console.log(`[Heartbeat] Cross-link audit complete: ${results.linksAdded} added, ${results.linksUpdated} updated, ${results.linksRemoved} removed (${reused} unchanged pairs skipped)`);
   return results;
 }
 
