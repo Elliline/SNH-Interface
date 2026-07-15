@@ -265,6 +265,84 @@ function parseJSON(text) {
   return null;
 }
 
+/**
+ * Repair a structurally-truncated JSON object and parse it. Local models
+ * sometimes emit a well-formed opening (`{"links":[ {...}, {...},`) but stop
+ * before the closing brackets — finish_reason 'stop', not 'length', so it isn't
+ * a token-budget truncation, just the model deciding it was done. parseJSON()
+ * can't recover that (its backward brace scan only finds inner complete objects
+ * that lack the wrapper key). This walks from the first '{', tracking string
+ * state and bracket depth, then closes any dangling string, drops the trailing
+ * comma left by the cut, and appends the missing closers in order.
+ *
+ * Intended as a LAST-RESORT fallback after parseJSON() returns null — it only
+ * runs on already-unparseable text, so it can recover more but never corrupt a
+ * response that was already valid.
+ * @param {string} text
+ * @returns {object|array|null}
+ */
+function repairTruncatedJSON(text) {
+  if (!text) return null;
+  const s = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '');
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+
+  const stack = [];
+  let inStr = false, esc = false, closeIdx = -1;
+  let lastSafe = null; // { idx, stack } right after a complete nested element closed
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      stack.pop();
+      if (stack.length === 0) { closeIdx = i; break; } // top-level object closed
+      lastSafe = { idx: i, stack: stack.slice() }; // a complete element just closed
+    }
+  }
+
+  const closeWith = (str, brackets) => {
+    let out = str;
+    for (let k = brackets.length - 1; k >= 0; k--) out += brackets[k] === '{' ? '}' : ']';
+    return out;
+  };
+  const tryParse = (body) => {
+    try {
+      const parsed = JSON.parse(body);
+      if (typeof parsed === 'object' && parsed !== null) return parsed;
+    } catch { /* fall through */ }
+    return null;
+  };
+
+  // 1. Clean close (also discards any trailing prose the model appended).
+  if (closeIdx >= 0) return tryParse(s.slice(start, closeIdx + 1));
+
+  // 2. Truncated: shut a dangling string, drop the trailing comma, close the
+  //    open brackets innermost-first.
+  let body = s.slice(start);
+  if (inStr) body += '"';
+  body = body.replace(/[\s,]*$/, '');
+  let parsed = tryParse(closeWith(body, stack));
+  if (parsed) return parsed;
+
+  // 3. The tail was an incomplete element (e.g. `"strength":` with no value).
+  //    Fall back to the last point where a nested element closed cleanly, drop
+  //    the partial trailing element, and close from there.
+  if (lastSafe) {
+    const trimmed = s.slice(start, lastSafe.idx + 1);
+    parsed = tryParse(closeWith(trimmed, lastSafe.stack));
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
 // ============ Step 1: Audit Cluster Coherence ============
 
 /**
@@ -663,6 +741,8 @@ Rules:
       return `Pair "${sa.label}|${sb.label}":\n  ${sa.label}: ${sa.summary}\n  ${sb.label}: ${sb.summary}`;
     }).join('\n\n');
 
+    const hasLinks = (p) => p && Array.isArray(p.links);
+
     let parsed = null;
     let rawContent = '';
     let wasTruncated = false;
@@ -674,10 +754,22 @@ Rules:
       wasTruncated = result.truncated;
       parsed = parseJSON(rawContent);
 
-      if (!parsed || !Array.isArray(parsed.links)) {
-        // Retry once with the same strict-format recovery auditClusterCoherence
-        // uses: the usual cause is the model wrapping the JSON in prose / <think>
-        // reasoning, so (a) demand raw JSON only and (b) double the token budget.
+      // Zero-cost recovery first: the observed batch-41 failure is a structurally
+      // unterminated object (finish_reason 'stop', not 'length') — the model emits
+      // `{"links":[ {...}, {...},` and stops before the closing brackets. Repair it
+      // in-process before spending another LLM call.
+      if (!hasLinks(parsed)) {
+        const repaired = repairTruncatedJSON(rawContent);
+        if (hasLinks(repaired)) {
+          parsed = repaired;
+          console.log(`[Heartbeat] Cross-link batch ${batchNum} recovered by repairing truncated JSON (${rawContent.length} chars, ${repaired.links.length} links)`);
+        }
+      }
+
+      if (!hasLinks(parsed)) {
+        // Still bad — retry once with the strict-format recovery auditCluster
+        // Coherence uses (demand raw JSON only, double the token budget) in case
+        // this batch's failure is instead prose/<think> wrapping.
         console.warn(`[Heartbeat] Parse failure for cross-link batch ${batchNum} (${rawContent.length} chars, truncated: ${wasTruncated}) — retrying with stricter format. Raw tail: ...${rawContent.slice(-300)}`);
         const strictSystem = systemPrompt + `
 
@@ -686,8 +778,8 @@ CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no 
         const retry = await callLLM(strictSystem, pairDescriptions, { maxTokens: retryTokens });
         rawContent = retry.content;
         wasTruncated = retry.truncated;
-        parsed = parseJSON(rawContent);
-        if (parsed && Array.isArray(parsed.links)) {
+        parsed = parseJSON(rawContent) || repairTruncatedJSON(rawContent);
+        if (hasLinks(parsed)) {
           console.log(`[Heartbeat] Cross-link batch ${batchNum} recovered on stricter-format retry`);
         }
       }
@@ -1816,4 +1908,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON, repairTruncatedJSON };
