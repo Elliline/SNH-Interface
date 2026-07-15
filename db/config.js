@@ -34,6 +34,13 @@ const DEFAULTS = {
   // that writes a daily-log warning when the brain stops answering, so a wedged
   // engine is caught in minutes instead of at the next heartbeat.
   livenessProbe: { enabled: true, intervalMinutes: 5, timeoutMs: 8000 },
+  // Brain watchdog: the self-healing ACTION for the vLLM wedge. Fed each liveness
+  // probe result — after `failureThreshold` consecutive failures it runs
+  // `docker restart <container>`. `cooldownMinutes` is grace while the model
+  // reloads (no re-trigger). `maxRestartsPerHour` is a hard cap: past it the
+  // watchdog stops restarting, logs CRITICAL, and leaves the circuit breaker as
+  // the fallback (a restart loop that isn't healing means something worse).
+  watchdog: { enabled: true, container: 'sparky-brain', failureThreshold: 3, cooldownMinutes: 5, maxRestartsPerHour: 2 },
   // Self-identity: a deliberately minimal seed. We do NOT define the AI's
   // personality — it develops one through its own accumulated self-observations
   // (self-facts). maxSelfFacts budgets how many active self-facts inject.

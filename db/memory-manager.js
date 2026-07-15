@@ -21,6 +21,7 @@ const memoryClusters = require('./memory-clusters');
 const factExtractor = require('./fact-extractor');
 const agentPool = require('./agent-pool');
 const initiativeEngine = require('./initiative-engine');
+const brainWatchdog = require('./brain-watchdog');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -1874,6 +1875,11 @@ function startLivenessProbe() {
       // (initiative, salience, contradiction judging) resumes once the brain is
       // back, without waiting for the next 2-hour heartbeat cycle to reset it.
       if (probe.ok) closeCircuit();
+
+      // Feed the watchdog: after N consecutive failures it restarts the brain
+      // container (the self-healing action the liveness probe alone never took).
+      // Guardrails (cooldown, per-hour cap, CRITICAL escalation) live inside it.
+      try { await brainWatchdog.onProbeResult(probe); } catch (e) { console.error('[Liveness] Watchdog error:', e.message); }
     } catch (err) {
       console.error('[Liveness] Probe error:', err.message);
     }
