@@ -120,7 +120,9 @@ function extractAllFactLines(content) {
  * @param {string} model - Model name
  * @param {string} apiKey - API key for the provider (if required)
  * @param {string} ollamaHost - Ollama host URL
- * @returns {Promise<string[]>} Array of extracted facts
+ * @returns {Promise<Array<{text: string, corrects: string|null}>>} Extracted
+ *   facts; corrects is a short description of the outdated belief a corrective
+ *   fact replaces ("It was Bernice not Bernie"), or null for plain facts.
  */
 async function extractFacts(userMessage, assistantMessage, provider, model, apiKey, ollamaHost) {
   try {
@@ -129,7 +131,7 @@ async function extractFacts(userMessage, assistantMessage, provider, model, apiK
     const systemPrompt = `You are a fact extraction system. Extract facts about the USER from what the USER said in the chat exchange below.
 
 RULES:
-- Return ONLY a valid JSON array of strings, or [] if nothing worth remembering.
+- Return ONLY a valid JSON array, or [] if nothing worth remembering. Items are strings, or correction objects (see CORRECTIONS below) — the array may mix both.
 - Each fact MUST be a complete, self-contained sentence with full context.
 - Only extract facts that the USER has stated about themselves, their life, their preferences, or their projects.
 - Do NOT extract general knowledge, web search results, trivia, or information the AI provided.
@@ -150,6 +152,14 @@ BAD examples (AI-provided info, fragments, general knowledge, or facts about the
 ["A viral TikTok trend featuring Mini Huskies", "Constantinople fell in 1453", "RTX 3090", "The weather is nice", "SNH is curious and analytical", "I tend to reflect on my own cognitive processes", "The AI cares deeply about evolving truth"]
 
 Every extracted fact must be something the USER told you about themselves or their work — not something you told the user, and not an observation about you, the AI.
+
+CORRECTIONS — when the user is fixing something previously believed:
+- If the user's message carries corrective framing — "It was X not Y", "actually it's X", "I was spelling it wrong", "her name is actually...", "I no longer...", "we renamed..." — return that fact as an OBJECT instead of a string:
+  {"fact": "<the corrected, complete fact>", "corrects": "<one short line describing the outdated belief being replaced>"}
+- The "corrects" line should name the wrong value being retired (the old spelling, old title, old tool, old plan) so stored facts carrying it can be found and superseded.
+- Example: user says "Its Bernice, i was spelling it wrong lol. She is the Director of Rooms here at ISH." →
+  {"fact": "User's colleague Bernice is the Director of Rooms at ISH", "corrects": "earlier facts calling her 'Bernie' or describing her as a manager at ISH"}
+- Plain new facts (no corrective framing) stay plain strings.
 
 ${getCurrentDateTimeString()}. When the user's statement is time-relative ("I just bought", "last week", "recently", "starting next month"), anchor the fact to an absolute date using the current date above — e.g. "As of July 2026, User is migrating from Syncro to Kaseya".`;
 
@@ -201,7 +211,8 @@ ${getCurrentDateTimeString()}. When the user's statement is time-relative ("I ju
 
     // Parse JSON array from response (handle markdown code blocks)
     const facts = parseFactsFromResponse(response);
-    console.log(`[FactExtractor] Extracted ${facts.length} facts`);
+    const corrections = facts.filter(f => f.corrects).length;
+    console.log(`[FactExtractor] Extracted ${facts.length} facts${corrections ? ` (${corrections} correction${corrections > 1 ? 's' : ''})` : ''}`);
     return facts;
 
   } catch (error) {
@@ -382,7 +393,10 @@ async function extractFromSquatchServe(systemPrompt, exchange, model, host, sign
 }
 
 /**
- * Parse facts from LLM response (handles markdown code blocks and Python-style arrays)
+ * Parse facts from LLM response (handles markdown code blocks and Python-style
+ * arrays). Items may be plain strings or {fact, corrects} correction objects;
+ * both normalize to {text, corrects} with corrects null for plain facts.
+ * @returns {Array<{text: string, corrects: string|null}>}
  */
 function parseFactsFromResponse(response) {
   try {
@@ -426,8 +440,21 @@ function parseFactsFromResponse(response) {
       return [];
     }
 
-    // Filter out empty strings, non-strings, and non-personal facts
-    return facts.filter(f => {
+    // Normalize to {text, corrects} — items are plain strings, or correction
+    // objects ({fact, corrects}) when the user's message carried corrective
+    // framing ("It was X not Y"). The corrects note travels with the fact so
+    // the contradiction judge can see the corrective intent.
+    const normalized = facts.map(f => {
+      if (typeof f === 'string') return { text: f, corrects: null };
+      if (f && typeof f === 'object' && typeof f.fact === 'string') {
+        const corrects = typeof f.corrects === 'string' && f.corrects.trim() ? f.corrects.trim() : null;
+        return { text: f.fact, corrects };
+      }
+      return null;
+    }).filter(Boolean);
+
+    // Filter out empty strings and non-personal facts
+    return normalized.filter(({ text: f }) => {
       if (typeof f !== 'string' || f.trim().length === 0) return false;
       const t = f.trim();
 
@@ -803,22 +830,37 @@ function loadMemoryContext(memoryDir) {
  * rather than guessing — the caller queues a clarifying question instead.
  * @param {string} newFact - The fact just extracted from the user
  * @param {string} oldFact - An existing active stored fact
+ * @param {Object} [context] - Source context so corrective intent survives to the verdict
+ * @param {string} [context.userMessage] - The user message the new fact was extracted from
+ * @param {string} [context.corrects] - Extractor's note on what the new fact corrects/replaces
  * @returns {Promise<{verdict: 'yes'|'no'|'uncertain', reasoning: string}>}
  */
-async function judgeContradiction(newFact, oldFact) {
+async function judgeContradiction(newFact, oldFact, context = {}) {
   try {
     const memoryManager = require('./memory-manager');
     const systemPrompt = `You are a fact contradiction detector for a personal memory system. You are given an EXISTING stored fact about the user and a NEW statement the user just made about themselves.
 
 Decide the relationship between them:
-- YES — they contradict: they cannot both be true of the user at the same time. Corrections and replacements count ("Actually my MSP is X, not Y", "I moved to Z", "I no longer use Q").
+- YES — they contradict: they cannot both be true of the user at the same time. Corrections and replacements count ("Actually my MSP is X, not Y", "I moved to Z", "I no longer use Q"). A correction of a name, spelling, or title counts even when the two statements COULD describe different people — if the user is correcting the record, the old version is wrong, not a second person.
 - NO — no contradiction: additional detail, refinement, or an unrelated fact.
 - UNCERTAIN — you genuinely cannot tell whether they conflict without more information (e.g. they might refer to two different things, or one might update the other, but it is ambiguous).
 
 Prefer UNCERTAIN over guessing when it is truly ambiguous.
 
 Respond with exactly YES, NO, or UNCERTAIN on the first line, then one short line of reasoning.`;
-    const userPrompt = `EXISTING fact: "${oldFact}"\nNEW statement: "${newFact}"\n\nDoes the NEW statement contradict the EXISTING fact?`;
+
+    // Corrective intent lives in the user's message, not the extracted fact
+    // strings ("It was Bernice not Bernie" extracts to a fact about Bernice
+    // that no longer mentions Bernie) — so pass the source alongside.
+    const contextParts = [];
+    if (context.corrects) {
+      contextParts.push(`The NEW statement was extracted from a message where the user was CORRECTING earlier information. It replaces: ${context.corrects}. If the EXISTING fact is (or contains) that outdated belief, they contradict.`);
+    }
+    if (context.userMessage) {
+      const msg = String(context.userMessage).slice(0, 600);
+      contextParts.push(`The user's original message, for context:\n"${msg}"`);
+    }
+    const userPrompt = `EXISTING fact: "${oldFact}"\nNEW statement: "${newFact}"\n${contextParts.length ? `\n${contextParts.join('\n\n')}\n` : ''}\nDoes the NEW statement contradict the EXISTING fact?`;
 
     const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
     const firstWord = (content.trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
@@ -960,6 +1002,56 @@ async function gapAlreadyAnswered(question) {
     console.error('[FactExtractor] gapAlreadyAnswered error:', error.message);
     return null;
   }
+}
+
+/**
+ * Backlog sweep: run every pending (never-surfaced) question through the
+ * answer-aware gate and retire the ones memory already answers. The mint-time
+ * gate (gapAlreadyAnswered, Layer 2) only screens NEW questions — anything
+ * queued before a gate improvement landed is grandfathered in and can sit
+ * pending for days before being asked ("What is ISH?" sat 8 days despite a
+ * defining fact predating it). Running this from the heartbeat makes every
+ * future gate improvement retroactive too.
+ *
+ * Retired questions flip to 'answered' via the normal markAnswered path;
+ * initiatives already minted from them are dismissed by noticeFromQuestions'
+ * self-heal on the same heartbeat cycle (it runs after this sweep).
+ * @param {Object} [opts]
+ * @param {boolean} [opts.dryRun] - Report what would be retired without retiring
+ * @param {string} [opts.dailyDir] - For the audit trail
+ * @returns {Promise<{swept: number, retired: Array<{id: string, question: string, evidence: string}>}>}
+ */
+async function sweepPendingQuestions(opts = {}) {
+  const questions = require('./questions');
+  const dailyDir = opts.dailyDir || DAILY_DIR;
+  const result = { swept: 0, retired: [] };
+  try {
+    const pending = questions.listPending(200);
+    for (const q of pending) {
+      result.swept++;
+      try {
+        const already = await gapAlreadyAnswered(q.question);
+        if (!already) continue;
+        if (opts.dryRun) {
+          result.retired.push({ id: q.id, question: q.question, evidence: already.evidence });
+          continue;
+        }
+        if (questions.markAnswered(q.id)) {
+          result.retired.push({ id: q.id, question: q.question, evidence: already.evidence });
+          appendToDailyLog(`Retired pending question (memory already answers it): "${q.question}" ← "${already.evidence}"`, dailyDir);
+        }
+      } catch (err) {
+        // One bad question (or a wedged brain call) shouldn't sink the sweep.
+        console.error(`[FactExtractor] Question sweep error on ${String(q.id).slice(0, 8)}:`, err.message);
+      }
+    }
+    if (result.swept > 0) {
+      console.log(`[FactExtractor] Question sweep: ${result.swept} pending checked, ${result.retired.length} ${opts.dryRun ? 'would be ' : ''}retired`);
+    }
+  } catch (error) {
+    console.error('[FactExtractor] sweepPendingQuestions error:', error.message);
+  }
+  return result;
 }
 
 /**
@@ -1109,8 +1201,13 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
     const extractionHost = extInst ? extInst.host : ollamaHost;
     console.log(`[FactExtractor] Using extraction model: ${extractionProvider}/${extractionModel}`);
 
-    // Extract facts using the configured extraction model
-    const facts = await extractFacts(userMessage, assistantMessage, extractionProvider, extractionModel, apiKey, extractionHost);
+    // Extract facts using the configured extraction model. Each comes back as
+    // {text, corrects} — corrects carries the extractor's note when the user
+    // was correcting the record ("It was Bernice not Bernie"), so supersession
+    // can act on the corrective intent instead of just the flattened fact text.
+    const extracted = await extractFacts(userMessage, assistantMessage, extractionProvider, extractionModel, apiKey, extractionHost);
+    const facts = extracted.map(e => e.text);
+    const correctsByFact = new Map(extracted.filter(e => e.corrects).map(e => [e.text, e.corrects]));
 
     const memoryFile = path.join(memoryDir, 'MEMORY.md');
     const dailyDir = path.join(memoryDir, 'daily');
@@ -1144,7 +1241,13 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
       try {
         const contradictionPairs = [];
         for (const fact of facts) {
-          const candidates = await memoryClusters.findContradictionCandidates(fact);
+          // A fact flagged as a correction casts a wider candidate net — the
+          // outdated belief it replaces may word things quite differently
+          // (misspelled name, old title), landing below the default threshold.
+          const candidates = await memoryClusters.findContradictionCandidates(
+            fact,
+            correctsByFact.has(fact) ? { threshold: 0.35, limit: 8 } : {}
+          );
           for (const candidate of candidates) {
             contradictionPairs.push({ fact, candidate });
           }
@@ -1153,7 +1256,10 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
         if (contradictionPairs.length > 0) {
           const judged = await agentPool.runBatch(
             contradictionPairs.map(({ fact, candidate }) => async () => {
-              const { verdict } = await judgeContradiction(fact, candidate.content);
+              const { verdict } = await judgeContradiction(fact, candidate.content, {
+                userMessage,
+                corrects: correctsByFact.get(fact) || null
+              });
               return verdict;
             }),
             'contradiction-judge'
@@ -1261,7 +1367,8 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
         const marked = memoryClusters.supersedeFact(s.oldMemberId, newMemberId);
         if (marked) {
           removeFactLineFromMemory(s.oldContent, memoryFile);
-          appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (user correction)`, dailyDir);
+          const how = correctsByFact.has(s.newFact) ? 'explicit user correction' : 'user correction';
+          appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (${how})`, dailyDir);
           console.log(`[FactExtractor] Supersession: "${s.oldContent}" → "${s.newFact}"`);
         }
       }
@@ -1544,6 +1651,7 @@ module.exports = {
   detectGapQuestion,
   judgeAnswered,
   gapAlreadyAnswered,
+  sweepPendingQuestions,
   detectAnswers,
   removeFactLineFromMemory,
   loadMemoryContext,

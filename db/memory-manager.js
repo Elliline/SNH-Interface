@@ -7,6 +7,7 @@
  *   Step 3: auditCrossLinks       — LLM-driven batch link scoring across all cluster pairs
  *   Step 4: generateReport        — build report object, log to console + daily file
  *   Task B: cleanupFacts          — LLM-driven fact dedup/reword/merge in MEMORY.md
+ *   Task B2: sweepPendingQuestions — retire pending questions memory already answers
  *   Task C: summarizeDailyLogs    — archive daily logs older than retention window
  */
 
@@ -1713,6 +1714,18 @@ async function runMaintenance() {
     const cleanup = await cleanupFacts();
     const archive = await summarizeDailyLogs();
 
+    // Task B2: retire pending questions the memory already answers. The
+    // mint-time gate only screens new questions; this sweep makes every gate
+    // improvement retroactive for the grandfathered backlog. Must run BEFORE
+    // the initiative layer so noticeFromQuestions' self-heal dismisses any
+    // initiative backed by a question retired here in the same cycle.
+    let questionSweep = { swept: 0, retired: [] };
+    try {
+      questionSweep = await factExtractor.sweepPendingQuestions();
+    } catch (sweepErr) {
+      console.error('[Heartbeat] Question sweep error:', sweepErr.message);
+    }
+
     // Task D: reflection — SNH observes itself from the day's conversations.
     // Runs at most once per cycle, and only when there are new conversations.
     let reflection = { skipped: true };
@@ -1743,7 +1756,7 @@ async function runMaintenance() {
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, cleanup, archive, reflection, initiative };
+    return { report, cleanup, archive, questionSweep, reflection, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     return { error: error.message };
