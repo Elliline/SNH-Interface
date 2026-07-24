@@ -112,8 +112,12 @@ const DEFAULTS = {
       pastConvoTokens: 800       // hybrid-search past-conversation snippets cap
     }
   },
+  // Web search via SearXNG. Single source of truth for BOTH the on/off toggle and
+  // the server URL — the search path and the capability manifest read these. (The
+  // URL used to live only in the client's localStorage + a hardcoded server
+  // fallback, so settings and reality disagreed; now it's config.)
   tools: {
-    searxng: { enabled: false }
+    searxng: { enabled: false, url: 'http://localhost:8888' }
   },
   voice: {
     stt: {
@@ -193,6 +197,14 @@ function migrateConfig(fileConfig) {
         fileConfig.models[role].instance = 'Local';
       }
     }
+  }
+
+  // Migrate the SearXNG URL to a single canonical key. Older configs stored it as
+  // `endpoint` (and the URL also lived in client localStorage); fold that into
+  // `url` so the search path + settings + manifest all read one field.
+  if (fileConfig.tools && fileConfig.tools.searxng) {
+    const sx = fileConfig.tools.searxng;
+    if (sx.endpoint && !sx.url) sx.url = sx.endpoint;
   }
 
   // Migrate old flat voice config to new provider-based format
@@ -333,4 +345,19 @@ function getVoiceProvider(category) {
   return voiceCat.providers.find(p => p.name === name && p.type === type) || null;
 }
 
-module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance, getVoiceProvider };
+/**
+ * Resolve the effective SearXNG search config from the single source of truth.
+ * Env SEARXNG_HOST wins (ops override), then config.tools.searxng.url, then the
+ * built-in default. `enabled` gates whether the search path runs at all.
+ * @returns {{ enabled: boolean, url: string }}
+ */
+function getSearxngConfig() {
+  const cfg = getConfig();
+  const sx = (cfg.tools && cfg.tools.searxng) || {};
+  return {
+    enabled: !!sx.enabled,
+    url: process.env.SEARXNG_HOST || sx.url || 'http://localhost:8888'
+  };
+}
+
+module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance, getVoiceProvider, getSearxngConfig };

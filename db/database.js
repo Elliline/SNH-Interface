@@ -82,6 +82,17 @@ function initDatabase() {
       ON conversations(updated_at DESC)
     `);
 
+    // Migration: sources — provenance for search-backed answers. When the
+    // assistant answers after a web search, the source titles+urls it drew from
+    // are stored here as JSON, so a later "cite your sources" reads retained links
+    // instead of reconstructing them (7/23: it confabulated attributions when
+    // asked to cite after the fact). Null for messages with no sources.
+    const msgCols = sqliteDb.prepare('PRAGMA table_info(messages)').all();
+    if (!msgCols.some(c => c.name === 'sources')) {
+      sqliteDb.exec('ALTER TABLE messages ADD COLUMN sources TEXT');
+      console.log('Migration: added sources to messages (search provenance)');
+    }
+
     // Create FTS5 virtual table for full-text search
     sqliteDb.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -235,6 +246,21 @@ function initDatabase() {
       console.log("Migration: added subject to cluster_members (existing rows set to 'user')");
     }
 
+    // Migration: claim_type — the auditability tag for self-facts, added for the
+    // self-coherence audit (SNH's first accepted initiative, 2026-07-05: stress-
+    // testing its own perspectives against contradictions and gaps). Self-facts
+    // split into behavioral CLAIMS ("I value precision", "I'm an analytical
+    // partner") — testable against how SNH actually behaved, so the audit samples
+    // these — and DECLARATIONS (name, preferences, history) — not testable, so
+    // never sampled. DISSONANCE rows are the audit's OWN records ("claimed X,
+    // behaved Y"); they are self-facts but are excluded from identity injection
+    // and never re-sampled. User facts stay NULL (not applicable). Existing self-
+    // facts stay NULL until the one-time classification pass tags them.
+    if (!memberCols.some(c => c.name === 'claim_type')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN claim_type TEXT');
+      console.log('Migration: added claim_type to cluster_members (self-fact auditability tag)');
+    }
+
     const clusterCols = sqliteDb.prepare('PRAGMA table_info(memory_clusters)').all();
     if (!clusterCols.some(c => c.name === 'subject')) {
       sqliteDb.exec("ALTER TABLE memory_clusters ADD COLUMN subject TEXT DEFAULT 'user'");
@@ -352,6 +378,40 @@ function getConversations() {
   }
 }
 
+/** Parse a message's stored sources JSON to an array (null/[] safe). */
+function parseSourcesJson(json) {
+  if (!json) return null;
+  try {
+    const arr = JSON.parse(json);
+    return Array.isArray(arr) && arr.length ? arr : null;
+  } catch { return null; }
+}
+
+/**
+ * The saved sources from the most recent search-backed assistant messages in a
+ * conversation, newest first. Used to give the entity the links it found earlier
+ * so a follow-up "give me the link for [S3]" reads the stored URL. Returns an
+ * array of source-arrays (one per message).
+ * @param {string} conversationId
+ * @param {number} [limit=1] - how many recent source-bearing messages to return
+ * @returns {Array<Array<{n:number,title:string,url:string}>>}
+ */
+function getRecentSources(conversationId, limit = 1) {
+  try {
+    if (!sqliteDb) return [];
+    const rows = sqliteDb.prepare(`
+      SELECT sources FROM messages
+      WHERE conversation_id = ? AND role = 'assistant' AND sources IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(conversationId, limit);
+    return rows.map(r => parseSourcesJson(r.sources)).filter(Boolean);
+  } catch (error) {
+    console.error('Error fetching recent sources:', error.message);
+    return [];
+  }
+}
+
 /**
  * Get full conversation with all messages
  * @param {string} id - Conversation ID
@@ -375,14 +435,18 @@ function getConversation(id) {
       return null;
     }
 
-    // Get all messages for this conversation
+    // Get all messages for this conversation. `sources` (search provenance) is
+    // parsed from JSON so the UI can render the clickable [S#] link list.
     const messagesStmt = sqliteDb.prepare(`
-      SELECT id, conversation_id, role, content, timestamp, model
+      SELECT id, conversation_id, role, content, timestamp, model, sources
       FROM messages
       WHERE conversation_id = ?
       ORDER BY timestamp ASC
     `);
-    const messages = messagesStmt.all(id);
+    const messages = messagesStmt.all(id).map(m => ({
+      ...m,
+      sources: parseSourcesJson(m.sources)
+    }));
 
     return {
       ...conversation,
@@ -475,19 +539,22 @@ function updateConversationTitle(id, title) {
  * @param {string} model - Model used (optional)
  * @returns {string} New message ID
  */
-function addMessage(conversation_id, role, content, model = null) {
+function addMessage(conversation_id, role, content, model = null, sources = null) {
   try {
     if (!sqliteDb) {
       throw new Error('Database not initialized. Call initDatabase() first.');
     }
 
     const id = randomUUID();
+    // sources: array of {n,title,url} the answer drew from, stored as JSON so
+    // "cite your sources" later reads retained links. Null when nothing was searched.
+    const sourcesJson = (Array.isArray(sources) && sources.length) ? JSON.stringify(sources) : null;
     const stmt = sqliteDb.prepare(`
-      INSERT INTO messages (id, conversation_id, role, content, model)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO messages (id, conversation_id, role, content, model, sources)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(id, conversation_id, role, content, model);
+    stmt.run(id, conversation_id, role, content, model, sourcesJson);
 
     // Also insert into FTS5 table for full-text search
     try {
@@ -1117,6 +1184,7 @@ module.exports = {
   // SQLite functions
   getConversations,
   getConversation,
+  getRecentSources,
   createConversation,
   deleteConversation,
   updateConversationTitle,

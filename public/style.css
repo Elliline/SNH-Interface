@@ -255,6 +255,35 @@ body {
   word-wrap: break-word;
 }
 
+/* Saved search sources rendered under a message — compact clickable [S#] list. */
+.message-sources {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(127, 127, 127, 0.2);
+  font-size: 0.8rem;
+  line-height: 1.7;
+  opacity: 0.85;
+}
+.message-sources-label {
+  font-weight: 600;
+  margin-right: 4px;
+  opacity: 0.7;
+}
+.msg-source {
+  display: inline-block;
+  margin-right: 8px;
+  color: #4a9eff;
+  text-decoration: none;
+  white-space: nowrap;
+  max-width: 22em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+a.msg-source:hover {
+  text-decoration: underline;
+}
+
 .message-content strong {
   font-weight: 600;
 }

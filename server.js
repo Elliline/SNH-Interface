@@ -52,6 +52,45 @@ const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
 const SEARXNG_HOST = process.env.SEARXNG_HOST || 'http://localhost:8888';
 
+// --- Search provenance: mark search-derived content distinctly and retain the
+// source links (title + url) through the tool loop into the conversation record.
+// The 7/23 test showed the entity blending a real search result with an invented
+// specific and, when asked to cite, confabulating attributions. Marking results
+// as [S#] SOURCES (and persisting them) makes searched facts distinguishable from
+// generated ones and makes citing read retained links, never reconstruct them.
+
+/** Add a source to the sink (dedup by url), returning its stable [S#] number. */
+function addSource(sink, { title, url, snippet }) {
+  if (url) {
+    const existing = sink.find(s => s.url === url);
+    if (existing) return existing.n;
+  }
+  const n = sink.length + 1;
+  sink.push({ n, title: title || '', url: url || '', snippet: (snippet || '').slice(0, 300) });
+  return n;
+}
+
+/**
+ * Turn a tool result into the string the model sees, marked as SOURCES, while
+ * collecting the source links into `sink`. Errors/other results pass through as
+ * before so the model still sees limit/error messages.
+ */
+function formatToolResult(fnName, result, sink) {
+  if (fnName === 'web_search' && result && Array.isArray(result.results) && result.results.length) {
+    const lines = ['WEB SEARCH RESULTS — these are your SOURCES. For any specific fact you take from them, cite the [S#] link; include the links you used in your answer. Anything not found here is from memory, not searched — hedge it.'];
+    for (const r of result.results) {
+      const n = addSource(sink, { title: r.title, url: r.url, snippet: r.snippet });
+      lines.push(`[S${n}] ${r.title || '(untitled)'} — ${r.url || '(no url)'}\n${r.snippet || ''}`);
+    }
+    return lines.join('\n');
+  }
+  if (fnName === 'web_fetch' && result && result.url) {
+    const n = addSource(sink, { title: result.title || result.url, url: result.url });
+    return `FETCHED PAGE [S${n}] — ${result.url}\n${result.content || ''}`;
+  }
+  return typeof result === 'string' ? result : JSON.stringify(result);
+}
+
 // Additional allowed Ollama hosts (comma-separated in .env)
 const ALLOWED_OLLAMA_HOSTS = process.env.ALLOWED_OLLAMA_HOSTS
   ? process.env.ALLOWED_OLLAMA_HOSTS.split(',').map(h => h.trim())
@@ -1408,6 +1447,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const needsTools = toolsEnabled && mcpClient.hasTools() && classifyToolNeed(userMessage.content, !!superSearch);
     console.log('Tool routing:', needsTools ? 'TOOLS (search/fetch likely needed)' : 'DIRECT (conversational, skipping tool loop)');
 
+    // Should-I-search honesty guard: if the question is about current/changeable
+    // facts (weather, prices, news, "right now"/"latest") but search will NOT run
+    // — because it's off, unavailable, or the classifier didn't route to it — the
+    // model must NOT answer confidently from memory (7/23: it fabricated a weather
+    // high). We inject an instruction to offer to look it up instead. When search
+    // WILL run (needsTools), the tool loop handles it and no nudge is needed.
+    const timeSensitiveUnsearched = isTimeSensitive(userMessage.content) && !needsTools;
+
     // Save user message to database
     const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model);
 
@@ -1627,6 +1674,40 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       enhancedMessages.push(ttsInstruction);
     }
 
+    // Should-I-search honesty guard (see timeSensitiveUnsearched above): the user
+    // is asking about current/changeable facts but no search will run.
+    if (timeSensitiveUnsearched) {
+      enhancedMessages.push({
+        role: 'system',
+        content: (toolsEnabled
+          ? 'The user is asking about current or changeable facts (weather, prices, news, live status, "right now"/"latest"). You cannot know these from memory. Do NOT state a specific current value as fact — say plainly you would need to look it up, and offer to search.'
+          : 'The user is asking about current or changeable facts (weather, prices, news, live status, "right now"/"latest"). You cannot know these from memory, and web search is currently turned off. Do NOT state a specific current value as fact — say you cannot look it up right now and that search would need to be enabled.')
+      });
+    }
+
+    // Follow-up source recall: give the entity the links it found in the most
+    // recent search turn of THIS conversation, so "give me the link for [S3]" is
+    // answered by reading the stored URL instead of refusing or fabricating. Most
+    // recent source-bearing turn only, compact, budget-capped — we're near the
+    // injection ceiling. Honesty fallback preserved: if a requested [S#] isn't
+    // listed, the instruction tells it to say it doesn't have that one.
+    try {
+      const recent = db.getRecentSources(convoId, 1); // array of source-arrays, newest first
+      const lastTurnSources = (recent && recent[0]) || [];
+      if (lastTurnSources.length) {
+        const SRC_TOKEN_CAP = 300;
+        let block = 'Links you found earlier in this conversation. If the user asks for "the link for [S#]", or asks you to cite these sources, give the matching URL below. If a requested [S#] is not listed here, say you no longer have that one — do not guess.';
+        for (const s of lastTurnSources) {
+          const line = `\n[S${s.n}] ${s.title || '(untitled)'} — ${s.url || '(no url)'}`;
+          if (injectionBudget.estTokens(block + line) > SRC_TOKEN_CAP) break;
+          block += line;
+        }
+        enhancedMessages.push({ role: 'system', content: block });
+      }
+    } catch (srcErr) {
+      console.error('[Sources] recall injection error:', srcErr.message);
+    }
+
     // Super Search system prompt: instruct the model to research thoroughly
     if (superSearch) {
       const superSearchInstruction = {
@@ -1768,6 +1849,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Route to appropriate provider
     let response;
     let toolsUsed = false;
+    // Sources (title+url) the model drew from during the tool loop, in [S#] order.
+    // Populated by both provider loops, persisted with the assistant message so a
+    // later "cite your sources" reads retained links instead of reconstructing them.
+    const usedSources = [];
     console.log(`=== Routing to provider: ${providerType} ===`);
 
     if (providerType === 'ollama') {
@@ -1793,10 +1878,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.log(`MCP [ollama]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
       if (needsTools) {
         const tools = mcpClient.getToolsForOpenAI();
-        const toolSearxngHost = searxngHost
-          ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
-          : SEARXNG_HOST;
-        const toolContext = { searxngHost: toolSearxngHost };
+        // Single source of truth (item 3): the SearXNG URL comes from config, not
+        // the per-request client host — settings and reality now agree.
+        const toolContext = { searxngHost: getSearxngConfig().url };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
@@ -1866,7 +1950,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
             ollamaMessages.push({
               role: 'tool',
-              content: typeof result === 'string' ? result : JSON.stringify(result)
+              content: formatToolResult(fnName, result, usedSources)
             });
           }
         }
@@ -1875,7 +1959,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           console.log('MCP [ollama]: Tools were used, making final streaming request');
           ollamaMessages.push({
             role: 'system',
-            content: 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
+            content: usedSources.length
+            ? 'Tool calls are complete. Answer using the SOURCES above. For each specific fact you state, cite the [S#] link it came from, and include the relevant website links in your answer. Any specific number, date, or claim not backed by a source must be hedged or left out — do not invent specifics, and never attribute a claim to a source that does not contain it.'
+            : 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
           });
         }
       }
@@ -1976,10 +2062,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.log(`MCP [${providerLabel}]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
       if (needsTools) {
         const tools = mcpClient.getToolsForOpenAI();
-        const toolSearxngHost = searxngHost
-          ? (isValidOllamaHost(searxngHost) ? searxngHost : SEARXNG_HOST)
-          : SEARXNG_HOST;
-        const toolContext = { searxngHost: toolSearxngHost };
+        // Single source of truth (item 3): the SearXNG URL comes from config, not
+        // the per-request client host — settings and reality now agree.
+        const toolContext = { searxngHost: getSearxngConfig().url };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
@@ -2061,7 +2146,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             llamacppMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
-              content: typeof result === 'string' ? result : JSON.stringify(result)
+              content: formatToolResult(fnName, result, usedSources)
             });
           }
         }
@@ -2087,7 +2172,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       if (toolsUsed) {
         llamacppMessages.push({
           role: 'system',
-          content: 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
+          content: usedSources.length
+            ? 'Tool calls are complete. Answer using the SOURCES above. For each specific fact you state, cite the [S#] link it came from, and include the relevant website links in your answer. Any specific number, date, or claim not backed by a source must be hedged or left out — do not invent specifics, and never attribute a claim to a source that does not contain it.'
+            : 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
         });
       }
 
@@ -2127,6 +2214,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     res.setHeader('X-Injected-Tokens', String(injectedTokens));
     res.setHeader('X-Has-Memory-Context', (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user) ? 'true' : 'false');
     res.setHeader('X-Tools-Used', toolsUsed ? 'true' : 'false');
+    // Search provenance for the live turn: hand the frontend the (light) source
+    // links so it can render the clickable [S#] list under the message right away,
+    // matching what it will show on reload from the DB. URL-encoded (headers are
+    // ASCII); snippets are dropped — the UI only needs n/title/url.
+    if (usedSources.length) {
+      const light = usedSources.map(s => ({ n: s.n, title: s.title, url: s.url }));
+      res.setHeader('X-Sources', encodeURIComponent(JSON.stringify(light)));
+    }
     // Count memory sources for the frontend
     const memorySources = [
       memoryFiles.memory ? 'long-term' : null,
@@ -2238,9 +2333,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       reader.releaseLock();
     }
 
-    // Save assistant response to database
+    // Save assistant response to database. When the answer was search-backed, the
+    // source links it drew from are retained on the message (JSON), so a later
+    // "cite your sources" reads them instead of reconstructing an attribution.
     if (fullResponse) {
-      const assistantMsgId = db.addMessage(convoId, 'assistant', fullResponse, model);
+      const assistantMsgId = db.addMessage(convoId, 'assistant', fullResponse, model,
+        usedSources.length ? usedSources : null);
 
       // Embed assistant response for future retrieval
       try {

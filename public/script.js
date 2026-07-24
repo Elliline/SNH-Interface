@@ -568,6 +568,15 @@ async function sendMessage() {
       showToolsIndicator();
     }
 
+    // Search provenance for the live turn: the server hands us the source links it
+    // drew from (URL-encoded JSON). Attached to the assistant message below so the
+    // clickable [S#] list renders immediately, matching the reload view.
+    let responseSources = null;
+    const sourcesHeader = response.headers.get('X-Sources');
+    if (sourcesHeader) {
+      try { responseSources = JSON.parse(decodeURIComponent(sourcesHeader)); } catch (e) { /* ignore */ }
+    }
+
     // Handle streaming response
     let fullResponse = '';
     const assistantMessageId = Date.now();
@@ -606,6 +615,7 @@ async function sendMessage() {
     const assistantMessageIndex = conversation.findIndex(msg => msg.id === assistantMessageId);
     if (assistantMessageIndex !== -1) {
       conversation[assistantMessageIndex].content = fullResponse;
+      if (responseSources) conversation[assistantMessageIndex].sources = responseSources;
       console.log('[sendMessage] Updated conversation at index:', assistantMessageIndex);
     }
 
@@ -990,6 +1000,25 @@ function updateLastMessage(content) {
   }
 }
 
+// Render a message's saved search sources as a compact clickable [S#] list.
+// Maps the inline [S#] tags in the answer to their URLs; links open in a new tab.
+// Only http(s) URLs become links (guards against javascript: URLs in results).
+function renderSourcesHtml(sources) {
+  if (!Array.isArray(sources) || !sources.length) return '';
+  const items = sources.map(s => {
+    const label = `[S${s.n}]`;
+    const rawTitle = s.title || '';
+    const shortTitle = rawTitle.length > 55 ? rawTitle.slice(0, 55) + '…' : rawTitle;
+    const titleHtml = shortTitle ? ' ' + escapeHtml(shortTitle) : '';
+    const isHttp = typeof s.url === 'string' && /^https?:\/\//i.test(s.url);
+    if (isHttp) {
+      return `<a class="msg-source" href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.url)}">${label}${titleHtml}</a>`;
+    }
+    return `<span class="msg-source">${label}${titleHtml}</span>`;
+  }).join('');
+  return `<div class="message-sources"><span class="message-sources-label">Sources:</span> ${items}</div>`;
+}
+
 // Render messages to the chat container
 function renderMessages() {
   messagesContainer.innerHTML = '';
@@ -1001,7 +1030,7 @@ function renderMessages() {
     if (msg.role === 'user') {
       messageElement.innerHTML = `<div class="message-content">${escapeHtml(msg.content)}</div>`;
     } else if (msg.role === 'assistant') {
-      messageElement.innerHTML = `<div class="message-content">${formatMessageContent(msg.content)}</div>`;
+      messageElement.innerHTML = `<div class="message-content">${formatMessageContent(msg.content)}</div>${renderSourcesHtml(msg.sources)}`;
     } else if (msg.role === 'system') {
       messageElement.innerHTML = `<div class="message-content system-message">${escapeHtml(msg.content)}</div>`;
     } else if (msg.role === 'error') {
@@ -2133,16 +2162,20 @@ async function loadSettingsToolsTab() {
   if (!container) return;
 
   const generation = ++toolsTabLoadGeneration;
-  const searxngHost = localStorage.getItem('searxngHost') || '';
 
-  // Fetch current tools config
+  // Read BOTH the on/off toggle and the URL from server config — the single source
+  // of truth (item 3). The host used to live in localStorage, so the settings UI
+  // and the actual search path disagreed; now the field saves to config.
   let searxngEnabled = false;
+  let searxngUrl = '';
   try {
     const resp = await fetch('/api/config');
     if (generation !== toolsTabLoadGeneration) return;
     if (resp.ok) {
       const config = await resp.json();
-      searxngEnabled = !!(config.tools && config.tools.searxng && config.tools.searxng.enabled);
+      const sx = (config.tools && config.tools.searxng) || {};
+      searxngEnabled = !!sx.enabled;
+      searxngUrl = sx.url || sx.endpoint || '';
     }
   } catch (e) { /* use default */ }
   if (generation !== toolsTabLoadGeneration) return;
@@ -2159,8 +2192,8 @@ async function loadSettingsToolsTab() {
         </label>
       </div>
       <div class="setting-item">
-        <label for="settings-searxngHost">SearXNG Host</label>
-        <input type="text" id="settings-searxngHost" class="api-key-input" placeholder="http://192.168.4.97:8888" value="${escapeHtml(searxngHost)}">
+        <label for="settings-searxngHost">SearXNG URL</label>
+        <input type="text" id="settings-searxngHost" class="api-key-input" data-config-key="tools.searxng.url" placeholder="http://localhost:8888" value="${escapeHtml(searxngUrl)}">
       </div>
     </div>
     <div class="settings-section">
@@ -2199,8 +2232,9 @@ async function saveSettingsHandler() {
     'settings-claudeApiKey': 'claudeApiKey',
     'settings-openaiApiKey': 'openaiApiKey',
     'settings-grokApiKey': 'grokApiKey',
-    'settings-squatchserveHost': 'squatchserveHost',
-    'settings-searxngHost': 'searxngHost'
+    'settings-squatchserveHost': 'squatchserveHost'
+    // NOTE: settings-searxngHost is NOT here — the SearXNG URL now saves to server
+    // config via its data-config-key (tools.searxng.url), the single source of truth.
   };
 
   for (const [elId, storageKey] of Object.entries(localStorageMap)) {
@@ -2472,11 +2506,12 @@ async function loadConversationById(id) {
     const data = await response.json();
     currentConversationId = id;
 
-    // Convert messages to our format
+    // Convert messages to our format (keep sources so the [S#] link list renders)
     conversation = data.messages.map(msg => ({
       role: msg.role,
       content: msg.content,
-      id: msg.id
+      id: msg.id,
+      sources: msg.sources || null
     }));
 
     // Update model if stored

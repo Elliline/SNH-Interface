@@ -49,7 +49,17 @@ const EPISTEMIC_CONDUCT =
   "evidence, nor are your training's leanings. Where rulings or data conflict, surface the tension " +
   'and ask their read.\n' +
   '- Self-check: catching yourself writing "likely," "probably," or "I imagine" about a source\'s ' +
-  "contents or a fact is the signal to search, or to say you don't know.";
+  "contents or a fact is the signal to search, or to say you don't know.\n" +
+  '- Searched vs. remembered: text shown to you under a WEB SEARCH RESULTS or FETCHED PAGE marker is ' +
+  'searched — for any specific fact you take from it, cite its [S#] link, and include the links you ' +
+  'used in your answer. Anything NOT under such a marker is from memory: a specific number, date, ' +
+  'price, or stat you cannot tie to a source must be hedged or left out, never stated as fact. Never ' +
+  'attribute a claim to a source that does not contain it.\n' +
+  '- Current/changeable facts (weather, prices, news, live status, "right now"/"latest"): you cannot ' +
+  "know these from memory — search, or say you'd need to look it up and offer to. Never present a " +
+  'guessed current value as real.\n' +
+  '- Citing later: if asked for your sources and you no longer have them, say "I no longer have the ' +
+  'source for that" — never reconstruct an authoritative-sounding attribution.';
 
 function getSeed() {
   const cfg = getConfig();

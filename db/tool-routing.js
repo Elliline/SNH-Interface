@@ -237,4 +237,34 @@ function classifyToolNeed(messageText, superSearchEnabled) {
   return false;
 }
 
-module.exports = { classifyToolNeed };
+// Questions about CURRENT / changeable facts that memory cannot answer reliably —
+// weather, news, prices, live status, "right now"/"latest". Used by the chat path
+// to REFUSE a confident-from-memory answer when search won't run (the 7/23 failure
+// where it invented a weather "high of 75°F"). This only gates an honesty nudge,
+// never an action, so it errs a little broad on the classic time-sensitive nouns.
+const TIME_SENSITIVE_PATTERNS = [
+  /\bweather\b/, /\bforecast\b/, /\btemperature\b/, /\bhow (hot|cold|warm) is it\b/,
+  /\b(stock|share)\s*price\b/, /\bstock market\b/, /\bexchange rate\b/, /\bprice of\b/,
+  /\b(crypto|bitcoin|ethereum|btc|eth)\b.{0,20}\b(price|value|worth)\b/,
+  /\b(latest|breaking|today'?s?|recent)\s+news\b/, /\bheadlines?\b/,
+  /\bwho won\b/, /\belection results?\b/, /\b(sports?|game)\s+scores?\b/,
+  /\bright now\b/, /\bat the moment\b/, /\bas of (today|now)\b/,
+  /\bcurrently\b.{0,30}\b(price|cost|rate|status|available|leader|president|ceo|score)\b/,
+  /\btoday('?s)?\b.{0,40}\b(price|rate|score|news|update|status|weather|forecast)\b/,
+  /\blatest\b.{0,40}\b(version|release|update|news|price|score)\b/,
+  /\bcurrent\b.{0,40}\b(price|rate|status|version|leader|president|ceo|weather|temperature)\b/,
+];
+
+/**
+ * Is this a question about current/changeable facts memory can't answer? See the
+ * pattern list above. The epistemic layer uses this so the entity offers to look
+ * it up instead of confidently making one up.
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isTimeSensitive(text) {
+  const t = String(text || '').toLowerCase();
+  return TIME_SENSITIVE_PATTERNS.some(r => r.test(t));
+}
+
+module.exports = { classifyToolNeed, isTimeSensitive };
