@@ -23,6 +23,15 @@
  *     restarted it myself").
  *
  * Config lives under `watchdog` in db/config.js (all knobs hot-read each probe).
+ *
+ * ROOT FIX APPLIED (2026-07-23): the sustained-load wedge was traced to the
+ * upstream GB10 / SM 12.1 bug vllm-project/vllm#40969 — silent hang with the
+ * default cudagraph_mode FULL_AND_PIECEWISE. sparky-brain now launches with
+ * cudagraph_mode PIECEWISE and gpu-memory-utilization 0.80 (see
+ * scripts/launch-brain.sh), which held clean over a 24-sequential + 24-concurrent
+ * stress test. This watchdog is now the SMOKE ALARM, not the fix: with the root
+ * cause addressed, a future trip should be treated as a NEW failure to diagnose,
+ * not the known wedge.
  */
 
 const { execFile } = require('child_process');
