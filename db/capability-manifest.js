@@ -180,6 +180,19 @@ const CONDITIONAL_CAPABILITIES = [
     schedule: 'When a question needs current info (only while search is enabled)',
     dateAdded: '2026-07-23',
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.searxng && cfg.tools.searxng.enabled)
+  },
+  {
+    id: 'voice',
+    name: 'Voice (speaking and listening)',
+    description: "You can speak and listen: your written reply can be spoken aloud (Kokoro text-to-speech), and a spoken message can be turned into text for you to read (NVIDIA Parakeet speech-to-text). Both run locally on Sparky's GPU alongside the rest of you.",
+    oneLiner: 'Speak your replies aloud and turn spoken input into text, both running locally.',
+    intro: 'I can speak my replies aloud and turn spoken input into text, both running locally on Sparky',
+    schedule: 'When the user uses the voice controls',
+    dateAdded: '2026-07-24',
+    // Honest gate: appears only once the TTS+STT engines are verified live and
+    // voice.enabled is turned on (see db/config.js). Was deferred while the
+    // containers were down; registers now that they answer.
+    when: (cfg) => !!(cfg && cfg.voice && cfg.voice.enabled)
   }
 ];
 

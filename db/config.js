@@ -120,6 +120,12 @@ const DEFAULTS = {
     searxng: { enabled: false, url: 'http://localhost:8888' }
   },
   voice: {
+    // Manifest honesty gate: the voice capability registers in the capability
+    // manifest ONLY when this is true — set it on once the TTS+STT containers are
+    // verified live (mirrors tools.searxng.enabled). Default false = "deferred"
+    // so voice is never claimed while the engines are down. The proxies themselves
+    // (/api/tts, /api/stt) don't read this; it purely gates self-knowledge.
+    enabled: false,
     stt: {
       active: 'whisper:Local',
       providers: [
