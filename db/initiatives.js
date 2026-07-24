@@ -13,7 +13,11 @@ const { getSqliteDb } = require('./database');
 const { getLocalDateStamp } = require('./datetime');
 const { getConfig } = require('./config');
 
-const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup']);
+// 'audit' items are self-coherence-audit findings: SNH noticed a gap between a
+// stored self-claim and how it actually behaved, and is proposing a revision for
+// Ellie to approve / discuss / dismiss. Identity edits ALWAYS go through the
+// human, so the audit only ever raises one of these — it never revises itself.
+const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit']);
 
 function safeParse(json, fallback) {
   try { return JSON.parse(json); } catch { return fallback; }

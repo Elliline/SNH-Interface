@@ -1779,6 +1779,24 @@ async function loadSettingsBrainTab() {
         desc: 'How similar two items must be (0–1) before SNH treats them as the same and skips the duplicate.' }
     ]));
 
+    // Self-Coherence Audit — SNH testing its stored self-claims against how it
+    // actually behaved, and raising gaps for approval. SNH's own feature request.
+    // Applies immediately on save (cadence changes need no restart).
+    const audit = config.audit || {};
+    container.appendChild(createConfigSection('Self-Coherence Audit', [
+      { key: 'audit.enabled', label: 'Enabled', type: 'checkbox', value: audit.enabled,
+        desc: 'Whether SNH runs the daily audit that checks its self-claims against its recent behavior and flags gaps for you.' },
+      { key: 'audit.cadenceDays', label: 'Run every N days', type: 'number', min: 1, max: 365, step: '1',
+        value: audit.cadenceDays,
+        desc: 'How often the audit runs. 1 = daily, 2 = every other day, and so on.' },
+      { key: 'audit.claimsPerRun', label: 'Claims sampled per run', type: 'number', min: 1, max: 10, step: '1',
+        value: audit.claimsPerRun,
+        desc: 'How many behavioral self-claims SNH tests each run (2–3 is the norm).' },
+      { key: 'audit.evidenceWindowDays', label: 'Evidence window (days)', type: 'number', min: 1, max: 90, step: '1',
+        value: audit.evidenceWindowDays,
+        desc: 'How many days of recent conversations count as evidence when judging a claim.' }
+    ]));
+
     // Rebuild Clusters button
     const rebuildSection = document.createElement('div');
     rebuildSection.className = 'config-section';

@@ -877,6 +877,39 @@ Respond with exactly YES, NO, or UNCERTAIN on the first line, then one short lin
 }
 
 /**
+ * Classify a self-fact as a behavioral CLAIM or a DECLARATION — the auditability
+ * split the self-coherence audit depends on. CLAIMS describe how SNH acts, values,
+ * or approaches things ("I value precision", "I'm an analytical partner") and can
+ * be tested against how it actually behaved, so the audit samples them.
+ * DECLARATIONS are facts about SNH's name, stated preferences, or history — true
+ * by assertion, not testable against behavior — so the audit leaves them alone.
+ * Defaults to 'declaration' on any doubt: mis-tagging a claim as a declaration
+ * just means it never gets audited (safe), while the reverse would audit an
+ * untestable fact and manufacture false "gaps".
+ * @param {string} text - the self-fact
+ * @returns {Promise<'claim'|'declaration'>}
+ */
+async function classifyClaimType(text) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You sort an AI's self-statements into two kinds:
+- CLAIM: about how it behaves, what it values, or how it approaches things — something you could check against what it actually did. Examples: "I value precision", "I tend to reframe problems structurally", "I'm an analytical partner", "I notice when I'm repeating myself and change course".
+- DECLARATION: about its name, its stated preferences, or its history — true because it's asserted, not something you'd verify by watching behavior. Examples: "My name is SNH", "I prefer to be addressed plainly", "I was first run on July 3rd", "I run on a machine called Squatch Neuro Hub".
+
+Answer with exactly one word on the first line: CLAIM or DECLARATION. If it could be either, answer DECLARATION.`;
+    const userPrompt = `Self-statement: "${text}"\n\nCLAIM or DECLARATION?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 8 });
+    const firstWord = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    const claimType = firstWord === 'claim' ? 'claim' : 'declaration';
+    console.log(`[FactExtractor] Claim-type: ${claimType.toUpperCase()} — "${String(text).slice(0, 70)}"`);
+    return claimType;
+  } catch (error) {
+    console.error('[FactExtractor] classifyClaimType error:', error.message);
+    return 'declaration'; // safe default — an unaudited fact, never a false gap
+  }
+}
+
+/**
  * Score how much a fact matters (salience, 1–10) with a judgment call to the
  * local model. Higher = durable and decision-relevant; lower = trivia/ephemeral.
  * @param {string} fact - The new fact to score
@@ -1602,12 +1635,24 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       if (s.oldSalience > cur) factToSalience.set(s.newFact, s.oldSalience);
     }
 
+    // === Claim/declaration tagging (concurrent) — the auditability split the
+    // self-coherence audit reads. Tagged at extraction time so every new self-
+    // fact is classified going forward; existing facts get a one-time pass. ===
+    const factToClaimType = new Map();
+    const claimSettled = await agentPool.runBatch(
+      facts.map(fact => async () => ({ fact, claimType: await classifyClaimType(fact) })),
+      'self-claim-type'
+    );
+    for (const c of claimSettled) {
+      if (c.status === 'fulfilled' && c.value) factToClaimType.set(c.value.fact, c.value.claimType);
+    }
+
     // === Cluster assignment (subject:'self', sequential DB writes) ===
     const factToMemberId = new Map();
     for (const fact of facts) {
       const res = await memoryClusters.assignToCluster(
         fact, extractionProvider, extractionModel, '', extractionHost,
-        source, factToSalience.get(fact) ?? 5, 'self'
+        source, factToSalience.get(fact) ?? 5, 'self', factToClaimType.get(fact) ?? 'declaration'
       );
       if (res && res.memberId) {
         factToMemberId.set(fact, res.memberId);
@@ -1647,6 +1692,7 @@ module.exports = {
   appendToOpsLog,
   prependDailyEntry,
   judgeContradiction,
+  classifyClaimType,
   scoreSalience,
   detectGapQuestion,
   judgeAnswered,

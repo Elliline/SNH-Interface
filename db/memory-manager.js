@@ -22,6 +22,7 @@ const memoryClusters = require('./memory-clusters');
 const factExtractor = require('./fact-extractor');
 const agentPool = require('./agent-pool');
 const initiativeEngine = require('./initiative-engine');
+const selfAudit = require('./self-audit');
 const brainWatchdog = require('./brain-watchdog');
 
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
@@ -1736,6 +1737,24 @@ async function runMaintenance() {
       reflection = { error: reflectErr.message };
     }
 
+    // Task F: self-coherence audit — SNH tests its stored self-CLAIMS against how
+    // it actually behaved, and raises any gaps for Ellie's approval. This was
+    // SNH's own feature request (its first accepted initiative, 2026-07-05;
+    // re-chosen 2026-07-23 to find out "if I'm actually growing, or just getting
+    // better at describing a growth that isn't happening"). It's a daily low-
+    // frequency pass — runIfDue self-gates on audit.cadenceDays, so it runs at
+    // most once per N days even though this cycle fires every couple of hours. It
+    // runs BEFORE Task E so any 'audit' initiatives it raises get prioritized and
+    // delivered in the same cycle. It NEVER revises identity — only documents and
+    // asks.
+    let selfAuditResult = { skipped: true };
+    try {
+      selfAuditResult = await selfAudit.runIfDue();
+    } catch (auditErr) {
+      console.error('[Heartbeat] Self-coherence audit error:', auditErr.message);
+      selfAuditResult = { error: auditErr.message };
+    }
+
     // Task E: initiative layer — turn findings into candidate initiatives, let a
     // pooled prioritizer re-score/expire/cap them, then maybe reach out once.
     let initiative = { skipped: true };
@@ -1756,7 +1775,7 @@ async function runMaintenance() {
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, cleanup, archive, questionSweep, reflection, initiative };
+    return { report, cleanup, archive, questionSweep, reflection, selfAudit: selfAuditResult, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     return { error: error.message };

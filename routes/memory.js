@@ -188,6 +188,30 @@ router.get('/self', (req, res) => {
 });
 
 /**
+ * GET /api/memory/capabilities
+ * The capability manifest — SNH's machine-true registry of what it can actually
+ * do. This is the "retrieved on demand" surface (full descriptions, schedules,
+ * dates) behind the compact block injected into chat. Optional ?q= filters by
+ * name/description. Read-only.
+ */
+router.get('/capabilities', (req, res) => {
+  try {
+    const capabilityManifest = require('../db/capability-manifest');
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const capabilities = q ? capabilityManifest.find(q) : capabilityManifest.getAll();
+    const injection = capabilityManifest.buildInjectionBlock();
+    res.json({
+      capabilities,
+      count: capabilities.length,
+      injection: { tokens: injection.tokens, text: injection.text }
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading capabilities:', error.message);
+    res.status(500).json({ error: 'Failed to load capabilities' });
+  }
+});
+
+/**
  * GET /api/memory/initiatives
  * List pending initiatives (highest priority first) plus the greeting threshold,
  * so the frontend bell can count those worth surfacing. Read-only view.

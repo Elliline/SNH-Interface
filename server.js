@@ -23,17 +23,18 @@ const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
 const agentPool = require('./db/agent-pool');
 const identity = require('./db/identity');
+const capabilityManifest = require('./db/capability-manifest');
 const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive } = require('./db/tool-routing');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
 
 // Configuration
-const { getConfig, updateConfig, getProviderInstance, getVoiceProvider } = require('./db/config');
+const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearxngConfig } = require('./db/config');
 
 // Routes
 const conversationsRouter = require('./routes/conversations');
@@ -1643,6 +1644,20 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       content: `${getCurrentDateTimeString()}. Use this as the current date/time when the user says "today", "now", "this week", etc., and when constructing web searches for current information.`
     });
 
+    // Capability self-knowledge: a compact, machine-true list of what SNH can
+    // actually do, so "what can you do / do you have a way to X" is answered from
+    // the manifest, not the model's guess (the failure that motivated this: SNH
+    // proposing to build a feature it already had). Kept small for the injection
+    // diet; full descriptions are retrieved on demand (GET /api/memory/capabilities).
+    // Unshifted before the identity block so identity still leads.
+    try {
+      const capBlock = capabilityManifest.buildInjectionBlock();
+      enhancedMessages.unshift({ role: 'system', content: capBlock.text });
+      console.log(`[Capabilities] Injected manifest: ${capBlock.count} capabilities, ~${capBlock.tokens} tokens`);
+    } catch (capErr) {
+      console.error('[Capabilities] Injection error:', capErr.message);
+    }
+
     // Self-identity: the minimal seed plus SNH's accumulated self-observations.
     // Injected as the leading system message so the identity it has developed for
     // itself frames every response. We never define this personality — it emerges
@@ -1659,10 +1674,31 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // X-Injected-Tokens response header and logged, so prefill cost is visible.
     let injectedTokens = 0;
     try {
-      injectedTokens = enhancedMessages
-        .filter(m => m.role === 'system')
-        .reduce((sum, m) => sum + injectionBudget.estTokens(m.content), 0);
-      console.log(`[Injection] Total system-context: ~${injectedTokens} tokens across ${enhancedMessages.filter(m => m.role === 'system').length} system message(s)`);
+      const sys = enhancedMessages.filter(m => m.role === 'system');
+      injectedTokens = sys.reduce((sum, m) => sum + injectionBudget.estTokens(m.content), 0);
+      // Per-block breakdown (measurement/observability — does NOT change what's
+      // injected), so we can see from real numbers what's worth trimming. Blocks
+      // are identified by their content markers; the identity block is split into
+      // its self-facts portion and the appended Epistemic-conduct portion.
+      const est = injectionBudget.estTokens;
+      const EPI = 'Epistemic conduct:';
+      const breakdown = { identity: 0, epistemic: 0, manifest: 0, memory: 0, sourcesRecall: 0, datetime: 0, other: 0 };
+      for (const m of sys) {
+        const c = m.content || '';
+        const t = est(c);
+        if (c.startsWith('Your built-in capabilities')) breakdown.manifest += t;
+        else if (c.includes('You are an AI running on SNH') || c.includes('What you have noticed about yourself')) {
+          const idx = c.indexOf(EPI);
+          if (idx >= 0) { breakdown.epistemic += est(c.slice(idx)); breakdown.identity += est(c.slice(0, idx)); }
+          else breakdown.identity += t;
+        }
+        else if (c.startsWith('Links you found earlier in this conversation')) breakdown.sourcesRecall += t;
+        else if (c.includes('Use this as the current date/time')) breakdown.datetime += t;
+        else if (c.startsWith('The user is asking about current')) breakdown.other += t; // time-sensitive guard
+        else breakdown.memory += t; // MEMORY.md / daily logs / clusters / past-convo
+      }
+      console.log(`[Injection] Total system-context: ~${injectedTokens} tokens across ${sys.length} system message(s)`);
+      console.log(`[Injection] Breakdown: identity=${breakdown.identity} epistemic=${breakdown.epistemic} manifest=${breakdown.manifest} memory=${breakdown.memory} sourcesRecall=${breakdown.sourcesRecall} datetime=${breakdown.datetime} other=${breakdown.other}`);
     } catch (_) {}
 
     // Auto-generate title from first user message if needed
@@ -2296,4 +2332,15 @@ app.listen(PORT, () => {
   }
   memoryManager.startHeartbeat();
   memoryManager.startLivenessProbe();
+
+  // Reconcile the capability manifest against its known-set and log any
+  // additions/removals to the ops ledger, so manifest changes leave a machine
+  // trail. Logs only — never writes self-facts (introductions are a separate,
+  // deliberate step, never a bulk insert).
+  try {
+    const { added, removed } = capabilityManifest.syncToOps();
+    console.log(`  - Capability manifest: ${capabilityManifest.getAll().length} capabilities (${added.length} new, ${removed.length} removed this boot)`);
+  } catch (e) {
+    console.error('[Capabilities] syncToOps error:', e.message);
+  }
 });

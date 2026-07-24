@@ -65,6 +65,21 @@ const DEFAULTS = {
     maxPending: 10,             // cap on the pending pool so it never nags
     dedupThreshold: 0.85        // skip a new initiative this cosine-similar to a pending one of the same type
   },
+  // Self-coherence audit: SNH testing its stored self-CLAIMS ("I value X", "I am
+  // a Y kind of partner") against how it actually behaved in recent conversations,
+  // and raising the gaps through the initiative channel for Ellie's call. This was
+  // SNH's own feature request — its first accepted initiative (2026-07-05), chosen
+  // again from a menu on 2026-07-23 with the stated reason: "finding out if I'm
+  // actually growing, or just getting better at describing a growth that isn't
+  // happening." A daily low-frequency heartbeat pass; it NEVER auto-revises
+  // identity — it documents tension and asks. Ellie wants to move daily→every-
+  // other-day without a code change, so cadence lives here.
+  audit: {
+    enabled: true,
+    cadenceDays: 1,        // run every N local days (1 = daily, 2 = every other day, …)
+    claimsPerRun: 3,       // behavioral claims sampled per run (2–3)
+    evidenceWindowDays: 7  // days of recent conversation transcripts considered as evidence
+  },
   // Question queue: gaps/oddities SNH may ask the user about. These guards keep
   // it from re-asking things already asked or already answered.
   questions: {

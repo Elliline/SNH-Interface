@@ -506,7 +506,7 @@ function createOrStrengthenLink(clusterA, clusterB, db) {
  * @param {string} source - Source of the fact
  * @returns {Promise<Object>} - {clusterId, clusterName, isNew}
  */
-async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user') {
+async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user', claimType = null) {
   try {
     const config = getConfig();
     const db = getSqliteDb();
@@ -663,9 +663,9 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     const nowIso = new Date().toISOString();
     const salienceValue = Number.isFinite(salience) ? Math.max(1, Math.min(10, Math.round(salience))) : 5;
     db.prepare(`
-      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience, subject)
-      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?)
-    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject);
+      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience, subject, claim_type)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?)
+    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, claimType);
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 
@@ -1010,22 +1010,35 @@ function getClusters(subject = null) {
  * @param {Object} [opts]
  * @param {string|null} [opts.status='active'] - 'active', 'superseded', or null for all
  * @param {number|null} [opts.limit=null] - max rows, or null for no limit
- * @returns {Array} cluster_member rows with cluster_name attached
+ * @param {string|null} [opts.claimType] - filter to one claim_type ('claim' |
+ *   'declaration' | 'dissonance'); 'unclassified' matches rows with a NULL tag.
+ *   Omit for all. Added for the self-coherence audit (samples 'claim' only).
+ * @param {string|null} [opts.excludeClaimType] - drop rows with this claim_type
+ *   (identity injection uses 'dissonance' to keep audit records out of chat).
+ * @returns {Array} cluster_member rows with cluster_name + claim_type attached
  */
-function getSelfFacts({ status = 'active', limit = null } = {}) {
+function getSelfFacts({ status = 'active', limit = null, claimType = null, excludeClaimType = null } = {}) {
   try {
     const db = getSqliteDb();
     if (!db) return [];
 
     let sql = `
       SELECT cm.id, cm.content, cm.salience, cm.status, cm.superseded_by,
-             cm.created_at, cm.updated_at, cm.cluster_id, cm.source,
+             cm.created_at, cm.updated_at, cm.cluster_id, cm.source, cm.claim_type,
              mc.name AS cluster_name
       FROM cluster_members cm
       LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
       WHERE cm.subject = 'self'`;
     const params = [];
     if (status) { sql += ' AND cm.status = ?'; params.push(status); }
+    if (claimType === 'unclassified') {
+      sql += ' AND cm.claim_type IS NULL';
+    } else if (claimType) {
+      sql += ' AND cm.claim_type = ?'; params.push(claimType);
+    }
+    if (excludeClaimType) {
+      sql += ' AND (cm.claim_type IS NULL OR cm.claim_type != ?)'; params.push(excludeClaimType);
+    }
     sql += ' ORDER BY cm.salience DESC, cm.created_at DESC';
     if (limit) { sql += ' LIMIT ?'; params.push(limit); }
 

@@ -66,10 +66,19 @@ function getSelfFactBudget() {
 
 /**
  * The highest-salience active self-facts, budgeted and salience-ordered.
+ *
+ * Excludes 'dissonance' rows — those are the self-coherence audit's own records
+ * ("claimed X on [date], behavior showed Y") and belong in the Self tab, not in
+ * the identity block injected into every chat. Letting them inject would feed
+ * SNH its own audit notes as if they were traits.
  * @returns {Array} self-fact rows (content, salience, created_at, cluster_name, ...)
  */
 function getActiveSelfFacts() {
-  return memoryClusters.getSelfFacts({ status: 'active', limit: getSelfFactBudget() });
+  return memoryClusters.getSelfFacts({
+    status: 'active',
+    limit: getSelfFactBudget(),
+    excludeClaimType: 'dissonance'
+  });
 }
 
 /**
