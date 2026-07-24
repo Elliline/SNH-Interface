@@ -14,3 +14,11 @@ Thumbs.db
 
 # Database files
 /data/
+
+# SQLite databases and their WAL/shared-memory sidecars (never track DB files —
+# db/chat.db was an empty tracked placeholder; the real DB lives under /data/)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
