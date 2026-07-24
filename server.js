@@ -1799,7 +1799,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // === UPGRADE 3: Memory flush before context overflow ===
     const providerType = provider || 'ollama';
-    const instanceName = req.body.instanceName;
+    // Fall back to the configured 'Local' instance when a local-provider request
+    // omits instanceName. Without this, a vLLM request with no instanceName fell
+    // through to OLLAMA_HOST below and 404'd against the wrong engine (7/22 manifest
+    // session finding). Only applied when a matching 'Local' instance actually
+    // exists, so llamacpp's existing host-fallback path is left untouched.
+    let instanceName = req.body.instanceName;
+    if (!instanceName && ['ollama', 'vllm', 'llamacpp'].includes(providerType)
+        && getProviderInstance(providerType, 'Local')) {
+      instanceName = 'Local';
+    }
 
     let providerHost;
     if (instanceName && ['ollama', 'vllm', 'llamacpp'].includes(providerType)) {
