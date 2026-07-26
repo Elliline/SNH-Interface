@@ -17,7 +17,11 @@ const { getConfig } = require('./config');
 // stored self-claim and how it actually behaved, and is proposing a revision for
 // Ellie to approve / discuss / dismiss. Identity edits ALWAYS go through the
 // human, so the audit only ever raises one of these — it never revises itself.
-const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit']);
+// 'proposal' = the entity is asking to DO something and needs a yes/no from
+// Ellie (currently only create_cron_job). Unlike the other types, which are
+// things to read, a proposal carries an action waiting on a decision — the bell
+// panel renders Approve/Reject for it instead of Discuss/Dismiss.
+const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit', 'proposal']);
 
 function safeParse(json, fallback) {
   try { return JSON.parse(json); } catch { return fallback; }

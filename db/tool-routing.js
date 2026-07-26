@@ -267,4 +267,56 @@ function isTimeSensitive(text) {
   return TIME_SENSITIVE_PATTERNS.some(r => r.test(t));
 }
 
-module.exports = { classifyToolNeed, isTimeSensitive };
+/**
+ * Scheduling intent — does this message ask for something to happen on a
+ * recurring schedule? Gates the create_cron_job action tool into the tool loop.
+ *
+ * Kept SEPARATE from classifyToolNeed (which is about web search) and
+ * deliberately NARROW, for the opposite reason: a false positive on the search
+ * classifier costs a wasted lookup, while a false positive here means the entity
+ * proposes a scheduled job during ordinary conversation and puts a decision in
+ * front of Ellie that she never asked for. The probe measured a 0/20
+ * false-positive rate on the model itself; this keeps the routing layer from
+ * undoing that.
+ *
+ * Requires BOTH a recurrence signal and a request/ask signal — "every morning"
+ * on its own ("I check disk space every morning") is a statement of habit, not
+ * a request to schedule one.
+ */
+const RECURRENCE_PATTERNS = [
+  /\bevery (day|morning|evening|night|hour|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+ (minutes?|hours?|days?|weeks?))\b/,
+  /\b(daily|hourly|weekly|monthly|nightly)\b/,
+  /\beach (day|morning|evening|night|week|month)\b/,
+  /\bon a (schedule|timer|cadence)\b/,
+  /\bcron\b/,
+  /\bevery so often\b/,
+];
+
+// The request must actually be ADDRESSED to the entity. A bare verb list is far
+// too loose here: "I run backups daily and it is fine" is a statement of habit,
+// and matching "run" in it would put an unasked-for decision in front of Ellie.
+// So a request signal is either an explicit second-person ask, or an imperative
+// at the very start of the message.
+const SCHEDULE_REQUEST_PATTERNS = [
+  /\bremind me\b/,
+  /\b(can|could|would|will) you\b/,
+  /\bplease\b/,
+  /\bi(’|')?d like you to\b/,
+  /\bi want you to\b/,
+  /\bset (it|this|that) up\b/,
+  /\bkeep (checking|watching|an eye)\b/,
+  // Imperative opener: "schedule a …", "set up a …", "add a nightly …"
+  /^\s*(schedule|set ?up|create|add|make|start|run|check)\b/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message is asking for a recurring job
+ */
+function classifySchedulingIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (!RECURRENCE_PATTERNS.some(r => r.test(t))) return false;
+  return SCHEDULE_REQUEST_PATTERNS.some(r => r.test(t));
+}
+
+module.exports = { classifyToolNeed, isTimeSensitive, classifySchedulingIntent };

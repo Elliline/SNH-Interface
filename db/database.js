@@ -328,6 +328,55 @@ function initDatabase() {
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_heartbeat_reports_created ON heartbeat_reports(created_at)`);
 
+    // Cron jobs proposed by the entity through the create_cron_job tool. PROPOSE
+    // ONLY: a tool call lands here as status='proposed' and raises an initiative;
+    // nothing becomes 'approved' without Ellie deciding in the bell panel.
+    //
+    // `source` is the provenance tag, mirroring cluster_members.source — every
+    // row the entity proposed carries 'kid-proposed', so kid-created jobs can be
+    // listed and reverted in bulk without guessing.
+    //
+    // NOTE: approving records the job; nothing executes it. There is no scheduler
+    // in SNH yet. Kept deliberately explicit so this table is never mistaken for
+    // a running crontab.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        id TEXT PRIMARY KEY,
+        schedule TEXT NOT NULL,             -- 5-field cron expression as proposed
+        description TEXT NOT NULL,
+        enabled INTEGER DEFAULT 0,          -- the 'enabled' the entity asked for
+        source TEXT DEFAULT 'kid-proposed', -- provenance (mirrors cluster_members.source)
+        status TEXT DEFAULT 'proposed',     -- proposed | approved | rejected | reverted
+        initiative_id TEXT,                 -- the bell item raised for this proposal
+        conversation_id TEXT,               -- where the entity proposed it
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decided_at DATETIME,
+        decided_note TEXT
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_status ON cron_jobs(status)`);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_source ON cron_jobs(source)`);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_created ON cron_jobs(created_at)`);
+
+    // Every tool call the entity makes and what came of it. Operational telemetry
+    // → surfaced in the Thinking tab, never injected into chat. Rejected/capped
+    // calls are logged too: a tool call that was refused is exactly the thing
+    // worth being able to look back at.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS tool_call_log (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        tool TEXT NOT NULL,
+        args_json TEXT,                     -- arguments as the model emitted them
+        outcome TEXT NOT NULL,              -- proposed | rejected-cap | error | approved | rejected
+        detail TEXT,                        -- human-readable one-liner
+        ref_id TEXT,                        -- e.g. the cron_jobs.id this produced
+        conversation_id TEXT
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_tool_call_log_created ON tool_call_log(created_at)`);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_tool_call_log_tool ON tool_call_log(tool)`);
+
     // Conversations may be started by SNH itself (unprompted initiatives).
     const convCols = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
     if (!convCols.some(c => c.name === 'initiated_by')) {

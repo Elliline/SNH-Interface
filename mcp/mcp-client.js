@@ -9,6 +9,8 @@ const fs = require('fs');
 const path = require('path');
 const SearXNGTool = require('./tools/searxng');
 const WebFetchTool = require('./tools/web-fetch');
+const CreateCronJobTool = require('./tools/create-cron-job');
+const { getConfig } = require('../db/config');
 
 class MCPClient {
   constructor() {
@@ -47,11 +49,24 @@ class MCPClient {
       // web_fetch is always available when tools are enabled
     }
 
-    // web_fetch is always available when any tool is enabled
-    if (this.tools.size > 0 && !this.tools.has('web_fetch')) {
+    // web_fetch rides along with SEARCH tools specifically — fetching a page is
+    // only useful when there is a search that produced the URL. Note this checks
+    // for a search tool rather than "any tool at all": action tools register
+    // below and must not drag web_fetch on with them.
+    if (this.tools.has('web_search') && !this.tools.has('web_fetch')) {
       const webFetch = new WebFetchTool();
       this.tools.set(webFetch.name, webFetch);
       console.log('MCP: Registered built-in tool "web_fetch"');
+    }
+
+    // Action tools register independently of the search stack. create_cron_job
+    // is gated only on its own config flag — it must be available when SearXNG
+    // is off, which is the default.
+    const cronCfg = (getConfig().tools && getConfig().tools.cron) || {};
+    if (cronCfg.enabled !== false) {
+      const cronTool = new CreateCronJobTool();
+      this.tools.set(cronTool.name, cronTool);
+      console.log(`MCP: Registered action tool "${cronTool.name}" (tier=${cronTool.tier}, propose-only)`);
     }
 
     console.log(`MCP: ${this.tools.size} tool(s) ready: [${this.getToolNames().join(', ')}]`);
@@ -87,7 +102,10 @@ class MCPClient {
       if (toolName === 'web_search' && context.searxngHost) {
         return await tool.execute(args, context.searxngHost);
       }
-      return await tool.execute(args);
+      // Everything else gets the context object as its second argument. Action
+      // tools need it (create_cron_job records which conversation proposed the
+      // job); web_fetch takes only args and ignores it.
+      return await tool.execute(args, context);
     } catch (error) {
       return { error: `Tool execution failed: ${error.message}` };
     }
@@ -98,6 +116,24 @@ class MCPClient {
    */
   hasTools() {
     return this.tools.size > 0;
+  }
+
+  /** Is one specific tool registered? */
+  hasTool(name) {
+    return this.tools.has(name);
+  }
+
+  /**
+   * Tier metadata for every registered tool that declares it. Nothing reads this
+   * yet — the tool registry will. Tools without getTierMetadata() are omitted
+   * rather than guessed at.
+   */
+  getTierMetadata() {
+    const out = [];
+    for (const tool of this.tools.values()) {
+      if (typeof tool.getTierMetadata === 'function') out.push(tool.getTierMetadata());
+    }
+    return out;
   }
 
   /**

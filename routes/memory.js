@@ -289,6 +289,97 @@ router.post('/initiatives/:id/discuss', async (req, res) => {
   }
 });
 
+// ============ cron proposals (create_cron_job, propose-only) ============
+
+/**
+ * GET /api/memory/cron
+ * Every cron job the entity proposed, with current cap usage. Read-only.
+ */
+router.get('/cron', (req, res) => {
+  try {
+    const cronJobs = require('../db/cron-jobs');
+    const status = typeof req.query.status === 'string' ? req.query.status : null;
+    const allowed = new Set(['proposed', 'approved', 'rejected', 'reverted']);
+    res.json({
+      jobs: cronJobs.listKidCreated({ status: allowed.has(status) ? status : null }),
+      caps: cronJobs.capStatus()
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error listing cron proposals:', error.message);
+    res.status(500).json({ error: 'Failed to list cron proposals' });
+  }
+});
+
+/**
+ * POST /api/memory/cron/:id/approve
+ * Approve a proposal. Records the job — nothing schedules or runs it.
+ */
+router.post('/cron/:id/approve', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUUID(id)) return res.status(400).json({ error: 'Invalid proposal ID' });
+    const cronJobs = require('../db/cron-jobs');
+    const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : null;
+    const result = cronJobs.approve(id, { note });
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    res.json({ success: true, job: result.job });
+  } catch (error) {
+    console.error('[MemoryAPI] Error approving cron proposal:', error.message);
+    res.status(500).json({ error: 'Failed to approve proposal' });
+  }
+});
+
+/**
+ * POST /api/memory/cron/:id/reject
+ * Reject a proposal. Writes a daily-log line so the entity learns the outcome.
+ */
+router.post('/cron/:id/reject', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUUID(id)) return res.status(400).json({ error: 'Invalid proposal ID' });
+    const cronJobs = require('../db/cron-jobs');
+    const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : null;
+    const result = cronJobs.reject(id, { note });
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    res.json({ success: true, job: result.job });
+  } catch (error) {
+    console.error('[MemoryAPI] Error rejecting cron proposal:', error.message);
+    res.status(500).json({ error: 'Failed to reject proposal' });
+  }
+});
+
+/**
+ * POST /api/memory/cron/revert-all
+ * Bulk revert every approved kid-created job. This is what the provenance tag
+ * is for. Rows are kept and marked 'reverted' — supersede, never delete.
+ */
+router.post('/cron/revert-all', (req, res) => {
+  try {
+    const cronJobs = require('../db/cron-jobs');
+    const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : 'bulk revert';
+    res.json({ success: true, ...cronJobs.revertAllKidCreated({ note }) });
+  } catch (error) {
+    console.error('[MemoryAPI] Error reverting cron jobs:', error.message);
+    res.status(500).json({ error: 'Failed to revert cron jobs' });
+  }
+});
+
+/**
+ * GET /api/memory/tool-calls
+ * Every tool call the entity made and what came of it — including calls refused
+ * by a rate cap. Operational telemetry for the Thinking tab; never injected.
+ */
+router.get('/tool-calls', (req, res) => {
+  try {
+    const cronJobs = require('../db/cron-jobs');
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    res.json({ calls: cronJobs.listToolCalls({ limit }) });
+  } catch (error) {
+    console.error('[MemoryAPI] Error listing tool calls:', error.message);
+    res.status(500).json({ error: 'Failed to list tool calls' });
+  }
+});
+
 /**
  * GET /api/memory/followup-traces
  * Recent conversation-followup traces (newest first): what each reflection cycle

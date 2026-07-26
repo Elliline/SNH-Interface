@@ -117,7 +117,22 @@ const DEFAULTS = {
   // URL used to live only in the client's localStorage + a hardcoded server
   // fallback, so settings and reality disagreed; now it's config.)
   tools: {
-    searxng: { enabled: false, url: 'http://localhost:8888' }
+    searxng: { enabled: false, url: 'http://localhost:8888' },
+    // create_cron_job — the first action tool. PROPOSE ONLY: a call raises an
+    // initiative for Ellie to approve or reject in the bell panel; nothing is
+    // created without her decision, and nothing executes even once approved
+    // (SNH has no scheduler yet — approving records the job).
+    //
+    // The caps are on the TOOL, not on any notion of trust level. Same shape as
+    // the watchdog's maxRestartsPerHour: a trailing-hour window plus a hard
+    // ceiling, past which the tool refuses and says so. Difference from the
+    // watchdog: these are counted from the DB rather than an in-memory array,
+    // so a server restart can't reset the entity's budget.
+    cron: {
+      enabled: true,
+      maxProposalsPerHour: 3,  // proposals (approved or not) in any trailing hour
+      maxKidCreatedJobs: 10    // hard ceiling on live kid-created jobs
+    }
   },
   voice: {
     // Manifest honesty gate: the voice capability registers in the capability

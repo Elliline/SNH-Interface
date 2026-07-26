@@ -2866,7 +2866,17 @@ async function loadInitiativeList() {
       container.innerHTML = '<div class="memory-empty">Nothing on SNH\'s mind right now.</div>';
       return;
     }
-    container.innerHTML = items.map(it => `
+    container.innerHTML = items.map(it => {
+      // A 'proposal' carries an action waiting on a yes/no, so it gets
+      // Approve/Reject instead of Discuss/Dismiss. source_ref is the cron_jobs
+      // row the decision applies to.
+      const isProposal = it.type === 'proposal' && it.source_kind === 'cron-proposal' && it.source_ref;
+      const actions = isProposal
+        ? `<button class="initiative-approve" data-cron-id="${escapeHtml(it.source_ref)}">Approve</button>
+           <button class="initiative-reject" data-cron-id="${escapeHtml(it.source_ref)}">Reject</button>`
+        : `<button class="initiative-discuss" data-id="${it.id}">Discuss</button>
+           <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>`;
+      return `
       <div class="initiative-item" data-id="${it.id}">
         <div class="initiative-item-head">
           <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
@@ -2874,12 +2884,36 @@ async function loadInitiativeList() {
           <span class="initiative-priority" title="priority">${it.priority}/10</span>
         </div>
         <div class="initiative-content">${escapeHtml(it.content)}</div>
-        <div class="initiative-actions">
-          <button class="initiative-discuss" data-id="${it.id}">Discuss</button>
-          <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>
-        </div>
-      </div>
-    `).join('');
+        ${isProposal ? '<div class="initiative-note">Approving records the job. Nothing runs it yet — SNH has no scheduler.</div>' : ''}
+        <div class="initiative-actions">${actions}</div>
+      </div>`;
+    }).join('');
+
+    // Approve / Reject on cron proposals.
+    const decide = (btn, verb) => async () => {
+      const actionsEl = btn.closest('.initiative-actions');
+      actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = true));
+      btn.textContent = verb === 'approve' ? 'Approving…' : 'Rejecting…';
+      try {
+        const res = await fetch(`/api/memory/cron/${btn.dataset.cronId}/${verb}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'failed');
+        loadInitiativeList();
+        refreshInitiativeBadge();
+      } catch (e) {
+        console.error(`[Initiatives] cron ${verb} failed:`, e);
+        btn.textContent = verb === 'approve' ? 'Approve' : 'Reject';
+        actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = false));
+      }
+    };
+    container.querySelectorAll('.initiative-approve').forEach(btn =>
+      btn.addEventListener('click', decide(btn, 'approve')));
+    container.querySelectorAll('.initiative-reject').forEach(btn =>
+      btn.addEventListener('click', decide(btn, 'reject')));
     container.querySelectorAll('.initiative-dismiss').forEach(btn => {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -3312,6 +3346,39 @@ function friendlyAnomaly(raw) {
 // telemetry) live in a separate ops log that is deliberately NEVER injected into
 // chat context. Surface the most recent ones here so a wedged/slow brain stays
 // observable. Returns an HTML string (empty if no ops recorded).
+/**
+ * Every tool call SNH made and what came of it — including calls its own rate
+ * cap refused. Operational telemetry, so it lives in the Thinking tab and is
+ * never injected into chat.
+ */
+async function loadToolCallSection() {
+  try {
+    const res = await fetch('/api/memory/tool-calls?limit=40');
+    if (!res.ok) return '';
+    const { calls } = await res.json();
+    if (!calls || calls.length === 0) return '';
+
+    const ICON = {
+      proposed: '📤', approved: '✅', rejected: '🚫',
+      'rejected-cap': '⛔', error: '⚠️'
+    };
+    const items = calls.map(c => {
+      const d = new Date((c.created_at || '').includes('T') ? c.created_at : (c.created_at || '').replace(' ', 'T') + 'Z');
+      const when = isNaN(d.getTime()) ? '' : d.toLocaleString();
+      return `<div class="thinking-anomaly">${ICON[c.outcome] || '🔧'} <span class="thinking-dim">${escapeHtml(when)}</span> <strong>${escapeHtml(c.tool)}</strong> · ${escapeHtml(c.outcome)}${c.detail ? ` — ${escapeHtml(c.detail)}` : ''}</div>`;
+    }).join('');
+
+    return `
+      <details class="thinking-entry thinking-ops">
+        <summary class="thinking-head"><span class="thinking-kind thinking-kind-ops">tool calls</span><span class="thinking-when">${calls.length} recent · not injected into chat</span></summary>
+        <div class="thinking-anomalies">${items}</div>
+      </details>`;
+  } catch (e) {
+    console.error('[Thinking] Error loading tool calls:', e);
+    return '';
+  }
+}
+
 async function loadOpsSection() {
   try {
     const listRes = await fetch('/api/memory/ops');
@@ -3358,14 +3425,16 @@ async function loadThinkingTab() {
   };
 
   try {
-    const [res, opsHtml] = await Promise.all([
+    const [res, opsHtml, toolHtml] = await Promise.all([
       fetch('/api/memory/thinking?limit=60'),
       loadOpsSection(),
+      loadToolCallSection(),
     ]);
     const data = await res.json();
     const entries = data.entries || [];
 
     let html = '<div class="memory-self-note">A read-only look at how SNH thinks in the background — each reflection cycle (what it reviewed, considered, and queued or skipped, and why) and each heartbeat maintenance pass. Newest first.</div>';
+    html += toolHtml;
     html += opsHtml;
 
     if (entries.length === 0) {

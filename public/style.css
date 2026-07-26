@@ -1977,6 +1977,38 @@ a.msg-source:hover {
 .initiative-discuss:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
 .initiative-type-observation { color: var(--secondary-color); }
 .initiative-type-followup { color: var(--success-color); }
+.initiative-type-proposal { color: var(--accent-color); }
+
+/* Cron proposals: a decision, not a read. Approve is affirmative, Reject is
+   neutral-destructive, and the note under the content states plainly that
+   approving records the job rather than scheduling it. */
+.initiative-note {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  margin: 4px 0 6px;
+}
+.initiative-approve,
+.initiative-reject {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  cursor: pointer;
+}
+.initiative-approve {
+  border-color: var(--success-color);
+  color: var(--success-color);
+}
+.initiative-approve:hover:not(:disabled) { background: var(--success-color); color: #fff; }
+.initiative-reject {
+  border-color: var(--error-color);
+  color: var(--error-color);
+}
+.initiative-reject:hover:not(:disabled) { background: var(--error-color); color: #fff; }
+.initiative-approve:disabled,
+.initiative-reject:disabled { opacity: 0.5; cursor: default; }
 
 /* Config item plain-language description */
 .config-item-desc {

@@ -193,6 +193,21 @@ const CONDITIONAL_CAPABILITIES = [
     // voice.enabled is turned on (see db/config.js). Was deferred while the
     // containers were down; registers now that they answer.
     when: (cfg) => !!(cfg && cfg.voice && cfg.voice.enabled)
+  },
+  {
+    id: 'cron-proposals',
+    name: 'Scheduled job proposals',
+    // HONESTY, deliberately laboured here because this is the easiest entry in
+    // the manifest to over-claim: proposing is ALL it does. Nothing is created
+    // without Ellie's approval, and even an approved job does not run — SNH has
+    // no scheduler. Saying "I can schedule things" would be exactly the failure
+    // this manifest exists to prevent.
+    description: "When the user asks for something to happen on a schedule, you can propose a recurring job — a cron expression plus a description — which goes to her bell panel for approval. You cannot create or run one yourself: she approves or rejects it, approving only records the job, and nothing executes it because there is no scheduler yet. You are limited in how many you may propose per hour and how many can exist.",
+    oneLiner: 'Propose a recurring job for the user to approve; approving records it, nothing runs it yet.',
+    intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and even approved it just gets recorded, because nothing runs scheduled jobs yet',
+    schedule: 'When the user asks for something recurring',
+    dateAdded: '2026-07-26',
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.cron && cfg.tools.cron.enabled !== false)
   }
 ];
 

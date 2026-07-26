@@ -28,7 +28,7 @@ const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent } = require('./db/tool-routing');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1402,7 +1402,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // Read tool enabled state from config instead of per-request flag
     const appConfig = getConfig();
+    // Search tools (web_search/web_fetch) ride on the SearXNG flag. Action tools
+    // have their own flag — create_cron_job must work while SearXNG is off,
+    // which is the default.
     const toolsEnabled = !!(appConfig.tools && appConfig.tools.searxng && appConfig.tools.searxng.enabled);
+    const cronToolEnabled = !!(appConfig.tools && appConfig.tools.cron && appConfig.tools.cron.enabled !== false);
 
     // SECURITY: Validate inputs
     if (!isValidModelName(model)) {
@@ -1443,9 +1447,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log('TTS enabled:', ttsEnabled, '(type:', typeof ttsEnabled, ')');
     console.log('Super Search:', !!superSearch);
 
-    // Smart tool routing: classify if this message needs web tools
-    const needsTools = toolsEnabled && mcpClient.hasTools() && classifyToolNeed(userMessage.content, !!superSearch);
-    console.log('Tool routing:', needsTools ? 'TOOLS (search/fetch likely needed)' : 'DIRECT (conversational, skipping tool loop)');
+    // Smart tool routing. Two independent reasons to enter the tool loop:
+    //   - search intent, gated on the SearXNG stack being enabled
+    //   - scheduling intent, gated on the create_cron_job action tool
+    // Either one pulls the turn into the loop; the model is handed the whole
+    // registered tool set and picks. Scheduling intent is matched narrowly
+    // (see classifySchedulingIntent) so ordinary conversation never routes here.
+    const needsSearchTools = toolsEnabled && mcpClient.hasTools() && classifyToolNeed(userMessage.content, !!superSearch);
+    const needsActionTools = cronToolEnabled && mcpClient.hasTool('create_cron_job')
+      && classifySchedulingIntent(userMessage.content);
+    const needsTools = needsSearchTools || needsActionTools;
+    console.log('Tool routing:', needsTools
+      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling'].filter(Boolean).join(' + ')})`
+      : 'DIRECT (conversational, skipping tool loop)');
 
     // Should-I-search honesty guard: if the question is about current/changeable
     // facts (weather, prices, news, "right now"/"latest") but search will NOT run
@@ -1638,7 +1652,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.log('Injecting memory context:', memoryParts.length, 'sections');
       const memorySystemMessage = {
         role: 'system',
-        content: `You have access to the following memory and context:\n\n${memoryParts.join('\n\n')}\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked. A "(learned ...)" annotation on a fact shows when you first learned that fact. If the user asks when they told you something or when a fact was learned, only answer with a time that is shown in a "(learned ...)" annotation; if no such timestamp is present for that fact, say you don't know rather than estimating or inventing one.`
+        content: `You have access to the following memory and context:\n\n${injectionBudget.memoryFraming(needsTools)}\n\n${memoryParts.join('\n\n')}\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked. A "(learned ...)" annotation on a fact shows when you first learned that fact. If the user asks when they told you something or when a fact was learned, only answer with a time that is shown in a "(learned ...)" annotation; if no such timestamp is present for that fact, say you don't know rather than estimating or inventing one.`
       };
       enhancedMessages = [memorySystemMessage, ...enhancedMessages];
     } else {
@@ -1706,6 +1720,26 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
     } catch (srcErr) {
       console.error('[Sources] recall injection error:', srcErr.message);
+    }
+
+    // Scheduling path: the model reliably knows it has "a way to propose jobs"
+    // and then either refuses ("I cannot create scheduled jobs on your system")
+    // or narrates a phantom one ("I have recorded a scheduled job…") without
+    // emitting the call. Both were measured on 2026-07-26. This says the two
+    // things the manifest entry alone does not: the tool is the ONLY way a
+    // proposal comes to exist, and proposing is genuinely within its remit
+    // because the tool does not create or run anything by itself.
+    if (needsActionTools) {
+      enhancedMessages.push({
+        role: 'system',
+        content: 'The user is asking for something to happen on a schedule. You have a tool for ' +
+          'exactly this: create_cron_job. Call it — a proposal exists ONLY if the tool call runs, ' +
+          'so describing what you would propose, or saying you have proposed or recorded something ' +
+          'without calling it, is false. Pass a 5-field cron expression (e.g. "0 6 * * *" for 6am ' +
+          'daily). Do not refuse on the grounds that you cannot change the system: the tool does ' +
+          'not create or run anything, it only puts the proposal to the user, and she approves or ' +
+          'rejects it. After calling it, tell her it is waiting on her approval.'
+      });
     }
 
     // Super Search system prompt: instruct the model to research thoroughly
@@ -1889,7 +1923,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const tools = mcpClient.getToolsForOpenAI();
         // Single source of truth (item 3): the SearXNG URL comes from config, not
         // the per-request client host — settings and reality now agree.
-        const toolContext = { searxngHost: getSearxngConfig().url };
+        // conversationId travels with the context so action tools can record
+        // which conversation proposed them (create_cron_job stores it).
+        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
@@ -2073,7 +2109,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const tools = mcpClient.getToolsForOpenAI();
         // Single source of truth (item 3): the SearXNG URL comes from config, not
         // the per-request client host — settings and reality now agree.
-        const toolContext = { searxngHost: getSearxngConfig().url };
+        // conversationId travels with the context so action tools can record
+        // which conversation proposed them (create_cron_job stores it).
+        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;

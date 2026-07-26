@@ -124,4 +124,60 @@ function budgetText(text, budgetTokens, label = 'content') {
   return { text: slice, tokens: estTokens(slice), truncated: true };
 }
 
-module.exports = { estTokens, splitDailyBlocks, entryHeadline, budgetDailyLogs, budgetText };
+/**
+ * Framing for the injected memory block.
+ *
+ * Every memory source above is a RETRIEVAL — top-k by relevance, then capped to
+ * a token budget by these helpers. Without saying so, the block reads as the
+ * entity's COMPLETE memory, and it answers "I don't have any information about
+ * that" for anything that missed the cut. That is a confident false negative:
+ * the fact is in memory, it just wasn't retrieved this turn. It affects every
+ * conversation, not only tool-calling ones.
+ *
+ * There are two variants because the fix for each case actively breaks the
+ * other. Measured on the 2026-07-26 probe (20 runs/case, ~8k injected memory,
+ * production sampling):
+ *
+ *   - WITH a memory-search tool available, the only thing that makes the model
+ *     actually search is a bare imperative pointing at the tools. Baseline was
+ *     0/20 tool selection; WITH_TOOLS scores 20/20, false positives 0/20.
+ *   - Adding ANY "otherwise, say it wasn't retrieved" fallback to that string
+ *     collapses it back to 0/20 — the model takes the cheaper phrasing branch
+ *     instead of searching. Three separate phrasings of the fallback were tried
+ *     (subordinated, conditional, and as a pure phrasing rule); all three
+ *     scored 0/20. The escape hatch always wins.
+ *   - WITHOUT tools there is nothing to search, so the imperative is inert and
+ *     the model still asserts false absence. NO_TOOLS drops the imperative and
+ *     keeps only the phrasing correction: 5/5 honest hedging on an absent fact,
+ *     while still answering a present fact directly 4/4 (it does not over-hedge).
+ *
+ * So the caller picks by whether the model is being handed tools this turn.
+ * Do not merge these back into one string — that regression is measured, not
+ * hypothetical.
+ */
+const MEMORY_EXCERPT_FRAMING_WITH_TOOLS =
+  'The memory below is a PARTIAL excerpt selected by relevance, not everything you ' +
+  'remember. Anything not shown here simply was not retrieved this turn. Before ' +
+  'telling the user you have no memory of something, search your memory using the ' +
+  'tools available to you.';
+
+const MEMORY_EXCERPT_FRAMING_NO_TOOLS =
+  'The memory below is a PARTIAL excerpt selected by relevance, not everything you ' +
+  'remember. Anything not shown here simply was not retrieved this turn — that is ' +
+  'not evidence it is absent from your memory. Do not tell the user you have no ' +
+  'memory of something on that basis; say it is not in what you retrieved this ' +
+  'turn, and offer to look properly.';
+
+/**
+ * Pick the memory framing for this turn.
+ * @param {boolean} toolsAvailable - true when the model is being handed a tool
+ *   schema this turn (i.e. it actually has something to search with).
+ */
+function memoryFraming(toolsAvailable) {
+  return toolsAvailable ? MEMORY_EXCERPT_FRAMING_WITH_TOOLS : MEMORY_EXCERPT_FRAMING_NO_TOOLS;
+}
+
+module.exports = {
+  estTokens, splitDailyBlocks, entryHeadline, budgetDailyLogs, budgetText,
+  MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS, memoryFraming
+};
