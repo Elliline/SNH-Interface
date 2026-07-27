@@ -447,6 +447,9 @@ router.get('/activity', (req, res) => {
       sub('selfCoherenceAudit', 'Self-coherence audit',
           'Tests stored self-claims against how it actually behaved and raises gaps for approval. Never edits identity.',
           'at most once per audit.cadenceDays (currently ' + (cfg.audit?.cadenceDays ?? 1) + '/day)'),
+      sub('capabilityDrift', 'Capability drift check',
+          'Probes the services behind config-gated organs and reconciles the capability manifest against the live tool registry. Any disagreement is raised in the bell, because the manifest is authoritative for capability questions — a stale entry makes SNH deny something it can do, or offer something that is down.',
+          'always'),
       sub('initiativeLayer', 'Initiative layer',
           'Turns findings into candidate initiatives, re-scores them, and may reach out once.',
           'quiet hours ' + (cfg.initiative?.quietHours?.start ?? 22) + ':00–' + (cfg.initiative?.quietHours?.end ?? 8) + ':00, max ' + (cfg.initiative?.maxUnpromptedPerDay ?? 1) + ' unprompted/day')

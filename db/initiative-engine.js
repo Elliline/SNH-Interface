@@ -527,9 +527,36 @@ async function openInitiativeConversation(it, channel) {
   return { conversationId, message };
 }
 
+/**
+ * Raise a capability-manifest drift finding through the bell.
+ *
+ * Deliberately an 'alert': the manifest is authoritative for capability
+ * questions, so a mismatch means the entity is currently telling the user
+ * something false about itself — either denying an ability it has, or
+ * offering one whose service is down. That is worth interrupting for.
+ *
+ * sourceRef is the drifting id, so addInitiative's exact-dedup keeps a
+ * persistent mismatch from re-queuing on every heartbeat.
+ *
+ * @param {{kind: string, id: string, message: string, detail?: string}} m
+ */
+async function raiseCapabilityDrift(m) {
+  if (!m || !m.message) return null;
+  const initiatives = require('./initiatives');
+  return initiatives.addInitiative({
+    type: 'alert',
+    content: `Something I believe about myself no longer matches how I'm actually built: ${m.message}` +
+             (m.detail ? ` (${m.detail})` : ''),
+    sourceKind: 'capability-drift',
+    sourceRef: `${m.kind}:${m.id}`,
+    priority: m.kind === 'unreachable-service' ? 8 : 7
+  });
+}
+
 module.exports = {
   noticeFromQuestions,
   noticeFromAudit,
+  raiseCapabilityDrift,
   noticeReflectionInsight,
   generateConversationFollowup,
   prioritize,

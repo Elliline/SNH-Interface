@@ -179,7 +179,18 @@ const CONDITIONAL_CAPABILITIES = [
     intro: 'I can search the web for current facts and answer with the actual source links I drew from',
     schedule: 'When a question needs current info (only while search is enabled)',
     dateAdded: '2026-07-23',
-    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.searxng && cfg.tools.searxng.enabled)
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.searxng && cfg.tools.searxng.enabled),
+    // Machine link to the MCP tools this entry accounts for. Any registered tool
+    // NOT claimed by some entry gets a derived entry instead of silently going
+    // unmentioned — which is exactly how web_fetch had no coverage at all.
+    coversTools: ['web_search', 'web_fetch'],
+    // Explicit config keys this entry accounts for. Declared, not guessed:
+    // matching "tools.searxng" to an entry called "web-search" by string
+    // similarity fails, and a check that cries wolf gets ignored.
+    coversConfig: ['tools.searxng'],
+    // Probed by checkDrift(). A registered organ whose service is unreachable
+    // must not keep reading as live.
+    probes: (cfg) => [{ name: 'SearXNG', url: (cfg.tools && cfg.tools.searxng && cfg.tools.searxng.url) || 'http://localhost:8888' }]
   },
   {
     id: 'voice',
@@ -192,7 +203,17 @@ const CONDITIONAL_CAPABILITIES = [
     // Honest gate: appears only once the TTS+STT engines are verified live and
     // voice.enabled is turned on (see db/config.js). Was deferred while the
     // containers were down; registers now that they answer.
-    when: (cfg) => !!(cfg && cfg.voice && cfg.voice.enabled)
+    when: (cfg) => !!(cfg && cfg.voice && cfg.voice.enabled),
+    coversConfig: ['voice'],
+    probes: (cfg) => {
+      const out = [];
+      const stt = (cfg.voice && cfg.voice.stt) || {}, tts = (cfg.voice && cfg.voice.tts) || {};
+      const find = (g) => (g.providers || []).find(p => `${p.type}:${p.name}` === g.active) || (g.providers || [])[0];
+      const s = find(stt), t = find(tts);
+      if (t && t.host) out.push({ name: 'TTS', url: t.host });
+      if (s && s.host) out.push({ name: 'STT', url: s.host });
+      return out;
+    }
   },
   {
     id: 'cron-proposals',
@@ -207,7 +228,9 @@ const CONDITIONAL_CAPABILITIES = [
     intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and even approved it just gets recorded, because nothing runs scheduled jobs yet',
     schedule: 'When the user asks for something recurring',
     dateAdded: '2026-07-26',
-    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.cron && cfg.tools.cron.enabled !== false)
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.cron && cfg.tools.cron.enabled !== false),
+    coversTools: ['create_cron_job'],
+    coversConfig: ['tools.cron']
   }
 ];
 
@@ -216,6 +239,82 @@ const CONDITIONAL_CAPABILITIES = [
 const UNAVAILABLE = [
   { name: 'Image / video generation', note: "you can't create, edit, or render images or video" }
 ];
+
+// ============ Derivation + health (self-maintenance) ============
+
+/**
+ * The LIVE MCP tool registry, wired at boot by server.js. The manifest reads
+ * this rather than restating it: a tool that is registered is a thing SNH can
+ * actually do, and that is already knowable at runtime.
+ */
+let toolRegistry = null;
+
+/** @param {{getToolNames: function, getToolsForOpenAI: function}} client */
+function setToolRegistry(client) { toolRegistry = client; }
+
+function registryToolNames() {
+  try { return toolRegistry ? toolRegistry.getToolNames() : []; } catch { return []; }
+}
+
+/** Tool name -> its own self-description, straight from the registered tool. */
+function registryToolSpecs() {
+  try {
+    const out = {};
+    for (const s of (toolRegistry ? toolRegistry.getToolsForOpenAI() : [])) {
+      if (s && s.function && s.function.name) out[s.function.name] = s.function.description || '';
+    }
+    return out;
+  } catch { return {}; }
+}
+
+/** Every tool name claimed by a hand-written entry via `coversTools`. */
+function coveredToolNames() {
+  const set = new Set();
+  for (const c of CAPABILITIES.concat(CONDITIONAL_CAPABILITIES)) {
+    for (const t of (c.coversTools || [])) set.add(t);
+  }
+  return set;
+}
+
+/**
+ * DERIVED entries: any registered MCP tool that no hand-written entry claims.
+ * This is what stops a shipped tool from being silently absent from the
+ * manifest — the failure mode that made a missing entry dangerous once the
+ * manifest became authoritative. Derived entries are machine-true by
+ * construction: their text comes from the tool's own description.
+ */
+function derivedToolCapabilities() {
+  const covered = coveredToolNames();
+  const specs = registryToolSpecs();
+  return registryToolNames()
+    .filter(n => !covered.has(n))
+    .map(n => ({
+      id: `tool:${n}`,
+      name: n,
+      description: specs[n] || `The ${n} tool is registered and callable.`,
+      oneLiner: (specs[n] || `The ${n} tool is available.`).split(/(?<=\.)\s/)[0].slice(0, 140),
+      intro: null,               // derived entries are never introduced as self-facts
+      schedule: 'When the model calls it',
+      dateAdded: null,
+      derived: true
+    }));
+}
+
+// ---- health cache -------------------------------------------------------
+// buildInjectionBlock() runs on EVERY chat request, so it must never probe the
+// network. checkDrift() (heartbeat) probes and writes here; injection only
+// reads. Unknown health is treated as "assume configured state" — we only
+// demote an entry on POSITIVE evidence that its service is down, so a probe
+// that has never run cannot silently erase a real capability.
+let healthCache = {};   // id -> { ok, checkedAt, detail }
+
+function getHealth() { return { ...healthCache }; }
+
+/** True only when we have positive evidence this entry's service is DOWN. */
+function isKnownUnhealthy(id) {
+  const h = healthCache[id];
+  return !!(h && h.ok === false);
+}
 
 // ============ Accessors ============
 
@@ -226,9 +325,20 @@ function activeConditional() {
   return CONDITIONAL_CAPABILITIES.filter(c => { try { return c.when(cfg); } catch { return false; } });
 }
 
-/** The capabilities that are actually available right now (static + active conditional). */
+/**
+ * Config-enabled entries whose backing service is currently unreachable. These
+ * are NOT available and must not read as live — the same over-claim rule that
+ * keeps an approved-but-unrunnable cron job from reading as scheduled.
+ */
+function degradedCapabilities() {
+  return activeConditional().filter(c => isKnownUnhealthy(c.id));
+}
+
+/** The capabilities that are actually available right now. */
 function activeCapabilities() {
-  return CAPABILITIES.concat(activeConditional());
+  return CAPABILITIES
+    .concat(activeConditional().filter(c => !isKnownUnhealthy(c.id)))
+    .concat(derivedToolCapabilities());
 }
 
 /** Full manifest as it currently stands (static + any config-enabled entries). */
@@ -271,7 +381,33 @@ function buildInjectionBlock() {
     'claim it. When asked what you can do or whether you can do something, answer from this list.\n' +
     lines +
     "\n\nExplicitly NOT available — if asked for these, say you can't:\n" +
-    unavailable;
+    unavailable +
+    // A config-enabled organ whose service is DOWN is listed here, not above.
+    // Same rule as an approved cron job that nothing runs: switched on is not
+    // the same as working, and the compact list must not blur the two.
+    (degradedCapabilities().length
+      ? '\n\nTemporarily UNAVAILABLE — switched on but not responding right now, so treat these as things you cannot currently do:\n' +
+        degradedCapabilities().map(c => `- ${c.name}: ${(getHealth()[c.id] || {}).detail || 'service not answering'}`).join('\n')
+      : '') +
+    // PRECEDENCE. This list is ~550 tokens against a ~6,500-token memory block,
+    // so on volume alone it loses to stored facts that describe a shipped organ
+    // as future work (facts written before it shipped, and never revised —
+    // memory records what was true when it was recorded, not what is true now).
+    // Stating the precedence explicitly is cheaper and more reliable than
+    // hoping the smaller block wins.
+    //
+    // Both directions are spelled out on purpose. The dangerous failure is not
+    // only "calls a live organ planned" — it is also the reverse, promoting a
+    // remembered PLAN into a claimed capability. Camera/vision is the live
+    // example: genuinely planned, genuinely not built, and it must stay that way.
+    '\n\nPRECEDENCE — this list wins. For any question about what you can do, what you ' +
+    'have access to, or where your operational limits are, THIS LIST is the source of truth and ' +
+    'overrides anything in your memory, regardless of how important or strongly-stated that memory ' +
+    'is. A stored fact saying one of the capabilities above is planned, upcoming, or not yet built ' +
+    'is simply out of date — it was written before the capability shipped. Trust this list instead ' +
+    'and speak in the present tense. The reverse holds just as strictly: a memory about something ' +
+    'planned, hoped for, or being worked on does NOT give you that capability. If it is not in the ' +
+    'list above, you do not have it yet, no matter how much memory you hold about intending to.';
   return { text, tokens: estTokens(text), count: caps.length };
 }
 
@@ -372,6 +508,158 @@ function logOps(line) {
  * introductions are a separate, deliberate step). Best-effort. Call on boot.
  * @returns {{added:string[], removed:string[]}}
  */
+// ============ Drift detection ============
+
+/** Is an HTTP service answering at all? Any response (even 404) means it's up. */
+async function probeUrl(url, timeoutMs = 4000) {
+  try {
+    const r = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
+    return { ok: true, status: r.status };
+  } catch (e) {
+    return { ok: false, error: e.name === 'TimeoutError' ? `timeout after ${timeoutMs}ms` : e.message };
+  }
+}
+
+/**
+ * Compare the manifest against reality and report every disagreement.
+ *
+ * Three kinds of drift, all of which have actually happened or nearly happened:
+ *   1. unreachable-service — an entry says a capability is live but its backing
+ *      service does not answer. Left alone this over-claims.
+ *   2. missing-entry — a registered MCP tool no entry accounts for. This is how
+ *      web_fetch ended up with no coverage at all.
+ *   3. stale-entry — an entry claims a tool that is no longer registered.
+ *
+ * Probes run here (heartbeat cadence), never on the injection path. Results are
+ * written to the health cache so buildInjectionBlock() can demote a dead organ
+ * without doing any I/O of its own.
+ *
+ * @returns {Promise<{mismatches: Array, checked: number, health: Object}>}
+ */
+async function checkDrift() {
+  const mismatches = [];
+  let cfg;
+  try { cfg = getConfig(); } catch { cfg = {}; }
+
+  // 1. service reachability for every currently-enabled entry that declares probes
+  let checked = 0;
+  for (const c of activeConditional()) {
+    if (typeof c.probes !== 'function') continue;
+    let targets = [];
+    try { targets = c.probes(cfg) || []; } catch { targets = []; }
+    if (!targets.length) continue;
+
+    const results = [];
+    for (const t of targets) {
+      checked++;
+      const r = await probeUrl(t.url);
+      results.push({ ...t, ...r });
+    }
+    const down = results.filter(r => !r.ok);
+    healthCache[c.id] = {
+      ok: down.length === 0,
+      checkedAt: new Date().toISOString(),
+      detail: down.length ? down.map(d => `${d.name} (${d.url}): ${d.error}`).join('; ') : 'all services answering'
+    };
+    if (down.length) {
+      mismatches.push({
+        kind: 'unreachable-service',
+        id: c.id,
+        message: `"${c.name}" is switched on in config but ${down.map(d => d.name).join(' and ')} ${down.length === 1 ? 'is' : 'are'} not answering — it is being reported as unavailable until it comes back.`,
+        detail: healthCache[c.id].detail
+      });
+    }
+  }
+
+  // 2 & 3. manifest <-> MCP registry correspondence
+  if (toolRegistry) {
+    const registered = new Set(registryToolNames());
+    const covered = coveredToolNames();
+    for (const t of registered) {
+      if (!covered.has(t) && !derivedToolCapabilities().some(d => d.name === t)) {
+        mismatches.push({
+          kind: 'missing-entry', id: `tool:${t}`,
+          message: `The tool "${t}" is registered and callable but no capability entry accounts for it.`
+        });
+      }
+    }
+    for (const t of covered) {
+      if (!registered.has(t)) {
+        mismatches.push({
+          kind: 'stale-entry', id: t,
+          message: `A capability entry claims the tool "${t}", but it is not in the live tool registry.`
+        });
+      }
+    }
+  } else {
+    mismatches.push({
+      kind: 'registry-not-wired', id: 'tool-registry',
+      message: 'The MCP tool registry was never handed to the capability manifest, so tool coverage cannot be checked.'
+    });
+  }
+
+  return { mismatches, checked, health: getHealth() };
+}
+
+/**
+ * Boot-time check. FAILS CLOSED for the two places a capability can actually
+ * appear — the MCP tool registry and config-gated services — by warning loudly
+ * about anything switched on that no entry accounts for, WITHOUT needing to
+ * know in advance what to look for.
+ *
+ * It cannot do the same for arbitrary new routes or UI features: an Express
+ * route is not a capability (most are plumbing), so route enumeration would be
+ * noise. Those still rely on the maintenance rule in CLAUDE.md.
+ *
+ * @returns {{warnings: string[]}}
+ */
+function startupCheck() {
+  const warnings = [];
+  let cfg;
+  try { cfg = getConfig(); } catch { cfg = {}; }
+
+  // (a) registered tools nothing accounts for. Derived entries normally absorb
+  // these, so a warning here means derivation itself is not wired.
+  if (!toolRegistry) {
+    warnings.push('MCP tool registry not wired into the capability manifest — tool coverage is unchecked.');
+  } else {
+    const covered = coveredToolNames();
+    const derived = new Set(derivedToolCapabilities().map(d => d.name));
+    for (const t of registryToolNames()) {
+      if (!covered.has(t) && !derived.has(t)) {
+        warnings.push(`MCP tool "${t}" is registered but has no capability entry (hand-written or derived).`);
+      }
+    }
+  }
+
+  // (b) config-gated services switched ON with no entry claiming them. This is
+  // the fail-closed half: turning on a new service in config without adding an
+  // entry warns at startup, rather than silently going unmentioned.
+  const declared = new Set();
+  for (const c of CAPABILITIES.concat(CONDITIONAL_CAPABILITIES)) {
+    for (const k of (c.coversConfig || [])) declared.add(k);
+  }
+  const enabledKeys = [];
+  for (const [key, val] of Object.entries(cfg.tools || {})) {
+    if (val && typeof val === 'object' && val.enabled === true) enabledKeys.push(`tools.${key}`);
+  }
+  if (cfg.voice && cfg.voice.enabled === true) enabledKeys.push('voice');
+  for (const k of enabledKeys) {
+    if (!declared.has(k)) {
+      warnings.push(`Config has "${k}" enabled but no capability entry declares coverage of it (add coversConfig: ['${k}'] to the entry, or add an entry).`);
+    }
+  }
+
+  for (const w of warnings) {
+    console.warn(`[CapabilityManifest] STARTUP WARNING: ${w}`);
+    logOps(`startup warning — ${w}`);
+  }
+  if (!warnings.length) {
+    console.log(`[CapabilityManifest] startup check clean — ${activeCapabilities().length} capabilities, ${registryToolNames().length} tool(s) all accounted for`);
+  }
+  return { warnings };
+}
+
 function syncToOps() {
   const state = readState();
   const knownIds = new Set((state.known || []).map(k => k.id));
@@ -401,6 +689,11 @@ module.exports = {
   getById,
   getCompact,
   buildInjectionBlock,
+  setToolRegistry,
+  checkDrift,
+  startupCheck,
+  degradedCapabilities,
+  getHealth,
   find,
   introSentence,
   getBriefing,

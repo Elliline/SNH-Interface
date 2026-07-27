@@ -246,6 +246,21 @@ app.put('/api/config', (req, res) => {
     return res.status(400).json({ error: 'Request body must be a JSON object' });
   }
   const updated = updateConfig(req.body);
+  // Several manifest entries are config-gated (voice, web search, cron
+  // proposals), so toggling one changes what SNH actually offers. Injection is
+  // unaffected — buildInjectionBlock() recomputes from live config on every
+  // request — but the ops ledger only reconciled at boot, so a capability that
+  // came or went mid-session left no trail until the next restart. Re-sync here
+  // so the ledger records it when it happens. Idempotent: a no-op when nothing
+  // changed.
+  try {
+    const { added, removed } = capabilityManifest.syncToOps();
+    if (added.length || removed.length) {
+      console.log(`[Capabilities] config change synced: +${added.length} -${removed.length}`);
+    }
+  } catch (e) {
+    console.error('[Capabilities] syncToOps after config update failed:', e.message);
+  }
   res.json(updated);
 });
 
@@ -2560,6 +2575,17 @@ app.listen(PORT, () => {
   }
   memoryManager.startHeartbeat();
   memoryManager.startLivenessProbe();
+
+  // Hand the LIVE MCP registry to the manifest so tool capabilities are DERIVED
+  // rather than restated. A registered tool no hand-written entry claims gets an
+  // entry generated from the tool's own description, so shipping a tool can no
+  // longer leave the manifest silently missing it.
+  try {
+    capabilityManifest.setToolRegistry(mcpClient);
+    capabilityManifest.startupCheck();
+  } catch (e) {
+    console.error('[Capabilities] startup check failed:', e.message);
+  }
 
   // Reconcile the capability manifest against its known-set and log any
   // additions/removals to the ops ledger, so manifest changes leave a machine

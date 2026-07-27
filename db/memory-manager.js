@@ -1913,6 +1913,30 @@ async function runMaintenance() {
       initiative = { error: initErr.message };
     }
 
+    // Task G: capability drift — does the manifest still match reality? Probes
+    // the services behind config-gated organs and reconciles the manifest
+    // against the live MCP tool registry. Any disagreement is raised through
+    // the bell rather than left silently wrong, because the manifest is now
+    // AUTHORITATIVE for capability questions: a stale entry makes the entity
+    // confidently deny something it can do, or claim something that is down.
+    try {
+      await runStep('capabilityDrift', 'always', async () => {
+        const capabilityManifest = require('./capability-manifest');
+        const { mismatches, checked } = await capabilityManifest.checkDrift();
+        for (const m of mismatches) {
+          await initiativeEngine.raiseCapabilityDrift(m);
+        }
+        if (mismatches.length) {
+          factExtractor.appendToOpsLog(
+            `Capability drift: ${mismatches.length} mismatch(es) — ` +
+            mismatches.map(m => `${m.kind}:${m.id}`).join(', '), OPS_DIR);
+        }
+        return { servicesProbed: checked, mismatches: mismatches.length };
+      });
+    } catch (driftErr) {
+      console.error('[Heartbeat] Capability drift check error:', driftErr.message);
+    }
+
     // Step 4: report
     const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps });
 
