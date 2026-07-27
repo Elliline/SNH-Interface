@@ -42,8 +42,14 @@ const memoryRouter = require('./routes/memory');
 
 const app = express();
 
-// Trust proxy for rate limiting behind reverse proxy (Nginx, Cloudflare, etc.)
-app.set('trust proxy', 1);
+// Trust proxy for rate limiting behind a reverse proxy.
+//
+// 'loopback' rather than 1: SNH is fronted by `tailscale serve`, which proxies
+// from 127.0.0.1, so X-Forwarded-For should be honored ONLY for connections
+// arriving on loopback. With the old `1`, any client that could reach :3000
+// directly (the listener is on 0.0.0.0) could send its own X-Forwarded-For and
+// be keyed as whatever it liked — a free reset of its own rate-limit bucket.
+app.set('trust proxy', 'loopback');
 
 // Configuration from environment
 const PORT = process.env.PORT || 3000;
@@ -98,21 +104,95 @@ const ALLOWED_OLLAMA_HOSTS = process.env.ALLOWED_OLLAMA_HOSTS
 
 // ============ Security Configuration ============
 
-// SECURITY: Rate limiting to prevent API abuse
+// SECURITY: Rate limiting to prevent API abuse.
+//
+// Caps and exemptions live in config.rateLimit (see db/config.js for why the
+// old literals were the direct cause of the 2026-07-27 whole-app 429).
+
+/** Normalize an Express req.ip to a bare IPv4/IPv6 string. */
+function normalizeIp(ip) {
+  if (!ip) return '';
+  // Express reports IPv4 over a dual-stack socket as ::ffff:127.0.0.1
+  return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+}
+
+function isLoopback(ip) {
+  const a = normalizeIp(ip);
+  return a === '::1' || a === 'localhost' || /^127\./.test(a);
+}
+
+/** Tailscale hands out 100.64.0.0/10 (CGNAT). */
+function isTailnet(ip) {
+  const a = normalizeIp(ip);
+  const m = a.match(/^100\.(\d{1,3})\./);
+  if (!m) return false;
+  const second = Number(m[1]);
+  return second >= 64 && second <= 127;
+}
+
+/**
+ * Skip limiting for this box's own traffic. This is a single-user machine: the
+ * limiter is here for a future public deployment, not for Ellie's browser.
+ * Loopback covers the Tailscale serve hop; tailnet covers her other devices.
+ */
+function skipLocal(req) {
+  const rl = getConfig().rateLimit || {};
+  const ip = req.ip;
+  if (rl.exemptLoopback !== false && isLoopback(ip)) return true;
+  if (rl.exemptTailnet !== false && isTailnet(ip)) return true;
+  return false;
+}
+
+/**
+ * Log every rejection. Previously a 429 left NO trace in the journal, which is
+ * why an app-wide outage had to be found by hand with curl.
+ */
+function makeLimitHandler(label, message) {
+  return (req, res) => {
+    console.warn(
+      `[RateLimit] 429 ${label} — key=${normalizeIp(req.ip) || 'unknown'} ` +
+      `${req.method} ${req.originalUrl}` +
+      (req.get('x-forwarded-for') ? ` xff=${req.get('x-forwarded-for')}` : '')
+    );
+    res.status(429).json(message);
+  };
+}
+
+const rlCfg = () => getConfig().rateLimit || {};
+
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  windowMs: (rlCfg().windowMinutes ?? 15) * 60 * 1000,
+  max: rlCfg().max ?? 1000,
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
+  // /api/tts is metered by ttsLimiter instead — without this exclusion a spoken
+  // reply's per-sentence requests would be charged to the shared bucket too.
+  skip: (req) => skipLocal(req) || req.path.startsWith('/tts'),
+  handler: makeLimitHandler('api', { error: 'Too many requests, please try again later.' })
 });
 
 const chatLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 20, // Limit each IP to 20 chat requests per minute
+  windowMs: (rlCfg().chatWindowMinutes ?? 1) * 60 * 1000,
+  max: rlCfg().chatMax ?? 60,
   message: { error: 'Too many chat requests, please slow down.' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipLocal,
+  handler: makeLimitHandler('chat', { error: 'Too many chat requests, please slow down.' })
+});
+
+// TTS gets its own budget: the client sends one request per sentence of a
+// spoken reply, so a long answer is dozens of calls. Under the shared /api/
+// bucket that alone could exhaust the window.
+const ttsLimiter = rateLimit({
+  windowMs: (rlCfg().ttsWindowMinutes ?? 1) * 60 * 1000,
+  max: rlCfg().ttsMax ?? 240,
+  message: { error: 'Too many speech requests, please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipLocal,
+  handler: makeLimitHandler('tts', { error: 'Too many speech requests, please slow down.' })
 });
 
 // SECURITY: Content Security Policy headers
@@ -144,6 +224,9 @@ app.use(express.json({ limit: '10mb' })); // Limit payload size
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Apply rate limiting to API routes
+// TTS first — it has its own (much higher) budget and is excluded from the
+// shared /api/ bucket by apiLimiter's skip.
+app.use('/api/tts', ttsLimiter);
 app.use('/api/', apiLimiter);
 
 // Mount conversation routes

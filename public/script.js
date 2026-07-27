@@ -84,16 +84,23 @@ const ttsChunker = {
     }
 
     while (true) {
+      // Chunk size is deliberately asymmetric. The FIRST chunk stays small so
+      // audio starts quickly; every chunk after it is allowed to grow, because
+      // by then playback is already running and the only thing extra requests
+      // buy is load. Each chunk is one /api/tts call, and a long spoken reply
+      // at a flat 80 chars was dozens of them — enough to exhaust the shared
+      // rate-limit window on its own (2026-07-27).
+      const minChunk = this.chunkIndex === 0 ? 80 : 280;
       const unsent = fullText.slice(this.sentIndex);
-      if (unsent.length < 80) break;
+      if (unsent.length < minChunk) break;
 
-      // Find first sentence boundary (. ! ? followed by whitespace, or paragraph break) at >= 80 chars
+      // Find first sentence boundary (. ! ? followed by whitespace, or paragraph break)
       const re = /[.!?](?=\s)|\n\n+/g;
       let found = false;
       let m;
       while ((m = re.exec(unsent)) !== null) {
         const textEnd = m[0].startsWith('\n') ? m.index : m.index + 1;
-        if (textEnd >= 80) {
+        if (textEnd >= minChunk) {
           const chunk = unsent.slice(0, textEnd).trim();
           // Advance past the boundary and any trailing whitespace
           this.sentIndex += m.index + m[0].length;
@@ -2811,10 +2818,28 @@ document.querySelectorAll('.initiative-view-btn').forEach(btn => {
   });
 });
 
+// Backoff state for the badge poll. It runs on a 60s interval and used to
+// swallow every error silently, so a server that was refusing requests looked
+// identical to one with nothing pending. On a 429 specifically we back off
+// hard rather than keep knocking — the limiter is already telling us to stop.
+let badgeBackoffUntil = 0;
+let badgeFailures = 0;
+
 async function refreshInitiativeBadge() {
   if (!initiativeBadge) return;
+  if (Date.now() < badgeBackoffUntil) return;   // still backing off
   try {
     const res = await fetch('/api/memory/initiatives');
+    if (res.status === 429) {
+      // Exponential backoff capped at 15 min (the limiter's own window).
+      badgeFailures++;
+      const waitMs = Math.min(15 * 60_000, 60_000 * Math.pow(2, badgeFailures));
+      badgeBackoffUntil = Date.now() + waitMs;
+      console.warn(`[Initiatives] badge poll rate-limited; backing off ${Math.round(waitMs / 1000)}s`);
+      return;
+    }
+    if (!res.ok) { badgeFailures++; badgeBackoffUntil = Date.now() + 60_000; return; }
+    badgeFailures = 0;
     const data = await res.json();
     const total = (data.initiatives || []).length;
     const above = data.aboveThreshold || 0;

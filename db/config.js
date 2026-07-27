@@ -25,6 +25,27 @@ const DEFAULTS = {
     heartbeat: { provider: 'ollama', instance: 'Local', model: 'qwen3:14b' },
     embedding: { provider: 'ollama', instance: 'Local', model: 'nomic-embed-text' }
   },
+  // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
+  // /api/) worked out to 6.7 req/min shared across every endpoint, which a
+  // polling UI plus chunked TTS exhausts in a couple of minutes — that is what
+  // 429'd the whole app on 2026-07-27.
+  //
+  // The limiter exists for a future PUBLIC deployment. On this single-user box
+  // every request comes from loopback (via Tailscale serve) or the tailnet, and
+  // those are exempted outright by `exemptLoopback`/`exemptTailnet` — so these
+  // caps only ever bind on traffic from somewhere else.
+  rateLimit: {
+    exemptLoopback: true,     // 127.0.0.0/8, ::1 — includes the Tailscale serve hop
+    exemptTailnet: true,      // 100.64.0.0/10, the CGNAT range Tailscale assigns
+    windowMinutes: 15,
+    max: 1000,                // was 100; ~67/min, comfortable for a polling UI
+    chatWindowMinutes: 1,
+    chatMax: 60,              // was 20
+    // TTS is chunked: one request per sentence of a spoken reply, so it needs a
+    // much higher ceiling than ordinary API calls or a long answer trips it.
+    ttsWindowMinutes: 1,
+    ttsMax: 240
+  },
   heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
   // Background LLM concurrency against the shared vLLM engine. Kept modest (3)
   // so background passes never starve chat or pile abandoned requests onto the

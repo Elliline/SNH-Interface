@@ -1116,7 +1116,9 @@ a.msg-source:hover {
   position: fixed;
   right: 0;
   top: 0;
-  width: 380px;
+  /* 380px was too cramped to read facts, clusters or the Activity tab in.
+     Scales with the viewport and stops growing on very wide screens. */
+  width: min(620px, 94vw);
   height: 100vh;
   background-color: var(--surface-dark);
   border-left: 1px solid var(--border-color);
@@ -1364,22 +1366,39 @@ a.msg-source:hover {
   background-clip: text;
 }
 
+/* Tabs must all stay reachable. With `flex: 1` on 8 tabs in a 380px panel each
+   got ~47px, so labels truncated and the last tab (Search) was clipped off the
+   edge with no way to reach it. Tabs now keep their natural width and the strip
+   scrolls horizontally instead of crushing them. */
 .memory-panel-tabs {
   display: flex;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+}
+/* Keep the strip slim — the scrollbar shouldn't eat the tab row. */
+.memory-panel-tabs::-webkit-scrollbar { height: 3px; }
+.memory-panel-tabs::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
 }
 
 .memory-tab {
-  flex: 1;
-  padding: 10px 8px;
+  flex: 0 0 auto;          /* natural width; scroll rather than shrink */
+  white-space: nowrap;
+  padding: 10px 12px;
   background: none;
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--text-secondary);
   cursor: pointer;
   font-size: 0.85rem;
-  transition: all 0.2s ease;
+  transition: color 0.2s ease, background-color 0.2s ease;
+  scroll-snap-align: start;
 }
 
 .memory-tab:hover {
@@ -2601,6 +2620,7 @@ a.msg-source:hover {
     display: flex;
   }
 }
+
 /* ============ Activity tab ============
    Read-only view of everything scheduled. The load-bearing distinction is
    ACTIVE (really runs) vs INERT (cron_jobs — recorded, never executed), so the
@@ -2770,3 +2790,16 @@ a.msg-source:hover {
 .act-path-heavy   { color: var(--accent-color); background: color-mix(in srgb, var(--accent-color) 12%, transparent); }
 .act-path-light   { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 12%, transparent); }
 .act-path-unknown { color: var(--text-secondary); font-style: italic; }
+
+/* ---- Memory panel at phone width ----
+   Full-bleed panel (a 620px slide-out on a 390px screen would be off-canvas),
+   and slightly tighter tabs so more of the strip is visible before scrolling.
+   The strip still scrolls, so every tab including Search stays reachable. */
+@media (max-width: 640px) {
+  .memory-panel { width: 100vw; }
+  .memory-panel.map-mode { width: 100vw; }
+  .memory-tab { padding: 10px 10px; font-size: 0.8rem; }
+  .act-grid { grid-template-columns: 1fr; }
+  .act-hist-when { min-width: 0; }
+  .act-label { min-width: 64px; }
+}
