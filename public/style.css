@@ -2601,3 +2601,172 @@ a.msg-source:hover {
     display: flex;
   }
 }
+/* ============ Activity tab ============
+   Read-only view of everything scheduled. The load-bearing distinction is
+   ACTIVE (really runs) vs INERT (cron_jobs — recorded, never executed), so the
+   two are given different section treatments rather than differing by a label. */
+
+.memory-activity-content { padding: 4px 2px 24px; }
+
+.act-anchor {
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--secondary-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 14px;
+  background: var(--surface-mid);
+}
+.act-anchor-title { font-size: 0.76rem; font-weight: 600; margin-bottom: 3px; }
+.act-anchor-body { font-size: 0.72rem; color: var(--text-secondary); line-height: 1.5; }
+
+.act-section-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 20px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+.act-section-active { color: var(--success-color); }
+.act-section-inert  { color: var(--text-secondary); }
+.act-section-gaps   { color: var(--text-secondary); }
+
+/* The no-scheduler fact is the section's banner, not a footnote. */
+.act-banner {
+  border: 1px solid var(--error-color);
+  border-radius: 4px;
+  padding: 9px 11px;
+  margin-bottom: 12px;
+  font-size: 0.73rem;
+  line-height: 1.55;
+  color: var(--text-color);
+  background: color-mix(in srgb, var(--error-color) 8%, transparent);
+}
+.act-banner code { font-size: 0.72rem; }
+
+.act-entry {
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--surface-mid);
+}
+.act-entry-disabled { opacity: 0.6; }
+/* Inert entries are visually muted and dashed — they must never read as live. */
+.act-entry-inert {
+  border-style: dashed;
+  background: transparent;
+  opacity: 0.85;
+}
+.act-entry-gap { border-style: dashed; background: transparent; }
+
+.act-entry-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.act-name { font-size: 0.82rem; font-weight: 600; }
+.act-desc { font-size: 0.73rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
+
+.act-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 4px 16px;
+  font-size: 0.72rem;
+}
+.act-grid > div { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.act-label {
+  color: var(--text-secondary);
+  min-width: 76px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+}
+.act-dim { color: var(--text-secondary); }
+.act-reason { font-size: 0.71rem; color: var(--error-color); margin-top: 5px; }
+.act-retention { font-size: 0.68rem; margin-top: 5px; }
+.act-never { color: var(--error-color); font-weight: 600; }
+
+.act-nohist { color: var(--text-secondary); font-style: italic; }
+.act-hist-empty { font-size: 0.72rem; margin-top: 6px; display: block; }
+
+/* pills */
+.act-pill {
+  font-size: 0.62rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-color);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.act-pill-ok       { color: var(--success-color); border-color: var(--success-color); }
+.act-pill-failed,
+.act-pill-aborted  { color: var(--error-color);   border-color: var(--error-color); }
+.act-pill-skipped  { color: var(--text-secondary); }
+.act-pill-unknown  { color: var(--text-secondary); }
+.act-pill-disabled { color: var(--text-secondary); }
+.act-pill-nohist   { color: var(--text-secondary); font-style: italic; }
+.act-pill-inert    { color: var(--error-color); border-color: var(--error-color); }
+.act-pill-driver   { color: var(--accent-color); border-color: var(--accent-color); }
+
+.act-prov { font-size: 0.62rem; margin-left: auto; text-transform: uppercase; letter-spacing: 0.04em; }
+.act-prov-system { color: var(--text-secondary); }
+.act-prov-kid    { color: var(--accent-color); }
+
+/* nested steps — indented + rail, so they read as parts of one pass */
+.act-subs { margin-top: 10px; }
+.act-subs-summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  padding: 3px 0;
+}
+.act-sub {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0 6px 10px;
+  margin-left: 6px;
+  border-left: 2px solid var(--border-color);
+}
+.act-sub-driver { border-left-color: var(--accent-color); }
+.act-sub-idx {
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  min-width: 14px;
+  padding-top: 2px;
+}
+.act-sub-body { flex: 1; min-width: 0; }
+.act-sub-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.act-sub-name { font-size: 0.74rem; font-weight: 600; }
+.act-gate {
+  font-size: 0.63rem;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+  border-radius: 3px;
+  padding: 0 5px;
+}
+.act-sub-desc { font-size: 0.69rem; color: var(--text-secondary); line-height: 1.45; margin: 2px 0; }
+.act-sub-run { font-size: 0.69rem; font-family: ui-monospace, monospace; word-break: break-word; }
+
+/* run history */
+.act-hist { margin-top: 8px; }
+.act-hist-summary { cursor: pointer; font-size: 0.7rem; color: var(--text-secondary); padding: 3px 0; }
+.act-hist-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.69rem;
+  padding: 3px 0 3px 10px;
+  margin-left: 6px;
+  border-left: 2px solid var(--border-color);
+}
+.act-hist-aborted, .act-hist-failed { border-left-color: var(--error-color); }
+.act-hist-when { color: var(--text-secondary); min-width: 150px; }
+.act-hist-dur { font-family: ui-monospace, monospace; min-width: 60px; }
+.act-hist-reason { color: var(--error-color); }
+
+/* the bimodal-duration explainer */
+.act-path { font-size: 0.65rem; padding: 0 5px; border-radius: 3px; }
+.act-path-heavy   { color: var(--accent-color); background: color-mix(in srgb, var(--accent-color) 12%, transparent); }
+.act-path-light   { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 12%, transparent); }
+.act-path-unknown { color: var(--text-secondary); font-style: italic; }

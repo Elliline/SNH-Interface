@@ -696,6 +696,16 @@ async function auditCrossLinks() {
     }
   }
 
+  // This is what actually decides how long a heartbeat pass takes. Every judged
+  // pair is an LLM call; a cache-hit pair costs nothing. On idle memory every
+  // pair hashes the same and the pass finishes in under a minute, while a pass
+  // after real fact churn re-judges hundreds of pairs and runs 10-20x longer.
+  // The link add/update/remove counts are NOT a usable proxy for this — a pass
+  // can judge many pairs and change no links (observed: 260.8s, 0 link changes).
+  results.pairsTotal = pairs.length;
+  results.pairsReused = reused;
+  results.pairsJudged = toJudge.length;
+
   console.log(`[Heartbeat] ${pairs.length} cluster pair(s): ${reused} unchanged (skipped), ${toJudge.length} to (re)evaluate in batches of 10`);
   if (toJudge.length === 0) {
     console.log('[Heartbeat] Cross-link audit complete: no content changes, nothing re-judged');
@@ -875,7 +885,7 @@ CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no 
  * @param {Object}  opts.crossLinkResults      - Result from auditCrossLinks
  * @returns {Object} The report object
  */
-function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults }) {
+function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps = [] }) {
   const totalDurationMs = Date.now() - cycleStartMs;
   const totalDuration = (totalDurationMs / 1000).toFixed(1) + 's';
 
@@ -894,13 +904,27 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
   ];
 
   const report = {
+    status: 'ok',
     clustersAudited,
     clustersSplit,
     splitDetails: splitResults.splitDetails || [],
     linksUpdated: crossLinkResults.linksUpdated || 0,
     linksRemoved: crossLinkResults.linksRemoved || 0,
     linksAdded: crossLinkResults.linksAdded || 0,
+    // Cross-link LLM workload — the actual driver of pass duration. See the
+    // comment in auditCrossLinks: this, not the link deltas, is why a pass is
+    // 55s or 17 minutes.
+    pairsTotal: crossLinkResults.pairsTotal ?? null,
+    pairsReused: crossLinkResults.pairsReused ?? null,
+    pairsJudged: crossLinkResults.pairsJudged ?? null,
     totalDuration,
+    // Numeric ms alongside the display string so the Activity view can trend
+    // pass duration (the 2026-07-26 pass took 1062s — ~15% of the 2h interval).
+    totalDurationMs,
+    // Per-step results. These were already being computed and then dropped to
+    // console: cleanupFacts, summarizeDailyLogs, sweepPendingQuestions and
+    // mergeByName all return counts that nothing persisted.
+    steps,
     perClusterTiming,
     anomalies
   };
@@ -983,8 +1007,8 @@ function recordHeartbeatReport(report) {
     db.prepare(`
       INSERT INTO heartbeat_reports
         (id, created_at, clusters_audited, clusters_split, links_added, links_updated,
-         links_removed, duration, anomaly_count, report_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         links_removed, duration, anomaly_count, report_json, status, status_reason, duration_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?)
     `).run(
       randomUUID(),
       new Date().toISOString(),
@@ -995,10 +1019,96 @@ function recordHeartbeatReport(report) {
       report.linksRemoved || 0,
       report.totalDuration || null,
       (report.anomalies || []).length,
-      JSON.stringify(report)
+      JSON.stringify(report),
+      report.totalDurationMs ?? null
     );
   } catch (err) {
     console.error('[Heartbeat] Failed to persist heartbeat report:', err.message);
+  }
+}
+
+/**
+ * Persist one liveness probe result and prune past the retention window.
+ * Deliberately the cheapest possible row: when, ok, how long, why not.
+ * @param {{ok: boolean, ms?: number, error?: string}} probe
+ * @param {number} retentionDays
+ */
+function recordLivenessProbe(probe, retentionDays) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    db.prepare(
+      'INSERT INTO liveness_probes (id, created_at, ok, latency_ms, error) VALUES (?, ?, ?, ?, ?)'
+    ).run(randomUUID(), new Date().toISOString(), probe.ok ? 1 : 0,
+          Number.isFinite(probe.ms) ? probe.ms : null, probe.ok ? null : (probe.error || 'unknown'));
+    // Prune inline. The table is small and created_at is indexed, so this is
+    // cheaper than carrying a separate cleanup schedule for one table.
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare('DELETE FROM liveness_probes WHERE datetime(created_at) < datetime(?)').run(cutoff);
+  } catch (err) {
+    console.error('[Liveness] Failed to record probe:', err.message);
+  }
+}
+
+/** Recent liveness probes (newest first) for the Activity view. */
+function getLivenessProbes(limit = 100) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    return db.prepare(
+      'SELECT * FROM liveness_probes ORDER BY datetime(created_at) DESC LIMIT ?'
+    ).all(Math.min(Math.max(1, limit), 1000));
+  } catch (err) {
+    console.error('[Liveness] Failed to read probes:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Persist a heartbeat pass that did NOT reach the report step.
+ *
+ * generateReport only runs on the success path, so before this existed a pass
+ * that bailed at the preflight probe (or was aborted mid-cycle by the breaker,
+ * or threw) left no row — the table read as an unbroken run of healthy passes
+ * through an outage. These rows are what make the Activity view trustworthy.
+ *
+ * @param {Object} o
+ * @param {'failed'|'aborted'|'skipped'} o.status
+ * @param {string} o.reason        - plain-language why
+ * @param {number} o.cycleStartMs  - so a partial pass still reports its duration
+ * @param {Object} [o.partial]     - whatever the pass did manage before bailing
+ */
+function recordHeartbeatOutcome({ status, reason, cycleStartMs, partial = {} }) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    const durationMs = cycleStartMs ? Date.now() - cycleStartMs : null;
+    const report = {
+      status,
+      statusReason: reason,
+      clustersAudited: (partial.auditResults || []).length,
+      clustersSplit: partial.splitResults?.clustersSplit || 0,
+      linksAdded: partial.crossLinkResults?.linksAdded || 0,
+      linksUpdated: partial.crossLinkResults?.linksUpdated || 0,
+      linksRemoved: partial.crossLinkResults?.linksRemoved || 0,
+      totalDurationMs: durationMs,
+      totalDuration: durationMs != null ? (durationMs / 1000).toFixed(1) + 's' : null,
+      anomalies: [reason].filter(Boolean)
+    };
+    db.prepare(`
+      INSERT INTO heartbeat_reports
+        (id, created_at, clusters_audited, clusters_split, links_added, links_updated,
+         links_removed, duration, anomaly_count, report_json, status, status_reason, duration_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(), new Date().toISOString(),
+      report.clustersAudited, report.clustersSplit, report.linksAdded,
+      report.linksUpdated, report.linksRemoved, report.totalDuration,
+      report.anomalies.length, JSON.stringify(report), status, reason, durationMs
+    );
+    console.log(`[Heartbeat] Recorded ${status} pass: ${reason}`);
+  } catch (err) {
+    console.error('[Heartbeat] Failed to persist heartbeat outcome:', err.message);
   }
 }
 
@@ -1637,12 +1747,31 @@ async function runAuditPipeline(clusters) {
 async function runMaintenance() {
   if (isRunning) {
     console.log('[Heartbeat] Maintenance already in progress, skipping');
+    recordHeartbeatOutcome({
+      status: 'skipped', reason: 'previous maintenance pass still running', cycleStartMs: null
+    });
     return { skipped: true };
   }
 
   isRunning = true;
   const cycleStartMs = Date.now();
   console.log('[Heartbeat] === Starting maintenance cycle ===');
+
+  // Per-step timing/results, filled in as the pass proceeds and handed to
+  // generateReport at the end. Instrumentation only — the steps themselves are
+  // untouched and still run in the same order.
+  const steps = [];
+  const runStep = async (name, gate, fn) => {
+    const t0 = Date.now();
+    try {
+      const result = await fn();
+      steps.push({ name, gate, ok: true, ms: Date.now() - t0, result });
+      return result;
+    } catch (err) {
+      steps.push({ name, gate, ok: false, ms: Date.now() - t0, error: err.message });
+      throw err;
+    }
+  };
 
   try {
     // Circuit breaker: before committing to a full cycle (dozens of LLM calls),
@@ -1663,6 +1792,11 @@ async function runMaintenance() {
       try {
         factExtractor.appendToOpsLog(`Heartbeat: brain unreachable, skipping cycle (${lastProbeErr})`, OPS_DIR);
       } catch (e) { /* best-effort ops-log write */ }
+      recordHeartbeatOutcome({
+        status: 'aborted',
+        reason: `brain unreachable at preflight (${lastProbeErr})`,
+        cycleStartMs
+      });
       return { skipped: true, reason: 'brain unreachable' };
     }
     // Preflight passed — start the cycle with a clean breaker.
@@ -1697,13 +1831,19 @@ async function runMaintenance() {
       try {
         factExtractor.appendToOpsLog('Heartbeat: brain wedged mid-cycle, aborting remaining tasks', OPS_DIR);
       } catch (e) { /* best-effort ops-log write */ }
+      recordHeartbeatOutcome({
+        status: 'aborted',
+        reason: 'brain wedged mid-cycle — remaining tasks skipped',
+        cycleStartMs,
+        partial: { auditResults, splitResults, crossLinkResults }
+      });
       return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults, crossLinkResults };
     }
 
     // Merge any clusters sharing the same name (catches duplicates from
     // assignToCluster creating clusters that later get renamed identically)
     try {
-      const mergedByName = await memoryClusters.mergeByName();
+      const mergedByName = await runStep('mergeByName', 'always', () => memoryClusters.mergeByName());
       if (mergedByName > 0) {
         console.log(`[Heartbeat] Merged ${mergedByName} duplicate-name cluster(s)`);
       }
@@ -1712,8 +1852,8 @@ async function runMaintenance() {
     }
 
     // Task B & C unchanged
-    const cleanup = await cleanupFacts();
-    const archive = await summarizeDailyLogs();
+    const cleanup = await runStep('cleanupFacts', 'always', () => cleanupFacts());
+    const archive = await runStep('summarizeDailyLogs', 'always', () => summarizeDailyLogs());
 
     // Task B2: retire pending questions the memory already answers. The
     // mint-time gate only screens new questions; this sweep makes every gate
@@ -1722,7 +1862,8 @@ async function runMaintenance() {
     // initiative backed by a question retired here in the same cycle.
     let questionSweep = { swept: 0, retired: [] };
     try {
-      questionSweep = await factExtractor.sweepPendingQuestions();
+      questionSweep = await runStep('sweepPendingQuestions', 'always',
+        () => factExtractor.sweepPendingQuestions());
     } catch (sweepErr) {
       console.error('[Heartbeat] Question sweep error:', sweepErr.message);
     }
@@ -1731,7 +1872,7 @@ async function runMaintenance() {
     // Runs at most once per cycle, and only when there are new conversations.
     let reflection = { skipped: true };
     try {
-      reflection = await runReflection();
+      reflection = await runStep('reflection', 'only if new conversations', () => runReflection());
     } catch (reflectErr) {
       console.error('[Heartbeat] Reflection error:', reflectErr.message);
       reflection = { error: reflectErr.message };
@@ -1749,7 +1890,8 @@ async function runMaintenance() {
     // asks.
     let selfAuditResult = { skipped: true };
     try {
-      selfAuditResult = await selfAudit.runIfDue();
+      selfAuditResult = await runStep('selfCoherenceAudit', 'at most once per audit.cadenceDays',
+        () => selfAudit.runIfDue());
     } catch (auditErr) {
       console.error('[Heartbeat] Self-coherence audit error:', auditErr.message);
       selfAuditResult = { error: auditErr.message };
@@ -1759,18 +1901,20 @@ async function runMaintenance() {
     // pooled prioritizer re-score/expire/cap them, then maybe reach out once.
     let initiative = { skipped: true };
     try {
-      await initiativeEngine.noticeFromQuestions();
-      await initiativeEngine.noticeFromAudit(auditResults);
-      const prioritized = await initiativeEngine.prioritize();
-      const unprompted = await initiativeEngine.deliverUnprompted();
-      initiative = { prioritized, unprompted };
+      initiative = await runStep('initiativeLayer', 'quiet hours + max 1 unprompted/day', async () => {
+        await initiativeEngine.noticeFromQuestions();
+        await initiativeEngine.noticeFromAudit(auditResults);
+        const prioritized = await initiativeEngine.prioritize();
+        const unprompted = await initiativeEngine.deliverUnprompted();
+        return { prioritized, unprompted };
+      });
     } catch (initErr) {
       console.error('[Heartbeat] Initiative layer error:', initErr.message);
       initiative = { error: initErr.message };
     }
 
     // Step 4: report
-    const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults });
+    const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps });
 
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
@@ -1778,6 +1922,9 @@ async function runMaintenance() {
     return { report, cleanup, archive, questionSweep, reflection, selfAudit: selfAuditResult, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
+    recordHeartbeatOutcome({
+      status: 'failed', reason: error.message, cycleStartMs
+    });
     return { error: error.message };
   } finally {
     isRunning = false;
@@ -1889,9 +2036,15 @@ function startLivenessProbe() {
   const timeoutMs = lp.timeoutMs || 8000;
   console.log(`[Liveness] Probing brain every ${intervalMs / 60000}min (timeout ${timeoutMs}ms)`);
 
+  const retentionDays = Math.max(1, lp.retentionDays ?? 14);
+
   livenessTimer = setInterval(async () => {
     try {
       const probe = await probeBrainLiveness(timeoutMs);
+      // Record EVERY probe. Previously only state transitions were logged, so a
+      // probe that ran and passed left no trace and "when did this last run"
+      // had no answer. Pruned to the retention window on each write.
+      recordLivenessProbe(probe, retentionDays);
       if (!probe.ok && lastLivenessOk) {
         lastLivenessOk = false;
         const msg = `⚠️ Brain liveness probe FAILED: ${probe.error} — engine may be wedged`;
@@ -1946,4 +2099,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, auditClusterCoherence, parseJSON, repairTruncatedJSON };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON };

@@ -33,7 +33,10 @@ const DEFAULTS = {
   // Lightweight periodic liveness probe: a tiny completion with a short timeout
   // that writes a daily-log warning when the brain stops answering, so a wedged
   // engine is caught in minutes instead of at the next heartbeat.
-  livenessProbe: { enabled: true, intervalMinutes: 5, timeoutMs: 8000 },
+  // `retentionDays` bounds the per-probe log (liveness_probes). At the default
+  // 5-minute cadence that's ~288 rows/day, so 14 days is ~4k rows — enough to
+  // see a pattern of intermittent failures without growing forever.
+  livenessProbe: { enabled: true, intervalMinutes: 5, timeoutMs: 8000, retentionDays: 14 },
   // Brain watchdog: the self-healing ACTION for the vLLM wedge. Fed each liveness
   // probe result — after `failureThreshold` consecutive failures it runs
   // `docker restart <container>`. `cooldownMinutes` is grace while the model

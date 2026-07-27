@@ -3033,6 +3033,225 @@ function switchMemoryTab(name) {
   else if (name === 'daily') loadDailyTab();
   else if (name === 'self') loadSelfTab();
   else if (name === 'thinking') loadThinkingTab();
+  else if (name === 'activity') loadActivityTab();
+}
+
+// ============ Activity tab ============
+// Read-only view of everything scheduled in SNH. Two categories kept visually
+// apart: ACTIVE (the two in-process timers, with heartbeat steps NESTED because
+// they are not independently scheduled) and INERT (cron_jobs — nothing executes
+// them). Anything without run history says so rather than showing a blank.
+
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+  return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
+
+function fmtRelative(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+  if (isNaN(d.getTime())) return '';
+  const diff = d.getTime() - Date.now();
+  const abs = Math.abs(diff);
+  const mins = Math.round(abs / 60000);
+  const unit = mins < 60 ? `${mins} min`
+    : mins < 1440 ? `${(mins / 60).toFixed(1)} h`
+    : `${(mins / 1440).toFixed(1)} d`;
+  return diff >= 0 ? `in ${unit}` : `${unit} ago`;
+}
+
+function fmtDur(ms) {
+  if (ms == null) return '—';
+  return ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${(ms / 60000).toFixed(1)} min`;
+}
+
+function activityStatusPill(status) {
+  const s = status || 'unknown';
+  return `<span class="act-pill act-pill-${escapeHtml(s)}">${escapeHtml(s)}</span>`;
+}
+
+async function loadActivityTab() {
+  const container = document.getElementById('memoryActivityContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading activity…</div>';
+
+  try {
+    const res = await fetch('/api/memory/activity');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'failed');
+
+    let html = '';
+
+    // --- anchor note: why the cadence moves after a deploy ---
+    html += `
+      <div class="act-anchor">
+        <div class="act-anchor-title">Schedules are anchored to process start, not the clock</div>
+        <div class="act-anchor-body">
+          ${escapeHtml(data.anchor.note)}<br>
+          Current anchor: <strong>${escapeHtml(fmtWhen(data.anchor.processStartedAt))}</strong>
+          <span class="act-dim">(up ${escapeHtml(fmtDur(data.anchor.uptimeMs))})</span>
+        </div>
+      </div>`;
+
+    // --- ACTIVE ---
+    html += '<div class="act-section-head act-section-active">Active — running on their own</div>';
+
+    for (const p of data.active) {
+      const lr = p.lastRun;
+      const disabled = p.enabled === false;
+      html += `
+      <div class="act-entry${disabled ? ' act-entry-disabled' : ''}">
+        <div class="act-entry-head">
+          <span class="act-name">${escapeHtml(p.name)}</span>
+          ${disabled ? '<span class="act-pill act-pill-disabled">disabled</span>' : ''}
+          <span class="act-prov act-prov-system">system</span>
+        </div>
+        <div class="act-desc">${escapeHtml(p.description)}</div>
+        <div class="act-grid">
+          <div><span class="act-label">Mechanism</span>${escapeHtml(p.mechanism)}</div>
+          <div><span class="act-label">Schedule</span>${escapeHtml(p.schedule)}</div>
+          <div><span class="act-label">Last run</span>${
+            lr ? `${escapeHtml(fmtWhen(lr.at))} <span class="act-dim">${escapeHtml(fmtRelative(lr.at))}</span> ${activityStatusPill(lr.status)} <span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span>`
+               : '<span class="act-nohist">no run history</span>'}</div>
+          <div><span class="act-label">Next run</span>${
+            p.nextRun ? `${escapeHtml(fmtWhen(p.nextRun))} <span class="act-dim">${escapeHtml(fmtRelative(p.nextRun))}</span>` : '<span class="act-nohist">n/a</span>'}</div>
+        </div>
+        ${lr && lr.statusReason ? `<div class="act-reason">${escapeHtml(lr.statusReason)}</div>` : ''}
+        ${p.retentionNote ? `<div class="act-dim act-retention">Probe log ${escapeHtml(p.retentionNote)}.</div>` : ''}
+        ${renderActivitySubTasks(p)}
+        ${renderActivityHistory(p)}
+      </div>`;
+    }
+
+    // --- INERT ---
+    const jobs = data.inert.jobs || [];
+    html += '<div class="act-section-head act-section-inert">Inert — recorded, never executed</div>';
+    html += `
+      <div class="act-banner">
+        <strong>Nothing here runs.</strong> SNH has no scheduler. These are proposals from the
+        <code>create_cron_job</code> tool: approving one records a row and nothing more. An
+        approved job is <em>not</em> running, and will not run, on any schedule.
+      </div>`;
+
+    if (jobs.length === 0) {
+      html += '<div class="memory-empty">No proposed jobs.</div>';
+    } else {
+      html += jobs.map(j => `
+        <div class="act-entry act-entry-inert">
+          <div class="act-entry-head">
+            <span class="act-name">${escapeHtml(j.description)}</span>
+            <span class="act-pill act-pill-inert">${escapeHtml(j.status)} · never runs</span>
+            <span class="act-prov act-prov-kid">kid-proposed</span>
+          </div>
+          <div class="act-grid">
+            <div><span class="act-label">Mechanism</span>none — row in <code>cron_jobs</code></div>
+            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(cronToWords(j.schedule))}</span></div>
+            <div><span class="act-label">Proposed</span>${escapeHtml(fmtWhen(j.created_at))}</div>
+            <div><span class="act-label">Next run</span><span class="act-never">never — no scheduler exists</span></div>
+          </div>
+          ${j.decided_at ? `<div class="act-dim">${escapeHtml(j.status)} ${escapeHtml(fmtWhen(j.decided_at))}${j.decided_note ? ` — ${escapeHtml(j.decided_note)}` : ''}</div>` : ''}
+        </div>`).join('');
+    }
+
+    // --- GAPS ---
+    html += '<div class="act-section-head act-section-gaps">Runs, but leaves no record</div>';
+    html += data.gaps.map(g => `
+      <div class="act-entry act-entry-gap">
+        <div class="act-entry-head">
+          <span class="act-name">${escapeHtml(g.name)}</span>
+          <span class="act-pill act-pill-nohist">no run history</span>
+        </div>
+        <div class="act-desc">${escapeHtml(g.what)}</div>
+        <div class="act-grid">
+          <div><span class="act-label">Mechanism</span>${escapeHtml(g.mechanism)}</div>
+          <div><span class="act-label">Why not listed</span>${escapeHtml(g.why)}</div>
+        </div>
+      </div>`).join('');
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('[Activity] Error loading:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load activity</div>';
+  }
+}
+
+/** Heartbeat steps, nested to show they are one serial pass — not peers. */
+function renderActivitySubTasks(p) {
+  if (!p.subTasks || p.subTasks.length === 0) return '';
+  const rows = p.subTasks.map((s, i) => {
+    const lr = s.lastRun;
+    const result = lr && lr.result != null
+      ? (typeof lr.result === 'object' ? JSON.stringify(lr.result) : String(lr.result))
+      : null;
+    return `
+      <div class="act-sub${s.isDurationDriver ? ' act-sub-driver' : ''}">
+        <span class="act-sub-idx">${i + 1}</span>
+        <div class="act-sub-body">
+          <div class="act-sub-head">
+            <span class="act-sub-name">${escapeHtml(s.name)}</span>
+            <span class="act-gate">${escapeHtml(s.gate)}</span>
+            ${s.isDurationDriver ? '<span class="act-pill act-pill-driver">drives pass duration</span>' : ''}
+          </div>
+          <div class="act-sub-desc">${escapeHtml(s.description)}</div>
+          <div class="act-sub-run">${
+            lr
+              ? `${lr.durationMs != null ? `<span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span> · ` : ''}${result ? escapeHtml(result.slice(0, 160)) : (lr.ok ? 'ok' : 'error')}`
+              : `<span class="act-nohist">no run history${s.noHistoryReason ? ` — ${escapeHtml(s.noHistoryReason)}` : ''}</span>`
+          }</div>
+        </div>
+      </div>`;
+  }).join('');
+  return `
+    <details class="act-subs" open>
+      <summary class="act-subs-summary">${p.subTasks.length} steps in this pass — run in order, not independently scheduled</summary>
+      ${rows}
+    </details>`;
+}
+
+/** Recent runs. For the heartbeat, each row says which code path it took. */
+function renderActivityHistory(p) {
+  const h = p.history || [];
+  if (h.length === 0) {
+    return '<div class="act-nohist act-hist-empty">No run history recorded yet.</div>';
+  }
+  const rows = h.slice(0, 20).map(r => `
+    <div class="act-hist-row act-hist-${escapeHtml(r.status)}">
+      <span class="act-hist-when">${escapeHtml(fmtWhen(r.at))}</span>
+      ${activityStatusPill(r.status)}
+      <span class="act-hist-dur">${escapeHtml(fmtDur(r.durationMs))}</span>
+      ${r.pathKind ? `<span class="act-path act-path-${escapeHtml(r.pathKind)}">${escapeHtml(r.pathLabel)}</span>` : ''}
+      ${r.statusReason ? `<span class="act-hist-reason">${escapeHtml(r.statusReason)}</span>` : ''}
+    </div>`).join('');
+  return `
+    <details class="act-hist">
+      <summary class="act-hist-summary">Recent runs (${h.length})</summary>
+      ${rows}
+    </details>`;
+}
+
+/** Cron expression → plain words. Covers the common shapes; falls back honestly. */
+function cronToWords(expr) {
+  const p = String(expr || '').trim().split(/\s+/);
+  if (p.length !== 5) return '';
+  const [min, hr, dom, mon, dow] = p;
+  const DAYS = { 0: 'Sunday', 1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday' };
+  const at = (h, m) => {
+    const hh = parseInt(h, 10), mm = parseInt(m, 10);
+    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return '';
+    const ampm = hh >= 12 ? 'pm' : 'am';
+    const h12 = hh % 12 || 12;
+    return `${h12}${mm ? ':' + String(mm).padStart(2, '0') : ''}${ampm}`;
+  };
+  const stepMin = min.match(/^\*\/(\d+)$/);
+  if (stepMin && hr === '*' && dom === '*' && mon === '*' && dow === '*') return `every ${stepMin[1]} minutes`;
+  if (min === '0' && hr === '*' && dom === '*' && mon === '*' && dow === '*') return 'every hour';
+  if (/^\d+$/.test(min) && /^\d+$/.test(hr)) {
+    if (dom === '*' && mon === '*' && dow === '*') return `every day at ${at(hr, min)}`;
+    if (dom === '*' && mon === '*' && /^\d$/.test(dow)) return `every ${DAYS[dow]} at ${at(hr, min)}`;
+    if (/^\d+$/.test(dom) && mon === '*' && (dow === '*' || dow === '?')) return `on the ${dom}${dom === '1' ? 'st' : dom === '2' ? 'nd' : dom === '3' ? 'rd' : 'th'} of each month at ${at(hr, min)}`;
+  }
+  return '';
 }
 
 // ---- Facts Tab ----

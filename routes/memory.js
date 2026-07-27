@@ -289,6 +289,238 @@ router.post('/initiatives/:id/discuss', async (req, res) => {
   }
 });
 
+// ============ activity: everything scheduled in SNH ============
+
+/**
+ * GET /api/memory/activity
+ *
+ * Read-only model of every recurring process. Two categories, kept apart on
+ * purpose:
+ *   ACTIVE — the two in-process timers. Everything else people call "scheduled"
+ *            is a STEP inside the heartbeat pass, so sub-tasks are nested under
+ *            it rather than listed as peers.
+ *   INERT  — cron_jobs rows. Nothing executes them; there is no scheduler.
+ *
+ * Reads real state (systemd process start, the run-history tables) rather than
+ * keeping a parallel record. Where a process leaves no trace, it says so
+ * instead of showing a blank.
+ */
+router.get('/activity', (req, res) => {
+  try {
+    const memoryManager = require('../db/memory-manager');
+    const cronJobs = require('../db/cron-jobs');
+    const { getSqliteDb } = require('../db/database');
+    const cfg = getConfig();
+    const db = getSqliteDb();
+
+    // --- timer phase anchor -------------------------------------------------
+    // Both timers are created at process start, so the whole cadence is
+    // anchored there and NOT to the wall clock: every deploy re-phases them.
+    // Surfaced explicitly so a shifted schedule after a restart reads as
+    // expected rather than as a bug.
+    const uptimeMs = Math.round(process.uptime() * 1000);
+    const processStartedAt = new Date(Date.now() - uptimeMs).toISOString();
+
+    const hbIntervalMs = (cfg.heartbeat?.intervalHours ?? 2) * 3600_000;
+    const hbWarmupMs = (cfg.heartbeat?.warmupMinutes ?? 5) * 60_000;
+    const lpIntervalMs = Math.max(1, cfg.livenessProbe?.intervalMinutes ?? 5) * 60_000;
+
+    // nth firing strictly after now, counting from the anchor.
+    const nextFrom = (anchorMs, offsetMs, intervalMs) => {
+      const first = anchorMs + offsetMs;
+      if (Date.now() < first) return new Date(first).toISOString();
+      const n = Math.floor((Date.now() - first) / intervalMs) + 1;
+      return new Date(first + n * intervalMs).toISOString();
+    };
+    const startMs = Date.now() - uptimeMs;
+
+    // --- heartbeat ----------------------------------------------------------
+    const hbRows = db
+      ? db.prepare('SELECT * FROM heartbeat_reports ORDER BY datetime(created_at) DESC LIMIT 40').all()
+      : [];
+
+    // Pass duration is BIMODAL (~55s vs ~1060s observed), and a long row next to
+    // a short one has to read as a different code path rather than a fault.
+    //
+    // The cluster-audit pipeline is NOT the discriminator: it engages on every
+    // recorded pass and costs a steady 13-36s. What actually drives duration is
+    // the cross-link audit's LLM workload — pairs whose content hash changed and
+    // must be re-judged. Idle memory = every pair is a cache hit = fast pass.
+    // Link add/update/remove counts are not a usable proxy (a 260.8s pass changed
+    // zero links), so passes recorded before pairsJudged existed say so plainly
+    // instead of guessing.
+    const hbHistory = hbRows.map(r => {
+      let parsed = {};
+      try { parsed = JSON.parse(r.report_json || '{}'); } catch (e) { /* keep {} */ }
+      const judged = parsed.pairsJudged;
+      const known = Number.isFinite(judged);
+      let pathLabel, pathKind;
+      if (!known) {
+        pathLabel = 'cross-link workload not recorded for this pass';
+        pathKind = 'unknown';
+      } else if (judged === 0) {
+        pathLabel = `light pass — no cluster pairs needed re-judging (${parsed.pairsReused ?? 0} cached)`;
+        pathKind = 'light';
+      } else {
+        pathLabel = `heavy pass — ${judged} cluster pair${judged === 1 ? '' : 's'} re-judged by the model` +
+                    (Number.isFinite(parsed.pairsReused) ? ` (${parsed.pairsReused} cached)` : '');
+        pathKind = 'heavy';
+      }
+      return {
+        at: r.created_at,
+        status: r.status || 'ok',
+        statusReason: r.status_reason || null,
+        durationMs: r.duration_ms ?? null,
+        duration: r.duration || null,
+        pairsJudged: known ? judged : null,
+        pairsReused: Number.isFinite(parsed.pairsReused) ? parsed.pairsReused : null,
+        pathKind,
+        pathLabel,
+        clusterPipelineEngaged: (r.clusters_audited || 0) > 0,
+        clustersAudited: r.clusters_audited || 0,
+        clustersSplit: r.clusters_split || 0,
+        linksAdded: r.links_added || 0,
+        linksUpdated: r.links_updated || 0,
+        linksRemoved: r.links_removed || 0,
+        anomalyCount: r.anomaly_count || 0,
+        // steps only exist on passes recorded after the 2026-07-26 instrumentation
+        steps: Array.isArray(parsed.steps) ? parsed.steps : null
+      };
+    });
+
+    const lastHb = hbHistory[0] || null;
+    const latestSteps = (hbHistory.find(h => h.steps && h.steps.length) || {}).steps || null;
+    const stepByName = {};
+    for (const s of latestSteps || []) stepByName[s.name] = s;
+
+    // Sub-tasks, in the order runMaintenance executes them. These are STEPS in
+    // one serial pass — not independently scheduled — hence nesting.
+    const sub = (key, name, description, gate, opts = {}) => {
+      const s = stepByName[key];
+      return {
+        key, name, description, gate,
+        lastRun: s ? { at: lastHb?.at || null, ok: s.ok, durationMs: s.ms, result: s.result ?? null } : null,
+        noHistory: !s && !opts.derived,
+        noHistoryReason: !s && !opts.derived
+          ? (latestSteps ? 'not reached on the most recent pass' : 'per-step timing recorded only from 2026-07-26')
+          : null,
+        ...opts
+      };
+    };
+
+    const subTasks = [
+      sub('preflight', 'Brain preflight probe',
+          'Probes the model engine up to 3 times before committing to a full pass; aborts the cycle if it is unreachable.',
+          'always — aborts the pass on failure',
+          { derived: true,
+            lastRun: lastHb ? { at: lastHb.at, ok: lastHb.status === 'ok', durationMs: null,
+                                result: lastHb.status === 'ok' ? 'engine answered' : lastHb.statusReason } : null }),
+      sub('clusterAudit', 'Cluster coherence audit + splits',
+          'Asks the model whether each oversized cluster is really one topic, and splits the ones that are not.',
+          'only when a cluster exceeds memory.maxFactsPerCluster',
+          { derived: true,
+            isClusterPipeline: true,
+            lastRun: lastHb ? { at: lastHb.at, ok: lastHb.status === 'ok', durationMs: null,
+                                result: lastHb.clusterPipeline
+                                  ? `${lastHb.clustersAudited} audited, ${lastHb.clustersSplit} split`
+                                  : 'skipped — no oversized clusters' } : null }),
+      sub('crossLinks', 'Cross-link audit',
+          'Scores how related each pair of clusters is and maintains the links between them. Pairs whose content has not changed are served from a cached judgment; only changed pairs go to the model. This step is what makes a pass fast or slow.',
+          'always — but only re-judges pairs whose content changed',
+          { derived: true,
+            isDurationDriver: true,
+            lastRun: lastHb ? { at: lastHb.at, ok: lastHb.status === 'ok', durationMs: null,
+                                result: (lastHb.pairsJudged != null
+                                  ? `${lastHb.pairsJudged} pair(s) re-judged, ${lastHb.pairsReused ?? 0} cached · `
+                                  : '') + `links +${lastHb.linksAdded} / ~${lastHb.linksUpdated} / -${lastHb.linksRemoved}` } : null }),
+      sub('mergeByName', 'Merge duplicate-name clusters',
+          'Collapses clusters that ended up sharing a name.', 'always'),
+      sub('cleanupFacts', 'Fact cleanup',
+          'Dedups, rewords and merges facts in long-term memory.', 'always'),
+      sub('summarizeDailyLogs', 'Daily log archival',
+          'Archives daily logs older than the retention window, keeping a digest.', 'always'),
+      sub('sweepPendingQuestions', 'Pending-question sweep',
+          'Retires queued questions that memory can already answer.', 'always'),
+      sub('reflection', 'Reflection',
+          'SNH reviews the day\'s conversations and records observations about itself.',
+          'only if there are new conversations'),
+      sub('selfCoherenceAudit', 'Self-coherence audit',
+          'Tests stored self-claims against how it actually behaved and raises gaps for approval. Never edits identity.',
+          'at most once per audit.cadenceDays (currently ' + (cfg.audit?.cadenceDays ?? 1) + '/day)'),
+      sub('initiativeLayer', 'Initiative layer',
+          'Turns findings into candidate initiatives, re-scores them, and may reach out once.',
+          'quiet hours ' + (cfg.initiative?.quietHours?.start ?? 22) + ':00–' + (cfg.initiative?.quietHours?.end ?? 8) + ':00, max ' + (cfg.initiative?.maxUnpromptedPerDay ?? 1) + ' unprompted/day')
+    ];
+
+    // --- liveness -----------------------------------------------------------
+    const lpRows = memoryManager.getLivenessProbes ? memoryManager.getLivenessProbes(60) : [];
+    const lpHistory = lpRows.map(r => ({
+      at: r.created_at, status: r.ok ? 'ok' : 'failed',
+      durationMs: r.latency_ms ?? null, statusReason: r.error || null
+    }));
+
+    const active = [
+      {
+        id: 'heartbeat',
+        name: 'Heartbeat maintenance pass',
+        description: 'One serial pass that maintains memory: audits and splits clusters, maintains links, cleans up facts, archives logs, reflects, audits its own self-claims, and raises initiatives.',
+        mechanism: 'node setInterval (in-process, db/memory-manager.js:1862)',
+        schedule: `every ${cfg.heartbeat?.intervalHours ?? 2} hours (first run ${cfg.heartbeat?.warmupMinutes ?? 5} min after start)`,
+        provenance: 'system',
+        enabled: cfg.heartbeat?.enabled !== false,
+        lastRun: lastHb,
+        nextRun: cfg.heartbeat?.enabled !== false ? nextFrom(startMs, hbWarmupMs, hbIntervalMs) : null,
+        history: hbHistory,
+        subTasks
+      },
+      {
+        id: 'liveness',
+        name: 'Brain liveness probe',
+        description: 'A tiny completion against the model engine to catch a wedged brain within minutes. Its result also feeds the watchdog.',
+        mechanism: 'node setInterval (in-process, db/memory-manager.js:1892)',
+        schedule: `every ${cfg.livenessProbe?.intervalMinutes ?? 5} minutes (timeout ${cfg.livenessProbe?.timeoutMs ?? 8000}ms)`,
+        provenance: 'system',
+        enabled: cfg.livenessProbe?.enabled !== false,
+        lastRun: lpHistory[0] || null,
+        nextRun: cfg.livenessProbe?.enabled !== false ? nextFrom(startMs, lpIntervalMs, lpIntervalMs) : null,
+        history: lpHistory,
+        retentionNote: `kept ${cfg.livenessProbe?.retentionDays ?? 14} days`,
+        subTasks: []
+      }
+    ];
+
+    // --- inert --------------------------------------------------------------
+    const jobs = cronJobs.listKidCreated({ limit: 100 });
+
+    // --- known gaps ---------------------------------------------------------
+    // Things that run but leave no queryable trace. Listed rather than hidden.
+    const gaps = [
+      { name: 'Brain watchdog', what: 'Restarts the engine container after repeated probe failures.',
+        why: 'Writes prose to the ops log only — no table, so runs and restarts cannot be listed here.',
+        mechanism: 'reacts to liveness probe results (not independently scheduled)' },
+      { name: 'Agent pool passes', what: 'Throttled queue that background LLM work runs through.',
+        why: 'Each pass writes one unstructured ops-log line; counts are not queryable.',
+        mechanism: 'used by the heartbeat (not independently scheduled)' },
+      { name: 'Memory flush', what: 'Condenses a conversation when it approaches the context limit.',
+        why: 'Leaves no run record. Also not on a timer — it fires per chat message.',
+        mechanism: 'triggered per message (not scheduled)' }
+    ];
+
+    res.json({
+      anchor: {
+        processStartedAt, uptimeMs,
+        note: 'Both timers are created at process start, so their cadence is anchored to it rather than to the wall clock. Restarting SNH re-phases every schedule below.'
+      },
+      active,
+      inert: { jobs, caps: cronJobs.capStatus() },
+      gaps
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error building activity view:', error.message);
+    res.status(500).json({ error: 'Failed to build activity view' });
+  }
+});
+
 // ============ cron proposals (create_cron_job, propose-only) ============
 
 /**

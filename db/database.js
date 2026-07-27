@@ -328,6 +328,45 @@ function initDatabase() {
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_heartbeat_reports_created ON heartbeat_reports(created_at)`);
 
+    // Migration: heartbeat outcome. The table used to be written ONLY by
+    // generateReport, which runs only on the success path — so during a brain
+    // outage the record looked clean while nothing was actually completing.
+    // Aborted/failed passes now write a row too, and `status` says which.
+    // Existing rows are backfilled to 'ok' because that is what they were: a
+    // row existing at all used to mean the pass reached the end.
+    const hbCols = sqliteDb.prepare('PRAGMA table_info(heartbeat_reports)').all();
+    if (!hbCols.some(c => c.name === 'status')) {
+      sqliteDb.exec("ALTER TABLE heartbeat_reports ADD COLUMN status TEXT DEFAULT 'ok'");
+      sqliteDb.exec("UPDATE heartbeat_reports SET status = 'ok' WHERE status IS NULL");
+      console.log("Migration: added status to heartbeat_reports (existing rows set to 'ok')");
+    }
+    if (!hbCols.some(c => c.name === 'status_reason')) {
+      sqliteDb.exec('ALTER TABLE heartbeat_reports ADD COLUMN status_reason TEXT');
+      console.log('Migration: added status_reason to heartbeat_reports');
+    }
+    if (!hbCols.some(c => c.name === 'duration_ms')) {
+      // duration was only ever stored as a display string ("1062.2s"), which the
+      // Activity view cannot sort or trend on. Numeric ms alongside it.
+      sqliteDb.exec('ALTER TABLE heartbeat_reports ADD COLUMN duration_ms INTEGER');
+      console.log('Migration: added duration_ms to heartbeat_reports');
+    }
+
+    // Liveness probe results — one row per probe, every few minutes. Previously
+    // the probe only wrote to the ops log on a STATE TRANSITION (ok→fail,
+    // fail→ok), so a probe that ran and passed left no trace at all and "when
+    // did it last run" was unanswerable. Pruned on a retention window
+    // (config.livenessProbe.retentionDays) so it cannot grow without bound.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS liveness_probes (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ok INTEGER NOT NULL,        -- 1 = brain answered, 0 = did not
+        latency_ms INTEGER,         -- round-trip for the probe completion
+        error TEXT                  -- failure reason when ok = 0
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_liveness_probes_created ON liveness_probes(created_at)`);
+
     // Cron jobs proposed by the entity through the create_cron_job tool. PROPOSE
     // ONLY: a tool call lands here as status='proposed' and raises an initiative;
     // nothing becomes 'approved' without Ellie deciding in the bell panel.

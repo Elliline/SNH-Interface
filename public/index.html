@@ -81,6 +81,7 @@
       <button class="memory-tab" data-tab="daily">Daily Logs</button>
       <button class="memory-tab" data-tab="self">Self</button>
       <button class="memory-tab" data-tab="thinking">Thinking</button>
+      <button class="memory-tab" data-tab="activity">Activity</button>
       <button class="memory-tab" data-tab="search">Search</button>
     </div>
     <div class="memory-panel-content">
@@ -138,6 +139,12 @@
       <div id="memoryTabThinking" class="memory-tab-content">
         <div id="memoryThinkingContent" class="memory-thinking-content">
           <div class="memory-loading">Loading thinking…</div>
+        </div>
+      </div>
+      <!-- Activity Tab (read-only: everything scheduled, plus inert cron proposals) -->
+      <div id="memoryTabActivity" class="memory-tab-content">
+        <div id="memoryActivityContent" class="memory-activity-content">
+          <div class="memory-loading">Loading activity…</div>
         </div>
       </div>
       <!-- Search Tab -->
