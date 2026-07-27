@@ -450,6 +450,9 @@ router.get('/activity', (req, res) => {
       sub('capabilityDrift', 'Capability drift check',
           'Probes the services behind config-gated organs and reconciles the capability manifest against the live tool registry. Any disagreement is raised in the bell, because the manifest is authoritative for capability questions — a stale entry makes SNH deny something it can do, or offer something that is down.',
           'always'),
+      sub('memoryReconcile', 'Memory store reconciliation',
+          'Checks that MEMORY.md, the fact database and the vector store still agree — a fact retired in one but not the others keeps being read or stays searchable. Reports only; it never edits a store.',
+          'always'),
       sub('initiativeLayer', 'Initiative layer',
           'Turns findings into candidate initiatives, re-scores them, and may reach out once.',
           'quiet hours ' + (cfg.initiative?.quietHours?.start ?? 22) + ':00–' + (cfg.initiative?.quietHours?.end ?? 8) + ':00, max ' + (cfg.initiative?.maxUnpromptedPerDay ?? 1) + ' unprompted/day')
@@ -690,7 +693,10 @@ router.get('/graph', (req, res) => {
     const clusterIds = new Set(clusterRows.map(c => c.id));
 
     const nodes = memberRows.map(m => {
-      const superseded = m.status === 'superseded' || !!m.superseded_by;
+      // Any non-active state is a ghost: 'superseded' (replaced by a newer
+      // fact) and 'retired' (deleted by the user, kept for history) both mean
+      // the fact no longer reaches context.
+      const superseded = (m.status && m.status !== 'active') || !!m.superseded_by;
       bump(m.cluster_id, superseded ? 'superseded' : 'active');
       const pendingQuestions = pendingByMember.get(m.id) || 0;
       return {
@@ -978,29 +984,13 @@ router.put('/edit', async (req, res) => {
       return res.status(404).json({ error: 'Fact not found' });
     }
 
-    // Update content in SQLite (bump updated_at to reflect the edit)
-    sqliteDb.prepare('UPDATE cluster_members SET content = ?, updated_at = ? WHERE id = ?')
-      .run(cleanContent, new Date().toISOString(), memberId);
-
-    // Re-embed in LanceDB
-    const clusterTable = await db.getClusterEmbeddingsTable();
-    if (clusterTable) {
-      try {
-        await clusterTable.delete(`member_id = "${memberId}"`);
-        const embedding = await memoryClusters.generateEmbedding(cleanContent);
-        if (embedding) {
-          const { randomUUID } = require('crypto');
-          await clusterTable.add([{
-            id: randomUUID(),
-            member_id: memberId,
-            cluster_id: member.cluster_id,
-            content: cleanContent,
-            vector: Array.from(embedding)
-          }]);
-        }
-      } catch (lanceErr) {
-        console.error('[MemoryAPI] LanceDB re-embed error:', lanceErr.message);
-      }
+    // One write path across SQLite + MEMORY.md + LanceDB. This route used to
+    // update the first and last only, so an edited fact kept its ORIGINAL line
+    // in MEMORY.md — the file that is actually injected — indefinitely.
+    const factStore = require('../db/fact-store');
+    const result = await factStore.reword(memberId, cleanContent);
+    if (!result.ok) {
+      return res.status(400).json({ error: result.reason || 'Could not edit fact' });
     }
 
     res.json({ success: true, memberId, content: cleanContent });
@@ -1033,21 +1023,23 @@ router.delete('/fact/:id', async (req, res) => {
     }
 
     // Delete from SQLite
-    sqliteDb.prepare('DELETE FROM cluster_members WHERE id = ?').run(id);
-
-    // Delete from LanceDB
-    const clusterTable = await db.getClusterEmbeddingsTable();
-    if (clusterTable) {
-      try {
-        await clusterTable.delete(`member_id = "${id}"`);
-      } catch (lanceErr) {
-        console.error('[MemoryAPI] LanceDB delete error:', lanceErr.message);
-      }
+    // RETIRE, never hard-delete. This was the one path in the system that broke
+    // supersede-never-delete: the row vanished, taking its history with it, and
+    // MEMORY.md kept the line anyway. Now the row is kept as status='retired'
+    // (still visible as a ghost in the Map) while the two stores that feed the
+    // model — MEMORY.md and LanceDB — are cleared.
+    const factStore = require('../db/fact-store');
+    const retired = await factStore.retire(id, { reason: 'deleted by user' });
+    if (!retired.ok && retired.reason === 'no such fact') {
+      return res.status(404).json({ error: 'Fact not found' });
     }
 
     // Check if cluster is now empty and clean up
+    // Count ACTIVE members: retired rows are kept for history, so a cluster
+    // whose facts have all been retired is empty for injection purposes even
+    // though rows remain.
     const remainingMembers = sqliteDb.prepare(
-      'SELECT COUNT(*) as count FROM cluster_members WHERE cluster_id = ?'
+      "SELECT COUNT(*) as count FROM cluster_members WHERE cluster_id = ? AND (status = 'active' OR status IS NULL)"
     ).get(member.cluster_id);
 
     if (remainingMembers.count === 0) {

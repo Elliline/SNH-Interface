@@ -1937,6 +1937,29 @@ async function runMaintenance() {
       console.error('[Heartbeat] Capability drift check error:', driftErr.message);
     }
 
+    // Task H: memory-store reconciliation — do MEMORY.md, SQLite and LanceDB
+    // still agree? A fact can be superseded in the DB while its line survives in
+    // the injected file, or while its embedding stays retrievable, and either
+    // way the entity keeps reading a fact it has retired. REPORT ONLY: this
+    // never edits a store, because deciding what to remove from the substrate
+    // the identity is built on is Ellie's call, not a background job's.
+    try {
+      await runStep('memoryReconcile', 'always', async () => {
+        const factStore = require('./fact-store');
+        const { mismatches, counts } = await factStore.reconcile();
+        for (const m of mismatches) {
+          await initiativeEngine.raiseMemoryDrift(m);
+        }
+        if (mismatches.length) {
+          factExtractor.appendToOpsLog(
+            `Memory reconciliation: ${mismatches.map(m => `${m.kind}=${m.count}`).join(', ')}`, OPS_DIR);
+        }
+        return counts;
+      });
+    } catch (reconErr) {
+      console.error('[Heartbeat] Memory reconciliation error:', reconErr.message);
+    }
+
     // Step 4: report
     const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps });
 

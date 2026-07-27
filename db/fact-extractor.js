@@ -1397,9 +1397,12 @@ async function processFactExtraction(userMessage, assistantMessage, provider, mo
       for (const s of supersessions) {
         const newMemberId = factToMemberId.get(s.newFact);
         if (!newMemberId) continue; // replacing fact wasn't stored — skip
-        const marked = memoryClusters.supersedeFact(s.oldMemberId, newMemberId);
-        if (marked) {
-          removeFactLineFromMemory(s.oldContent, memoryFile);
+        // Single write path: SQLite + MEMORY.md + LanceDB. This used to update
+        // only the first two, leaving the superseded fact's embedding live and
+        // still retrievable by similarity.
+        const factStore = require('./fact-store');
+        const res = await factStore.supersede(s.oldMemberId, newMemberId, { memoryFile });
+        if (res.ok) {
           const how = correctsByFact.has(s.newFact) ? 'explicit user correction' : 'user correction';
           appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (${how})`, dailyDir);
           console.log(`[FactExtractor] Supersession: "${s.oldContent}" → "${s.newFact}"`);
@@ -1670,7 +1673,8 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     for (const s of supersessions) {
       const newMemberId = factToMemberId.get(s.newFact);
       if (!newMemberId) continue;
-      if (memoryClusters.supersedeFact(s.oldMemberId, newMemberId)) {
+      const factStore = require('./fact-store');
+      if ((await factStore.supersede(s.oldMemberId, newMemberId)).ok) {
         result.superseded++;
         appendToDailyLog(`Superseded self-fact: "${s.oldContent}" → "${s.newFact}" (revised self-view)`, dailyDir);
       }

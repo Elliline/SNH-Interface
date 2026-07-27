@@ -553,10 +553,34 @@ async function raiseCapabilityDrift(m) {
   });
 }
 
+/**
+ * Raise a memory-store reconciliation finding through the bell.
+ *
+ * Same shape as raiseCapabilityDrift: an 'alert', because a store disagreement
+ * means the entity is currently reading facts it believes it retired, or has
+ * lost access to facts it believes it holds. sourceRef is the drift kind so a
+ * standing mismatch doesn't re-queue on every heartbeat.
+ */
+async function raiseMemoryDrift(m) {
+  if (!m || !m.message) return null;
+  const initiatives = require('./initiatives');
+  const examples = (m.examples || []).length
+    ? ` For example: ${m.examples.map(e => `"${e}"`).join('; ')}.`
+    : '';
+  return initiatives.addInitiative({
+    type: 'alert',
+    content: `My memory stores have drifted apart: ${m.message}${examples} I can't fix this myself — it needs your call on what to keep.`,
+    sourceKind: 'memory-drift',
+    sourceRef: m.kind,
+    priority: m.kind === 'retired-still-retrievable' ? 8 : 7
+  });
+}
+
 module.exports = {
   noticeFromQuestions,
   noticeFromAudit,
   raiseCapabilityDrift,
+  raiseMemoryDrift,
   noticeReflectionInsight,
   generateConversationFollowup,
   prioritize,
