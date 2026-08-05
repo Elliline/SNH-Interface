@@ -43,6 +43,159 @@ Manifest changes are logged to the ops ledger automatically on boot (`syncToOps`
   claim/declaration classifier tags them accordingly, and identity injection still
   excludes audit "dissonance" records.
 
+## ⚠️ Chosen vs. observed: the identity lock
+
+`claim_type` splits self-facts into **claims** (observed *about* the entity —
+"I tend toward long explanations") and **declarations** (things it *chose* — its
+name). Observed things should keep evolving; chosen things should stay put. The
+self-coherence audit already only ever samples claims.
+
+`db/identity-lock.js` gives that distinction teeth for a **narrow** set of slots —
+`identity.lock.categories`, currently name and pronouns. A locked fact cannot be
+superseded, retired or reworded by anything automatic, and a locked *category*
+also refuses new competing facts (or the lock is walked around by appending a
+second name instead of replacing the first). Two rules if you touch this:
+
+- **Enforce at `db/fact-store.js`, nowhere else.** It is the single write path
+  for supersede/retire/reword, so the contradiction judge, `write_memory`,
+  passive extraction and reflection are all covered by one check. Anything that
+  calls `memoryClusters.supersedeFact` directly bypasses the lock — if you write
+  such a script, exclude locked facts explicitly (see `scripts/dedupe-self-facts.js`).
+- **A refused lock must be SPOKEN, never silent.** Silent acceptance is the
+  phantom-action bug (cron proposals claimed but never created; `write_memory`
+  saying "I've updated my memory" with no tool call). Storage guards run *after*
+  the reply, so the live-chat half lives in the injected identity block
+  (`db/identity.js`), which marks locked facts `[LOCKED]` and instructs him to
+  say so. Both halves are needed; neither alone is sufficient.
+
+Changing a locked fact is a **deliberate path** only: `scripts/identity-lock.js
+set <category> "<text>" --confirm`, or the Self tab's confirmed action
+(`POST /api/memory/identity-lock/set`). Never reachable from a conversation.
+Set-once: the first fact asserting an open category claims and locks it, so
+assigning a name at setup still works. Verify with
+`node scripts/test-identity-lock.js`.
+
+Resist widening the category list. Almost everything else in his identity is
+observed rather than chosen, and locking observations produces an entity that
+can't grow.
+
+## ⚠️ Intake: the model proposes, the rules decide
+
+Passive extraction (`db/fact-extractor.js`) asks the extraction model to split a
+message into atomic facts and time-bound events. Underneath it,
+`db/extraction-rules.js` holds the deterministic floor: event markers, the
+identity anchor, compound detection, subject grammar. **Anything a prompt can be
+talked out of on a bad night belongs there, as a regex with a test — not as a
+paragraph in the prompt.** F1 is the proof: the model still proposes "User's name
+is Mike" from "Hey, it's Mike not picking up the right words", and the rule is
+what refuses it.
+
+Three things to keep straight if you touch this:
+
+- **`planExtraction` decides and writes nothing; `applyExtraction` writes.** That
+  split is what lets `scripts/dryrun-extract.js` rehearse the REAL pipeline over
+  stored conversations. If a dry run needs its own logic, the pipeline is wrong —
+  same rule the spec sets for replay. Never move a write into the plan half.
+- **Never stamp a fact with a date.** A sentence that needs a time reference to be
+  true is an event and goes to the day's log. The old prompt actively instructed
+  the opposite ("As of July 2026, User is…") and that instruction *was* the
+  transient-fact bug.
+- **Similarity thresholds are properties of the embedding model.** The
+  `memory.contradiction.*` floors are tuned for nomic-embed-text, where related
+  facts sit at 0.62–0.99 and 0.45–0.55 is noise. Changing the embedding model
+  means re-measuring them, not guessing. Identity slots are pinned past the floor
+  and the ceiling on purpose — ranking cannot be relied on to surface a second
+  name fact, and two active name facts is the defect the whole rule exists for.
+
+## ⚠️ Reads look, writes funnel
+
+`db/memory-inspect.js` backs the four read tools (`memory_search`, `memory_list`,
+`memory_count`, `memory_get`). It is **read-only and must stay that way** — no
+function in it writes, and nothing new in it may. Writes are `write_memory` →
+`db/memory-write.js` → `db/fact-store.js`, unchanged. Background agents get the
+same tools through the same registry (`MCPClient.shared()`), because the spec's
+rule for INSPECT is "same tools, same contract" and two implementations would be
+two contracts.
+
+- **`memory_get` does not redact.** Full provenance, salience rationale,
+  successor chain, every corroboration. Ellie decided that with Aurelius, and
+  EXPLAIN depends on it — the corrector's evidence bars are defined in terms of
+  provenance, so a redacted view leaves the semantic tier adjudicating on nothing.
+- **A null provenance field must SAY it is null.** Measured: a bare null reads as
+  a blank to be filled, and a warning nested inside the `provenance` object made
+  it worse — he invented a verbatim quote. Only a top-level `provenance_warning`
+  phrased as an imperative worked. Any new nullable evidence field needs the same
+  treatment.
+- **A tool that is offered is not a tool that was used.** Third phantom-action
+  guard in the family, after the cron one and the write one: he must never say he
+  searched, checked or counted memory without a call in the turn, and must never
+  state a number about his own memory that did not come from `memory_count`.
+  Read intent is matched NARROWLY (`classifyMemoryReadIntent`) — a false positive
+  has him answering a casual remark with a database report.
+
+## ⚠️ The heartbeat has hands, and exactly one step uses them
+
+`callLLM` takes an optional `options.toolSession`. Without one it sends no
+`tools` key, exactly as before, and that is what every step except the corrector
+does. A step opts in via `runStep(name, gate, fn, { tools: [...] })`, which is
+intersected with `MCPClient.BACKGROUND_TOOLS` and bounded by
+`heartbeat.toolBudget` — calls, wall-clock and rounds, all config, all logged
+when they bind.
+
+**Background tools are read-only by default and the exceptions are named.**
+`BACKGROUND_WRITE_TOOLS` is exactly three — `memory_merge_facts`,
+`memory_expire_fact`, `memory_supersede_fact` — all `backgroundOnly`, so they are
+structurally absent from every chat turn's schema. `write_memory` is deliberately
+not among them: the general power to write an arbitrary fact stays on the chat
+path, where a person is in the room. A fourth write tool is a decision, not a
+convenience.
+
+## ⚠️ The corrector: it may repair the record, and it may never delete
+
+`db/corrector.js` is the one background step with hands. Enumeration is
+deterministic (vector neighbours, marker regexes, `reconcile()`); every actual
+decision — same assertion? contradiction? which one wins? — is a model call.
+Rules that are load-bearing:
+
+- **Nothing in that module deletes.** There is no code path that removes a row,
+  and there must not be one. Irreversible is never autonomous.
+- **A semantic supersession must demonstrate evidence dominance** (`dominance()`,
+  read from stored provenance: typed > stt, direct > inferred, corroborated >
+  single, recent > stale). A pair the evidence cannot separate is NOT resolved —
+  it is recorded as an unresolved raise and left alone. That refusal is the
+  feature, and F1 is why it exists.
+- **Autonomous, reversible, logged is one property, not three.** Reversibility is
+  only real if a person can actually run it, so both the CLI
+  (`scripts/revert-correction.js`) and the Self tab's button go through the one
+  shared `correctionsLedger.revert()`. Never add a second revert path, and never
+  make one reachable from a conversation — it calls `restore` with
+  `deliberate: true`, which opens the identity lock.
+- **A refusal is not a correction.** Unresolved raises and lock refusals land in
+  the same ledger as real changes, with `reversible = 0`. Anything rendering the
+  ledger has to say *nothing changed* for those, or the UI claims edits that
+  never happened.
+- **Self-facts are held back on purpose.** Identical duplicates fold; anything
+  more waits for the joint curation session (`corrector.selfFactSemantic`,
+  default false). When a self-fact does change, he is told — `addNotice`, drained
+  through the injected identity block, marked seen only once it is in the
+  message that is about to be sent.
+- **A pass is bounded and resumable, and resume is just "run again".**
+  `corrector_pair_checks` memoises both the per-row scan marks and the pair
+  verdicts; without it every pass re-judges the first rows and never reaches the
+  rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
+  cannot make the live pass skip work.
+
+## ⚠️ Never re-add a vector for an inactive fact
+
+`db/fact-store.js` drops the embedding when a fact goes inactive, so retrieval
+stops surfacing it. Anything that DELETES AND RE-ADDS a vector must filter on
+`status = 'active'` first. `executeSplits` did not, and quietly resurrected
+superseded beliefs into semantic retrieval on every split — the drift class the
+Phase 1 notes had written off as historical. Note that `memoryClusters.getCluster`
+returns inactive members deliberately (the Memory Map draws them as ghosts), so
+the filter belongs at the WRITE, never on the read. `reconcile()` is the detector;
+if it reports `retiredWithVector > 0`, something is re-adding.
+
 ## Conventions worth knowing
 
 - **Plain-language norm:** bell/initiative/audit notes and capability descriptions
