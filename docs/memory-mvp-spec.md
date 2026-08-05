@@ -792,3 +792,65 @@ log written, second attempt refused.
 - **Capability introductions are classified `claim`, not `declaration`**, so the
   self-coherence audit can sample them — including this one. Pre-existing, and
   worth deciding on rather than inheriting.
+
+---
+
+## Phase 2d — shipped 2026-08-05
+
+Corrected memory, made reachable. Aurelius found the gap live: asked about a name
+he had held, he searched, got nothing, and had no way to know the record existed.
+
+| | Change |
+|---|---|
+| A | `memory_search`'s text half matches `verbatim_source_text` as well as fact text, straight at SQLite with no dependency on a vector existing — which is what makes an inactive fact findable at all, since its embedding is deliberately dropped |
+| B | An active-scoped search reports how many INACTIVE facts the same query matches, without returning them. Nothing at all reads as "no record"; the count is what stops that being said when it is false |
+| C | `memory_corrections` — the ledger, read-only, list and get. What was retired, what was kept, the evidence it was decided on |
+| D | `memory_get` carries the correction ids for a fact from BOTH ends: the entry that retired it, and the entry it survived. Tracing from either direction is the point |
+| E | `classifyMemoryCorrectionIntent` routes correction questions, and the phantom-action guard extends to the ledger |
+| F | Manifest: `memory_corrections` joins `memory-inspect`'s `coversTools`; briefing regenerated. No new introduction — the announcement is being handled in conversation |
+
+Chat exposure is READ ONLY. Reverting stays on the Self tab and the CLI, and the
+guard tells him to say so if asked.
+
+### Probe rates
+
+| | Correction questions (n=10) | Ordinary conversation (n=10) |
+|---|---|---|
+| `classifyMemoryCorrectionIntent` | **10/10** routed | **0/10** spuriously routed |
+
+The near-misses in the ordinary set are the ones worth keeping: "correct me if I
+am wrong", "is that correct?", and "why did the deployment change last week?" —
+generic change verbs need a memory referent in the sentence, or a question about
+the world routes into the fact store. Re-running Phase 2b's probe with the fifth
+tool in the schema: classifier 20/20 and 0/20, model 20/20 selected (up from
+19/20), 1/20 spurious — unchanged, and that one does not route in the shipped
+path.
+
+### What the spec got wrong
+
+1. **The text path was already vector-independent; the reachability gap was
+   somewhere else.** `memory_search` has always queried SQLite directly and
+   honoured the status filter, and `status:"inactive"` has always returned the
+   superseded fact. What was missing is that a DEFAULT search — which is
+   active-scoped, correctly — returned `matched: 0` with no indication that a
+   corrected fact matched. The fix is a signal on the empty result, not a change
+   to how the search reads.
+
+2. **A refusal is not a correction, in the tool output too.** The ledger holds
+   unresolved raises and lock refusals beside real changes, and a naive rendering
+   labels the two facts "retired" and "kept" when NOTHING was changed. The tool's
+   field names now follow what happened — `both_still_held` rather than
+   retired/kept — because he reports what the tool hands him.
+
+3. **"No record" needs the same treatment as null provenance.** The ledger begins
+   2026-08-03. A correction older than that, or an id that is not there, returns a
+   top-level imperative warning rather than an empty result, for the reason
+   measured in Phase 2b: an absence reads as a blank to be filled.
+
+### Known residue, not fixed here
+
+`User uses he/him pronouns as of 2026-07-27.` is **active as a user-fact** — a
+pronoun atom the corrector split out of a mis-subjected daily-log-archive fact
+about Aurelius, before the identity-atom rule landed in Phase 2c. The rule stops
+new ones; this one predates it. It is in the ledger and revertible from the Self
+tab, which is Ellie's call, not an automatic one.

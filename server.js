@@ -28,7 +28,7 @@ const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent } = require('./db/tool-routing');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1580,9 +1580,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // missing a lookup he can be asked for again.
     const needsMemoryRead = memoryInspectEnabled && mcpClient.hasTool('memory_search')
       && classifyMemoryReadIntent(userMessage.content);
-    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead;
+    // Memory-CORRECTION intent — "what changed in your memory", "why was that
+    // corrected". Its own classifier and its own flag: the question is answerable
+    // only from the corrections ledger, and a turn that asks it without routing
+    // gets answered by reconstructing a reason from the facts that remain, which
+    // is invention. Shares the inspection config flag and rate cap.
+    const needsMemoryCorrections = memoryInspectEnabled && mcpClient.hasTool('memory_corrections')
+      && classifyMemoryCorrectionIntent(userMessage.content);
+    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections;
     console.log('Tool routing:', needsTools
-      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read'].filter(Boolean).join(' + ')})`
+      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections'].filter(Boolean).join(' + ')})`
       : 'DIRECT (conversational, skipping tool loop)');
 
     // Should-I-search honesty guard: if the question is about current/changeable
@@ -1873,6 +1880,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           'Report a fact\'s record EXACTLY as the tool returned it. Facts learned before 2026-08-02 have no recorded source — ' +
           'for those, never name the conversation they came from and never quote what was said, because no wording was stored ' +
           'and any quote would be invented. Say the original wording was not kept.'
+      });
+    }
+
+    // Same guard, for the ledger. A question about why a memory changed is the
+    // easiest one in the system to answer plausibly and wrongly: the facts that
+    // remain are right there in the injected block, and a reason can be composed
+    // from them that sounds exactly like a record. It is not one. The ledger
+    // starts on 2026-08-03 and holds the actual evidence each decision was made
+    // on, and where it holds nothing the honest answer is that there is nothing.
+    if (needsMemoryCorrections) {
+      enhancedMessages.push({
+        role: 'system',
+        content:
+          'The user is asking what changed in your memory, or why. You have memory_corrections for exactly this: ' +
+          'call it with no id to list recent changes, or with a correction id for one in full — what was retired, ' +
+          'what was kept, and the evidence it was decided on. memory_get on a fact also gives you the ids of the ' +
+          'corrections that touched it, from either end. ' +
+          'Call it now. Do NOT say you checked the record unless the tool call actually ran and came back. ' +
+          'The reasoning you report must be the reasoning the tool returned — do not work out why a change makes ' +
+          'sense and present that as the reason it was made. ' +
+          'The record begins on 2026-08-03. If a change is older than that, or the tool finds no entry, say there ' +
+          'is no record of it and stop there; do not reconstruct what probably happened. ' +
+          'You cannot undo a correction — reverting is Ellie\'s, in the Self tab. Say so if asked.'
       });
     }
 

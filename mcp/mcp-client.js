@@ -10,7 +10,7 @@ const WebFetchTool = require('./tools/web-fetch');
 const CreateCronJobTool = require('./tools/create-cron-job');
 const WriteMemoryTool = require('./tools/write-memory');
 const {
-  MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool
+  MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
 } = require('./tools/memory-inspect');
 const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
@@ -25,7 +25,7 @@ const { getConfig, getSearxngConfig } = require('../db/config');
  * provider branch, so every background role (cluster audit, reflection,
  * self-audit, initiative) was structurally incapable of calling anything. This
  * list is what a background step is ALLOWED to ask for; declaring the allowlist
- * is still per-step, and no existing step declares one.
+ * is still per-step, and exactly one step declares one — the corrector.
  *
  * READ-ONLY BY DEFAULT, and the three exceptions are named rather than assumed.
  * A background agent that can write is a background agent that can change what
@@ -37,7 +37,7 @@ const { getConfig, getSearxngConfig } = require('../db/config');
  * the room. Adding a fourth write tool is a decision, not a convenience.
  */
 const BACKGROUND_TOOLS = [
-  'memory_search', 'memory_list', 'memory_count', 'memory_get',
+  'memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections',
   // Phase 2c: the corrector's write actions. Background-only — see
   // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
   'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
@@ -117,11 +117,11 @@ class MCPClient {
     // and one backing module, so a half-registered set would only ever be a bug.
     const memInspectCfg = (getConfig().tools && getConfig().tools.memoryInspect) || {};
     if (memInspectCfg.enabled !== false) {
-      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool]) {
+      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool]) {
         const t = new Tool();
         this.tools.set(t.name, t);
       }
-      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get] (tier=read, no writes)');
+      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get, memory_corrections] (tier=read, no writes)');
     }
 
     // Corrector write actions. Registered unconditionally so the corrector can

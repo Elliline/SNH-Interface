@@ -157,4 +157,41 @@ class MemoryGetTool extends BaseInspectTool {
   }
 }
 
-module.exports = { MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool };
+class MemoryCorrectionsTool extends BaseInspectTool {
+  constructor() {
+    super();
+    this.name = 'memory_corrections';
+    this.description =
+      'Read the record of changes made to your own memory. Call this whenever you are asked what has changed ' +
+      'in your memory, why a fact was corrected, replaced or removed, or what you used to believe and why you ' +
+      'stopped. Leave out the id to list recent changes; pass a correction id for one in full — what was ' +
+      'retired, what was kept, and the evidence it was decided on. This is the ONLY source for why something ' +
+      'changed: if a change is not in here, there is no record of it, and you say so rather than working out ' +
+      'an explanation. Read-only — you cannot undo a correction, that is Ellie\'s to do.';
+    this.parameters = {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'A correction id, from a list result or from memory_get on a fact. The first 8 characters are enough. Omit to list.' },
+        subject: {
+          type: 'string',
+          enum: ['user', 'self'],
+          description: 'Whose facts the change was to. "user" = facts about Ellie. "self" = facts about you. Omit for both.'
+        },
+        action: {
+          type: 'string',
+          enum: ['merge', 'expire', 'split', 'supersede', 'reconcile'],
+          description: 'Only changes of this kind. merge = duplicates folded together. expire = something that was really a passing event moved out. split = one fact that said two things separated. supersede = one belief replaced by a better-evidenced one. reconcile = an index repair.'
+        },
+        tier: {
+          type: 'string',
+          enum: ['mechanical', 'semantic'],
+          description: '"mechanical" repaired the record (duplicates, events, indexes). "semantic" changed what you believe.'
+        },
+        limit: { type: 'integer', description: 'How many to list. Default 10, maximum 20.' }
+      },
+      required: []
+    };
+  }
+}
+
+module.exports = { MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool };

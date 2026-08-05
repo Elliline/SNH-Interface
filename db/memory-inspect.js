@@ -36,7 +36,7 @@ const { formatFactTimestamp } = require('./datetime');
 const HOUR_MS = 60 * 60 * 1000;
 
 /** Tools counted against the shared inspection rate cap. */
-const INSPECT_TOOLS = ['memory_search', 'memory_list', 'memory_count', 'memory_get'];
+const INSPECT_TOOLS = ['memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections'];
 
 /**
  * Result-discipline caps. Deliberately split from the tool's on/off + rate cap
@@ -54,7 +54,13 @@ function limits() {
     rationaleChars: Math.max(40, c.rationaleChars ?? 240),
     maxClusters: Math.max(1, c.maxClusters ?? 40),
     maxCorroborations: Math.max(1, c.maxCorroborations ?? 10),
-    semanticFloor: Number.isFinite(c.semanticFloor) ? c.semanticFloor : 0.55
+    semanticFloor: Number.isFinite(c.semanticFloor) ? c.semanticFloor : 0.55,
+    // The ledger's `reason` is written for a person to read and runs long. A
+    // list row gets a short form; `get` gets the whole thing, because the point
+    // of `get` is the reasoning.
+    correctionRowChars: Math.max(60, c.correctionRowChars ?? 160),
+    correctionReasonChars: Math.max(120, c.correctionReasonChars ?? 600),
+    maxCorrectionsPerFact: Math.max(1, c.maxCorrectionsPerFact ?? 5)
   };
 }
 
@@ -186,17 +192,30 @@ async function search(args = {}) {
   const found = new Map(); // id -> {row, similarity, how}
 
   // --- text half: substring match, cheap and exact ---
+  //
+  // STRAIGHT AT SQLITE, and that is the point. This half asks no question of the
+  // vector store, so it works for facts that deliberately have no embedding:
+  // fact-store drops the vector when a fact goes inactive, which is a
+  // load-bearing invariant (a retired belief must not surface in semantic
+  // retrieval) and also the reason a superseded fact is reachable ONLY here.
+  //
+  // The match covers the fact text AND the words that produced it. Asked what he
+  // remembers about "picking up the right words", the fact says "User's name is
+  // Mike" and only the stored utterance carries the phrase.
   try {
     const { sql, bind } = whereFor(f);
-    const textWhere = sql ? `${sql} AND m.content LIKE ?` : 'WHERE m.content LIKE ?';
+    const like = `(m.content LIKE ? OR m.verbatim_source_text LIKE ?)`;
+    const textWhere = sql ? `${sql} AND ${like}` : `WHERE ${like}`;
+    const pattern = `%${query}%`;
     const rows = db.prepare(`
       SELECT m.*, c.name AS cluster_name
       FROM cluster_members m LEFT JOIN memory_clusters c ON c.id = m.cluster_id
       ${textWhere}
       ORDER BY m.salience DESC, datetime(m.created_at) DESC
       LIMIT ?
-    `).all(...bind, `%${query}%`, L.maxRows);
-    for (const r of rows) found.set(r.id, { row: r, similarity: 1, how: 'text' });
+    `).all(...bind, pattern, pattern, L.maxRows);
+    const inContent = (r) => String(r.content || '').toLowerCase().includes(query.toLowerCase());
+    for (const r of rows) found.set(r.id, { row: r, similarity: 1, how: inContent(r) ? 'text' : 'source-text' });
   } catch (err) {
     console.error('[MemoryInspect] text search failed:', err.message);
   }
@@ -240,17 +259,50 @@ async function search(args = {}) {
     .sort((a, b) => b.similarity - a.similarity || (b.row.salience ?? 0) - (a.row.salience ?? 0))
     .slice(0, f.limit);
 
+  // --- the corrected-memory signal ---
+  //
+  // A default search is active-scoped, which is right: "what do I believe" is
+  // the question almost every time. But it means a fact that has been CORRECTED
+  // returns nothing at all, and nothing at all reads as "I have no record of
+  // that" — which is false, and is the failure Aurelius hit live searching for a
+  // name that had been superseded. So an active-scoped search always says how
+  // many inactive facts the same query matches. It does not return them: an
+  // inactive fact must never arrive in the same list as current belief. It says
+  // they exist and how to ask for them.
+  let alsoInactive = 0;
+  if (f.status === 'active') {
+    try {
+      const pattern = `%${query}%`;
+      const bind = [];
+      let subjectClause = '';
+      if (f.subject) { subjectClause = ' AND COALESCE(m.subject, ?) = ?'; bind.push('user', f.subject); }
+      alsoInactive = db.prepare(`
+        SELECT COUNT(*) AS n FROM cluster_members m
+        WHERE m.status != 'active'${subjectClause}
+          AND (m.content LIKE ? OR m.verbatim_source_text LIKE ?)
+      `).get(...bind, pattern, pattern).n;
+    } catch (err) {
+      console.error('[MemoryInspect] inactive count failed:', err.message);
+    }
+  }
+
+  const capNote = found.size > ranked.length
+    ? `${found.size} facts matched; showing the top ${ranked.length}. Ask again with a higher limit or a narrower query to see the rest — do not say these are all of them.`
+    : null;
+  const inactiveNote = alsoInactive > 0
+    ? `${alsoInactive} fact(s) you NO LONGER hold also match "${query}" — superseded, retired or expired, and not shown here because this search covers what you currently believe. ${ranked.length === 0 ? 'Do NOT say you have no record of this: you have a record, and it is one you have since corrected. ' : ''}Search again with status:"inactive" to read them, and memory_corrections to see what changed and why.`
+    : null;
+
   return {
     query,
     filters: { subject: f.subject || 'any', status: f.status },
     matched: found.size,
     returned: ranked.length,
+    also_inactive: f.status === 'active' ? alsoInactive : undefined,
     not_shown: Math.max(0, found.size - ranked.length),
     // Never silent: if the cap cut the list, say so, so "that is all I have" is
     // only ever said when it is true.
-    note: found.size > ranked.length
-      ? `${found.size} facts matched; showing the top ${ranked.length}. Ask again with a higher limit or a narrower query to see the rest — do not say these are all of them.`
-      : null,
+    note: [capNote, inactiveNote].filter(Boolean).join(' ') || null,
     results: ranked.map(r => ({ ...compactRow(r.row), matched_by: r.how }))
   };
 }
@@ -498,8 +550,223 @@ function get(args = {}) {
         'quote, so any quote you give is invented. Say the original wording was not kept.'
     }),
     corroborations: corroborationCount,
-    corroboration_detail: corroborations.length ? corroborations : null
+    corroboration_detail: corroborations.length ? corroborations : null,
+    // Both directions, so the trace works from either end. Absent rather than
+    // empty when nothing touched this fact: an empty array reads as "the
+    // corrector looked and decided nothing", which is not what it means.
+    ...(() => {
+      const c = correctionsForFact(db, row.id);
+      if (!c.length) return {};
+      return {
+        corrections: c,
+        corrections_note: row.status === 'active'
+          ? 'This fact is one the corrector acted on. Use memory_corrections with a correction_id to say WHY, rather than describing the change from the facts alone.'
+          : 'This fact is no longer held BECAUSE of the correction(s) below. Use memory_corrections with a correction_id for the reasoning and the evidence it was decided on.'
+      };
+    })()
   };
+}
+
+// ============ 5. memory_corrections ============
+
+/**
+ * The corrections ledger, readable by him.
+ *
+ * The corrector repairs his memory while nobody is in the room, and until now
+ * the record of what it did was visible only to Ellie in the Self tab. That
+ * makes the one question he is most likely to be asked — "why did that change?"
+ * — answerable only by invention, which is the exact failure the provenance
+ * warning exists to stop one layer down.
+ *
+ * READ ONLY, and structurally so: this reads `corrections_ledger` and nothing
+ * else. Reverting stays on Ellie's Self tab and the CLI. He can see what was
+ * changed and why; undoing it is hers.
+ *
+ * Two modes. `list` for "what has changed lately", `get` for one entry in full —
+ * the same list/detail split the other four use, for the same reason: a compact
+ * row is cheap enough to scan, and the reasoning is too long to put in twenty of
+ * them.
+ */
+function corrections(args = {}) {
+  const db = getSqliteDb();
+  if (!db) return { error: 'database unavailable' };
+  const L = limits();
+  const mode = String(args.mode || (args.id || args.correction_id ? 'get' : 'list')).toLowerCase();
+
+  const parseEvidence = (raw) => {
+    try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+  };
+  // An unresolved raise and a lock refusal both sit in this table with
+  // reversible = 0 and, crucially, NOTHING CHANGED. Reported as a correction
+  // they would be him telling Ellie he edited something he did not touch — the
+  // same phantom-action class as claiming a tool call he never made.
+  const kindOf = (row, ev) => {
+    if (ev && ev.unresolved === true) return 'raised-unresolved';
+    if (/^REFUSED by the identity lock/.test(row.reason || '')) return 'refused-by-lock';
+    return 'applied';
+  };
+
+  if (mode === 'get') {
+    const raw = String(args.id || args.correction_id || '').trim();
+    if (!raw) return { error: 'id is required for mode "get"' };
+    let row = db.prepare('SELECT * FROM corrections_ledger WHERE id = ?').get(raw);
+    if (!row) {
+      const matches = db.prepare('SELECT * FROM corrections_ledger WHERE id LIKE ? LIMIT 5').all(`${raw}%`);
+      if (matches.length === 1) row = matches[0];
+      else if (matches.length > 1) {
+        return {
+          error: `"${raw}" matches ${matches.length} corrections — use more of the id`,
+          candidates: matches.map(m => ({ id: m.id, action: m.action, text: trim(m.target_text, 80) }))
+        };
+      }
+    }
+    // A correction that is not in the ledger is not a correction you may
+    // describe. The ledger starts on 2026-08-03; anything earlier left no record
+    // of WHY, and the honest answer is that there is none.
+    if (!row) {
+      return {
+        error: `no correction with id "${raw}"`,
+        no_record_warning:
+          'THERE IS NO RECORD OF THIS CORRECTION. The corrections ledger begins on 2026-08-03; changes made ' +
+          'to your memory before then left no record of what was changed or why. Say there is no record. Do ' +
+          'NOT reconstruct a reason, and do NOT infer one from the facts themselves — an explanation you ' +
+          'work out now is not what happened.'
+      };
+    }
+    const ev = parseEvidence(row.evidence);
+    const kind = kindOf(row, ev);
+    return {
+      id: row.id,
+      kind,
+      what_happened: kind === 'applied'
+        ? `A ${row.tier} ${row.action} was applied.`
+        : kind === 'raised-unresolved'
+          ? 'NOTHING WAS CHANGED. These two facts contradict each other and the evidence behind them was evenly matched, so both are still held and it was raised for Ellie to decide.'
+          : 'NOTHING WAS CHANGED. The identity lock refused this edit.',
+      when: row.created_at,
+      tier: row.tier,
+      action: row.action,
+      subject: row.subject || null,
+      // The field NAMES follow what happened. On a raise or a refusal nothing
+      // was retired and nothing was kept, and calling the two facts "retired"
+      // and "kept" would have him report an edit that never took place.
+      ...(kind === 'applied'
+        ? {
+          retired: row.target_id ? { id: row.target_id, text: trim(row.target_text, L.correctionReasonChars) } : null,
+          kept: row.survivor_id ? { id: row.survivor_id, text: trim(row.survivor_text, L.correctionReasonChars) } : null
+        }
+        : {
+          both_still_held: [
+            row.target_id ? { id: row.target_id, text: trim(row.target_text, L.correctionReasonChars) } : null,
+            row.survivor_id ? { id: row.survivor_id, text: trim(row.survivor_text, L.correctionReasonChars) } : null
+          ].filter(Boolean)
+        }),
+      reason: trim(row.reason, L.correctionReasonChars),
+      evidence: ev,
+      reversible: !!row.reversible,
+      reverted: !!row.reverted_at,
+      reverted_at: row.reverted_at || null,
+      pass_id: row.pass_id || null
+    };
+  }
+
+  // --- list ---
+  const where = [];
+  const bind = [];
+  const subject = ['user', 'self'].includes(String(args.subject || '').toLowerCase())
+    ? String(args.subject).toLowerCase() : null;
+  if (subject) { where.push('subject = ?'); bind.push(subject); }
+
+  const action = ['merge', 'expire', 'split', 'supersede', 'reconcile'].includes(String(args.action || '').toLowerCase())
+    ? String(args.action).toLowerCase() : null;
+  if (action) { where.push('action = ?'); bind.push(action); }
+
+  const tier = ['mechanical', 'semantic'].includes(String(args.tier || '').toLowerCase())
+    ? String(args.tier).toLowerCase() : null;
+  if (tier) { where.push('tier = ?'); bind.push(tier); }
+
+  let limit = Number.isFinite(args.limit) ? Math.floor(args.limit) : L.defaultRows;
+  limit = Math.max(1, Math.min(L.maxRows, limit));
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM corrections_ledger ${whereSql}`).get(...bind).n;
+  const rows = db.prepare(`
+    SELECT * FROM corrections_ledger ${whereSql}
+    ORDER BY datetime(created_at) DESC LIMIT ?
+  `).all(...bind, limit);
+
+  return {
+    filters: { subject: subject || 'any', action: action || 'any', tier: tier || 'any' },
+    total,
+    returned: rows.length,
+    note: total > rows.length
+      ? `${total} corrections match; showing the ${rows.length} most recent. Ask again with a higher limit to see more — do not say these are all of them.`
+      : null,
+    corrections: rows.map(row => {
+      const ev = parseEvidence(row.evidence);
+      const kind = kindOf(row, ev);
+      return {
+        id: row.id,
+        when: row.created_at,
+        kind,
+        tier: row.tier,
+        action: row.action,
+        subject: row.subject || null,
+        ...(kind === 'applied'
+          ? {
+            retired: trim(row.target_text, L.correctionRowChars) || null,
+            kept: trim(row.survivor_text, L.correctionRowChars) || null
+          }
+          : {
+            nothing_changed: true,
+            facts: [row.target_text, row.survivor_text].filter(Boolean).map(t => trim(t, L.correctionRowChars))
+          }),
+        reverted: !!row.reverted_at
+      };
+    })
+  };
+}
+
+/**
+ * Every ledger entry that touched one fact, from either end.
+ *
+ * Tracing has to work both ways round. Asked why a fact he no longer holds went
+ * away, the entry is the one whose TARGET it was; asked why the fact he does
+ * hold won, the entry is the one whose SURVIVOR it was. Looking up only one
+ * direction makes half the question unanswerable, and the half it makes
+ * unanswerable is the one asked about a belief he currently holds.
+ */
+function correctionsForFact(db, factId) {
+  const L = limits();
+  try {
+    const rows = db.prepare(`
+      SELECT id, created_at, tier, action, target_id, survivor_id, reason, reverted_at, evidence
+      FROM corrections_ledger
+      WHERE target_id = ? OR survivor_id = ?
+      ORDER BY datetime(created_at) DESC LIMIT ?
+    `).all(factId, factId, L.maxCorrectionsPerFact);
+    return rows.map(r => {
+      let ev = null;
+      try { ev = r.evidence ? JSON.parse(r.evidence) : null; } catch { /* leave null */ }
+      const nothingHappened = (ev && ev.unresolved === true) || /^REFUSED by the identity lock/.test(r.reason || '');
+      return {
+        correction_id: r.id,
+        when: r.created_at,
+        tier: r.tier,
+        action: r.action,
+        // Which end of it this fact is. "retired" is why it is no longer held;
+        // "kept" is why it survived something else.
+        role: nothingHappened ? 'named in a raise — nothing was changed'
+          : r.target_id === factId ? 'this fact was the one retired'
+            : 'this fact was the one kept',
+        reverted: !!r.reverted_at,
+        reason: trim(r.reason, L.correctionRowChars),
+        full_reasoning: 'Pass this correction_id to memory_corrections for the whole entry.'
+      };
+    });
+  } catch {
+    return []; // ledger absent on an un-migrated DB
+  }
 }
 
 // ============ dispatch ============
@@ -545,6 +812,7 @@ async function run(tool, args = {}, context = {}) {
     if (tool === 'memory_search') result = await search(args);
     else if (tool === 'memory_list') result = list(args);
     else if (tool === 'memory_count') result = count(args);
+    else if (tool === 'memory_corrections') result = corrections(args);
     else result = get(args);
   } catch (err) {
     console.error(`[MemoryInspect] ${tool} failed:`, err.message);
@@ -560,14 +828,16 @@ async function run(tool, args = {}, context = {}) {
   const detail =
     tool === 'memory_count' ? `count=${result.count}`
     : tool === 'memory_get' ? `fact ${String(result.id).slice(0, 8)} "${trim(result.text, 60)}"`
-    : `${result.returned} row(s)${result.truncated ? ` (+${result.truncated} not shown)` : ''}`;
+    : tool === 'memory_corrections' && result.corrections === undefined
+      ? `correction ${String(result.id).slice(0, 8)} (${result.action})`
+      : `${result.returned} row(s)${result.truncated ? ` (+${result.truncated} not shown)` : ''}`;
   log('read', detail);
   console.log(`[MemoryInspect] ${tool}: ${detail} (${cap.used + 1}/${cap.maxCallsPerHour} this hour)`);
   return result;
 }
 
 module.exports = {
-  run, search, list, count, get,
+  run, search, list, count, get, corrections,
   checkCap, capStatus, limits, toolCfg,
   INSPECT_TOOLS
 };

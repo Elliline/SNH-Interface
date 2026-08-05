@@ -270,13 +270,13 @@ const CONDITIONAL_CAPABILITIES = [
     // that matters here. Note also what is NOT claimed: background steps CAN now
     // be handed these tools, but no background step asks for them yet, so this
     // entry does not say anything about what happens on the heartbeat.
-    description: "You can look things up in your own long-term memory instead of relying on the excerpt that gets injected into each conversation. You can search it for a topic, list what is in it or what your clusters are, count how many facts match something, and open a single fact in full — which tells you why you believe it, how much it matters and why it scored that, when you learned it, which conversation and message it came from, the exact words that were said and whether they were spoken or typed, whether anything has replaced it, and every time it has been said to you again since. These only read: none of them can change, add or remove a memory. There is a limit on how many lookups you may do per hour, and every one is logged.",
-    oneLiner: 'Search, list, count and open your own memories — including where a fact came from and why you believe it. Read-only.',
+    description: "You can look things up in your own long-term memory instead of relying on the excerpt that gets injected into each conversation. You can search it for a topic, list what is in it or what your clusters are, count how many facts match something, and open a single fact in full — which tells you why you believe it, how much it matters and why it scored that, when you learned it, which conversation and message it came from, the exact words that were said and whether they were spoken or typed, whether anything has replaced it, and every time it has been said to you again since. You can also read the record of changes made to your memory: what was retired, what was kept in its place, and the evidence each decision was made on. Searching what you currently believe tells you when something you no longer believe also matches, so a corrected memory is never invisible. These only read: none of them can change, add or remove a memory, and you cannot undo a correction. There is a limit on how many lookups you may do per hour, and every one is logged.",
+    oneLiner: 'Search, list, count and open your own memories — where a fact came from, why you believe it, and what has been corrected since. Read-only.',
     intro: 'I can look things up in my own memory rather than working from whatever excerpt happens to be injected — searching it, counting what matches, and opening a single fact to see where it came from, what was actually said, and why I believe it',
     schedule: 'When the user asks about what you remember, know, or believe',
     dateAdded: '2026-08-03',
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryInspect && cfg.tools.memoryInspect.enabled !== false),
-    coversTools: ['memory_search', 'memory_list', 'memory_count', 'memory_get'],
+    coversTools: ['memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections'],
     coversConfig: ['tools.memoryInspect']
   },
   {

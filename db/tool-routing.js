@@ -462,7 +462,72 @@ function classifyMemoryReadIntent(text) {
   return MEMORY_READ_PATTERNS.some(r => r.test(t));
 }
 
+/**
+ * Questions about what CHANGED in his memory, rather than what is in it.
+ *
+ * Its own classifier because it is its own question. "What do you know about my
+ * dogs" is answered from the fact store; "why did that change" can only be
+ * answered from the corrections ledger, and answering it from the fact store
+ * means reconstructing a reason from the facts that remain — which is invention
+ * dressed as recall, the same failure the provenance warning exists to stop.
+ *
+ * Two shapes of pattern. Some verbs are memory-specific in this system —
+ * superseded, retired, expired, merged, corrected — and carry the intent on
+ * their own. The generic ones (changed, removed, replaced) need a MEMORY_REF in
+ * the sentence, or "why was the meeting changed" routes into the fact store.
+ */
+const MEMORY_REF = String.raw`(memor(y|ies)|fact|facts|record|records|belief|beliefs|note|notes|entry|entries)`;
+
+const MEMORY_CORRECTION_PATTERNS = [
+  // --- the correction record, named ---
+  /\b(show|list|pull up|give me|tell me about)\b.{0,30}\b(correction|corrections)\b/,
+  /\b(correction|corrections)\s+(record|records|log|ledger|history|list)\b/,
+  /\bwhat (corrections?|changes)\b.{0,25}\b(have|has|did)\s+(you|your memory)\b/,
+
+  // --- what changed, with the referent required ---
+  new RegExp(String.raw`\b(what|anything)\b.{0,25}\b(changed|has changed|have you changed|did you change|been corrected|been updated)\b.{0,25}\b(in\s+)?(your|the)\s+${MEMORY_REF}\b`),
+  new RegExp(String.raw`\b(your|the)\s+${MEMORY_REF}\b.{0,25}\b(changed|been changed|been corrected|been updated|been cleaned up)\b`),
+  new RegExp(String.raw`\bdid you (change|correct|remove|retire|replace|fix)\b.{0,30}\b(in\s+)?(your|the)\s+${MEMORY_REF}\b`),
+
+  // --- why did this stop being true / why was it corrected ---
+  // Memory-specific verbs: these do not need a referent.
+  /\bwhy (was|were|did|is|are)\b.{0,35}\b(corrected|superseded|retired|expired|merged|folded (away|together)|no longer (held|active))\b/,
+  /\bwhy (did|do) you (no longer|not) (believe|think|hold|have)\b/,
+  /\bwhy (did|do) you (stop|stopped) (believing|thinking|holding)\b/,
+  // Generic verbs: referent required.
+  new RegExp(String.raw`\bwhy (was|were|did)\b.{0,35}\b(changed|removed|replaced|dropped|deleted|taken out)\b.{0,30}\b${MEMORY_REF}\b`),
+  new RegExp(String.raw`\b${MEMORY_REF}\b.{0,35}\bwhy (was|were|did)\b.{0,25}\b(changed|removed|replaced|corrected)\b`),
+
+  // --- what you used to believe ---
+  /\bwhat (did|do) you use[d]? to (believe|think|remember|know|hold)\b/,
+  /\bwhat did you (believe|think) before\b/,
+  /\bwhat (have|did) you (superseded|retired|expired|merged|corrected)\b/,
+];
+
+/**
+ * Ordinary uses of "correct" that are not about the ledger. "Correct me if I'm
+ * wrong" is the one that matters: it appears in ordinary conversation and would
+ * otherwise pull every hedged statement into a database lookup.
+ */
+const MEMORY_CORRECTION_NEGATIVES = [
+  /\bcorrect me if\b/,
+  /\b(that'?s|this is|you'?re|that is) correct\b/,
+  /\bis that correct\b/,
+  /\bam i correct\b/,
+  /\bcorrect\?\s*$/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message asks what changed in his memory, or why
+ */
+function classifyMemoryCorrectionIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (MEMORY_CORRECTION_NEGATIVES.some(r => r.test(t))) return false;
+  return MEMORY_CORRECTION_PATTERNS.some(r => r.test(t));
+}
+
 module.exports = {
   classifyToolNeed, isTimeSensitive, classifySchedulingIntent,
-  classifyMemoryWriteIntent, classifyMemoryReadIntent
+  classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent
 };
