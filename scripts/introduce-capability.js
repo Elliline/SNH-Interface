@@ -45,6 +45,16 @@ const factExtractor = require(path.join(ROOT, 'db/fact-extractor'));
   }
 
   db.initDatabase();
+  // The VECTOR store too, and not optionally. initDatabase() only opens SQLite;
+  // without this, getClusterEmbeddingsTable() returns null, assignToCluster
+  // silently skips the embedding, and the introduction lands in SQLite with no
+  // vector — present in the DB but unfindable by semantic search, which is the
+  // 'active-not-retrievable' half of what reconcile() reports. The self-fact
+  // pipeline degrades quietly here rather than failing, so the omission is
+  // invisible at the call site. (Hit exactly this on 2026-07-27 storing the
+  // name.) Also makes the semantic dedup upstream actually work, instead of
+  // waving every fact through because it can't compare against anything.
+  await db.initVectorStore();
   // Process through the normal self-fact pipeline — classify (→declaration),
   // dedup, cluster, store. Same path reflection uses.
   const result = await factExtractor.processSelfFacts([intro], { source: 'capability-intro' });
