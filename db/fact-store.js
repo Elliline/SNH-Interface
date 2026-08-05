@@ -371,6 +371,65 @@ async function supersede(oldMemberId, newMemberId, opts = {}) {
 }
 
 /**
+ * Re-point an ALREADY-INACTIVE fact at a different successor.
+ *
+ * The narrowest write in this file, and it exists for one shape of defect: a
+ * supersession that was correct to make and named the wrong winner. "User's name
+ * is Mike" was rightly retired, but its successor was
+ * "User (Aurelius) has established his name as Aurelius…" — a fact about
+ * Aurelius that had been filed as a fact about Ellie. The retirement stands; the
+ * pointer does not.
+ *
+ * It touches successor_id and superseded_by and NOTHING else. Not status, not
+ * content, not the vector — an inactive fact has no embedding and must not
+ * acquire one here.
+ *
+ * The alternative was restore() followed by supersede(), and it is worse than it
+ * looks: it would make "User's name is Mike" briefly ACTIVE and re-embedded, and
+ * a failure between the two steps leaves a false name fact live in the corpus.
+ * A pointer repair should not pass through a state where the wrong belief is
+ * held.
+ *
+ * DELIBERATE PATH ONLY. Nothing automatic calls this — not the corrector, not a
+ * conversation. It is for a named repair a person has decided on, which is why
+ * the lock guard is still consulted: a locked fact's chain is not rewritten by
+ * anything that did not say `deliberate`.
+ *
+ * @returns {Promise<{ok: boolean, sqlite: boolean, previousSuccessor: string|null, reason?: string}>}
+ */
+async function repoint(memberId, newSuccessorId, { deliberate = false } = {}) {
+  const db = getSqliteDb();
+  const member = getMember(memberId);
+  if (!db || !member) return { ok: false, sqlite: false, previousSuccessor: null, reason: 'no such fact' };
+  if (member.status === 'active') {
+    return { ok: false, sqlite: false, previousSuccessor: null, reason: 'fact is active — an active fact has no successor to re-point' };
+  }
+  const successor = getMember(newSuccessorId);
+  if (!successor) return { ok: false, sqlite: false, previousSuccessor: null, reason: 'no such successor fact' };
+  if (successor.status !== 'active') {
+    // Pointing at another inactive fact is how the chain got wrong in the first
+    // place. The successor of a retired belief has to be a belief still held.
+    return { ok: false, sqlite: false, previousSuccessor: null, reason: 'successor is not active' };
+  }
+  if (successor.id === memberId) {
+    return { ok: false, sqlite: false, previousSuccessor: null, reason: 'a fact cannot succeed itself' };
+  }
+
+  const refused = lockRefusal(memberId, 'repoint', { deliberate });
+  if (refused) return refused;
+
+  const previousSuccessor = member.successor_id || member.superseded_by || null;
+  const info = db.prepare(`
+    UPDATE cluster_members
+    SET successor_id = ?, superseded_by = ?, updated_at = ?
+    WHERE id = ? AND status != 'active'
+  `).run(newSuccessorId, newSuccessorId, new Date().toISOString(), memberId);
+
+  console.log(`[FactStore] re-pointed ${memberId.slice(0, 8)}: successor ${String(previousSuccessor).slice(0, 8)} -> ${String(newSuccessorId).slice(0, 8)} (sqlite=${info.changes > 0})`);
+  return { ok: info.changes > 0, sqlite: info.changes > 0, previousSuccessor };
+}
+
+/**
  * Retire a fact with NO replacement — the user deleted it.
  *
  * Deliberately not a DELETE. `DELETE /api/memory/fact/:id` used to remove the
@@ -591,7 +650,7 @@ async function reconcile() {
 }
 
 module.exports = {
-  supersede, retire, expire, restore, reword, dropVector, replaceVector, reconcile,
+  supersede, retire, expire, restore, reword, repoint, dropVector, replaceVector, reconcile,
   findExactDuplicate, absorbDuplicate, absorbRepeat, recordCorroboration, corroborationCount,
   getMember
 };

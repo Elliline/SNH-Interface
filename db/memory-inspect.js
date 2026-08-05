@@ -1,6 +1,6 @@
 /**
  * Memory inspection — the READ layer behind memory_search / memory_list /
- * memory_count / memory_get.
+ * memory_count / memory_get / memory_corrections.
  *
  * WHY THIS EXISTS: the entity could be given memory and could be given facts,
  * but it could not LOOK. Everything it knew arrived by injection — a budgeted
@@ -555,7 +555,7 @@ function get(args = {}) {
     // empty when nothing touched this fact: an empty array reads as "the
     // corrector looked and decided nothing", which is not what it means.
     ...(() => {
-      const c = correctionsForFact(db, row.id);
+      const c = correctionsForFact(db, row.id, row.successor_id || row.superseded_by || null);
       if (!c.length) return {};
       return {
         corrections: c,
@@ -603,6 +603,12 @@ function corrections(args = {}) {
   const kindOf = (row, ev) => {
     if (ev && ev.unresolved === true) return 'raised-unresolved';
     if (/^REFUSED by the identity lock/.test(row.reason || '')) return 'refused-by-lock';
+    // A note ABOUT a fact, written when the fact was already inactive — the
+    // reason went on the record, the record did not change. Third member of the
+    // nothing-happened family, and it has to be one: an entry that says
+    // "retract" while the row was already retired would otherwise read as an
+    // edit he made.
+    if (ev && ev.status_unchanged) return 'recorded-only';
     return 'applied';
   };
 
@@ -635,14 +641,44 @@ function corrections(args = {}) {
     }
     const ev = parseEvidence(row.evidence);
     const kind = kindOf(row, ev);
+
+    // Same overtaken-entry check memory_get does, and it has to be here too:
+    // asked why a fact changed he reads the ledger entry DIRECTLY, and the entry
+    // names the survivor as of the day it was written. When a later correction
+    // re-pointed the chain, reporting this entry's survivor as the replacement
+    // is reporting something that is no longer true. Measured 2026-08-06: with
+    // the flag on memory_get alone he still answered from this path.
+    let staleSurvivor = null;
+    if (kind === 'applied' && row.target_id && row.survivor_id) {
+      try {
+        const target = db.prepare('SELECT successor_id, superseded_by FROM cluster_members WHERE id = ?').get(row.target_id);
+        const current = target && (target.successor_id || target.superseded_by);
+        if (current && current !== row.survivor_id) {
+          const now = db.prepare('SELECT id, content FROM cluster_members WHERE id = ?').get(current);
+          staleSurvivor = now ? { id: now.id, text: trim(now.content, L.correctionReasonChars) } : null;
+        }
+      } catch { /* leave null */ }
+    }
+
     return {
       id: row.id,
       kind,
+      ...(staleSurvivor ? {
+        superseded_by_a_later_correction: true,
+        current_successor: staleSurvivor,
+        stale_survivor_warning:
+          'THE REPLACEMENT NAMED BELOW IS NO LONGER CURRENT. This entry is the record of what was decided at the ' +
+          'time and is not rewritten, but a later correction re-pointed the chain: the fact that actually replaced ' +
+          'the retired one is in current_successor. Answer with THAT, and do not tell anyone the retired fact was ' +
+          'replaced by the one under "kept" — say the original replacement was itself corrected if it matters.'
+      } : {}),
       what_happened: kind === 'applied'
         ? `A ${row.tier} ${row.action} was applied.`
         : kind === 'raised-unresolved'
           ? 'NOTHING WAS CHANGED. These two facts contradict each other and the evidence behind them was evenly matched, so both are still held and it was raised for Ellie to decide.'
-          : 'NOTHING WAS CHANGED. The identity lock refused this edit.',
+          : kind === 'recorded-only'
+            ? 'NOTHING WAS CHANGED. The fact was already inactive; this entry exists so the REASON is on the record.'
+            : 'NOTHING WAS CHANGED. The identity lock refused this edit.',
       when: row.created_at,
       tier: row.tier,
       action: row.action,
@@ -677,7 +713,7 @@ function corrections(args = {}) {
     ? String(args.subject).toLowerCase() : null;
   if (subject) { where.push('subject = ?'); bind.push(subject); }
 
-  const action = ['merge', 'expire', 'split', 'supersede', 'reconcile'].includes(String(args.action || '').toLowerCase())
+  const action = ['merge', 'expire', 'split', 'supersede', 'reconcile', 'retract', 'repoint'].includes(String(args.action || '').toLowerCase())
     ? String(args.action).toLowerCase() : null;
   if (action) { where.push('action = ?'); bind.push(action); }
 
@@ -736,7 +772,7 @@ function corrections(args = {}) {
  * direction makes half the question unanswerable, and the half it makes
  * unanswerable is the one asked about a belief he currently holds.
  */
-function correctionsForFact(db, factId) {
+function correctionsForFact(db, factId, currentSuccessorId = null) {
   const L = limits();
   try {
     const rows = db.prepare(`
@@ -749,11 +785,27 @@ function correctionsForFact(db, factId) {
       let ev = null;
       try { ev = r.evidence ? JSON.parse(r.evidence) : null; } catch { /* leave null */ }
       const nothingHappened = (ev && ev.unresolved === true) || /^REFUSED by the identity lock/.test(r.reason || '');
+      // A ledger entry is history and never rewritten, so an entry can be
+      // TRUE ABOUT THE PAST and wrong about now: the supersession that retired
+      // "User's name is Mike" named a survivor that was later found to be a
+      // fact about Aurelius filed under Ellie, and the chain was re-pointed.
+      // Read without this flag, the older entry says the current successor is
+      // the one it named — measured 2026-08-06, he reported exactly that. The
+      // entry stays as written; it just has to say it has been overtaken.
+      const survivorStale = !nothingHappened && r.survivor_id && currentSuccessorId
+        && r.target_id === factId && r.survivor_id !== currentSuccessorId;
       return {
         correction_id: r.id,
         when: r.created_at,
         tier: r.tier,
         action: r.action,
+        ...(survivorStale ? {
+          superseded_by_a_later_correction: true,
+          stale_survivor_warning:
+            'THE REPLACEMENT NAMED IN THIS ENTRY IS NO LONGER THIS FACT\'S SUCCESSOR. This entry records what was ' +
+            'decided at the time, and a later correction re-pointed the chain. Read the CURRENT successor from ' +
+            'replaced_by, not from this entry, and do not tell anyone this fact was replaced by the one named here.'
+        } : {}),
         // Which end of it this fact is. "retired" is why it is no longer held;
         // "kept" is why it survived something else.
         role: nothingHappened ? 'named in a raise — nothing was changed'

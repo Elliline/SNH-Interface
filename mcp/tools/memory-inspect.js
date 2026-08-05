@@ -1,12 +1,13 @@
 /**
- * The four READ tools: memory_search, memory_list, memory_count, memory_get.
+ * The READ tools: memory_search, memory_list, memory_count, memory_get,
+ * memory_corrections.
  *
- * One file rather than four, because they are one capability with one rate cap,
+ * One file rather than five, because they are one capability with one rate cap,
  * one config flag and one backing module (db/memory-inspect.js) — splitting them
- * would put four copies of the same "read-only, never writes" contract in four
+ * would put five copies of the same "read-only, never writes" contract in five
  * places to drift apart.
  *
- * TIER. All four are `read` — the first tools here that neither act on the world
+ * TIER. All of them are `read` — the first tools here that neither act on the world
  * nor change anything. No approval, no reversal needed, nothing destructive. The
  * rate cap is not a safety bound; it exists because his injection budget is small
  * and a model that can look things up will happily look up forty things.
@@ -179,8 +180,8 @@ class MemoryCorrectionsTool extends BaseInspectTool {
         },
         action: {
           type: 'string',
-          enum: ['merge', 'expire', 'split', 'supersede', 'reconcile'],
-          description: 'Only changes of this kind. merge = duplicates folded together. expire = something that was really a passing event moved out. split = one fact that said two things separated. supersede = one belief replaced by a better-evidenced one. reconcile = an index repair.'
+          enum: ['merge', 'expire', 'split', 'supersede', 'reconcile', 'retract', 'repoint'],
+          description: 'Only changes of this kind. merge = duplicates folded together. expire = something that was really a passing event moved out. split = one fact that said two things separated. supersede = one belief replaced by a better-evidenced one. reconcile = an index repair. retract = a fact withdrawn with no replacement, e.g. one filed under the wrong person. repoint = a retired fact aimed at a different successor, where the retirement was right and the replacement named was wrong.'
         },
         tier: {
           type: 'string',
