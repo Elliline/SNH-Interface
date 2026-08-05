@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 /**
- * Rebuild memory clusters from existing MEMORY.md facts.
+ * Rebuild memory clusters from the fact corpus in SQLite.
+ *
+ * Sourced from MEMORY.md until 2026-08-02; that file is no longer a store, and
+ * SQLite is the record of truth, so the facts are read from cluster_members and
+ * re-clustered in place.
  * Wipes cluster tables and LanceDB cluster_embeddings, then re-assigns each fact.
  */
 
@@ -31,15 +35,13 @@ async function main() {
   await db.resetClusterEmbeddingsTable();
   console.log('LanceDB cluster_embeddings reset');
 
-  // 3. Read MEMORY.md and extract facts
-  const memoryFile = path.join(__dirname, '../data/memory/MEMORY.md');
-  const content = fs.readFileSync(memoryFile, 'utf8');
-  const factLines = content.split('\n')
-    .filter(line => line.startsWith('- '))
-    .map(line => line.substring(2).trim())
-    .filter(f => f.length > 0);
+  // 3. Read the active fact corpus from SQLite
+  const sqlite = db.getSqliteDb();
+  const factLines = sqlite.prepare(
+    "SELECT content FROM cluster_members WHERE subject = 'user' AND status = 'active' ORDER BY datetime(created_at) ASC"
+  ).all().map(r => r.content).filter(f => f && f.length > 0);
 
-  console.log(`\n=== Found ${factLines.length} facts in MEMORY.md ===`);
+  console.log(`\n=== Found ${factLines.length} active user facts in SQLite ===`);
   factLines.forEach((f, i) => console.log(`  ${i + 1}. ${f}`));
 
   // 4. Assign each fact to clusters using the updated logic

@@ -10,7 +10,7 @@
  *   8b05824b (Bernie/manager)            → superseded by bd135dee (Bernice/Director of Rooms at ISH)
  *   c7a04ab6 (Bernice dupe, salience 10) → superseded by bd135dee (which inherits salience 10)
  *   71c821de (ISH-client dupe, sal. 1)   → superseded by b77ce55a (7/7 defining fact)
- * plus removal of the superseded facts' MEMORY.md bullets (SQLite keeps history;
+ * (SQLite keeps history;
  * only the injected markdown copies are pruned).
  *
  * Idempotent: supersedeFact only touches status='active' rows, so a re-run
@@ -47,7 +47,6 @@ const REPAIRS = [
   const sql = db.getSqliteDb();
   const mc = require(path.join(ROOT, 'db/memory-clusters'));
   const fx = require(path.join(ROOT, 'db/fact-extractor'));
-  const memoryFile = path.join(fx.MEMORY_DIR, 'MEMORY.md');
 
   const getFact = id => sql.prepare(
     'SELECT id, content, status, superseded_by, salience FROM cluster_members WHERE id = ?'
@@ -87,8 +86,8 @@ const REPAIRS = [
     }
     applied++;
     if (inherit) mc.updateFactSalience(r.newId, inherit);
-    const removed = fx.removeFactLineFromMemory(oldFact.content, memoryFile);
-    console.log(`  MEMORY.md line ${removed ? 'removed' : 'not present (nothing to remove)'}`);
+    // The MEMORY.md bullet removal that used to happen here is gone: the
+    // injected block renders from SQLite, so superseding the row is sufficient.
     fx.appendToDailyLog(
       `Superseded fact: "${oldFact.content}" → replaced by "${newFact.content}" (manual repair: correction-supersession)`,
       fx.DAILY_DIR

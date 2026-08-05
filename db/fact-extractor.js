@@ -4,13 +4,6 @@ const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, formatFactTimestamp, getLocalDateStamp } = require('./datetime');
 const agentPool = require('./agent-pool');
 
-// A fact line written to MEMORY.md may carry a "(learned YYYY-MM-DD H:MM AM/PM)"
-// annotation so the model can answer "when did I tell you this". Strip it when
-// comparing/deduping/matching fact text so only the bare fact is considered.
-function stripLearnedAnnotation(text) {
-  return text.replace(/\s*\(learned\s+[^)]*\)\s*$/i, '').trim();
-}
-
 const MEMORY_DIR = path.join(__dirname, '../data/memory');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 
@@ -70,100 +63,93 @@ function cosineSimilarity(a, b) {
 }
 
 /**
- * Parse MEMORY.md into sections
- * Returns array of { heading, startIndex, endIndex, factLines }
+ * Extract candidates from a chat exchange, split into durable FACTS and
+ * time-bound EVENTS.
+ *
+ * Phase 2a rewrite. Three things changed and each one has a defect behind it:
+ *
+ *  - ATOMICITY. "User's professional entities include her MSP, MettaSphere, and
+ *    her AI research venture, Coastal Squatch." was stored as a single fact under
+ *    a cluster named for one of the two entities, so a query about the other could
+ *    not reach it. One fact now asserts one thing.
+ *
+ *  - EVENT vs STATE. "User has a pet named Roscoe who had a restless night as of
+ *    July 2026" is in the corpus as a permanent fact. Events go to the day's log
+ *    and never to the fact store.
+ *
+ *  - NO DATE STAMPING. The old prompt ended by instructing the model to anchor
+ *    time-relative statements to an absolute date ("As of July 2026, User is
+ *    migrating…"). That is the opposite of the rule above: it manufactured the
+ *    very timestamp that marks a sentence as an event. It is gone.
+ *
+ * @returns {Promise<{facts: Array<{text: string, corrects: string|null}>,
+ *                    events: Array<{text: string}>}>}
  */
-function parseMemorySections(content) {
-  const sections = [];
-  const lines = content.split('\n');
-  let currentSection = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith('## ')) {
-      if (currentSection) {
-        currentSection.endLine = i - 1;
-        sections.push(currentSection);
-      }
-      currentSection = {
-        heading: line.replace('## ', '').trim(),
-        startLine: i,
-        endLine: -1,
-        factLines: []
-      };
-    } else if (currentSection && line.startsWith('- ')) {
-      currentSection.factLines.push(stripLearnedAnnotation(line.substring(2).trim()));
-    }
-  }
-  if (currentSection) {
-    currentSection.endLine = lines.length - 1;
-    sections.push(currentSection);
-  }
-
-  return sections;
-}
-
-/**
- * Extract all fact lines (lines starting with "- ") from content
- */
-function extractAllFactLines(content) {
-  return content.split('\n')
-    .filter(line => line.startsWith('- '))
-    .map(line => stripLearnedAnnotation(line.substring(2).trim()));
-}
-
-/**
- * Extract facts from a chat exchange using the same model/provider
- * @param {string} userMessage - The user's message
- * @param {string} assistantMessage - The assistant's response
- * @param {string} provider - LLM provider (ollama, claude, openai, grok, llamacpp, squatchserve)
- * @param {string} model - Model name
- * @param {string} apiKey - API key for the provider (if required)
- * @param {string} ollamaHost - Ollama host URL
- * @returns {Promise<Array<{text: string, corrects: string|null}>>} Extracted
- *   facts; corrects is a short description of the outdated belief a corrective
- *   fact replaces ("It was Bernice not Bernie"), or null for plain facts.
- */
-async function extractFacts(userMessage, assistantMessage, provider, model, apiKey, ollamaHost) {
+async function extractCandidates(userMessage, assistantMessage, provider, model, apiKey, ollamaHost) {
   try {
-    console.log(`[FactExtractor] Extracting facts using ${provider}/${model}`);
+    console.log(`[FactExtractor] Extracting candidates using ${provider}/${model}`);
 
-    const systemPrompt = `You are a fact extraction system. Extract facts about the USER from what the USER said in the chat exchange below.
+    const systemPrompt = `You sort what the USER said in a chat exchange into two buckets: durable FACTS and time-bound EVENTS.
 
-RULES:
-- Return ONLY a valid JSON array, or [] if nothing worth remembering. Items are strings, or correction objects (see CORRECTIONS below) — the array may mix both.
-- Each fact MUST be a complete, self-contained sentence with full context.
-- Only extract facts that the USER has stated about themselves, their life, their preferences, or their projects.
-- Do NOT extract general knowledge, web search results, trivia, or information the AI provided.
-- Do NOT extract facts from the Assistant's response — only from what the User said.
-- Include: names, preferences, technical specs, relationships, decisions, project details the user mentions.
-- Do NOT include: greetings, casual chat, temporary context, questions without answers.
-- Write facts as "User has..." or "User prefers..." — never "Assistant has...".
+Return ONLY a JSON object in exactly this shape, and nothing else:
+{"facts": [...], "events": [...]}
+Both keys are always present. Either may be empty. Nothing appears in both.
 
-USER FACTS vs FACTS ABOUT ME (the AI) — this distinction is critical:
-- A fact about the USER, their life, their preferences, or their WORK/PROJECTS is a user fact — extract it. This INCLUDES the SNH (Squatch Neuro Hub) project the user is building: "User's SNH system uses semantic clustering" or "User is building SNH, a cluster-memory tool" are legitimate user facts about what the USER built.
-- A fact about ME — the AI/SNH's OWN nature, personality, feelings, values, self-image, or behavioral tendencies — is NOT a user fact. Never extract it. If the user says "you're really curious", "SNH tends to be verbose", or "you seem to care about accuracy", that is an observation about the AI, not a fact about the user — SKIP it. The AI records its own self-observations through a separate reflection pipeline, not here.
-- The test for every candidate: "Is this a fact about the USER (or the user's work), or a fact about ME, the AI?" Keep only the former. When phrased in the first person ("I tend to...", "I care about...") it is about the AI — skip it.
+=== THE TEST: STRIP THE TIMESTAMP ===
+Take the statement and remove every reference to time. Is what remains still true next month, and still worth knowing?
+- YES → it is a FACT (a standing state): has / owns / is / is named / prefers / works at / believes / is building.
+- NO  → it is an EVENT.
 
-GOOD examples (facts the user stated about themselves or their project):
-["User has 4 dogs: Casper, Cece, Calypso, and Erika", "User is migrating from Syncro to Kaseya for RMM", "User's AI server has dual RTX 3090s with 48GB total VRAM", "User's SNH system uses salience scoring from 1-10 to prioritize facts"]
+These are ALWAYS events, with no exceptions:
+- Something that happened: "washed the car", "the dog had a restless night", "bought dirt this morning".
+- Anything qualified by today, tonight, last night, this week, currently, right now, or a specific date.
+- An activity in progress: "the cleaners are filling the holes in the yard".
+- A mood, an energy level, or a feeling: "is exhausted", "has no motivation at the moment", "is frustrated with the microphone".
 
-BAD examples (AI-provided info, fragments, general knowledge, or facts about the AI itself):
-["A viral TikTok trend featuring Mini Huskies", "Constantinople fell in 1453", "RTX 3090", "The weather is nice", "SNH is curious and analytical", "I tend to reflect on my own cognitive processes", "The AI cares deeply about evolving truth"]
+When you cannot decide, put it in EVENTS. A durable fact that gets missed will be picked up the next time it comes up. A transient one that gets stored as a fact pollutes the memory forever.
 
-Every extracted fact must be something the USER told you about themselves or their work — not something you told the user, and not an observation about you, the AI.
+=== ATOMIC ===
+One fact asserts ONE thing about ONE subject. Split compounds into separate facts.
+- "User enjoys computers, gaming, cars, and guns"
+  → "User enjoys computers", "User enjoys gaming", "User enjoys cars", "User enjoys guns"
+- "User's MSP is MettaSphere and her AI research venture is Coastal Squatch"
+  → "User's MSP is MettaSphere", "User's AI research venture is Coastal Squatch"
+Never join unrelated assertions with "and". A clause that describes the SAME one thing stays together: "User has a dog named Casper" is one fact, not two.
 
-CORRECTIONS — when the user is fixing something previously believed:
-- If the user's message carries corrective framing — "It was X not Y", "actually it's X", "I was spelling it wrong", "her name is actually...", "I no longer...", "we renamed..." — return that fact as an OBJECT instead of a string:
-  {"fact": "<the corrected, complete fact>", "corrects": "<one short line describing the outdated belief being replaced>"}
-- The "corrects" line should name the wrong value being retired (the old spelling, old title, old tool, old plan) so stored facts carrying it can be found and superseded.
-- Example: user says "Its Bernice, i was spelling it wrong lol. She is the Director of Rooms here at ISH." →
+=== NO DATE STAMPING ===
+Never write a date or a time reference into a fact. If a statement needs one to be true, it is an EVENT — put it in events with the time reference kept.
+
+=== WHOSE FACT IT IS ===
+Attribute from WHAT THE USER ACTUALLY SAID, quoted below. Never from the assistant's reply, and never from the assistant's restatement of the user's words — the assistant rewrites pronouns, and a detail that appears only in its reply is not the user's fact.
+
+WATCH THE SPEAKER. The user says "I" and "my" about HERSELF, and "you" and "your" about the ASSISTANT.
+- "my gaming PC is 850W" → a USER fact: "User's gaming PC is 850W".
+- "you're on an ASUS GX10", "your box does 200W", "your name is X", "you tend to over-explain" → these are about the ASSISTANT'S own hardware, name or behaviour. They are NOT user facts. SKIP them entirely — do not rewrite them as "User's…". The assistant records what it learns about itself through a separate pipeline.
+Rewriting a "you" statement into a "User" statement is the single most damaging mistake available here: it files a fact about the assistant as a belief about the user, where it can then contradict and retire things that are actually true of her.
+- A fact about the USER, their life, their preferences, or their WORK/PROJECTS is a user fact — extract it. This INCLUDES the SNH (Squatch Neuro Hub) project the user is building: "User's SNH system uses semantic clustering" is a legitimate user fact about what the USER built.
+- A fact about ME — the AI/SNH's OWN nature, personality, feelings, values, self-image, or behavioral tendencies — is NOT a user fact, and never belongs in either bucket. If the user says "you're really curious" or "SNH tends to be verbose", that is an observation about the AI — SKIP it entirely. The AI records its own self-observations through a separate pipeline.
+- Do NOT extract general knowledge, web search results, trivia, or anything the AI told the user.
+- Write facts in the third person, starting with "User": "User has…", "User's MSP is…". Never "Assistant has…", never first person.
+
+=== NAMES AND IDENTITY ===
+Only record the user's own name, pronouns, or family relationships when the user INTRODUCES them outright — "my name is…", "call me…", "my pronouns are…". A name that merely appears in passing, especially in a message that reads as garbled or mis-transcribed, is not evidence of anything. Leave it out.
+
+=== CORRECTIONS ===
+If the user's message carries corrective framing — "It was X not Y", "actually it's X", "I was spelling it wrong", "her name is actually…", "I no longer…", "we renamed…" — return that fact as an OBJECT instead of a string:
+  {"fact": "<the corrected fact>", "corrects": "<one short line naming the outdated belief being replaced>"}
+Example: "Its Bernice, i was spelling it wrong lol. She is the Director of Rooms here at ISH." →
   {"fact": "User's colleague Bernice is the Director of Rooms at ISH", "corrects": "earlier facts calling her 'Bernie' or describing her as a manager at ISH"}
-- Plain new facts (no corrective framing) stay plain strings.
+Plain new facts stay plain strings.
 
-${getCurrentDateTimeString()}. When the user's statement is time-relative ("I just bought", "last week", "recently", "starting next month"), anchor the fact to an absolute date using the current date above — e.g. "As of July 2026, User is migrating from Syncro to Kaseya".`;
+=== ITEM SHAPES ===
+- facts:  a string, or a correction object as above.
+- events: a string — one plain sentence, time reference kept.
 
-    const exchange = `USER MESSAGE:\n${userMessage}\n\nASSISTANT RESPONSE (for context only — do NOT extract facts from this):\n${assistantMessage}`;
+Skip greetings, small talk, and questions with no answer. Return {"facts": [], "events": []} when there is nothing worth recording.
+
+${getCurrentDateTimeString()}. Use the current date only to make an EVENT's wording unambiguous — never to stamp a fact.`;
+
+    const exchange = `WHAT THE USER ACTUALLY SAID (authoritative — attribute only from this):\n${userMessage}\n\nASSISTANT RESPONSE (for context only — do NOT extract anything from this):\n${assistantMessage}`;
 
     let response;
     const controller = new AbortController();
@@ -203,26 +189,36 @@ ${getCurrentDateTimeString()}. When the user's statement is time-relative ("I ju
         }
         default:
           console.log(`[FactExtractor] Unsupported provider: ${provider}`);
-          return [];
+          return { facts: [], events: [] };
       }
     } finally {
       clearTimeout(timeoutId);
     }
 
-    // Parse JSON array from response (handle markdown code blocks)
-    const facts = parseFactsFromResponse(response);
-    const corrections = facts.filter(f => f.corrects).length;
-    console.log(`[FactExtractor] Extracted ${facts.length} facts${corrections ? ` (${corrections} correction${corrections > 1 ? 's' : ''})` : ''}`);
-    return facts;
+    const parsed = parseCandidatesFromResponse(response);
+    const corrections = parsed.facts.filter(f => f.corrects).length;
+    console.log(`[FactExtractor] Extracted ${parsed.facts.length} fact(s), ${parsed.events.length} event(s)${corrections ? ` (${corrections} correction${corrections > 1 ? 's' : ''})` : ''}`);
+    return parsed;
 
   } catch (error) {
     if (error.name === 'AbortError') {
       console.error('[FactExtractor] Extraction timeout after 30s');
     } else {
-      console.error('[FactExtractor] Error extracting facts:', error.message);
+      console.error('[FactExtractor] Error extracting candidates:', error.message);
     }
-    return [];
+    return { facts: [], events: [] };
   }
+}
+
+/**
+ * Legacy array-returning wrapper. `scripts/test-correction-supersession.js`
+ * asserts on the {text, corrects} shape, and that assertion is still the right
+ * one — corrections are unchanged by this rewrite.
+ * @returns {Promise<Array<{text: string, corrects: string|null}>>}
+ */
+async function extractFacts(userMessage, assistantMessage, provider, model, apiKey, ollamaHost) {
+  const { facts } = await extractCandidates(userMessage, assistantMessage, provider, model, apiKey, ollamaHost);
+  return facts;
 }
 
 /**
@@ -393,57 +389,90 @@ async function extractFromSquatchServe(systemPrompt, exchange, model, host, sign
 }
 
 /**
- * Parse facts from LLM response (handles markdown code blocks and Python-style
- * arrays). Items may be plain strings or {fact, corrects} correction objects;
- * both normalize to {text, corrects} with corrects null for plain facts.
+ * Pull the first JSON value out of an LLM response, tolerating markdown fences
+ * and Python-style single quotes.
+ * @param {string} response
+ * @param {'object'|'array'} shape
+ * @returns {any|null}
+ */
+function parseJsonBlob(response, shape) {
+  const cleaned = String(response || '').replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
+  const re = shape === 'object' ? /\{[\s\S]*\}/ : /\[[\s\S]*\]/;
+  const match = cleaned.match(re);
+  if (!match) return null;
+
+  let jsonStr = match[0];
+  try {
+    return JSON.parse(jsonStr);
+  } catch {
+    // Python-style single-quoted output: ['fact', 'fact']. Convert structural
+    // single quotes while preserving apostrophes inside strings ("User's name").
+    jsonStr = jsonStr
+      .replace(/\[\s*'/g, '["')
+      .replace(/'\s*\]/g, '"]')
+      .replace(/'\s*,\s*'/g, '", "')
+      .replace(/'\s*,\s*"/g, '", "')
+      .replace(/"\s*,\s*'/g, '", "');
+    try {
+      return JSON.parse(jsonStr);
+    } catch (retryErr) {
+      console.error('[FactExtractor] JSON parse failed:', retryErr.message);
+      return null;
+    }
+  }
+}
+
+/**
+ * Parse the two-bucket extraction response: {"facts": [...], "events": [...]}.
+ * A model that ignores the shape and returns a bare array is treated as having
+ * returned facts only — the deterministic event markers in db/extraction-rules
+ * still re-route anything time-bound, so a sloppy response degrades to the old
+ * behaviour plus the mechanical floor, not to no routing at all.
+ * @returns {{facts: Array<{text: string, corrects: string|null}>, events: Array<{text: string}>}}
+ */
+function parseCandidatesFromResponse(response) {
+  try {
+    const obj = parseJsonBlob(response, 'object');
+    if (obj && !Array.isArray(obj) && (Array.isArray(obj.facts) || Array.isArray(obj.events))) {
+      return {
+        facts: normalizeFactItems(Array.isArray(obj.facts) ? obj.facts : []),
+        events: normalizeEventItems(Array.isArray(obj.events) ? obj.events : [])
+      };
+    }
+    const arr = parseJsonBlob(response, 'array');
+    if (Array.isArray(arr)) {
+      console.log('[FactExtractor] Response was a bare array — treating every item as a fact candidate');
+      return { facts: normalizeFactItems(arr), events: [] };
+    }
+    console.log('[FactExtractor] No parseable JSON in extraction response');
+    return { facts: [], events: [] };
+  } catch (error) {
+    console.error('[FactExtractor] Error parsing candidates from response:', error.message);
+    return { facts: [], events: [] };
+  }
+}
+
+/** Normalize event items to {text}. Items are strings or {event}/{text} objects. */
+function normalizeEventItems(items) {
+  return items.map(e => {
+    if (typeof e === 'string') return { text: e.trim() };
+    if (e && typeof e === 'object') {
+      const t = e.event || e.text || e.description;
+      if (typeof t === 'string' && t.trim()) return { text: t.trim() };
+    }
+    return null;
+  }).filter(Boolean).filter(e => e.text.length >= 4);
+}
+
+/**
+ * Normalize fact items to {text, corrects} and drop the ones that are not user
+ * facts at all. Items are plain strings, or correction objects ({fact, corrects})
+ * when the user's message carried corrective framing ("It was X not Y") — the
+ * corrects note travels with the fact so the contradiction judge sees the intent.
  * @returns {Array<{text: string, corrects: string|null}>}
  */
-function parseFactsFromResponse(response) {
+function normalizeFactItems(facts) {
   try {
-    // Strip markdown code fences before parsing
-    response = response.replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
-
-    // Try to find JSON array in the response
-    const jsonMatch = response.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      console.log('[FactExtractor] No JSON array found in response');
-      return [];
-    }
-
-    let jsonStr = jsonMatch[0];
-
-    // Try parsing as valid JSON first
-    let facts;
-    try {
-      facts = JSON.parse(jsonStr);
-    } catch (parseErr) {
-      // Handle Python-style single-quoted arrays: ['fact', 'fact']
-      // Convert structural single quotes to double quotes while preserving
-      // apostrophes inside strings (e.g. "User's name")
-      console.log('[FactExtractor] JSON parse failed, trying Python-style fixup');
-      jsonStr = jsonStr
-        .replace(/\[\s*'/g, '["')           // [' → ["
-        .replace(/'\s*\]/g, '"]')           // '] → "]
-        .replace(/'\s*,\s*'/g, '", "')     // ', ' → ", "
-        .replace(/'\s*,\s*"/g, '", "')     // ', " → ", "
-        .replace(/"\s*,\s*'/g, '", "');    // ", ' → ", "
-      try {
-        facts = JSON.parse(jsonStr);
-      } catch (retryErr) {
-        console.error('[FactExtractor] Python-style fixup also failed:', retryErr.message);
-        return [];
-      }
-    }
-
-    if (!Array.isArray(facts)) {
-      console.log('[FactExtractor] Parsed JSON is not an array');
-      return [];
-    }
-
-    // Normalize to {text, corrects} — items are plain strings, or correction
-    // objects ({fact, corrects}) when the user's message carried corrective
-    // framing ("It was X not Y"). The corrects note travels with the fact so
-    // the contradiction judge can see the corrective intent.
     const normalized = facts.map(f => {
       if (typeof f === 'string') return { text: f, corrects: null };
       if (f && typeof f === 'object' && typeof f.fact === 'string') {
@@ -503,177 +532,22 @@ function parseFactsFromResponse(response) {
     });
 
   } catch (error) {
-    console.error('[FactExtractor] Error parsing facts from response:', error.message);
+    console.error('[FactExtractor] Error normalizing fact items:', error.message);
     return [];
   }
 }
 
-/**
- * Append facts to MEMORY.md with embedding-based dedup and section-aware placement.
- * Facts are placed under the most semantically similar existing section.
- * @param {string[]} facts - Array of fact strings
- * @param {string} memoryFilePath - Path to MEMORY.md
- */
-async function appendToMemory(facts, memoryFilePath) {
-  try {
-    if (!facts || facts.length === 0) return;
-
-    console.log(`[FactExtractor] Processing ${facts.length} candidate facts`);
-
-    // Ensure directory exists
-    const memoryDir = path.dirname(memoryFilePath);
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
-    }
-
-    // Read and parse existing content
-    let content = '';
-    if (fs.existsSync(memoryFilePath)) {
-      content = fs.readFileSync(memoryFilePath, 'utf8');
-    } else {
-      content = '# Long-Term Memory\n';
-    }
-
-    const sections = parseMemorySections(content);
-    const existingFacts = extractAllFactLines(content);
-    console.log(`[FactExtractor] Found ${sections.length} sections, ${existingFacts.length} existing facts`);
-
-    // Generate embeddings for all existing facts (for dedup)
-    const existingEmbeddings = [];
-    for (const fact of existingFacts) {
-      existingEmbeddings.push(await generateFactEmbedding(fact));
-    }
-
-    // Generate embeddings for each section (heading + content for matching)
-    const sectionEmbeddings = [];
-    for (const section of sections) {
-      const sectionText = section.heading + ': ' + section.factLines.join('. ');
-      sectionEmbeddings.push(await generateFactEmbedding(sectionText));
-    }
-
-    // Process each new fact: dedup then categorize
-    // Map of sectionIndex → [fact strings to add]
-    const factsPerSection = new Map();
-
-    for (const fact of facts) {
-      // Quick string-match dedup first
-      const normalizedFact = fact.toLowerCase();
-      if (existingFacts.some(ef => ef.toLowerCase() === normalizedFact)) {
-        console.log(`[FactExtractor] Skipping exact duplicate: "${fact}"`);
-        continue;
-      }
-
-      // Embedding-based dedup
-      const factEmbedding = await generateFactEmbedding(fact);
-      if (factEmbedding) {
-        let isDuplicate = false;
-        for (let i = 0; i < existingEmbeddings.length; i++) {
-          if (!existingEmbeddings[i]) continue;
-          const sim = cosineSimilarity(factEmbedding, existingEmbeddings[i]);
-          if (sim > 0.85) {
-            console.log(`[FactExtractor] Skipping semantic duplicate (${sim.toFixed(3)}): "${fact}" ≈ "${existingFacts[i]}"`);
-            isDuplicate = true;
-            break;
-          }
-        }
-        if (isDuplicate) continue;
-
-        // Find best matching section
-        let bestIdx = -1;
-        let bestScore = 0;
-        for (let i = 0; i < sectionEmbeddings.length; i++) {
-          if (!sectionEmbeddings[i]) continue;
-          const score = cosineSimilarity(factEmbedding, sectionEmbeddings[i]);
-          if (score > bestScore) {
-            bestScore = score;
-            bestIdx = i;
-          }
-        }
-
-        if (bestIdx >= 0 && bestScore > 0.3) {
-          console.log(`[FactExtractor] Placing "${fact}" → ${sections[bestIdx].heading} (score: ${bestScore.toFixed(3)})`);
-        } else {
-          console.log(`[FactExtractor] Placing "${fact}" → Other (best score: ${bestScore.toFixed(3)})`);
-          bestIdx = -1; // will go to Other
-        }
-
-        if (!factsPerSection.has(bestIdx)) factsPerSection.set(bestIdx, []);
-        factsPerSection.get(bestIdx).push(fact);
-
-        // Add to existing embeddings so subsequent facts in this batch dedup against it
-        existingFacts.push(fact);
-        existingEmbeddings.push(factEmbedding);
-      } else {
-        // Embedding failed — fall back to "Other" section, skip embedding dedup
-        console.log(`[FactExtractor] Embedding unavailable, placing "${fact}" → Other`);
-        if (!factsPerSection.has(-1)) factsPerSection.set(-1, []);
-        factsPerSection.get(-1).push(fact);
-      }
-    }
-
-    if (factsPerSection.size === 0) {
-      console.log('[FactExtractor] No new facts to add (all duplicates)');
-      return;
-    }
-
-    // Rebuild content with facts inserted into their sections
-    const lines = content.split('\n');
-
-    // Annotate each newly written fact with when it was learned (now), so the
-    // markdown injection path carries timestamps like the cluster path does.
-    const learnedAt = formatFactTimestamp(new Date().toISOString());
-    const factLine = f => (learnedAt ? `- ${f} (learned ${learnedAt})` : `- ${f}`);
-
-    // Insert facts into existing sections (iterate in reverse to preserve line numbers)
-    const sectionInserts = []; // [{lineIndex, facts}]
-    for (const [sectionIdx, sectionFacts] of factsPerSection.entries()) {
-      if (sectionIdx < 0) continue; // handle "Other" separately
-      const section = sections[sectionIdx];
-      // Insert after the last fact line in the section, or after the heading
-      let insertAfter = section.startLine;
-      for (let i = section.startLine; i <= section.endLine; i++) {
-        if (lines[i].startsWith('- ')) insertAfter = i;
-      }
-      sectionInserts.push({ lineIndex: insertAfter, facts: sectionFacts });
-    }
-
-    // Sort inserts by line index descending so earlier inserts don't shift later ones
-    sectionInserts.sort((a, b) => b.lineIndex - a.lineIndex);
-    for (const insert of sectionInserts) {
-      const newLines = insert.facts.map(f => factLine(f));
-      lines.splice(insert.lineIndex + 1, 0, ...newLines);
-    }
-
-    // Handle "Other" section (facts with no good section match)
-    const otherFacts = factsPerSection.get(-1);
-    if (otherFacts && otherFacts.length > 0) {
-      // Find or create ## Other section
-      const hasOther = lines.some(l => l.startsWith('## Other'));
-      if (hasOther) {
-        const otherIdx = lines.findIndex(l => l.startsWith('## Other'));
-        let insertAfter = otherIdx;
-        for (let i = otherIdx; i < lines.length; i++) {
-          if (lines[i].startsWith('- ')) insertAfter = i;
-          if (i > otherIdx && lines[i].startsWith('## ')) break;
-        }
-        const newLines = otherFacts.map(f => factLine(f));
-        lines.splice(insertAfter + 1, 0, ...newLines);
-      } else {
-        lines.push('', '## Other');
-        for (const f of otherFacts) lines.push(factLine(f));
-      }
-    }
-
-    const updatedContent = lines.join('\n');
-    fs.writeFileSync(memoryFilePath, updatedContent, 'utf8');
-
-    const totalAdded = Array.from(factsPerSection.values()).reduce((s, a) => s + a.length, 0);
-    console.log(`[FactExtractor] Added ${totalAdded} new facts to memory`);
-
-  } catch (error) {
-    console.error('[FactExtractor] Error appending to memory:', error.message);
-  }
-}
+// appendToMemory was removed 2026-08-02 along with MEMORY.md as a store.
+//
+// It wrote facts as "- <fact> (learned <when>)" lines into data/memory/MEMORY.md,
+// deduping against the FILE by exact text and embedding similarity. That dedup
+// guarded the projection while assignToCluster inserted into SQLite regardless,
+// so the two stores disagreed by construction — one machine-gun line in the file,
+// three rows in the database.
+//
+// The injected block is now rendered from SQLite per request
+// (memoryClusters.renderLongTermMemory) and dedup happens at the SQLite write
+// (factStore.findExactDuplicate). Nothing writes a memory file.
 
 /**
  * Insert a pre-formatted entry block at the TOP of the day's log, directly
@@ -781,11 +655,9 @@ function loadMemoryContext(memoryDir) {
       dailyYesterday: ''
     };
 
-    // Read MEMORY.md
-    const memoryFile = path.join(memoryDir, 'MEMORY.md');
-    if (fs.existsSync(memoryFile)) {
-      result.memory = fs.readFileSync(memoryFile, 'utf8');
-    }
+    // Long-term memory is rendered from SQLite, not read from a file. Callers
+    // that need it use memoryClusters.renderLongTermMemory().
+    result.memory = '';
 
     // Read USER.md
     const userFile = path.join(memoryDir, 'USER.md');
@@ -873,6 +745,273 @@ Respond with exactly YES, NO, or UNCERTAIN on the first line, then one short lin
   } catch (error) {
     console.error('[FactExtractor] Contradiction judge error:', error.message);
     return { verdict: 'no', reasoning: '' };
+  }
+}
+
+/**
+ * REPEAT detection, second half. Vector similarity finds the neighbours; this
+ * decides whether a near-neighbour is the SAME ASSERTION restated, as opposed to
+ * a related-but-different fact.
+ *
+ * The bar is deliberately strict and the default is NO. A false positive here
+ * silently discards a genuinely new fact, which is the worst outcome available:
+ * unlike a false negative (a second row, which the corrector can merge later),
+ * nothing downstream can recover information that was never written.
+ *
+ * @returns {Promise<{same: boolean, reasoning: string}>}
+ */
+async function judgeSameAssertion(newFact, oldFact) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You decide whether two sentences about a user assert THE SAME THING, so that storing both would be storing one fact twice.
+
+Answer SAME only when the second adds no information the first does not already carry — a rewording, a restatement, the same claim in different words.
+
+Answer DIFFERENT when either sentence carries anything the other does not: an extra detail, a narrower or wider claim, a different object, a different attribute. "User has a dog named Casper" and "User has a dog named Casper who helps pull them up hills" are DIFFERENT — the second knows something the first does not.
+
+If you are unsure, answer DIFFERENT.
+
+Respond with exactly SAME or DIFFERENT on the first line, then one short line of reasoning.`;
+    const userPrompt = `EXISTING fact: "${oldFact}"\nNEW statement: "${newFact}"\n\nSame assertion, or different?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 100 });
+    const firstWord = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    const same = firstWord === 'same';
+    const reasoning = String(content).trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Repeat judge: ${same ? 'SAME' : 'DIFFERENT'} — "${newFact}" vs "${oldFact}"`);
+    return { same, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] Repeat judge error:', error.message);
+    return { same: false, reasoning: '' }; // a failed check must never eat a fact
+  }
+}
+
+/**
+ * Does one of these two facts already contain the other?
+ *
+ * A DIFFERENT question from judgeSameAssertion, and it has to be, because that
+ * judge is defined the other way for exactly this case: at intake, "User has a
+ * dog named Casper who helps pull them up hills" arriving against a stored "User
+ * has a dog named Casper" carries new information and must be stored, so the
+ * repeat judge answers DIFFERENT — the fixture pair is written into its prompt
+ * as the worked example.
+ *
+ * The corrector is asking something else. Both rows are already held, and a
+ * subset sitting beside its superset is one fact stored twice with one copy
+ * impoverished. So: is everything the shorter one asserts already asserted by
+ * the longer one? If yes, the shorter folds into it, and the DETAIL is what
+ * survives — never the reverse.
+ *
+ * Deliberately strict. "Neither" is the safe answer and the default on any doubt,
+ * because folding two facts that merely overlap loses whatever the loser knew.
+ *
+ * @returns {Promise<{relation: 'a-contains-b'|'b-contains-a'|'neither', reasoning: string}>}
+ */
+async function judgeSubsumption(a, b) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You are given two sentences about the same person, both currently stored as separate facts. Decide whether one of them ALREADY CONTAINS everything the other says.
+
+Answer A if sentence A asserts everything B asserts and more.
+Answer B if sentence B asserts everything A asserts and more.
+Answer NEITHER if each one knows something the other does not, or if they are about different things.
+
+"User has a dog named Casper" and "User has a dog named Casper who helps pull them up hills during walks" → the second contains the first entirely, so the answer is whichever letter that longer sentence is.
+"User has a dog named Casper" and "User has a cat named Mia" → NEITHER.
+"User works at ISH" and "User works 20 hours a week" → NEITHER; each carries something the other does not.
+
+If you are unsure, answer NEITHER.
+
+Respond with exactly A, B, or NEITHER on the first line, then one short line of reasoning.`;
+    const userPrompt = `A: "${a}"\nB: "${b}"\n\nDoes one already contain the other?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 100 });
+    const first = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toUpperCase();
+    const relation = first === 'A' ? 'a-contains-b' : first === 'B' ? 'b-contains-a' : 'neither';
+    const reasoning = String(content).trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Subsumption judge: ${relation} — "${String(a).slice(0, 70)}" / "${String(b).slice(0, 70)}"`);
+    return { relation, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] Subsumption judge error:', error.message);
+    return { relation: 'neither', reasoning: '' }; // a failed check must never fold a fact away
+  }
+}
+
+/**
+ * The strip-the-timestamp test, asked properly.
+ *
+ * At intake a time marker can force the event branch outright, and that is fine:
+ * a fresh statement carrying "as of July 2026" is almost always an event, and a
+ * durable fact missed there re-extracts the next time it comes up. The cost of a
+ * false positive is one lost extraction.
+ *
+ * For the CORRECTOR the arithmetic is reversed. It acts on facts already held,
+ * and the cost of a false positive is retiring something true. The first dry run
+ * made the case unanswerably: the marker heuristic alone proposed expiring
+ * "User's partner passed away on January 24th, 2025, at 4:00 AM" — a date-bearing
+ * sentence that is among the most durable facts in the corpus — along with every
+ * dated capability declaration he holds about himself.
+ *
+ * So the marker is a CANDIDATE FILTER, and this is the actual test: remove the
+ * time reference and ask whether anything durable is left. "Partner passed away"
+ * survives it. "Dog had a restless night" does not.
+ *
+ * @returns {Promise<{isEvent: boolean, reasoning: string}>}
+ */
+async function judgeStripTheTimestamp(text) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `You decide whether a stored sentence is a LASTING FACT or a PASSING EVENT.
+
+The test: remove every reference to time from the sentence, then ask whether what remains is still true next year and still worth knowing.
+
+- LASTING — something that stays true. "Her partner died on 24 January 2025" → strip the date → "her partner died" → still true forever. LASTING. Life events, deaths, births, when something was founded, a diagnosis, a permanent change, a standing habit, a capability someone has — all LASTING, even when the sentence names a date.
+- PASSING — something that was only true around then. "The dog had a restless night" → strip the time → nothing durable remains. "She is visiting the cheese factory today", "the cleaners are filling holes this week", "she is tired at the moment" — all PASSING.
+
+A date in the sentence does NOT make it passing. Plenty of permanent facts are dated. Ask only whether the underlying thing endures.
+
+A MOOD or an ENERGY LEVEL is PASSING even with no date attached: "she is exhausted", "he has lost motivation", "she is experiencing burnout and low motivation" — how someone feels at a point in their life is not a standing truth about them. A DIAGNOSIS or a chronic condition is LASTING. If the sentence describes how someone is doing rather than how someone is, it is PASSING.
+
+If you are unsure, answer LASTING. This decides whether a stored memory is retired, and wrongly retiring something true is far worse than keeping something stale.
+
+Answer with exactly LASTING or PASSING on the first line, then one short line of reasoning.`;
+    const userPrompt = `Stored sentence: "${text}"\n\nLASTING or PASSING?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 100 });
+    const firstWord = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    const isEvent = firstWord === 'passing';
+    const reasoning = String(content).trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Strip-the-timestamp: ${isEvent ? 'PASSING' : 'LASTING'} — "${String(text).slice(0, 70)}"`);
+    return { isEvent, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] judgeStripTheTimestamp error:', error.message);
+    return { isEvent: false, reasoning: '' }; // a failed check never retires a fact
+  }
+}
+
+/**
+ * Which of two facts asserting the same thing should SURVIVE?
+ *
+ * Length was the first proxy and it is wrong often enough to matter: the dry run
+ * picked "User's Managed Service Provider (MSP) is called MettaSphere." over
+ * "User's MSP is MettaSphere LLC" because it is longer, silently dropping "LLC".
+ * More words is not more information.
+ *
+ * @returns {Promise<'a'|'b'|null>} null when it genuinely does not matter
+ */
+async function judgeWhichSurvives(a, b) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `Two sentences record the same fact. One will be kept and the other discarded. Choose the one that should be KEPT.
+
+Keep whichever carries MORE information — more specific names, qualifiers, or detail. Length is not information: a wordier sentence that drops a detail is the worse one.
+If they carry exactly the same information, answer EITHER.
+
+Answer with exactly A, B, or EITHER on the first line, then one short line of reasoning.`;
+    const userPrompt = `A: "${a}"\nB: "${b}"\n\nWhich should be kept?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 80 });
+    const first = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    if (first === 'a') return 'a';
+    if (first === 'b') return 'b';
+    return null;
+  } catch (error) {
+    console.error('[FactExtractor] judgeWhichSurvives error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Split a candidate that still joins unrelated assertions after the extraction
+ * prompt asked for atoms. Only called when db/extraction-rules.looksCompound
+ * fires, so this costs nothing on the ordinary path.
+ *
+ * Returns the original text unchanged on any failure — a fact stored whole is a
+ * worse fact, but a fact lost to a parse error is no fact at all.
+ *
+ * @returns {Promise<string[]>}
+ */
+async function splitCompoundFact(text, subject = 'user') {
+  try {
+    const memoryManager = require('./memory-manager');
+    const rules = require('./extraction-rules');
+    const isSelf = subject === 'self';
+
+    // SUBJECT-AWARE, and this is not a nicety.
+    //
+    // The original prompt said "start each part with User", which is right for a
+    // user fact and catastrophic for a self-fact. The corrector's first dry run
+    // caught it turning "I tend to view my own existence through the lens of my
+    // architectural design" into "User tends to view their own existence…" — his
+    // self-observation rewritten as a third-person belief about Ellie. That is
+    // the 2026-07-27 misattribution exactly, arriving by a new route.
+    const person = isSelf
+      ? 'Every part must be written in the FIRST PERSON, as the speaker talking about themselves, and must start with "I" or "My". Never write "User" or "the user" — these are the speaker\'s statements about THEMSELF.'
+      : 'Every part must be written in the THIRD PERSON and must start with "User". Never write it in the first person.';
+
+    const example = isSelf
+      ? '- "I value rigor and I use architectural metaphors" → "I value rigor.", "I use architectural metaphors."'
+      : '- "User\'s professional entities include her MSP, MettaSphere, and her AI research venture, Coastal Squatch" → "User\'s MSP is MettaSphere.", "User\'s AI research venture is Coastal Squatch."';
+
+    const systemPrompt = `You split a sentence into atomic facts. One atomic fact asserts ONE thing about ONE subject.
+
+Rules:
+- ${person}
+- REWRITE each part as a natural standalone sentence. Do not simply cut the original at its commas.
+${example}
+- A reader who sees only that one sentence must understand it.
+- Do not invent anything, and do not LOSE anything. Every detail in the original must appear in one of the atoms, and every atom must be supported by the original.
+- A clause describing the SAME single thing stays with it: "${isSelf ? 'I have a habit of pausing when I am unsure, which slows me down' : 'User has a dog named Casper who helps pull them up hills'}" is ONE fact.
+- If the sentence is already atomic, return it unchanged as the only item.
+
+Return ONLY a JSON array of strings.`;
+    const userPrompt = `Sentence: "${text}"\n\nAtomic facts:`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 300 });
+    const arr = parseJsonBlob(content, 'array');
+    if (!Array.isArray(arr)) return [text];
+
+    // Verify, do not trust. The grammatical subject of every atom must match the
+    // subject of the fact being split; an atom that drifted is dropped, and if
+    // any did, the whole split is abandoned rather than half-applied — a partial
+    // split would supersede the original with an incomplete set.
+    const parts = arr
+      .filter(x => typeof x === 'string')
+      .map(x => x.trim())
+      .filter(x => x.length >= 8);
+    const wellFormed = parts.filter(x => rules.grammaticalSubject(x) === subject);
+    if (wellFormed.length !== parts.length) {
+      console.warn(`[FactExtractor] compound split changed subject on ${parts.length - wellFormed.length} atom(s) — abandoning the split of "${text.slice(0, 60)}"`);
+      return [text];
+    }
+    if (wellFormed.length === 0) return [text];
+    if (wellFormed.length === 1) return wellFormed;
+
+    // ENTAILMENT CHECK. Splitting an awkward sentence produces awkward atoms, and
+    // an awkward atom is a false fact. The corrector's dry run turned "User has a
+    // RAV4 that has been washed, but the wheels, tires, wax and ceramic coating
+    // have not been done" into, among others, "User's RAV4 wheels have not been
+    // applied" — wheels are not applied to anything. Six rows of near-nonsense
+    // would then have superseded one coherent compound.
+    //
+    // One call, only on the split path, and it fails CLOSED: anything less than a
+    // clean yes abandons the split and leaves the original alone.
+    const check = await memoryManager.callLLM(
+      `You check whether a set of split sentences faithfully covers an original sentence.
+
+Answer NO if any part invents something the original does not say, if any part is garbled or not a sensible English sentence, or if the parts together lose something the original says.
+Answer YES only if every part is sensible, supported by the original, and nothing is lost.
+
+Answer with exactly YES or NO on the first line, then one short line of reasoning.`,
+      `Original: "${text}"\n\nParts:\n${wellFormed.map(p => `- ${p}`).join('\n')}\n\nFaithful?`,
+      { maxTokens: 100 }
+    );
+    const ok = /^\s*yes\b/i.test(String(check.content || '').trim());
+    if (!ok) {
+      console.warn(`[FactExtractor] compound split failed the faithfulness check, leaving original alone: "${text.slice(0, 60)}"`);
+      return [text];
+    }
+
+    console.log(`[FactExtractor] Split compound into ${wellFormed.length} (${subject}): "${text.slice(0, 70)}"`);
+    return wellFormed;
+  } catch (error) {
+    console.error('[FactExtractor] splitCompoundFact error:', error.message);
+    return [text];
   }
 }
 
@@ -1181,270 +1320,589 @@ async function buildNearbyContext(facts) {
     return { text: '', clusterIds: [] };
   }
 }
-
 /**
- * Remove a superseded fact's line from MEMORY.md so it stops entering model
- * context. The SQLite row is kept for history; only the injected markdown copy
- * is pruned. Matches the `- <fact>` bullet by trimmed content.
- * @param {string} factContent - The exact fact text to remove
- * @param {string} memoryFilePath - Path to MEMORY.md
- * @returns {boolean} - true if a line was removed
+ * API key for the EXTRACTION provider, from the environment.
+ *
+ * The old orchestrator threaded the CHAT request's key through to the extraction
+ * call, which is wrong whenever the two providers differ — and they normally do,
+ * since the extraction model is chosen in config independently of the chat
+ * model. Local providers ignore the key entirely (which is why nothing broke),
+ * but a cloud extraction model would have been handed the wrong one.
  */
-function removeFactLineFromMemory(factContent, memoryFilePath) {
-  try {
-    if (!fs.existsSync(memoryFilePath)) return false;
-    const target = factContent.trim().toLowerCase();
-    const lines = fs.readFileSync(memoryFilePath, 'utf8').split('\n');
-    const kept = lines.filter(line => {
-      const m = line.match(/^\s*-\s+(.*)$/);
-      if (!m) return true;
-      // Compare on the bare fact, ignoring any "(learned ...)" annotation.
-      return stripLearnedAnnotation(m[1].trim()).toLowerCase() !== target;
-    });
-    if (kept.length !== lines.length) {
-      fs.writeFileSync(memoryFilePath, kept.join('\n'), 'utf8');
-      console.log(`[FactExtractor] Removed superseded fact line from MEMORY.md: "${factContent}"`);
-      return true;
-    }
-    return false;
-  } catch (error) {
-    console.error('[FactExtractor] Error removing fact line from memory:', error.message);
-    return false;
+function extractionApiKey(provider) {
+  switch (String(provider || '').toLowerCase()) {
+    case 'claude': return process.env.CLAUDE_API_KEY || '';
+    case 'grok': return process.env.GROK_API_KEY || '';
+    case 'openai': return process.env.OPENAI_API_KEY || '';
+    default: return '';
   }
 }
 
 /**
- * Process fact extraction for a chat exchange (high-level orchestrator)
- * @param {string} userMessage - The user's message
- * @param {string} assistantMessage - The assistant's response
- * @param {string} provider - LLM provider
- * @param {string} model - Model name
- * @param {string} apiKey - API key
- * @param {string} ollamaHost - Ollama/llamacpp/squatchserve host
- * @param {string} conversationId - Conversation this exchange belongs to
- * @param {string} memoryDir - Memory directory path
+ * ============================================================================
+ * PASSIVE INTAKE — planned first, applied second
+ * ============================================================================
+ *
+ * The pipeline is split in two on purpose. `planExtraction` decides EVERYTHING
+ * and writes NOTHING: what the model proposed, which candidates were split,
+ * which were routed to the day's log as events, which were refused by the
+ * identity anchor, which are repeats of facts already held, what the
+ * contradiction check considered and what the judge said about each candidate.
+ * `applyExtraction` takes that plan and performs the writes, all of them through
+ * the fact-store funnel.
+ *
+ * That split is what makes the dry-run harness (scripts/dryrun-extract.js) run
+ * the REAL pipeline rather than a copy of it. The spec's rule for replay — "if
+ * replay needs a special case, the pipeline is wrong" — applies just as much to
+ * a dry run: a rehearsal that exercises different code proves nothing about the
+ * code that will actually run.
  */
-async function processFactExtraction(userMessage, assistantMessage, provider, model, apiKey, ollamaHost, conversationId = null, memoryDir = MEMORY_DIR) {
+
+/**
+ * Decide what an exchange should produce. Read-only: no rows, no vectors, no log
+ * lines. Every LLM call it makes is a judgment, never a mutation.
+ *
+ * @param {Object} p
+ * @param {string} p.userMessage
+ * @param {string} p.assistantMessage
+ * @param {string} [p.conversationId]
+ * @param {string} [p.messageId]
+ * @param {string} [p.inputModality] - 'stt' | 'typed' | 'unknown'
+ * @returns {Promise<Object>} the plan (see the shape assembled at the end)
+ */
+async function planExtraction({
+  userMessage, assistantMessage,
+  conversationId = null, messageId = null, inputModality = 'unknown'
+} = {}) {
+  const config = getConfig();
+  const rules = require('./extraction-rules');
+  const memoryClusters = require('./memory-clusters');
+  const factStore = require('./fact-store');
+
+  const exCfg = config.memory?.extraction || {};
+  const conCfg = config.memory?.contradiction || {};
+  const gatedModalities = Array.isArray(exCfg.identityAnchorModalities)
+    ? exCfg.identityAnchorModalities : ['stt', 'unknown'];
+  const repeatFloor = Number.isFinite(exCfg.repeatSimilarityFloor) ? exCfg.repeatSimilarityFloor : 0.80;
+  const repeatMax = Number.isInteger(exCfg.repeatMaxCandidates) ? exCfg.repeatMaxCandidates : 5;
+  const maxFacts = Number.isInteger(exCfg.maxFactsPerExchange) ? exCfg.maxFactsPerExchange : 12;
+  const maxEvents = Number.isInteger(exCfg.maxEventsPerExchange) ? exCfg.maxEventsPerExchange : 8;
+
+  const extractionProvider = config.models.extraction.provider;
+  const extractionModel = config.models.extraction.model;
+  const extInst = getProviderInstance(extractionProvider, config.models.extraction.instance);
+  const extractionHost = extInst ? extInst.host : 'http://localhost:11434';
+
+  const modality = (inputModality || 'unknown').toLowerCase();
+  const provenance = {
+    conversationId,
+    messageId,
+    // The user's ACTUAL words, never the extractor's paraphrase. This is what
+    // lets a later correction tell "User's name is Mike" — extracted from a
+    // mis-transcribed "it's mic not picking up the right words" — apart from a
+    // name Ellie actually stated.
+    verbatimSourceText: userMessage,
+    inputModality: modality
+  };
+
+  const plan = {
+    conversationId, messageId, inputModality: modality,
+    userMessage, assistantMessage,
+    model: `${extractionProvider}/${extractionModel}`,
+    proposed: { facts: [], events: [] },
+    splits: [],      // {from, into[]}
+    routedToLog: [], // {text, why, marker}
+    refusals: [],    // {text, rule, detail}
+    repeats: [],     // {text, existingId, existingContent, similarity, detectedBy, reasoning}
+    facts: [],       // {text, corrects, salience, salienceRationale}
+    recall: [],      // {fact, diagnostics, judged[]}
+    supersessions: [],
+    uncertainties: [],
+    gapQuestion: null,
+    truncated: { facts: 0, events: 0 },
+    error: null
+  };
+
+  // ---- 1. Ask the model for atomic facts and time-bound events. ----
+  const extracted = await extractCandidates(
+    userMessage, assistantMessage, extractionProvider, extractionModel,
+    extractionApiKey(extractionProvider), extractionHost
+  );
+  plan.proposed.facts = extracted.facts.map(f => ({ text: f.text, corrects: f.corrects }));
+  plan.proposed.events = extracted.events.map(e => e.text);
+
+  // ---- 2. Deterministic floor under the model's routing. ----
+  // Atomicity first, THEN routing: a compound may hold a durable state and a
+  // passing event in one sentence, and routing before splitting would throw the
+  // state away with the event (or keep the event with the state).
+  let candidates = [];
+  for (const f of extracted.facts) {
+    const compound = rules.looksCompound(f.text);
+    if (!compound.compound) { candidates.push(f); continue; }
+    const parts = await splitCompoundFact(f.text);
+    if (parts.length <= 1) { candidates.push(f); continue; }
+    plan.splits.push({ from: f.text, into: parts, why: compound.why });
+    for (const part of parts) candidates.push({ text: part, corrects: f.corrects });
+  }
+
+  const eventTexts = [...plan.proposed.events];
+  const survivors = [];
+  for (const c of candidates) {
+    // EVENT MARKERS — decisive regardless of which bucket the model chose.
+    const marker = rules.eventMarker(c.text);
+    if (marker.isEvent) {
+      plan.routedToLog.push({
+        text: c.text,
+        why: `carries a ${marker.kind} time marker ("${marker.marker}") — strip it and nothing durable remains`,
+        marker: marker.marker
+      });
+      eventTexts.push(c.text);
+      continue;
+    }
+
+    // SUBJECT ATTRIBUTION — a user fact must name the user. An unanchored
+    // sentence is how a self-observation slips into the user's corpus wearing no
+    // pronoun at all (the 2026-07-27 misattribution, by a different route).
+    const grammatical = rules.grammaticalSubject(c.text);
+    if (grammatical !== 'user') {
+      plan.refusals.push({
+        text: c.text, rule: 'subject-attribution',
+        detail: grammatical === 'self'
+          ? 'written in the first person — an observation about the assistant, not about the user'
+          : 'does not name the user, so it cannot be filed as a fact about her'
+      });
+      continue;
+    }
+
+    // IDENTITY ANCHOR — F1. A name, pronoun or core-relationship fact from a
+    // message that was not provably typed needs an explicit self-introduction in
+    // what was actually said.
+    const refusal = rules.identityAnchorRefusal(c.text, userMessage, modality, gatedModalities);
+    if (refusal) {
+      plan.refusals.push({ text: c.text, rule: refusal.rule, detail: refusal.detail, klass: refusal.klass });
+      continue;
+    }
+
+    survivors.push(c);
+  }
+
+  if (survivors.length > maxFacts) {
+    plan.truncated.facts = survivors.length - maxFacts;
+    survivors.length = maxFacts;
+  }
+  if (eventTexts.length > maxEvents) {
+    plan.truncated.events = eventTexts.length - maxEvents;
+    eventTexts.length = maxEvents;
+  }
+  plan.events = eventTexts.map(t => ({ text: t }));
+
+  if (survivors.length === 0) return plan;
+
+  // ---- 3. REPEAT detection, before anything is written. ----
+  // Exact match first (free), then semantic near-match (vector + judge). A
+  // confirmed repeat never becomes a second row: it raises the held fact's
+  // salience and records a corroboration against its provenance.
+  const fresh = [];
+  for (const c of survivors) {
+    const exact = factStore.findExactDuplicate(c.text, 'user');
+    if (exact) {
+      plan.repeats.push({
+        text: c.text, existingId: exact.id, existingContent: exact.content,
+        existingSalience: exact.salience ?? 5, similarity: 1, detectedBy: 'exact',
+        reasoning: 'byte-identical to a fact already held'
+      });
+      continue;
+    }
+
+    const { candidates: near } = await memoryClusters.findActiveNeighbours(c.text, {
+      subject: 'user', threshold: repeatFloor, limit: repeatMax
+    });
+    let matched = null;
+    for (const n of near) {
+      const { same, reasoning } = await judgeSameAssertion(c.text, n.content);
+      if (same) { matched = { n, reasoning }; break; }
+    }
+    if (matched) {
+      plan.repeats.push({
+        text: c.text, existingId: matched.n.memberId, existingContent: matched.n.content,
+        existingSalience: matched.n.salience ?? 5, similarity: matched.n.similarity,
+        detectedBy: 'semantic', reasoning: matched.reasoning
+      });
+      continue;
+    }
+    fresh.push(c);
+  }
+
+  // A repeat still gets scored. "She has said this before" can mean it matters
+  // more than the first scoring judged, which is the whole reason a repeat raises
+  // salience rather than being discarded outright — and the score is the existing
+  // absorbDuplicate semantics (take the higher of the two), not a new policy.
+  if (plan.repeats.length > 0) {
+    const repeatScores = await agentPool.runBatch(
+      plan.repeats.map(rep => async () => {
+        const { salience } = await scoreSalience(rep.text, rep.existingContent);
+        return { text: rep.text, salience };
+      }),
+      'salience'
+    );
+    const byText = new Map();
+    for (const s of repeatScores) if (s.status === 'fulfilled' && s.value) byText.set(s.value.text, s.value.salience);
+    for (const rep of plan.repeats) rep.plannedSalience = byText.get(rep.text) ?? rep.existingSalience;
+  }
+
+  if (fresh.length === 0) return plan;
+
+  const factTexts = fresh.map(f => f.text);
+  const correctsByFact = new Map(fresh.filter(f => f.corrects).map(f => [f.text, f.corrects]));
+  const nearby = await buildNearbyContext(factTexts);
+  plan.nearbyClusterIds = nearby.clusterIds;
+
+  // ---- 4. Contradiction check, with the recall record. ----
+  // Candidate lookup is a cheap read, so gather every pair first, then judge them
+  // all concurrently through the agent pool. Verdicts are applied in gather order
+  // so the outcome is deterministic.
+  const seenOld = new Set();
   try {
-    // Always use the configured extraction model, independent of chat model
-    const config = getConfig();
-    const extractionProvider = config.models.extraction.provider;
-    const extractionModel = config.models.extraction.model;
-    const extInst = getProviderInstance(extractionProvider, config.models.extraction.instance);
-    const extractionHost = extInst ? extInst.host : ollamaHost;
-    console.log(`[FactExtractor] Using extraction model: ${extractionProvider}/${extractionModel}`);
+    const pairs = [];
+    for (const fact of factTexts) {
+      const isCorrection = correctsByFact.has(fact);
+      // A fact asserting an identity slot pins every other active fact asserting
+      // the same slot into the candidate set, past the floor and past the
+      // ceiling. Two active name facts is precisely the F1 defect, and it is not
+      // something a similarity ranking can be relied on to surface.
+      const slot = rules.identityClassOf(fact);
+      const { candidates: cands, diagnostics } = await memoryClusters.findActiveNeighbours(fact, {
+        subject: 'user',
+        pinSlot: slot ? slot.klass : null,
+        threshold: isCorrection
+          ? (Number.isFinite(conCfg.correctionSimilarityFloor) ? conCfg.correctionSimilarityFloor : 0.45)
+          : undefined,
+        limit: isCorrection
+          ? (Number.isInteger(conCfg.correctionMaxCandidates) ? conCfg.correctionMaxCandidates : 20)
+          : undefined
+      });
+      // THE RECORD. "The judge ran and said no" and "the judge never saw it" are
+      // different failures with different fixes, and until now the logs could not
+      // tell them apart. Everything the check considered is captured here and
+      // written to the ops ledger by applyExtraction.
+      plan.recall.push({
+        fact, isCorrection, diagnostics, pinnedSlot: slot ? slot.klass : null,
+        considered: cands.map(c => ({ memberId: c.memberId, content: c.content, similarity: c.similarity, pinned: c.pinned || null })),
+        judged: []
+      });
+      for (const candidate of cands) pairs.push({ fact, candidate });
+    }
 
-    // Extract facts using the configured extraction model. Each comes back as
-    // {text, corrects} — corrects carries the extractor's note when the user
-    // was correcting the record ("It was Bernice not Bernie"), so supersession
-    // can act on the corrective intent instead of just the flattened fact text.
-    const extracted = await extractFacts(userMessage, assistantMessage, extractionProvider, extractionModel, apiKey, extractionHost);
-    const facts = extracted.map(e => e.text);
-    const correctsByFact = new Map(extracted.filter(e => e.corrects).map(e => [e.text, e.corrects]));
+    if (pairs.length > 0) {
+      const judged = await agentPool.runBatch(
+        pairs.map(({ fact, candidate }) => async () => {
+          const { verdict, reasoning } = await judgeContradiction(fact, candidate.content, {
+            userMessage, corrects: correctsByFact.get(fact) || null
+          });
+          return { verdict, reasoning };
+        }),
+        'contradiction-judge'
+      );
 
-    const memoryFile = path.join(memoryDir, 'MEMORY.md');
-    const dailyDir = path.join(memoryDir, 'daily');
-    const opsDir = path.join(memoryDir, 'ops');
-    const memoryClusters = require('./memory-clusters');
-    const questions = require('./questions');
-
-    // === Answer detection ===
-    // Retire any question this message answers — asked in this conversation, or
-    // any outstanding one across conversations whose topic matches (Layer 3).
-    await detectAnswers(userMessage, conversationId, dailyDir);
-
-    // At most ONE question per chat session, shared by contradiction-uncertainty
-    // (higher priority) and gap detection.
-    let questionQueued = false;
-
-    // Append to memory if facts found
-    if (facts.length > 0) {
-      // Surrounding cluster context — informs salience scoring and gap detection.
-      const nearby = await buildNearbyContext(facts);
-
-      // === Contradiction detection (3-way: yes / no / uncertain) ===
-      // Gather every (newFact, oldFact) candidate pair first — candidate lookup
-      // is a cheap read — then judge them all concurrently through the agent
-      // pool (vLLM batches them). Verdicts are applied afterward in gather
-      // order so the outcome is deterministic and identical to a sequential pass:
-      // the one-question-per-session slot still goes to the first uncertain pair,
-      // and an old member already claimed by a 'yes' is never superseded twice.
-      const supersessions = []; // {oldMemberId, oldContent, oldSalience, newFact}
-      const seenOld = new Set();
-      try {
-        const contradictionPairs = [];
-        for (const fact of facts) {
-          // A fact flagged as a correction casts a wider candidate net — the
-          // outdated belief it replaces may word things quite differently
-          // (misspelled name, old title), landing below the default threshold.
-          const candidates = await memoryClusters.findContradictionCandidates(
-            fact,
-            correctsByFact.has(fact) ? { threshold: 0.35, limit: 8 } : {}
-          );
-          for (const candidate of candidates) {
-            contradictionPairs.push({ fact, candidate });
-          }
-        }
-
-        if (contradictionPairs.length > 0) {
-          const judged = await agentPool.runBatch(
-            contradictionPairs.map(({ fact, candidate }) => async () => {
-              const { verdict } = await judgeContradiction(fact, candidate.content, {
-                userMessage,
-                corrects: correctsByFact.get(fact) || null
-              });
-              return verdict;
-            }),
-            'contradiction-judge'
-          );
-
-          for (let i = 0; i < contradictionPairs.length; i++) {
-            const { fact, candidate } = contradictionPairs[i];
-            if (seenOld.has(candidate.memberId)) continue;
-            const verdict = judged[i].status === 'fulfilled' ? judged[i].value : 'no';
-            if (verdict === 'yes') {
-              seenOld.add(candidate.memberId);
-              supersessions.push({
-                oldMemberId: candidate.memberId,
-                oldContent: candidate.content,
-                oldSalience: candidate.salience ?? 5,
-                newFact: fact
-              });
-            } else if (verdict === 'uncertain' && !questionQueued) {
-              // Ambiguous conflict — ask the user rather than guess; both facts stay active.
-              const q = `I have two things noted that might not line up: "${candidate.content}" and now "${fact}". Which is correct?`;
-              if (await questions.addQuestion({
-                question: q,
-                reason: 'contradiction-uncertainty',
-                clusterId: candidate.clusterId,
-                memberId: candidate.memberId,
-                conversationId
-              })) {
-                questionQueued = true;
-                appendToDailyLog(`Queued clarifying question (contradiction-uncertainty): "${q}"`, dailyDir);
-              }
-            }
-          }
-        }
-      } catch (contradictionError) {
-        console.error('[FactExtractor] Contradiction detection error:', contradictionError.message);
-      }
-
-      // === Salience scoring + gap detection (concurrent) ===
-      // Score each new fact's salience concurrently, and run gap-question
-      // detection alongside them as one more pool task rather than after — all
-      // are independent, read-only LLM judgments over the same context. The DB
-      // writes they inform stay sequential below, so there are no write races.
-      const factToSalience = new Map();
-      const runGap = !questionQueued; // skip if contradiction already claimed the one-question slot
-      const [salienceSettled, gapCandidate] = await Promise.all([
-        agentPool.runBatch(
-          facts.map(fact => async () => {
-            const { salience, reasoning } = await scoreSalience(fact, nearby.text);
-            return { fact, salience, reasoning };
-          }),
-          'salience'
-        ),
-        runGap
-          ? agentPool.schedule(() => detectGapQuestion(facts, nearby.text), 'gap').catch(err => {
-              console.error('[FactExtractor] Gap detection error:', err.message);
-              return null;
-            })
-          : Promise.resolve(null)
-      ]);
-
-      // Apply salience results in fact order for a stable daily-log trail.
-      const salienceByFact = new Map();
-      for (const s of salienceSettled) {
-        if (s.status === 'fulfilled' && s.value) salienceByFact.set(s.value.fact, s.value);
-      }
-      for (const fact of facts) {
-        const scored = salienceByFact.get(fact);
-        const salience = scored ? scored.salience : 5;
-        factToSalience.set(fact, salience);
-        appendToDailyLog(`Scored fact salience ${salience}/10: "${fact}" — ${scored ? scored.reasoning : 'default (scoring failed)'}`, dailyDir);
-      }
-
-      // A superseding fact inherits at least the salience of the fact it replaces.
-      for (const s of supersessions) {
-        const cur = factToSalience.get(s.newFact) ?? 5;
-        if (s.oldSalience > cur) {
-          factToSalience.set(s.newFact, s.oldSalience);
-          console.log(`[FactExtractor] "${s.newFact}" inherits salience ${s.oldSalience} from superseded fact`);
-        }
-      }
-
-      await appendToMemory(facts, memoryFile);
-
-      // === Assign facts to clusters (carrying salience) ===
-      const factToMemberId = new Map();
-      const factToClusterId = new Map();
-      try {
-        for (const fact of facts) {
-          const res = await memoryClusters.assignToCluster(
-            fact, extractionProvider, extractionModel, apiKey, extractionHost,
-            'fact-extraction', factToSalience.get(fact) ?? 5
-          );
-          if (res && res.memberId) factToMemberId.set(fact, res.memberId);
-          if (res && res.clusterId) factToClusterId.set(fact, res.clusterId);
-        }
-        console.log(`[FactExtractor] Assigned ${facts.length} facts to clusters`);
-      } catch (clusterError) {
-        console.error('[FactExtractor] Cluster assignment error:', clusterError.message);
-      }
-
-      // === Apply supersessions (after the replacing facts exist) ===
-      for (const s of supersessions) {
-        const newMemberId = factToMemberId.get(s.newFact);
-        if (!newMemberId) continue; // replacing fact wasn't stored — skip
-        // Single write path: SQLite + MEMORY.md + LanceDB. This used to update
-        // only the first two, leaving the superseded fact's embedding live and
-        // still retrievable by similarity.
-        const factStore = require('./fact-store');
-        const res = await factStore.supersede(s.oldMemberId, newMemberId, { memoryFile });
-        if (res.ok) {
-          const how = correctsByFact.has(s.newFact) ? 'explicit user correction' : 'user correction';
-          appendToDailyLog(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" (${how})`, dailyDir);
-          console.log(`[FactExtractor] Supersession: "${s.oldContent}" → "${s.newFact}"`);
-        }
-      }
-
-      // === Gap question queuing ===
-      // The gap-detection LLM call already ran concurrently with salience scoring
-      // above; here we only queue its result, anchored to the cluster the new
-      // facts landed in so it surfaces when the user next chats about that topic.
-      // Respect the one-question-per-session slot (contradiction takes priority).
-      if (!questionQueued && gapCandidate && gapCandidate.question) {
-        // Layer 2: don't queue a gap the memory can already answer.
-        const already = await gapAlreadyAnswered(gapCandidate.question);
-        if (already) {
-          appendToDailyLog(`Skipped gap question (already answered by memory): "${gapCandidate.question}" ← "${already.evidence}"`, dailyDir);
-          console.log(`[FactExtractor] Gap already answered by fact "${already.evidence}" — not queuing: "${gapCandidate.question}"`);
-        } else {
-          const anchorClusterId = factToClusterId.get(facts[0]) || nearby.clusterIds[0] || null;
-          const anchorMemberId = factToMemberId.get(facts[0]) || null;
-          // addQuestion also does semantic dedup vs all existing questions (Layer 1).
-          if (await questions.addQuestion({
-            question: gapCandidate.question,
-            reason: 'gap',
-            clusterId: anchorClusterId,
-            memberId: anchorMemberId,
-            conversationId
-          })) {
-            questionQueued = true;
-            appendToDailyLog(`Queued clarifying question (gap): "${gapCandidate.question}"`, dailyDir);
-          }
+      for (let i = 0; i < pairs.length; i++) {
+        const { fact, candidate } = pairs[i];
+        const settled = judged[i].status === 'fulfilled' ? judged[i].value : { verdict: 'no', reasoning: 'judge failed' };
+        const rec = plan.recall.find(r => r.fact === fact);
+        if (rec) rec.judged.push({ memberId: candidate.memberId, content: candidate.content, similarity: candidate.similarity, pinned: candidate.pinned || null, verdict: settled.verdict, reasoning: settled.reasoning });
+        if (seenOld.has(candidate.memberId)) continue;
+        if (settled.verdict === 'yes') {
+          seenOld.add(candidate.memberId);
+          plan.supersessions.push({
+            oldMemberId: candidate.memberId, oldContent: candidate.content,
+            oldSalience: candidate.salience ?? 5, newFact: fact,
+            explicitCorrection: correctsByFact.has(fact)
+          });
+        } else if (settled.verdict === 'uncertain') {
+          plan.uncertainties.push({
+            newFact: fact, oldContent: candidate.content,
+            clusterId: candidate.clusterId, memberId: candidate.memberId
+          });
         }
       }
     }
+  } catch (contradictionError) {
+    console.error('[FactExtractor] Contradiction detection error:', contradictionError.message);
+    plan.error = contradictionError.message;
+  }
 
-    // Per-exchange telemetry marker → ops log (operational, not cognitive).
-    // The facts themselves land in the daily log via the salience entries above.
-    const summary = `Chat exchange with ${extractionProvider}/${extractionModel} - ${facts.length} facts extracted`;
-    appendToOpsLog(summary, opsDir);
+  // ---- 5. Salience + gap detection (concurrent, both read-only). ----
+  const runGap = plan.uncertainties.length === 0;
+  const [salienceSettled, gapCandidate] = await Promise.all([
+    agentPool.runBatch(
+      factTexts.map(fact => async () => {
+        const { salience, reasoning } = await scoreSalience(fact, nearby.text);
+        return { fact, salience, reasoning };
+      }),
+      'salience'
+    ),
+    runGap
+      ? agentPool.schedule(() => detectGapQuestion(factTexts, nearby.text), 'gap').catch(err => {
+          console.error('[FactExtractor] Gap detection error:', err.message);
+          return null;
+        })
+      : Promise.resolve(null)
+  ]);
 
+  const salienceByFact = new Map();
+  for (const s of salienceSettled) {
+    if (s.status === 'fulfilled' && s.value) salienceByFact.set(s.value.fact, s.value);
+  }
+  for (const f of fresh) {
+    const scored = salienceByFact.get(f.text);
+    plan.facts.push({
+      text: f.text,
+      corrects: f.corrects || null,
+      salience: scored ? scored.salience : 5,
+      // Stored, not just logged — the scorer's reasoning used to go to the daily
+      // log as prose and then be thrown away, so nothing could later answer
+      // "why is this a 10?".
+      salienceRationale: scored ? scored.reasoning : 'default (scoring failed)',
+      provenance
+    });
+  }
+
+  // A superseding fact inherits at least the salience of the fact it replaces.
+  for (const s of plan.supersessions) {
+    const target = plan.facts.find(f => f.text === s.newFact);
+    if (target && s.oldSalience > target.salience) {
+      target.salience = s.oldSalience;
+      target.salienceRationale = `${target.salienceRationale} (raised to ${s.oldSalience}, inherited from the fact it replaces)`;
+    }
+  }
+
+  plan.gapQuestion = gapCandidate && gapCandidate.question ? gapCandidate.question : null;
+  return plan;
+}
+
+/**
+ * Render a plan as human-readable lines. Used by the dry-run harness for its
+ * report and by applyExtraction for the ops-ledger recall record, so what the
+ * rehearsal shows and what the live run records are the same text.
+ * @returns {string[]}
+ */
+function describeRecall(plan) {
+  const out = [];
+  for (const r of plan.recall) {
+    const floor = r.diagnostics.threshold;
+    if (r.diagnostics.error) {
+      out.push(`contradiction check for "${r.fact}": COULD NOT RUN — ${r.diagnostics.error}`);
+      continue;
+    }
+    if (r.considered.length === 0) {
+      const near = r.diagnostics.nearestBelowFloor;
+      out.push(
+        `contradiction check for "${r.fact}": the judge saw nothing — no active user-fact reached the ${floor} floor ` +
+        `(${r.diagnostics.vectorHits} neighbours fetched; ${r.diagnostics.rejectedInactive} inactive and ` +
+        `${r.diagnostics.rejectedSubject} wrong-subject discarded before ranking` +
+        (near ? `; nearest was ${near.similarity.toFixed(4)} "${String(near.content).slice(0, 80)}"` : '') + ')'
+      );
+      continue;
+    }
+    const verdicts = r.judged.map(j =>
+      `${j.verdict.toUpperCase()} @${j.similarity.toFixed(4)}${j.pinned ? ` [pinned ${j.pinned}]` : ''} "${String(j.content).slice(0, 60)}"`
+    ).join('; ');
+    out.push(
+      `contradiction check for "${r.fact}": ${r.considered.length} candidate(s) put to the judge (floor ${floor}` +
+      (r.diagnostics.pinned ? `, ${r.diagnostics.pinned} pinned as ${r.pinnedSlot} facts past the floor` : '') + ')' +
+      (r.diagnostics.truncated ? ` — ${r.diagnostics.truncated} more above the floor NOT judged (cost ceiling)` : '') +
+      ` → ${verdicts}`
+    );
+  }
+  return out;
+}
+
+/**
+ * Perform the writes a plan describes. Every fact mutation goes through the
+ * fact-store funnel; nothing here touches cluster_members directly.
+ *
+ * @param {Object} plan - from planExtraction
+ * @param {Object} [opts]
+ * @param {string} [opts.memoryDir]
+ * @returns {Promise<{stored: number, repeats: number, events: number, superseded: number}>}
+ */
+async function applyExtraction(plan, opts = {}) {
+  const memoryDir = opts.memoryDir || MEMORY_DIR;
+  const dailyDir = path.join(memoryDir, 'daily');
+  const opsDir = path.join(memoryDir, 'ops');
+  const memoryClusters = require('./memory-clusters');
+  const factStore = require('./fact-store');
+  const questions = require('./questions');
+  const config = getConfig();
+
+  const result = { stored: 0, repeats: 0, events: 0, superseded: 0, refusals: plan.refusals.length };
+  const extractionProvider = config.models.extraction.provider;
+  const extractionModel = config.models.extraction.model;
+  const extInst = getProviderInstance(extractionProvider, config.models.extraction.instance);
+  const extractionHost = extInst ? extInst.host : 'http://localhost:11434';
+
+  // Provenance on every log entry, same as on every fact.
+  const src = plan.conversationId
+    ? ` [conversation ${String(plan.conversationId).slice(0, 8)}${plan.messageId ? `, message ${String(plan.messageId).slice(0, 8)}` : ''}, ${plan.inputModality}]`
+    : '';
+
+  // ---- events → the day's log, never the fact store ----
+  for (const e of plan.events) {
+    appendToDailyLog(`${e.text}${src}`, dailyDir);
+    result.events++;
+  }
+  for (const r of plan.routedToLog) {
+    appendToOpsLog(`Routed to the day's log rather than stored as a fact — ${r.why}: "${r.text}"`, opsDir);
+  }
+
+  // ---- refusals: spoken to the record, never silent ----
+  for (const ref of plan.refusals) {
+    const line = `Did not record "${ref.text}" — ${ref.detail}.`;
+    appendToDailyLog(`${line}${src}`, dailyDir);
+    appendToOpsLog(`Intake refusal (${ref.rule}): ${line}`, opsDir);
+  }
+
+  // ---- repeats: fold into the fact already held ----
+  for (const rep of plan.repeats) {
+    const existing = { id: rep.existingId, content: rep.existingContent, salience: rep.existingSalience };
+    const absorbed = factStore.absorbRepeat(existing, rep.plannedSalience ?? rep.existingSalience, {
+      conversationId: plan.conversationId,
+      messageId: plan.messageId,
+      verbatimSourceText: plan.userMessage,
+      inputModality: plan.inputModality,
+      restatedAs: rep.text,
+      similarity: rep.similarity,
+      detectedBy: rep.detectedBy
+    });
+    result.repeats++;
+    appendToDailyLog(
+      `Already knew this, so I did not write it down twice — "${rep.text}" restates "${rep.existingContent}"` +
+      `${absorbed.raised ? ` (its salience rose to ${absorbed.salience})` : ''}.${src}`,
+      dailyDir
+    );
+  }
+
+  // ---- facts: the only write path ----
+  const factToMemberId = new Map();
+  const factToClusterId = new Map();
+  for (const f of plan.facts) {
+    appendToDailyLog(`Scored fact salience ${f.salience}/10: "${f.text}" — ${f.salienceRationale}`, dailyDir);
+    try {
+      const res = await memoryClusters.assignToCluster(
+        f.text, extractionProvider, extractionModel, extractionApiKey(extractionProvider), extractionHost,
+        'fact-extraction', f.salience, 'user', null,
+        { ...f.provenance, salienceRationale: f.salienceRationale }
+      );
+      if (res && res.memberId) {
+        factToMemberId.set(f.text, res.memberId);
+        result.stored++;
+      }
+      if (res && res.clusterId) factToClusterId.set(f.text, res.clusterId);
+    } catch (clusterError) {
+      console.error('[FactExtractor] Cluster assignment error:', clusterError.message);
+    }
+  }
+
+  // ---- supersessions, after the replacing facts exist ----
+  for (const s of plan.supersessions) {
+    const newMemberId = factToMemberId.get(s.newFact);
+    if (!newMemberId) continue;
+    const res = await factStore.supersede(s.oldMemberId, newMemberId);
+    if (res.ok) {
+      result.superseded++;
+      appendToDailyLog(
+        `Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" ` +
+        `(${s.explicitCorrection ? 'explicit user correction' : 'user correction'}).${src}`,
+        dailyDir
+      );
+    } else if (res.locked) {
+      // A refused lock must be spoken. Storage guards run after the reply, so
+      // this half lands in the record; the live-chat half is the [LOCKED] marker
+      // in the injected identity block.
+      appendToDailyLog(`I did not change a locked fact: ${res.reason}`, dailyDir);
+    }
+  }
+
+  // ---- the recall record ----
+  for (const line of describeRecall(plan)) appendToOpsLog(line, opsDir);
+  if (plan.truncated.facts || plan.truncated.events) {
+    appendToOpsLog(
+      `Per-exchange intake ceiling reached — ${plan.truncated.facts} fact(s) and ${plan.truncated.events} event(s) dropped from this exchange.`,
+      opsDir
+    );
+  }
+
+  // ---- one question per exchange: contradiction-uncertainty outranks a gap ----
+  let questionQueued = false;
+  for (const u of plan.uncertainties) {
+    if (questionQueued) break;
+    const q = `I have two things noted that might not line up: "${u.oldContent}" and now "${u.newFact}". Which is correct?`;
+    if (await questions.addQuestion({
+      question: q, reason: 'contradiction-uncertainty',
+      clusterId: u.clusterId, memberId: u.memberId, conversationId: plan.conversationId
+    })) {
+      questionQueued = true;
+      appendToDailyLog(`Queued clarifying question (contradiction-uncertainty): "${q}"`, dailyDir);
+    }
+  }
+
+  if (!questionQueued && plan.gapQuestion) {
+    const already = await gapAlreadyAnswered(plan.gapQuestion);
+    if (already) {
+      appendToDailyLog(`Skipped gap question (already answered by memory): "${plan.gapQuestion}" ← "${already.evidence}"`, dailyDir);
+    } else {
+      const firstFact = plan.facts[0];
+      const anchorClusterId = (firstFact && factToClusterId.get(firstFact.text)) || (plan.nearbyClusterIds || [])[0] || null;
+      const anchorMemberId = (firstFact && factToMemberId.get(firstFact.text)) || null;
+      if (await questions.addQuestion({
+        question: plan.gapQuestion, reason: 'gap',
+        clusterId: anchorClusterId, memberId: anchorMemberId, conversationId: plan.conversationId
+      })) {
+        appendToDailyLog(`Queued clarifying question (gap): "${plan.gapQuestion}"`, dailyDir);
+      }
+    }
+  }
+
+  appendToOpsLog(
+    `Chat exchange with ${plan.model} — ${result.stored} fact(s) stored, ${result.repeats} repeat(s) folded, ` +
+    `${result.events} event(s) logged, ${result.refusals} refused, ${result.superseded} superseded`,
+    opsDir
+  );
+  return result;
+}
+
+/**
+ * Process fact extraction for a chat exchange (high-level orchestrator).
+ * Plan, then apply — see the block comment above planExtraction.
+ *
+ * @param {string} userMessage - The user's message
+ * @param {string} assistantMessage - The assistant's response
+ * @param {string} provider - LLM provider (unused: the configured extraction
+ *   model is always used, independent of the chat model)
+ * @param {string} model - Model name (same)
+ * @param {string} apiKey - API key (same)
+ * @param {string} ollamaHost - Host (same)
+ * @param {string} conversationId - Conversation this exchange belongs to
+ * @param {string} memoryDir - Memory directory path
+ * @param {Object} provenance - {messageId, inputModality}
+ */
+async function processFactExtraction(userMessage, assistantMessage, provider, model, apiKey, ollamaHost, conversationId = null, memoryDir = MEMORY_DIR, provenance = {}) {
+  try {
+    const dailyDir = path.join(memoryDir, 'daily');
+
+    // Answer detection first — retire any question this message answers, whether
+    // it was asked in this conversation or any other (Layer 3).
+    await detectAnswers(userMessage, conversationId, dailyDir);
+
+    const plan = await planExtraction({
+      userMessage,
+      assistantMessage,
+      conversationId,
+      messageId: provenance.messageId ?? null,
+      inputModality: provenance.inputModality ?? 'unknown'
+    });
+
+    await applyExtraction(plan, { memoryDir });
     console.log('[FactExtractor] Fact extraction complete');
-
   } catch (error) {
     console.error('[FactExtractor] Error in processFactExtraction:', error.message);
   }
@@ -1533,6 +1991,51 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     }
     if (facts.length === 0) return result;
 
+    // === Per-day budget on what reflection may conclude about itself ===
+    // Checked FIRST — before the embedding sweep, the identity-lock pass, salience
+    // scoring and claim-type tagging — so a refusal costs nothing. Checking it
+    // later meant embedding every active self-fact just to discover there was no
+    // allowance left to write into.
+    //
+    // Only the automatic loop is budgeted. Deliberate writes (capability
+    // introductions, the lock test) are human-triggered and pass through.
+    // Counted from the DB against the local calendar day, so a server restart
+    // does not hand reflection a fresh allowance.
+    if (source === 'reflection') {
+      try {
+        const sqlite = require('./database').getSqliteDb();
+        const cap = getConfig().reflection?.maxSelfFactsPerDay ?? 5;
+        if (sqlite && Number.isFinite(cap)) {
+          const dayStart = new Date(`${getLocalDateStamp()}T00:00:00`).toISOString();
+          const usedToday = sqlite.prepare(
+            "SELECT COUNT(*) AS n FROM cluster_members WHERE subject = 'self' AND source = 'reflection' AND created_at >= ?"
+          ).get(dayStart).n;
+          const remaining = Math.max(0, cap - usedToday);
+
+          if (facts.length > remaining) {
+            const kept = facts.slice(0, remaining);
+            const blocked = facts.slice(remaining);
+            // Loud by construction: a silently dropped observation is
+            // indistinguishable from one that was never had.
+            for (const b of blocked) {
+              console.log(`[SelfFacts] Budget reached (${usedToday}/${cap} today) — not recording: "${b.slice(0, 80)}"`);
+              appendToDailyLog(
+                `Reached my daily limit of ${cap} self-observations (${usedToday} already recorded today), so I did not record this one: "${b}"`,
+                dailyDir
+              );
+            }
+            result.budgetBlocked = blocked.length;
+            result.budget = { cap, usedToday, remaining };
+            facts.length = 0;
+            facts.push(...kept);
+          }
+        }
+      } catch (budgetErr) {
+        console.error('[SelfFacts] Budget check failed (continuing):', budgetErr.message);
+      }
+    }
+    if (facts.length === 0) return result;
+
     // === Semantic dedup: skip a self-observation near-identical to one SNH
     // already holds (or to another accepted in this same batch). Defends the
     // identity against reworded-identical restamps (e.g. from a reflection
@@ -1569,6 +2072,41 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       facts.push(...deduped);
     } catch (dedupErr) {
       console.error('[SelfFacts] Semantic dedup skipped (continuing):', dedupErr.message);
+    }
+    if (facts.length === 0) return result;
+
+    // === Identity lock: drop anything that collides with a locked slot ===
+    // Reflection and passive extraction are the two paths that can rewrite the
+    // entity's self-view without anyone asking, which is exactly what they are
+    // for — and exactly what must not reach a chosen name. A collision here is
+    // dropped BEFORE contradiction detection, so the judge is never given the
+    // chance to call it a replacement.
+    //
+    // Refusals from this path can't be spoken in the turn (it runs after the
+    // reply), so they go to the ops ledger and the daily log instead. Silence
+    // is not an option in either direction.
+    try {
+      const identityLock = require('./identity-lock');
+      const kept = [];
+      for (const fact of facts) {
+        const check = identityLock.checkNewFact(fact, 'self');
+        if (check.ok) { kept.push(fact); continue; }
+        if (check.duplicate) {
+          console.log(`[SelfFacts] Identity fact already held verbatim, skipping: "${fact.slice(0, 70)}"`);
+          continue;
+        }
+        identityLock.recordRefusal({
+          category: check.category,
+          attempted: fact,
+          existing: check.existing.content,
+          via: `self-fact pipeline (source: ${source})`
+        });
+        result.lockRefusals = (result.lockRefusals || 0) + 1;
+      }
+      facts.length = 0;
+      facts.push(...kept);
+    } catch (lockErr) {
+      console.error('[SelfFacts] Identity lock check failed:', lockErr.message);
     }
     if (facts.length === 0) return result;
 
@@ -1627,11 +2165,14 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     );
     const byFact = new Map();
     for (const s of salienceSettled) if (s.status === 'fulfilled' && s.value) byFact.set(s.value.fact, s.value);
+    const factToSelfSalienceReason = new Map();
     for (const fact of facts) {
       const scored = byFact.get(fact);
       const salience = scored ? scored.salience : 5;
+      const reasoning = scored ? scored.reasoning : 'default (scoring failed)';
       factToSalience.set(fact, salience);
-      appendToDailyLog(`Scored self-fact salience ${salience}/10: "${fact}" — ${scored ? scored.reasoning : 'default (scoring failed)'}`, dailyDir);
+      factToSelfSalienceReason.set(fact, reasoning);
+      appendToDailyLog(`Scored self-fact salience ${salience}/10: "${fact}" — ${reasoning}`, dailyDir);
     }
     for (const s of supersessions) {
       const cur = factToSalience.get(s.newFact) ?? 5;
@@ -1653,18 +2194,36 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     // === Cluster assignment (subject:'self', sequential DB writes) ===
     const factToMemberId = new Map();
     for (const fact of facts) {
+      // A self-fact has no user message behind it — it came from SNH reflecting.
+      // conversation_id/message_id stay null and modality is 'unknown' (there was
+      // no input), but the observation text and its salience reasoning are real
+      // provenance and are recorded.
       const res = await memoryClusters.assignToCluster(
         fact, extractionProvider, extractionModel, '', extractionHost,
-        source, factToSalience.get(fact) ?? 5, 'self', factToClaimType.get(fact) ?? 'declaration'
+        source, factToSalience.get(fact) ?? 5, 'self', factToClaimType.get(fact) ?? 'declaration',
+        {
+          verbatimSourceText: fact,
+          inputModality: 'unknown',
+          salienceRationale: factToSelfSalienceReason.get(fact) ?? null
+        }
       );
       if (res && res.memberId) {
         factToMemberId.set(fact, res.memberId);
         result.stored++;
+        // Set-once: if this is the first assertion of an identity slot, it locks
+        // itself here. Every later attempt is refused by the check above.
+        let lockedCats = [];
+        try { lockedCats = require('./identity-lock').autoLock(res.memberId, fact, 'self'); }
+        catch (e) { console.error('[SelfFacts] autoLock failed:', e.message); }
+        if (lockedCats.length) {
+          appendToDailyLog(`Locked my ${lockedCats.join(' and ')} — set once, and now protected from being changed in conversation: "${fact}"`, dailyDir);
+        }
         result.facts.push({
           content: fact,
           memberId: res.memberId,
           salience: factToSalience.get(fact) ?? 5,
-          clusterName: res.clusterName
+          clusterName: res.clusterName,
+          locked: lockedCats.length ? lockedCats : null
         });
       }
     }
@@ -1690,8 +2249,15 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
 
 module.exports = {
   extractFacts,
-  extractAllFactLines,
-  appendToMemory,
+  extractCandidates,
+  planExtraction,
+  applyExtraction,
+  describeRecall,
+  judgeSameAssertion,
+  judgeSubsumption,
+  judgeStripTheTimestamp,
+  judgeWhichSurvives,
+  splitCompoundFact,
   appendToDailyLog,
   appendToOpsLog,
   prependDailyEntry,
@@ -1703,7 +2269,6 @@ module.exports = {
   gapAlreadyAnswered,
   sweepPendingQuestions,
   detectAnswers,
-  removeFactLineFromMemory,
   loadMemoryContext,
   processFactExtraction,
   parseSelfObservations,

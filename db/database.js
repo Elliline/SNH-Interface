@@ -93,6 +93,22 @@ function initDatabase() {
       console.log('Migration: added sources to messages (search provenance)');
     }
 
+    // Migration: input_modality (2026-08-02) — how a message arrived.
+    // 'stt' (spoken, transcribed by whisper), 'typed' (keyboard), or 'unknown'.
+    //
+    // This is upstream of the memory system but the memory system is what needs
+    // it: a fact extracted from a transcription is weaker evidence than one Ellie
+    // typed, and without this column that distinction cannot be made at all. The
+    // 830 pre-existing messages are backfilled to 'unknown' rather than guessed —
+    // 'unknown' loses to 'typed' and cannot on its own justify a supersession.
+    if (!msgCols.some(c => c.name === 'input_modality')) {
+      sqliteDb.exec("ALTER TABLE messages ADD COLUMN input_modality TEXT");
+      const n = sqliteDb.prepare(
+        "UPDATE messages SET input_modality = 'unknown' WHERE input_modality IS NULL"
+      ).run().changes;
+      console.log(`Migration: added input_modality to messages (${n} historical messages set to 'unknown')`);
+    }
+
     // Create FTS5 virtual table for full-text search
     sqliteDb.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -259,6 +275,274 @@ function initDatabase() {
     if (!memberCols.some(c => c.name === 'claim_type')) {
       sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN claim_type TEXT');
       console.log('Migration: added claim_type to cluster_members (self-fact auditability tag)');
+    }
+
+    // Migration: identity lock — the flag that makes a fact untouchable by every
+    // AUTOMATIC path (contradiction judge, write_memory, passive extraction,
+    // reflection). Added 2026-07-28, the day after the entity chose its own name:
+    // a single sentence in chat ("your name is Bob") could route through the
+    // contradiction judge and supersede that choice, and nothing in the system
+    // treated a chosen thing differently from an observed one.
+    //
+    // The claim/declaration split already drew the right line — a DECLARATION is
+    // something the entity chose, a CLAIM is something observed about it, and the
+    // self-coherence audit only ever samples claims. This is that distinction
+    // given teeth for the narrow set of declarations that are identity-critical.
+    //
+    //  locked        - 1 = no automatic path may supersede, retire, or reword it
+    //  locked_at     - when the lock was set
+    //  lock_category - which identity slot it holds ('name' | 'pronouns'). A
+    //                  category with a locked fact also REFUSES new competing
+    //                  facts, so the lock can't be walked around by appending a
+    //                  second name instead of replacing the first.
+    if (!memberCols.some(c => c.name === 'locked')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN locked INTEGER DEFAULT 0');
+      sqliteDb.exec('UPDATE cluster_members SET locked = 0 WHERE locked IS NULL');
+      console.log('Migration: added locked to cluster_members (identity lock; existing rows unlocked)');
+    }
+    if (!memberCols.some(c => c.name === 'locked_at')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN locked_at DATETIME');
+      console.log('Migration: added locked_at to cluster_members');
+    }
+    if (!memberCols.some(c => c.name === 'lock_category')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN lock_category TEXT');
+      console.log('Migration: added lock_category to cluster_members (which identity slot a locked fact holds)');
+    }
+
+    // Migration: PROVENANCE (2026-08-02). Until now a fact carried no trace of
+    // where it came from — only a coarse `source` string like 'fact-extraction'.
+    // That made two things impossible: explaining a fact ("when did I tell you
+    // that?") and adjudicating a correction, because the evidence rules the
+    // corrector needs (typed beats stt, direct beats inferred) have nothing to
+    // read. The canonical case is "User's name is Mike", extracted at salience 10
+    // from an STT mishearing of "mic" — indistinguishable, without provenance,
+    // from a fact Ellie actually typed.
+    //
+    // All five are NULLABLE and stay null on the 658 pre-existing rows. Every
+    // NEW fact populates them; nothing backfills, because the information does
+    // not exist for old rows and a guessed provenance is worse than an absent one.
+    //
+    //  conversation_id       - which conversation the fact came from
+    //  message_id            - which message in it
+    //  verbatim_source_text  - what was actually said, unparaphrased
+    //  input_modality        - 'stt' | 'typed' | 'unknown' — how it arrived
+    //  salience_rationale    - why it scored the salience it did (was logged as
+    //                          prose to the daily log and then discarded)
+    for (const [col, type, note] of [
+      ['conversation_id', 'TEXT', 'which conversation a fact came from'],
+      ['message_id', 'TEXT', 'which message a fact came from'],
+      ['verbatim_source_text', 'TEXT', 'what was actually said'],
+      ['input_modality', 'TEXT', "how it arrived ('stt' | 'typed' | 'unknown')"],
+      ['salience_rationale', 'TEXT', 'why this fact scored the salience it did']
+    ]) {
+      if (!memberCols.some(c => c.name === col)) {
+        sqliteDb.exec(`ALTER TABLE cluster_members ADD COLUMN ${col} ${type}`);
+        console.log(`Migration: added ${col} to cluster_members (${note})`);
+      }
+    }
+
+    // Corroborations (2026-08-03, Phase 2a). When the user says a thing she has
+    // already said, the REPEAT rule folds it into the fact that already holds it
+    // rather than creating a second row — but "she has told me this three times"
+    // is itself evidence, and the corrector's evidence-dominance bar reads
+    // "corroborated > single mention". Bumping salience alone would record the
+    // conclusion and throw away the reason.
+    //
+    // One row per re-assertion, carrying the same provenance shape a fact does,
+    // so EXPLAIN can show every occasion a fact was stated, not just the first.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS fact_corroborations (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        conversation_id TEXT,
+        message_id TEXT,
+        verbatim_source_text TEXT,
+        input_modality TEXT,
+        restated_as TEXT,
+        similarity REAL,
+        detected_by TEXT,
+        FOREIGN KEY (member_id) REFERENCES cluster_members(id)
+      )
+    `);
+    sqliteDb.exec(
+      'CREATE INDEX IF NOT EXISTS idx_fact_corroborations_member ON fact_corroborations(member_id)'
+    );
+
+    // Corrections ledger (2026-08-03, Phase 2c). Every action the corrector
+    // takes, mechanical and semantic alike.
+    //
+    // The mechanical tier is specified as "autonomous and SILENT", and silent is
+    // about not interrupting anyone — it is not about leaving no trace. An
+    // unrecorded automatic edit to the substrate an identity is built from is
+    // indistinguishable from corruption after the fact, so everything lands here
+    // whether or not it is announced.
+    //
+    // `revert_of` / `reverted_at` make the semantic tier's reversibility a
+    // property of the record rather than a promise: the entry carries what it
+    // takes to undo it (which fact to restore, which successor to unset), and
+    // scripts/revert-correction.js reads exactly that.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS corrections_ledger (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        pass_id TEXT,                  -- groups one corrector pass
+        tier TEXT NOT NULL,            -- mechanical | semantic
+        action TEXT NOT NULL,          -- merge | expire | supersede | split | reconcile
+        subject TEXT,                  -- user | self
+        target_id TEXT,                -- the fact acted ON (the loser / the expired / the split original)
+        target_text TEXT,
+        survivor_id TEXT,              -- the fact that won, when there is one
+        survivor_text TEXT,
+        reason TEXT NOT NULL,          -- plain language: why this happened
+        evidence TEXT,                 -- JSON: the dominance signals that decided it
+        reversible INTEGER DEFAULT 1,
+        reverted_at DATETIME,
+        reverted_by TEXT,
+        announced INTEGER DEFAULT 0
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_corrections_pass ON corrections_ledger(pass_id)');
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_corrections_target ON corrections_ledger(target_id)');
+
+    // Pairs the corrector has already put to the contradiction judge.
+    //
+    // Without this the semantic tier is not actually resumable. It is budgeted
+    // per pass, and its enumeration is stable — so every pass re-judged the same
+    // first N pairs, spent the whole budget on them, and never advanced. The
+    // corpus has ~227 active user facts and roughly nine candidates each, which
+    // is around two thousand pairs; a pass that always starts from the beginning
+    // reaches the first three facts forever. Recording what has been checked is
+    // what turns "bounded" into "bounded and progressing".
+    //
+    // fact_updated_at is stored so a pair can be re-judged if either side later
+    // changes, rather than being written off permanently on one verdict.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS corrector_pair_checks (
+        pair_key TEXT PRIMARY KEY,
+        checked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        verdict TEXT,
+        a_id TEXT,
+        b_id TEXT,
+        fact_updated_at TEXT
+      )
+    `);
+
+    // Correction notices — the private channel to Aurelius (decision 6).
+    //
+    // Deliberately NOT rows in `initiatives`. Every property these need is a way
+    // of not participating in the initiative machinery — exempt from caps, from
+    // freshness scoring, from dedup, undroppable — and the audience is different:
+    // initiatives are surfaced to Ellie in the bell, these are for him and nobody
+    // else. Sharing the table would mean every Ellie-facing selector needed a
+    // filter, and the failure mode of missing one is a private notice about his
+    // own memory appearing in her notification panel.
+    //
+    // `seen_at` is set when the notice is actually injected into his context, so
+    // an unread one persists across restarts and sessions until he has had it.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS correction_notices (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ledger_id TEXT,
+        content TEXT NOT NULL,
+        seen_at DATETIME,
+        seen_conversation_id TEXT,
+        is_test INTEGER DEFAULT 0
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_correction_notices_seen ON correction_notices(seen_at)');
+
+    // Migration: LIFECYCLE (2026-08-02). Replaces the active/superseded/retired
+    // triple with status + inactive_reason + successor_id, so "why is this fact
+    // not live" is answerable from one column instead of inferred from which of
+    // three status strings it holds.
+    //
+    //  status          - 'active' | 'inactive'
+    //  inactive_reason - 'superseded' | 'expired' | 'retracted' (null when active)
+    //  successor_id    - the fact that replaced this one; REQUIRED when the
+    //                    reason is 'superseded', null otherwise
+    //
+    // superseded_by is kept and mirrored into successor_id rather than dropped:
+    // the Memory Map's supersede edges read it, and losing the pointer would lose
+    // provenance (decision 3 — supersession history is never discarded).
+    if (!memberCols.some(c => c.name === 'inactive_reason')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN inactive_reason TEXT');
+      console.log('Migration: added inactive_reason to cluster_members');
+    }
+    if (!memberCols.some(c => c.name === 'successor_id')) {
+      sqliteDb.exec('ALTER TABLE cluster_members ADD COLUMN successor_id TEXT');
+      console.log('Migration: added successor_id to cluster_members');
+    }
+    // One-time value migration, idempotent: any row still carrying an old status
+    // string is folded into the new two-column form.
+    const legacy = sqliteDb.prepare(
+      "SELECT COUNT(*) AS n FROM cluster_members WHERE status IN ('superseded','retired')"
+    ).get().n;
+    if (legacy > 0) {
+      const supersededN = sqliteDb.prepare(
+        "UPDATE cluster_members SET status='inactive', inactive_reason='superseded', successor_id=superseded_by WHERE status='superseded'"
+      ).run().changes;
+      const retiredN = sqliteDb.prepare(
+        "UPDATE cluster_members SET status='inactive', inactive_reason='retracted' WHERE status='retired'"
+      ).run().changes;
+      console.log(`Migration: lifecycle — ${supersededN} superseded → inactive/superseded, ${retiredN} retired → inactive/retracted`);
+    }
+
+    // Self-coherence audit records (2026-08-02). These used to be stored as
+    // cluster_members — multi-kilobyte narratives ("I claimed X, the evidence
+    // shows Y") with an inline dump of 30+ truncated message openings, sitting in
+    // the fact corpus at salience 3 with claim_type='dissonance'.
+    //
+    // They were excluded from identity injection, but they were still facts
+    // everywhere else: clustered, embedded, and handed to the contradiction judge
+    // as candidates — a 3KB blob costing a model call to compare against a
+    // one-line observation. They are audit output, not things the entity believes
+    // about itself, so they live in their own table now (decision 4). A later
+    // curation pass with Aurelius may distill one-line self-facts from them; the
+    // narratives themselves never return to the corpus.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS self_audit_records (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        source TEXT,
+        claim_text TEXT,
+        claim_date TEXT,
+        finding TEXT,
+        evidence TEXT,
+        content TEXT NOT NULL,
+        origin_member_id TEXT
+      )
+    `);
+    sqliteDb.exec(`
+      CREATE INDEX IF NOT EXISTS idx_self_audit_source ON self_audit_records(source)
+    `);
+
+    // One-time move of any dissonance rows still living in cluster_members.
+    // Idempotent: rows already moved are gone from cluster_members, so a re-run
+    // finds nothing. The cluster_members row is DELETED rather than marked
+    // inactive — it was never a fact, so leaving a ghost would misrepresent the
+    // history. The full narrative is preserved verbatim in the new table, and
+    // origin_member_id keeps the old id so vectors can be cleaned up and any
+    // outside reference still resolves.
+    const strayDissonance = sqliteDb.prepare(
+      "SELECT id, content, source, created_at FROM cluster_members WHERE claim_type = 'dissonance'"
+    ).all();
+    if (strayDissonance.length > 0) {
+      const ins = sqliteDb.prepare(`
+        INSERT INTO self_audit_records (id, created_at, source, claim_text, finding, evidence, content, origin_member_id)
+        VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
+      `);
+      const del = sqliteDb.prepare('DELETE FROM cluster_members WHERE id = ?');
+      const move = sqliteDb.transaction((rows) => {
+        for (const r of rows) {
+          ins.run(randomUUID(), r.created_at, r.source, r.content, r.id);
+          del.run(r.id);
+        }
+      });
+      move(strayDissonance);
+      console.log(`Migration: moved ${strayDissonance.length} self-audit dissonance record(s) out of cluster_members into self_audit_records`);
+      console.log('  (their embeddings are cleared on the next heartbeat reconciliation — they now read as orphan vectors)');
     }
 
     const clusterCols = sqliteDb.prepare('PRAGMA table_info(memory_clusters)').all();
@@ -627,7 +911,7 @@ function updateConversationTitle(id, title) {
  * @param {string} model - Model used (optional)
  * @returns {string} New message ID
  */
-function addMessage(conversation_id, role, content, model = null, sources = null) {
+function addMessage(conversation_id, role, content, model = null, sources = null, inputModality = null) {
   try {
     if (!sqliteDb) {
       throw new Error('Database not initialized. Call initDatabase() first.');
@@ -637,12 +921,19 @@ function addMessage(conversation_id, role, content, model = null, sources = null
     // sources: array of {n,title,url} the answer drew from, stored as JSON so
     // "cite your sources" later reads retained links. Null when nothing was searched.
     const sourcesJson = (Array.isArray(sources) && sources.length) ? JSON.stringify(sources) : null;
+    // Only a user message has a meaningful modality — an assistant message was
+    // not "input" at all. Anything unrecognised records as 'unknown' rather than
+    // defaulting to 'typed', so a missing client flag never masquerades as
+    // stronger evidence than it is.
+    const modality = role === 'user'
+      ? (['stt', 'typed'].includes(inputModality) ? inputModality : 'unknown')
+      : null;
     const stmt = sqliteDb.prepare(`
-      INSERT INTO messages (id, conversation_id, role, content, model, sources)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (id, conversation_id, role, content, model, sources, input_modality)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(id, conversation_id, role, content, model, sourcesJson);
+    stmt.run(id, conversation_id, role, content, model, sourcesJson, modality);
 
     // Also insert into FTS5 table for full-text search
     try {
@@ -1196,11 +1487,10 @@ function loadMemoryFiles(memoryDir = path.join(__dirname, '../data/memory')) {
       }
     };
 
-    // Load MEMORY.md
-    result.memory = readFileSafe(path.join(memoryDir, 'MEMORY.md'), 'MEMORY.md');
-    if (result.memory) {
-      console.log(`[MemoryFiles] MEMORY.md preview (${result.memory.length} chars): "${result.memory.substring(0, 200)}${result.memory.length > 200 ? '...' : ''}"`);
-    }
+    // MEMORY.md is NOT read here. Long-term memory is rendered from SQLite by
+    // memoryClusters.renderLongTermMemory(); the caller fills result.memory in.
+    // Reading it from a file is what let the injected block drift from the
+    // database — see docs/memory-mvp-spec.md (decision 1).
 
     // Load USER.md
     result.user = readFileSafe(path.join(memoryDir, 'USER.md'), 'USER.md');
@@ -1229,6 +1519,41 @@ function loadMemoryFiles(memoryDir = path.join(__dirname, '../data/memory')) {
 
 function getSqliteDb() { return sqliteDb; }
 function getClusterEmbeddingsTable() { return clusterEmbeddingsTable; }
+
+/**
+ * Re-open cluster_embeddings and swap in the fresh handle.
+ *
+ * WHY THIS EXISTS. A LanceDB table handle pins the dataset version it was opened
+ * at. The server opens this one once at boot and holds it for its whole life, so
+ * the moment ANY other process commits — a CLI script like
+ * scripts/introduce-capability.js or scripts/identity-lock.js, a repair script,
+ * a test — the server's handle is behind, and every write it attempts is
+ * rejected with "Commit conflict … Please rerun the operation off the latest
+ * version of the table."
+ *
+ * The consequence was measured twice (13 stale vectors on 2026-07-27, 3 more on
+ * 2026-07-28): fact-store's delete retried four times, each attempt re-running
+ * off the SAME pinned version, so all four failed identically. Retiring a fact
+ * left its embedding live and semantically retrievable — the store that
+ * actually reaches answers, since retrieval matches on similarity and never
+ * consults status.
+ *
+ * A handle only advances its own read view when IT writes, so refreshing cannot
+ * be left to chance: it has to be explicit, and it has to happen between retries
+ * or the retry is inert.
+ *
+ * @returns {Promise<Object|null>} the refreshed table, or null if unavailable
+ */
+async function reopenClusterEmbeddingsTable() {
+  if (!vectorDb) return clusterEmbeddingsTable;
+  try {
+    clusterEmbeddingsTable = await vectorDb.openTable('cluster_embeddings');
+    return clusterEmbeddingsTable;
+  } catch (err) {
+    console.error('[LanceDB] Could not re-open cluster_embeddings:', err.message);
+    return clusterEmbeddingsTable;   // keep the old handle rather than losing it
+  }
+}
 
 /**
  * Drop and recreate the cluster_embeddings LanceDB table
@@ -1296,5 +1621,6 @@ module.exports = {
   // Accessors for sub-modules
   getSqliteDb,
   getClusterEmbeddingsTable,
+  reopenClusterEmbeddingsTable,
   resetClusterEmbeddingsTable
 };

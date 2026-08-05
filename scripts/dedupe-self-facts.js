@@ -39,7 +39,21 @@ function cosine(a, b) {
   // getSelfFacts already orders by salience DESC, created_at DESC. We want the
   // KEPT canonical to be highest salience then EARLIEST, so re-sort ascending by
   // time within equal salience.
-  const facts = mc.getSelfFacts({ status: 'active' })
+  // LOCKED facts are excluded outright — they can be neither the duplicate that
+  // gets superseded nor the canonical that absorbs others. This script calls
+  // memoryClusters.supersedeFact directly, so it does NOT pass through
+  // db/fact-store.js and the identity lock's guard never sees it; a near-
+  // duplicate of the name fact would otherwise retire a chosen name during
+  // routine cleanup, which is precisely the silent loss the lock exists to stop.
+  const allActive = mc.getSelfFacts({ status: 'active' });
+  const lockedOut = allActive.filter(f => f.locked);
+  if (lockedOut.length) {
+    console.log(`Skipping ${lockedOut.length} locked identity fact(s) — not eligible for dedup:`);
+    for (const f of lockedOut) console.log(`  [${f.lock_category}] "${f.content.slice(0, 80)}"`);
+    console.log('');
+  }
+  const facts = allActive
+    .filter(f => !f.locked)
     .sort((a, b) => (b.salience - a.salience) || (new Date(a.created_at) - new Date(b.created_at)));
 
   const embs = [];

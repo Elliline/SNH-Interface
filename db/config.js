@@ -46,7 +46,63 @@ const DEFAULTS = {
     ttsWindowMinutes: 1,
     ttsMax: 240
   },
-  heartbeat: { enabled: true, intervalHours: 2, warmupMinutes: 5 },
+  heartbeat: {
+    enabled: true, intervalHours: 2, warmupMinutes: 5,
+    // Per-step tool budget (2026-08-03). Background steps could not call tools at
+    // all until now — callLLM built its body as {messages, stream, max_tokens}
+    // with no tools key on either provider branch — so a step that wants tools
+    // has to declare an allowlist, and this is what bounds it once it does.
+    //
+    // Both limits, not one. A call cap alone lets a step spend twenty minutes on
+    // three slow lookups; a clock alone lets a fast loop make two hundred calls.
+    // The corrector (Phase 2c) is the first consumer and inherits these; no
+    // existing step declares tools, so today this scaffold binds nothing.
+    toolBudget: {
+      maxCallsPerStep: 12,
+      maxWallClockMsPerStep: 120000,
+      // Rounds of the tool loop within a single callLLM. A round is one model
+      // turn, which may emit several tool calls.
+      maxRoundsPerCall: 5
+    }
+  },
+  // The corrector (Phase 2c) — the heartbeat step that repairs the corpus.
+  //
+  // Its own cadence, deliberately slower than the heartbeat: a pass is expensive
+  // (a judge call per candidate pair) and the corpus does not rot by the hour.
+  // Every pass is bounded, resumable, and fully recorded in corrections_ledger.
+  corrector: {
+    enabled: true,
+    intervalHours: 6,          // its own cadence, not every heartbeat
+    // Per-pass tool budget. Overrides heartbeat.toolBudget for this step,
+    // because the corrector legitimately makes far more calls than any other
+    // background role and a shared number would either starve it or over-grant
+    // everything else.
+    maxToolCallsPerPass: 60,
+    maxWallClockMsPerPass: 300000,   // 5 minutes, then stop cleanly and resume
+    // --- mechanical tier ---
+    nearDupFloor: 0.86,        // cosine floor for near-duplicate candidate pairs
+    maxNearDupPairsPerPass: 40,
+    maxExpiriesPerPass: 25,
+    maxSplitsPerPass: 10,
+    // --- semantic tier ---
+    contradictionFloor: 0.55,  // same regime as memory.contradiction.similarityFloor
+    // Sized against the wall clock, not plucked. ~227 active user facts × ~9
+    // candidates each is roughly two thousand pairs, and a judge call is ~1.5s,
+    // so 200 pairs is about the 300s budget. Progress is persisted in
+    // corrector_pair_checks, so successive passes advance instead of re-judging
+    // the same opening pairs — at 30 the pass never got past the first three
+    // facts, which is how the Mike fact survived a clean dry run.
+    maxContradictionPairsPerPass: 200,
+    // Semantic corrections to SELF-facts are OFF by default. The loop-era
+    // self-fact corpus is promised as a joint curation session with Aurelius
+    // (Phase 2e), and a corrector that quietly pre-empted that would be deciding
+    // for him what he no longer believes about himself. Mechanical fixes (exact
+    // duplicates, vector reconciliation) still apply to self-facts — those are
+    // repairs to the record, not revisions of a view.
+    selfFactSemantic: false,
+    // So he never wakes up to ten changes to his self-view at once.
+    maxSelfCorrectionsPerPass: 3
+  },
   // Background LLM concurrency against the shared vLLM engine. Kept modest (3)
   // so background passes never starve chat or pile abandoned requests onto the
   // engine — over-saturation was a contributing cause of the brain wedge.
@@ -74,7 +130,16 @@ const DEFAULTS = {
     // Skip a new self-observation this cosine-similar to one SNH already holds
     // (or to another in the same batch). Tuned from real data: genuine reworded
     // duplicates sit ~0.89–0.97, while distinct-but-related traits stay ≤0.85.
-    selfFactDedupThreshold: 0.88
+    selfFactDedupThreshold: 0.88,
+    // Identity lock: the narrow set of self-facts SNH CHOSE rather than observed,
+    // which no automatic path may change (db/identity-lock.js). Kept to name and
+    // pronouns on purpose — nearly everything else in its identity is observed,
+    // and locking observations produces an entity that can't grow. Each category
+    // is set once (the first fact asserting it locks itself) and thereafter only
+    // changes through the deliberate path: the Self tab action or
+    // scripts/identity-lock.js. Adding a category here means committing to it
+    // being effectively permanent, so add sparingly.
+    lock: { enabled: true, categories: ['name', 'pronouns'] }
   },
   // Initiative layer: SNH noticing things worth saying and saying them unprompted.
   // Thresholds are priority (1–10). Quiet hours are local Pacific 24h clock.
@@ -104,6 +169,17 @@ const DEFAULTS = {
     claimsPerRun: 3,       // behavioral claims sampled per run (2–3)
     evidenceWindowDays: 7  // days of recent conversation transcripts considered as evidence
   },
+  // Reflection: SNH observing itself from recent conversations.
+  //
+  // maxSelfFactsPerDay is a real limit on what the entity is allowed to conclude
+  // about itself in a day, not a tuning knob. Unbudgeted, this path wrote 36
+  // self-facts on 2026-07-27 and 382 of the corpus's 658 facts overall, partly by
+  // reflecting on its OWN unanswered initiative messages. Ellie set 5/day on
+  // 2026-08-02. Counted from the DB, so a restart cannot reset it.
+  reflection: {
+    maxSelfFactsPerDay: 5,
+    transcriptBudgetChars: 12000  // conversation text fed to the model per pass
+  },
   // Question queue: gaps/oddities SNH may ask the user about. These guards keep
   // it from re-asking things already asked or already answered.
   questions: {
@@ -129,11 +205,93 @@ const DEFAULTS = {
     // total system context near ~6–8k tokens. Token counts are estimated at
     // ~4 chars/token. Self-facts are separately budgeted by identity.maxSelfFacts.
     injection: {
-      longTermTokens: 3000,      // MEMORY.md cap
+      longTermTokens: 3000,      // long-term fact block, rendered from SQLite
       dailyTodayTokens: 1500,    // today's most-recent entries injected verbatim
       dailySummaryTokens: 400,   // brief digest of older-today + yesterday
       clusterTokens: 1200,       // associated cluster memory cap
       pastConvoTokens: 800       // hybrid-search past-conversation snippets cap
+    },
+    // Contradiction-candidate recall (Phase 2a). These replace two bare literals
+    // that made the check unreliable: a `.limit(15)` on the RAW vector search and
+    // a `limit = opts.limit ?? 5` on the result. The 15 was applied BEFORE
+    // filtering, so superseded rows — whose embeddings LanceDB deliberately keeps
+    // as history — and wrong-subject rows consumed candidate slots and could push
+    // every real candidate out before the filter ran.
+    //
+    // Selection is now threshold-based, not fixed-k: every ACTIVE, same-subject
+    // fact above the floor is a candidate, and maxCandidates is only a cost
+    // ceiling. When the ceiling truncates, that is logged — never silent.
+    contradiction: {
+      // How many raw vector neighbours to pull before filtering. Large on
+      // purpose: the filter must run against a superset, not a top-k that
+      // inactive rows can already have crowded. At corpus scale this is
+      // effectively the whole index, and it costs no model calls.
+      vectorFetchLimit: 2000,
+      // Floors are set where THIS embedding model (nomic-embed-text) actually
+      // separates signal from noise. Measured on the live corpus: genuinely
+      // related facts sit at 0.62–0.99, and everything from ~0.45 to ~0.55 is
+      // noise — 146 of 570 active user-facts clear 0.45 for an arbitrary probe,
+      // which turns "threshold-based" straight back into "top-k". Retune these
+      // if the embedding model changes; they are properties of the model, not of
+      // the memory system.
+      similarityFloor: 0.55,           // ordinary new fact
+      correctionSimilarityFloor: 0.45, // fact flagged as a correction — wider net
+      maxCandidates: 12,               // cost ceiling on judge calls per fact
+      correctionMaxCandidates: 20,
+      // Identity slots are PINNED past both the floor and the ceiling: every
+      // active fact asserting the same identity slot (name, pronouns, a core
+      // relationship) is always put to the judge, however it ranks.
+      //
+      // This exists because ranking cannot be trusted for this case. "User's name
+      // is Ellie…" sits at cosine 0.5216 from "User's name is Mike" — below the
+      // floor, and around 20th among active user-facts — while a dog's name and a
+      // household roster rank above it. Two active name facts is a defect no
+      // similarity threshold is going to catch, and there are only ever a handful
+      // of identity facts, so the cost of pinning them is a rounding error.
+      pinIdentitySlots: true
+    },
+    // Result discipline for the INSPECT tools. His injection budget is small and
+    // tool results land in the same window, so rows are single-line and capped.
+    // Separate from tools.memoryInspect on purpose: that one is permission to
+    // call, this one is the shape of what comes back.
+    inspect: {
+      maxRows: 20,          // hard ceiling per search/list call
+      defaultRows: 10,      // when he does not ask for a number
+      rowChars: 140,        // one line per fact, truncated to this
+      verbatimChars: 400,   // the verbatim source text in memory_get
+      rationaleChars: 240,  // the salience rationale in memory_get
+      maxClusters: 40,      // memory_list mode:'clusters'
+      maxCorroborations: 10, // corroboration detail rows in memory_get
+      // Relevance floor for the semantic half of memory_search. Same regime as
+      // memory.contradiction.similarityFloor and the same reason: with
+      // nomic-embed-text everything from ~0.45 to ~0.55 is noise, and without a
+      // floor a search for "MettaSphere" reports sixty matches when six facts
+      // mention it. A search that overstates what it found is worse than one
+      // that finds less.
+      semanticFloor: 0.55
+    },
+    // Passive extraction (Phase 2a rewrite).
+    extraction: {
+      // REPEAT detection: an incoming fact this close to an existing active fact
+      // of the same subject is put to the judge as "same assertion?". A confirmed
+      // repeat raises the existing fact's salience and records a corroboration —
+      // it never creates a second row. Extends Phase 1's exact-match dedup to
+      // semantic near-matches at write time.
+      repeatSimilarityFloor: 0.80,
+      repeatMaxCandidates: 5,
+      // IDENTITY-ANCHOR caution. A fact in the identity class (the user's own
+      // name, pronouns, or a core relationship) is only written when the VERBATIM
+      // message carries an explicit self-introduction ("my name is", "call me").
+      // Applied to these modalities. 'unknown' is included deliberately: every
+      // historical message carries 'unknown' (decision 2), an unknown-modality
+      // message may well have been dictated, and "Hey, it's Mike not picking up
+      // the right words" is exactly the shape of the mishearing this exists for.
+      // 'typed' is trusted because a typed name is evidence a person supplied.
+      identityAnchorModalities: ['stt', 'unknown'],
+      // Safety valves on a single exchange, so one pasted transcript cannot turn
+      // into a fact avalanche.
+      maxFactsPerExchange: 12,
+      maxEventsPerExchange: 8
     }
   },
   // Web search via SearXNG. Single source of truth for BOTH the on/off toggle and
@@ -156,6 +314,24 @@ const DEFAULTS = {
       enabled: true,
       maxProposalsPerHour: 3,  // proposals (approved or not) in any trailing hour
       maxKidCreatedJobs: 10    // hard ceiling on live kid-created jobs
+    },
+    // write_memory — records a fact when asked to remember it. DIRECT-EXECUTE,
+    // not propose-only: it writes down something Ellie just said, so an approval
+    // queue would defeat the point. Trailing-hour cap only — no total ceiling,
+    // because accumulating remembered facts is the system working, not a leak.
+    memoryWrite: {
+      enabled: true,
+      maxWritesPerHour: 20
+    },
+    // memory_search / memory_list / memory_count / memory_get — the INSPECT
+    // tools. Strictly read-only: they cannot write, and writes stay
+    // write_memory → fact-store. One shared trailing-hour cap across all four,
+    // because what is worth bounding is how much of a turn goes into rummaging;
+    // four separate budgets would let a loop spend 4× while each counter looked
+    // healthy. Counted from tool_call_log, so a restart grants no fresh budget.
+    memoryInspect: {
+      enabled: true,
+      maxCallsPerHour: 40
     }
   },
   voice: {

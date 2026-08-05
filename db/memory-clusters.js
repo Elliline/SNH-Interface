@@ -1,6 +1,7 @@
 const { randomUUID } = require('crypto');
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const { getConfig, getProviderInstance } = require('./config');
+const { formatFactTimestamp } = require('./datetime');
 
 // UUID validation for safe LanceDB filter interpolation
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -457,44 +458,16 @@ async function renameAllClusters(options = {}) {
   }
 }
 
-/**
- * Create or strengthen a link between two clusters
- * @param {string} clusterA - First cluster ID
- * @param {string} clusterB - Second cluster ID
- * @param {Object} db - SQLite database instance
- */
-function createOrStrengthenLink(clusterA, clusterB, db) {
-  if (clusterA === clusterB) {
-    return; // Don't link a cluster to itself
-  }
-
-  try {
-    // Check if link exists (in either direction)
-    const existingLink = db.prepare(`
-      SELECT id, strength FROM cluster_links
-      WHERE (cluster_a = ? AND cluster_b = ?)
-         OR (cluster_a = ? AND cluster_b = ?)
-    `).get(clusterA, clusterB, clusterB, clusterA);
-
-    if (existingLink) {
-      // Strengthen existing link (max 1.0)
-      const newStrength = Math.min(1.0, existingLink.strength + 0.1);
-      db.prepare('UPDATE cluster_links SET strength = ? WHERE id = ?')
-        .run(newStrength, existingLink.id);
-      console.log(`[Clusters] Strengthened link between clusters (${newStrength.toFixed(2)})`);
-    } else {
-      // Create new link
-      const linkId = randomUUID();
-      db.prepare(`
-        INSERT INTO cluster_links (id, cluster_a, cluster_b, strength)
-        VALUES (?, ?, ?, 0.5)
-      `).run(linkId, clusterA, clusterB);
-      console.log(`[Clusters] Created new link between clusters`);
-    }
-  } catch (error) {
-    console.error('[Clusters] Error creating/strengthening link:', error.message);
-  }
-}
+// createOrStrengthenLink was removed 2026-08-02 along with the cross-link audit.
+//
+// It inserted every new cluster_links row at a hardcoded strength of 0.5 and bumped
+// existing ones by +0.1 per co-occurrence, with no model involved. That constant is
+// why 737 of 2,366 stored links (31%) sit at exactly 0.50 — a number that reads as a
+// judgment and never was one.
+//
+// cluster_links is now read-only: the Memory Map renders what is already there and
+// nothing writes to it. Associations become query-time vector neighbours in a later
+// phase — see docs/memory-mvp-spec.md (RETRIEVE).
 
 /**
  * Assign a fact to a cluster (existing or new)
@@ -506,10 +479,32 @@ function createOrStrengthenLink(clusterA, clusterB, db) {
  * @param {string} source - Source of the fact
  * @returns {Promise<Object>} - {clusterId, clusterName, isNew}
  */
-async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user', claimType = null) {
+async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user', claimType = null, provenance = null) {
   try {
     const config = getConfig();
     const db = getSqliteDb();
+
+    // Dedup BEFORE anything is spent: this used to insert unconditionally, so a
+    // fact already held word-for-word still cost an embedding, a cluster search
+    // and a row. The rule itself lives in fact-store, which is the single write
+    // path — see findExactDuplicate for why exact-only is the MVP scope.
+    if (db && fact) {
+      const factStore = require('./fact-store');
+      const dup = factStore.findExactDuplicate(fact, subject);
+      if (dup) {
+        factStore.absorbDuplicate(dup, salience);
+        console.log(`[Clusters] Already held word-for-word, not storing again: "${String(fact).slice(0, 70)}"`);
+        const existingCluster = db.prepare('SELECT name FROM memory_clusters WHERE id = ?').get(dup.cluster_id);
+        return {
+          clusterId: dup.cluster_id,
+          clusterName: existingCluster?.name || 'Unknown',
+          isNew: false,
+          memberId: dup.id,
+          salience: Math.max(dup.salience ?? 0, Number.isFinite(salience) ? salience : 0),
+          duplicateOf: dup.id
+        };
+      }
+    }
     if (!db) {
       console.error('[Clusters] Database not initialized');
       return { clusterId: null, clusterName: null, isNew: false };
@@ -527,7 +522,6 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     const clusterTable = await getClusterEmbeddingsTable();
     let bestClusterId = null;
     let bestSimilarity = 0;
-    const crossClusterCandidates = [];
 
     if (clusterTable) {
       console.log('[Clusters] Searching for similar cluster members');
@@ -548,14 +542,6 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
           clusterScores[result.cluster_id] = [];
         }
         clusterScores[result.cluster_id].push(similarity);
-
-        // Track potential cross-cluster links
-        if (similarity > config.memory.clusterLinkThreshold) {
-          crossClusterCandidates.push({
-            clusterId: result.cluster_id,
-            similarity: similarity
-          });
-        }
       }
 
       // Restrict candidates to clusters of the SAME subject so self-observations
@@ -569,13 +555,20 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         ).all(...candidateIds);
         const subjById = new Map(subjRows.map(r => [r.id, r.subject || 'user']));
         for (const cid of candidateIds) {
-          if ((subjById.get(cid) || 'user') !== subject) delete clusterScores[cid];
-        }
-        // Drop cross-cluster link candidates that are a different subject too.
-        for (let i = crossClusterCandidates.length - 1; i >= 0; i--) {
-          if ((subjById.get(crossClusterCandidates[i].clusterId) || 'user') !== subject) {
-            crossClusterCandidates.splice(i, 1);
+          // A vector may point at a cluster that no longer exists in SQLite —
+          // LanceDB is not covered by the foreign key, so a deleted cluster
+          // leaves its members' embeddings behind. Such a candidate has to be
+          // dropped BEFORE the subject test, because `undefined || 'user'` reads
+          // a ghost as a user-fact cluster and lets it win the match; the insert
+          // then fails on the cluster_id foreign key and the caller loses the
+          // write. Found by the corrector: the F5 compound split failed exactly
+          // here, on a 0.951 match to a cluster with no row.
+          if (!subjById.has(cid)) {
+            console.warn(`[Clusters] Ignoring vector match on cluster ${cid.slice(0, 8)} — no such cluster in SQLite (orphan embedding)`);
+            delete clusterScores[cid];
+            continue;
           }
+          if ((subjById.get(cid) || 'user') !== subject) delete clusterScores[cid];
         }
       }
 
@@ -662,10 +655,29 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     const memberId = randomUUID();
     const nowIso = new Date().toISOString();
     const salienceValue = Number.isFinite(salience) ? Math.max(1, Math.min(10, Math.round(salience))) : 5;
+    // Provenance: null-filled rather than omitted, so a caller that passes
+    // nothing writes explicit nulls instead of silently inheriting a default.
+    // 'unknown' modality is a real answer ("we don't know how this arrived"),
+    // distinct from null ("this fact predates provenance").
+    const prov = provenance || {};
+    const p = {
+      conversationId: prov.conversationId ?? null,
+      messageId: prov.messageId ?? null,
+      verbatimSourceText: prov.verbatimSourceText ?? null,
+      inputModality: ['stt', 'typed', 'unknown'].includes(prov.inputModality) ? prov.inputModality : null,
+      salienceRationale: prov.salienceRationale ?? null
+    };
     db.prepare(`
-      INSERT INTO cluster_members (id, cluster_id, content, source, importance, created_at, updated_at, salience, subject, claim_type)
-      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?)
-    `).run(memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, claimType);
+      INSERT INTO cluster_members (
+        id, cluster_id, content, source, importance, created_at, updated_at,
+        salience, subject, claim_type, status,
+        conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale
+      )
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+    `).run(
+      memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, claimType,
+      p.conversationId, p.messageId, p.verbatimSourceText, p.inputModality, p.salienceRationale
+    );
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 
@@ -680,19 +692,6 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         content: fact,
         vector: vectorForStorage
       }]);
-    }
-
-    // Cross-cluster linking — link when fact is similar to members in other clusters
-    if (crossClusterCandidates.length > 0) {
-      const uniqueClusters = [...new Set(crossClusterCandidates.map(c => c.clusterId))];
-      const otherClusters = uniqueClusters.filter(id => id !== clusterId);
-
-      if (otherClusters.length > 0) {
-        console.log(`[Clusters] Creating/strengthening ${otherClusters.length} cross-cluster link(s)`);
-        for (const otherClusterId of otherClusters) {
-          createOrStrengthenLink(clusterId, otherClusterId, db);
-        }
-      }
     }
 
     return { clusterId, clusterName, isNew, memberId, salience: salienceValue };
@@ -725,77 +724,183 @@ function updateFactSalience(memberId, salience) {
 }
 
 /**
- * Find existing ACTIVE facts that are semantically close to a candidate fact.
- * Used by the extraction pipeline to surface potential contradictions before
- * an LLM makes the final yes/no call. Superseded facts are excluded — we only
- * contradict against what is currently believed true.
+ * Find existing ACTIVE facts of the same subject that are semantically close to a
+ * candidate fact — the recall step the contradiction judge runs on.
+ *
+ * WHAT CHANGED (Phase 2a) AND WHY. This used to pull the top 15 RAW vector
+ * neighbours (`.limit(15)`, a bare literal) and only afterwards discard the ones
+ * that were superseded, of the wrong subject, or verbatim duplicates — then cap
+ * what survived at 5 (`opts.limit ?? 5`, another literal). Both filters ran
+ * AFTER the cap had already been spent, and LanceDB deliberately keeps the
+ * embeddings of superseded facts as history, so a dense pocket of inactive rows
+ * could consume all 15 slots and the judge would be handed nothing. "The judge
+ * said no" and "the judge was never shown it" were indistinguishable from the
+ * outside, and the second was happening.
+ *
+ * Now: fetch a large superset, filter to active + same subject FIRST, and select
+ * by THRESHOLD rather than by rank — every surviving fact above the similarity
+ * floor is a candidate. maxCandidates is a cost ceiling on judge calls, not a
+ * selection rule, and when it truncates, the diagnostics say so.
+ *
+ * Every number here is a config key (`memory.contradiction.*`).
+ *
  * @param {string} factText - The new candidate fact
  * @param {Object} [opts]
- * @param {number} [opts.threshold=0.45] - Min cosine similarity to consider
- * @param {number} [opts.limit=5] - Max candidates to return
- * @returns {Promise<Array<{memberId,content,clusterId,similarity}>>}
+ * @param {number} [opts.threshold] - Min cosine similarity (default: config floor)
+ * @param {number} [opts.limit] - Max candidates (default: config maxCandidates)
+ * @param {string} [opts.subject='user']
+ * @param {boolean} [opts.includeVerbatim=false] - keep word-for-word matches
+ * @returns {Promise<{candidates: Array, diagnostics: Object}>}
  */
-async function findContradictionCandidates(factText, opts = {}) {
-  const threshold = opts.threshold ?? 0.45;
-  const limit = opts.limit ?? 5;
+async function findActiveNeighbours(factText, opts = {}) {
+  const cfg = getConfig().memory?.contradiction || {};
+  const threshold = opts.threshold ?? (Number.isFinite(cfg.similarityFloor) ? cfg.similarityFloor : 0.45);
+  const limit = opts.limit ?? (Number.isInteger(cfg.maxCandidates) ? cfg.maxCandidates : 15);
+  const fetchLimit = Number.isInteger(cfg.vectorFetchLimit) ? cfg.vectorFetchLimit : 500;
   const subject = opts.subject ?? 'user';
+  // The verbatim filter below is right for the question this function was built
+  // for — "does anything already held contradict this?" — where an identical row
+  // is a repeat and never a contradiction. It is exactly wrong for the corrector's
+  // duplicate sweep, whose whole job is the rows that ARE identical: three
+  // byte-identical machine-gun facts were structurally invisible to it, and the
+  // merge phase's "identical pairs skip the judge" branch could never be reached.
+  const includeVerbatim = opts.includeVerbatim === true;
+
+  // Diagnostics exist so the record can answer "did the judge ever see it?".
+  // nearestBelowFloor is the one that matters: it distinguishes "nothing was
+  // close" from "something was close and the floor excluded it".
+  const diagnostics = {
+    subject, threshold, limit, fetchLimit,
+    embedded: false, vectorHits: 0,
+    rejectedInactive: 0, rejectedSubject: 0, rejectedVerbatim: 0, rejectedMissing: 0,
+    aboveFloor: 0, belowFloor: 0, truncated: 0,
+    nearestBelowFloor: null, error: null
+  };
+
   try {
     const db = getSqliteDb();
-    if (!db) return [];
+    if (!db) { diagnostics.error = 'database unavailable'; return { candidates: [], diagnostics }; }
 
     const embedding = await generateEmbedding(factText);
-    if (!embedding) return [];
+    if (!embedding) { diagnostics.error = 'embedding unavailable'; return { candidates: [], diagnostics }; }
+    diagnostics.embedded = true;
 
     const clusterTable = await getClusterEmbeddingsTable();
-    if (!clusterTable) return [];
+    if (!clusterTable) { diagnostics.error = 'vector table unavailable'; return { candidates: [], diagnostics }; }
 
-    const vectorArray = Array.from(embedding);
     const results = await clusterTable
-      .search(vectorArray)
+      .search(Array.from(embedding))
       .metricType('cosine')
-      .limit(15)
+      .limit(fetchLimit)
       .execute();
+    diagnostics.vectorHits = results.length;
 
     const normalizedNew = factText.trim().toLowerCase();
     const seen = new Set();
-    const candidates = [];
+    const eligible = [];
 
+    // Prepared once, not per neighbour — the fetch limit is now in the hundreds
+    // to low thousands rather than 15, so preparing inside the loop would be
+    // paying the parse cost on every row.
+    const memberStmt = db.prepare(
+      'SELECT id, content, cluster_id, status, salience, subject FROM cluster_members WHERE id = ?'
+    );
+
+    // --- PASS 1: filter, with no cap in sight. ---
     for (const result of results) {
-      const similarity = 1 - (result._distance || 0);
-      if (similarity < threshold) continue;
       const memberId = result.member_id;
       if (!memberId || seen.has(memberId)) continue;
-
-      // Confirm the member still exists and is ACTIVE (LanceDB retains
-      // embeddings of superseded facts for history; SQLite is the truth).
-      const row = db.prepare(
-        'SELECT id, content, cluster_id, status, salience, subject FROM cluster_members WHERE id = ?'
-      ).get(memberId);
-      if (!row) continue;
-      if (row.status && row.status !== 'active') continue;
-      // Only contradict within the same subject: self-observations can only
-      // supersede other self-observations, user-facts only user-facts.
-      if ((row.subject || 'user') !== subject) continue;
-
-      // A verbatim duplicate is not a contradiction — skip the judge call.
-      if (row.content.trim().toLowerCase() === normalizedNew) continue;
-
       seen.add(memberId);
-      candidates.push({
+
+      const row = memberStmt.get(memberId);
+      if (!row) { diagnostics.rejectedMissing++; continue; }
+      // LanceDB retains the embeddings of inactive facts as history; SQLite is
+      // the truth about what is still believed.
+      if (row.status && row.status !== 'active') { diagnostics.rejectedInactive++; continue; }
+      // Self-observations only contradict self-observations, user-facts only
+      // user-facts.
+      if ((row.subject || 'user') !== subject) { diagnostics.rejectedSubject++; continue; }
+      // A verbatim duplicate is a REPEAT, not a contradiction — the repeat path
+      // handles it, and putting it to the contradiction judge would only ever
+      // waste a call. Callers looking FOR duplicates pass includeVerbatim.
+      if (!includeVerbatim && row.content.trim().toLowerCase() === normalizedNew) { diagnostics.rejectedVerbatim++; continue; }
+
+      const similarity = 1 - (result._distance || 0);
+      eligible.push({
         memberId: row.id,
         content: row.content,
         clusterId: row.cluster_id,
         salience: row.salience ?? 5,
         similarity
       });
-      if (candidates.length >= limit) break;
     }
 
-    return candidates;
+    // --- PASS 2: threshold, then (only then) the cost ceiling. ---
+    eligible.sort((a, b) => b.similarity - a.similarity);
+    const above = eligible.filter(c => c.similarity >= threshold);
+    const below = eligible.filter(c => c.similarity < threshold);
+    diagnostics.aboveFloor = above.length;
+    diagnostics.belowFloor = below.length;
+    if (below.length) {
+      diagnostics.nearestBelowFloor = {
+        content: below[0].content, similarity: below[0].similarity, memberId: below[0].memberId
+      };
+    }
+
+    const candidates = above.slice(0, limit);
+    diagnostics.truncated = above.length - candidates.length;
+
+    // --- PASS 3: pinned identity slots, past both the floor and the ceiling. ---
+    // See memory.contradiction.pinIdentitySlots in db/config.js for why ranking
+    // is not trusted here. Cheap: a scan of active same-subject rows, matched by
+    // the same deterministic classifier the intake gate uses.
+    if (opts.pinSlot && cfg.pinIdentitySlots !== false) {
+      const { identityClassOf } = require('./extraction-rules');
+      const already = new Set(candidates.map(c => c.memberId));
+      const byId = new Map(eligible.map(c => [c.memberId, c]));
+      const rows = db.prepare(
+        "SELECT id, content, cluster_id, salience FROM cluster_members WHERE status = 'active' AND subject = ?"
+      ).all(subject);
+      for (const row of rows) {
+        if (already.has(row.id)) continue;
+        if (row.content.trim().toLowerCase() === normalizedNew) continue;
+        const klass = identityClassOf(row.content);
+        if (!klass || klass.klass !== opts.pinSlot) continue;
+        const known = byId.get(row.id);
+        candidates.push({
+          memberId: row.id, content: row.content, clusterId: row.cluster_id,
+          salience: row.salience ?? 5,
+          similarity: known ? known.similarity : 0,
+          pinned: opts.pinSlot
+        });
+        already.add(row.id);
+        diagnostics.pinned = (diagnostics.pinned || 0) + 1;
+      }
+    }
+
+    if (diagnostics.truncated > 0) {
+      // No silent caps: a truncation that is never mentioned reads as complete
+      // coverage.
+      console.warn(`[Clusters] contradiction recall ceiling hit: ${above.length} active ${subject}-facts above ${threshold}, judging ${candidates.length} (${diagnostics.truncated} not judged)`);
+    }
+
+    return { candidates, diagnostics };
   } catch (error) {
-    console.error('[Clusters] Error in findContradictionCandidates:', error.message);
-    return [];
+    console.error('[Clusters] Error in findActiveNeighbours:', error.message);
+    diagnostics.error = error.message;
+    return { candidates: [], diagnostics };
   }
+}
+
+/**
+ * Array-returning wrapper over findActiveNeighbours, kept because several
+ * callers (gap-answer checks, the write_memory supersession lookup, the
+ * self-fact path) only want the list.
+ * @returns {Promise<Array<{memberId,content,clusterId,salience,similarity}>>}
+ */
+async function findContradictionCandidates(factText, opts = {}) {
+  const { candidates } = await findActiveNeighbours(factText, opts);
+  return candidates;
 }
 
 /**
@@ -809,9 +914,16 @@ function supersedeFact(oldMemberId, newMemberId) {
   try {
     const db = getSqliteDb();
     if (!db) return false;
-    const info = db.prepare(
-      "UPDATE cluster_members SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ? AND status = 'active'"
-    ).run(newMemberId, new Date().toISOString(), oldMemberId);
+    // Lifecycle (2026-08-02): status becomes 'inactive' with an explicit reason,
+    // and successor_id records what replaced it. superseded_by is written in
+    // step so the Memory Map's supersede edges keep working — the two are kept
+    // deliberately redundant rather than one being dropped.
+    const info = db.prepare(`
+      UPDATE cluster_members
+      SET status = 'inactive', inactive_reason = 'superseded',
+          successor_id = ?, superseded_by = ?, updated_at = ?
+      WHERE id = ? AND status = 'active'
+    `).run(newMemberId, newMemberId, new Date().toISOString(), oldMemberId);
     if (info.changes > 0) {
       console.log(`[Clusters] Superseded fact ${oldMemberId} → ${newMemberId}`);
       return true;
@@ -1006,9 +1118,81 @@ function getClusters(subject = null) {
 }
 
 /**
+ * Render the injected long-term memory block FROM SQLITE.
+ *
+ * This replaces reading data/memory/MEMORY.md, which until 2026-08-02 was the
+ * thing actually injected as "=== Long-Term Memory ===". Keeping the injected
+ * text in a file made the file a second system of record: it drifted from the
+ * database (one machine-gun line in the file, three rows in SQLite), it was
+ * edited by a cleanup step that could not match its own annotations, and a fact
+ * retired in SQLite kept its line in the file and went on being read as current.
+ *
+ * Rendering per request means the injected block cannot disagree with the
+ * database, because there is nothing left to disagree with.
+ *
+ * Shape is deliberately close to the old file so the chat system prompt's
+ * contract still holds — "- fact (learned <when>)" lines under "## <heading>"
+ * headings — including the rule that a "(learned ...)" annotation is the ONLY
+ * thing SNH may quote when asked when it learned something.
+ *
+ * Ordering carries the truncation policy: clusters are ordered by their most
+ * salient fact and facts by salience within a cluster, so when budgetText cuts
+ * the tail it drops the least important facts rather than an arbitrary slice.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.subject='user'] - which corpus to render
+ * @returns {string} markdown, or '' when there are no active facts
+ */
+function renderLongTermMemory({ subject = 'user' } = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return '';
+
+    const rows = db.prepare(`
+      SELECT cm.content, cm.salience, cm.created_at,
+             COALESCE(mc.name, 'Other') AS cluster_name
+      FROM cluster_members cm
+      LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
+      WHERE cm.subject = ? AND cm.status = 'active'
+    `).all(subject);
+    if (rows.length === 0) return '';
+
+    const byCluster = new Map();
+    for (const r of rows) {
+      if (!byCluster.has(r.cluster_name)) byCluster.set(r.cluster_name, []);
+      byCluster.get(r.cluster_name).push(r);
+    }
+
+    const sal = r => (Number.isFinite(r.salience) ? r.salience : 5);
+    const groups = [...byCluster.entries()]
+      .map(([name, facts]) => {
+        facts.sort((a, b) => sal(b) - sal(a) || String(a.created_at).localeCompare(String(b.created_at)));
+        return { name, facts, top: sal(facts[0]) };
+      })
+      .sort((a, b) => b.top - a.top || a.name.localeCompare(b.name));
+
+    const out = ['# Long-Term Memory', ''];
+    for (const g of groups) {
+      out.push(`## ${g.name}`);
+      for (const f of g.facts) {
+        const when = formatFactTimestamp(f.created_at);
+        out.push(when ? `- ${f.content} (learned ${when})` : `- ${f.content}`);
+      }
+      out.push('');
+    }
+    return out.join('\n').trimEnd();
+  } catch (err) {
+    console.error('[Clusters] renderLongTermMemory failed:', err.message);
+    return '';
+  }
+}
+
+/**
  * Get self-facts (SNH's observations about itself), salience-ordered.
  * @param {Object} [opts]
- * @param {string|null} [opts.status='active'] - 'active', 'superseded', or null for all
+ * @param {string|null} [opts.status='active'] - 'active', 'inactive', or null for
+ *   all. 'superseded'/'retired' are accepted as legacy aliases and mapped onto
+ *   the inactive_reason column, so existing callers keep working.
  * @param {number|null} [opts.limit=null] - max rows, or null for no limit
  * @param {string|null} [opts.claimType] - filter to one claim_type ('claim' |
  *   'declaration' | 'dissonance'); 'unclassified' matches rows with a NULL tag.
@@ -1024,13 +1208,24 @@ function getSelfFacts({ status = 'active', limit = null, claimType = null, exclu
 
     let sql = `
       SELECT cm.id, cm.content, cm.salience, cm.status, cm.superseded_by,
+             cm.inactive_reason, cm.successor_id,
              cm.created_at, cm.updated_at, cm.cluster_id, cm.source, cm.claim_type,
+             cm.locked, cm.locked_at, cm.lock_category,
+             cm.conversation_id, cm.message_id, cm.verbatim_source_text,
+             cm.input_modality, cm.salience_rationale,
              mc.name AS cluster_name
       FROM cluster_members cm
       LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
       WHERE cm.subject = 'self'`;
     const params = [];
-    if (status) { sql += ' AND cm.status = ?'; params.push(status); }
+    // Legacy aliases: callers that still ask for 'superseded' or 'retired' get
+    // the matching inactive rows rather than silently getting none.
+    if (status === 'superseded' || status === 'retired') {
+      sql += " AND cm.status = 'inactive' AND cm.inactive_reason = ?";
+      params.push(status === 'retired' ? 'retracted' : 'superseded');
+    } else if (status) {
+      sql += ' AND cm.status = ?'; params.push(status);
+    }
     if (claimType === 'unclassified') {
       sql += ' AND cm.claim_type IS NULL';
     } else if (claimType) {
@@ -1500,6 +1695,7 @@ async function mergeByName() {
 module.exports = {
   assignToCluster,
   findContradictionCandidates,
+  findActiveNeighbours,
   supersedeFact,
   updateFactSalience,
   searchClusters,
@@ -1515,5 +1711,6 @@ module.exports = {
   isValidClusterName,
   renameAllClusters,
   mergeByName,
-  mergeSingletons
+  mergeSingletons,
+  renderLongTermMemory
 };

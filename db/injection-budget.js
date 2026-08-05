@@ -169,15 +169,38 @@ const MEMORY_EXCERPT_FRAMING_NO_TOOLS =
   'turn, and offer to look properly.';
 
 /**
+ * The phantom-lookup rule, appended to BOTH framings (2026-08-03).
+ *
+ * The read tools make a new phantom action available, and it is a quieter one
+ * than the others: "I searched my memory and found three facts about that" is
+ * unfalsifiable in the moment, sounds like diligence, and costs nothing to say.
+ * It belongs to the same family as the cron proposal that was described but
+ * never created and the write_memory "I've updated my memory" with no call.
+ *
+ * Appended to the NO_TOOLS branch too, and that is the important half: the turn
+ * where he was handed nothing is exactly the turn where a claim to have looked
+ * cannot be true.
+ */
+const MEMORY_LOOKUP_HONESTY =
+  ' You have tools that search, list, count and open your memory. Saying you searched, ' +
+  'looked up, checked, counted or pulled up anything from your memory is TRUE ONLY IF ' +
+  'you called one of those tools in this turn. If you did not call one, do not say you ' +
+  'did — answer from what is in front of you and say that is what you are doing, or ' +
+  'offer to look properly. Never state a number about your own memory that you did not ' +
+  'get from memory_count.';
+
+/**
  * Pick the memory framing for this turn.
  * @param {boolean} toolsAvailable - true when the model is being handed a tool
  *   schema this turn (i.e. it actually has something to search with).
  */
 function memoryFraming(toolsAvailable) {
-  return toolsAvailable ? MEMORY_EXCERPT_FRAMING_WITH_TOOLS : MEMORY_EXCERPT_FRAMING_NO_TOOLS;
+  return (toolsAvailable ? MEMORY_EXCERPT_FRAMING_WITH_TOOLS : MEMORY_EXCERPT_FRAMING_NO_TOOLS)
+    + MEMORY_LOOKUP_HONESTY;
 }
 
 module.exports = {
   estTokens, splitDailyBlocks, entryHeadline, budgetDailyLogs, budgetText,
-  MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS, memoryFraming
+  MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS,
+  MEMORY_LOOKUP_HONESTY, memoryFraming
 };

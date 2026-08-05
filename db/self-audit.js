@@ -41,6 +41,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
 const { getSqliteDb } = require('./database');
 const { getLocalDateStamp, formatFactTimestamp } = require('./datetime');
@@ -264,24 +265,34 @@ Reply with ONLY this JSON and nothing else:
 // ============ recording a gap (dissonance fact + revision initiative) ============
 
 /**
- * Record a dissonance self-fact for a detected gap. Written DIRECTLY through
- * assignToCluster — never processSelfFacts — so the contradiction/supersession
- * machinery does not run on it. That's the guardrail: documenting "claimed X,
- * behaved Y" must never retire the original claim X. Deduped to one active
- * record per audited claim (we never delete or supersede — just don't duplicate).
+ * Record a dissonance finding for a detected gap.
+ *
+ * Written to self_audit_records, NOT to cluster_members (2026-08-02, decision 4).
+ * These are audit output — "I claimed X, the evidence shows Y" — not things the
+ * entity believes about itself. As facts they were multi-kilobyte narratives that
+ * clustered, embedded, and got handed to the contradiction judge as candidates,
+ * costing model calls to compare a 3KB blob against a one-line observation.
+ *
+ * The guardrail that mattered still holds and is now structural rather than
+ * conventional: documenting "claimed X, behaved Y" cannot retire the original
+ * claim X, because this write never touches the fact store at all.
+ *
+ * Deduped to one record per audited claim — we never delete, just don't duplicate.
  */
 async function writeDissonanceFact({ claimText, claimDate, finding, evidenceRefs = [], sourceRef }) {
   const db = getSqliteDb();
   const source = `self-audit:${sourceRef}`;
+  if (!db) {
+    logOps(`could not record dissonance for "${claimText.slice(0, 60)}" (DB unavailable) — finding still recorded to ops + initiative`);
+    return { memberId: null, duplicate: false };
+  }
 
-  if (db) {
-    const existing = db.prepare(
-      "SELECT id FROM cluster_members WHERE subject='self' AND claim_type='dissonance' AND status='active' AND source = ?"
-    ).get(source);
-    if (existing) {
-      logOps(`dissonance record already exists for "${claimText.slice(0, 60)}" — not duplicating`);
-      return { memberId: existing.id, duplicate: true };
-    }
+  const existing = db.prepare(
+    'SELECT id FROM self_audit_records WHERE source = ?'
+  ).get(source);
+  if (existing) {
+    logOps(`dissonance record already exists for "${claimText.slice(0, 60)}" — not duplicating`);
+    return { memberId: existing.id, duplicate: true };
   }
 
   const refText = evidenceRefs.length
@@ -290,25 +301,18 @@ async function writeDissonanceFact({ claimText, claimDate, finding, evidenceRefs
   const whenClaimed = claimDate ? ` on ${claimDate}` : '';
   const content = `Self-coherence audit — dissonance: I claimed${whenClaimed} that "${claimText}". ${finding} Evidence: ${refText}. (This records the tension only; the original self-fact is unchanged — any revision is Ellie's call.)`;
 
-  const cfg = getConfig();
-  const ext = cfg.models.extraction;
-  const inst = getProviderInstance(ext.provider, ext.instance);
-  const host = inst ? inst.host : 'http://localhost:11434';
-
   try {
-    const res = await memoryClusters.assignToCluster(
-      content, ext.provider, ext.model, '', host, source, 3, 'self', 'dissonance'
-    );
-    if (res && res.memberId) {
-      logOps(`wrote dissonance self-fact for "${claimText.slice(0, 60)}" (member ${res.memberId})`);
-      return { memberId: res.memberId, duplicate: false };
-    }
+    const id = randomUUID();
+    db.prepare(`
+      INSERT INTO self_audit_records (id, created_at, source, claim_text, claim_date, finding, evidence, content, origin_member_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(id, new Date().toISOString(), source, claimText, claimDate || null, finding, refText, content);
+    logOps(`recorded dissonance for "${claimText.slice(0, 60)}" (audit record ${id})`);
+    return { memberId: id, duplicate: false };
   } catch (err) {
     console.error('[SelfAudit] writeDissonanceFact error:', err.message);
   }
-  // Embeddings/DB unavailable — the finding still lives in the ops log and the
-  // initiative, so nothing is lost; only the self-fact write was skipped.
-  logOps(`could not write dissonance self-fact for "${claimText.slice(0, 60)}" (embeddings/DB unavailable) — finding still recorded to ops + initiative`);
+  logOps(`could not record dissonance for "${claimText.slice(0, 60)}" — finding still recorded to ops + initiative`);
   return { memberId: null, duplicate: false };
 }
 
