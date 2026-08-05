@@ -122,7 +122,7 @@ const trim = (s, n) => {
  * though they were live is the drift this whole subsystem exists to prevent.
  */
 function normalizeFilters(args = {}) {
-  const subject = ['user', 'self'].includes(String(args.subject || '').toLowerCase())
+  const subject = ['user', 'self', 'world'].includes(String(args.subject || '').toLowerCase())
     ? String(args.subject).toLowerCase() : null;
 
   const rawStatus = String(args.status || 'active').toLowerCase();
@@ -425,7 +425,12 @@ function count(args = {}) {
       user_active: breakdown.find(b => b.subject === 'user' && b.state === 'active')?.n ?? 0,
       user_inactive: breakdown.find(b => b.subject === 'user' && b.state === 'inactive')?.n ?? 0,
       self_active: breakdown.find(b => b.subject === 'self' && b.state === 'active')?.n ?? 0,
-      self_inactive: breakdown.find(b => b.subject === 'self' && b.state === 'inactive')?.n ?? 0
+      self_inactive: breakdown.find(b => b.subject === 'self' && b.state === 'inactive')?.n ?? 0,
+      // Reported even at zero: world facts are absent from the injected block by
+      // design, so a count that omitted them entirely would leave him unable to
+      // tell "none held" from "not counted".
+      world_active: breakdown.find(b => b.subject === 'world' && b.state === 'active')?.n ?? 0,
+      world_inactive: breakdown.find(b => b.subject === 'world' && b.state === 'inactive')?.n ?? 0
     }
   };
 }
@@ -709,7 +714,7 @@ function corrections(args = {}) {
   // --- list ---
   const where = [];
   const bind = [];
-  const subject = ['user', 'self'].includes(String(args.subject || '').toLowerCase())
+  const subject = ['user', 'self', 'world'].includes(String(args.subject || '').toLowerCase())
     ? String(args.subject).toLowerCase() : null;
   if (subject) { where.push('subject = ?'); bind.push(subject); }
 

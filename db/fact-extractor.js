@@ -598,14 +598,18 @@ function prependDailyEntry(entry, dailyDir, date, headerLabel = 'Daily Log') {
  * @param {string} summary - Summary text
  * @param {string} dailyDir - Path to daily log directory
  */
-function appendToDailyLog(summary, dailyDir) {
+function appendToDailyLog(summary, dailyDir, dateStamp = null) {
   try {
     if (!summary || summary.trim().length === 0) {
       return;
     }
 
+    // dateStamp exists for the REPLAY. An event pulled out of a conversation
+    // from 4 July belongs in 4 July's log, not in today's — a replay that dumped
+    // eight months of events into one day would be manufacturing a day that
+    // never happened. Live intake passes nothing and gets today, as before.
     const now = new Date();
-    const date = getLocalDateStamp(now); // local Pacific YYYY-MM-DD
+    const date = dateStamp || getLocalDateStamp(now); // local Pacific YYYY-MM-DD
     const time = now.toTimeString().slice(0, 5); // HH:MM
 
     const entry = `### ${time}\n- ${summary}\n\n`;
@@ -1729,6 +1733,10 @@ async function applyExtraction(plan, opts = {}) {
   const memoryDir = opts.memoryDir || MEMORY_DIR;
   const dailyDir = path.join(memoryDir, 'daily');
   const opsDir = path.join(memoryDir, 'ops');
+  // Replay writes each exchange's log lines under the date the conversation
+  // actually happened. Unset on the live path, which means today.
+  const dateStamp = opts.dateStamp || null;
+  const logDaily = (summary) => appendToDailyLog(summary, dailyDir, dateStamp);
   const memoryClusters = require('./memory-clusters');
   const factStore = require('./fact-store');
   const questions = require('./questions');
@@ -1747,7 +1755,7 @@ async function applyExtraction(plan, opts = {}) {
 
   // ---- events → the day's log, never the fact store ----
   for (const e of plan.events) {
-    appendToDailyLog(`${e.text}${src}`, dailyDir);
+    logDaily(`${e.text}${src}`);
     result.events++;
   }
   for (const r of plan.routedToLog) {
@@ -1757,7 +1765,7 @@ async function applyExtraction(plan, opts = {}) {
   // ---- refusals: spoken to the record, never silent ----
   for (const ref of plan.refusals) {
     const line = `Did not record "${ref.text}" — ${ref.detail}.`;
-    appendToDailyLog(`${line}${src}`, dailyDir);
+    logDaily(`${line}${src}`);
     appendToOpsLog(`Intake refusal (${ref.rule}): ${line}`, opsDir);
   }
 
@@ -1774,18 +1782,15 @@ async function applyExtraction(plan, opts = {}) {
       detectedBy: rep.detectedBy
     });
     result.repeats++;
-    appendToDailyLog(
-      `Already knew this, so I did not write it down twice — "${rep.text}" restates "${rep.existingContent}"` +
-      `${absorbed.raised ? ` (its salience rose to ${absorbed.salience})` : ''}.${src}`,
-      dailyDir
-    );
+    logDaily(`Already knew this, so I did not write it down twice — "${rep.text}" restates "${rep.existingContent}"` +
+      `${absorbed.raised ? ` (its salience rose to ${absorbed.salience})` : ''}.${src}`);
   }
 
   // ---- facts: the only write path ----
   const factToMemberId = new Map();
   const factToClusterId = new Map();
   for (const f of plan.facts) {
-    appendToDailyLog(`Scored fact salience ${f.salience}/10: "${f.text}" — ${f.salienceRationale}`, dailyDir);
+    logDaily(`Scored fact salience ${f.salience}/10: "${f.text}" — ${f.salienceRationale}`);
     try {
       const res = await memoryClusters.assignToCluster(
         f.text, extractionProvider, extractionModel, extractionApiKey(extractionProvider), extractionHost,
@@ -1809,16 +1814,13 @@ async function applyExtraction(plan, opts = {}) {
     const res = await factStore.supersede(s.oldMemberId, newMemberId);
     if (res.ok) {
       result.superseded++;
-      appendToDailyLog(
-        `Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" ` +
-        `(${s.explicitCorrection ? 'explicit user correction' : 'user correction'}).${src}`,
-        dailyDir
-      );
+      logDaily(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" ` +
+        `(${s.explicitCorrection ? 'explicit user correction' : 'user correction'}).${src}`);
     } else if (res.locked) {
       // A refused lock must be spoken. Storage guards run after the reply, so
       // this half lands in the record; the live-chat half is the [LOCKED] marker
       // in the injected identity block.
-      appendToDailyLog(`I did not change a locked fact: ${res.reason}`, dailyDir);
+      logDaily(`I did not change a locked fact: ${res.reason}`);
     }
   }
 
@@ -1841,14 +1843,14 @@ async function applyExtraction(plan, opts = {}) {
       clusterId: u.clusterId, memberId: u.memberId, conversationId: plan.conversationId
     })) {
       questionQueued = true;
-      appendToDailyLog(`Queued clarifying question (contradiction-uncertainty): "${q}"`, dailyDir);
+      logDaily(`Queued clarifying question (contradiction-uncertainty): "${q}"`);
     }
   }
 
   if (!questionQueued && plan.gapQuestion) {
     const already = await gapAlreadyAnswered(plan.gapQuestion);
     if (already) {
-      appendToDailyLog(`Skipped gap question (already answered by memory): "${plan.gapQuestion}" ← "${already.evidence}"`, dailyDir);
+      logDaily(`Skipped gap question (already answered by memory): "${plan.gapQuestion}" ← "${already.evidence}"`);
     } else {
       const firstFact = plan.facts[0];
       const anchorClusterId = (firstFact && factToClusterId.get(firstFact.text)) || (plan.nearbyClusterIds || [])[0] || null;
@@ -1857,7 +1859,7 @@ async function applyExtraction(plan, opts = {}) {
         question: plan.gapQuestion, reason: 'gap',
         clusterId: anchorClusterId, memberId: anchorMemberId, conversationId: plan.conversationId
       })) {
-        appendToDailyLog(`Queued clarifying question (gap): "${plan.gapQuestion}"`, dailyDir);
+        logDaily(`Queued clarifying question (gap): "${plan.gapQuestion}"`);
       }
     }
   }

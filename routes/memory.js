@@ -63,7 +63,9 @@ function sanitizeString(str, maxLength = 1000) {
 router.get('/', (req, res) => {
   try {
     const memoryFiles = db.loadMemoryFiles();
-    memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: 'user' }) || null;
+    const injectSubjects = ['user'];
+    if (getConfig().memory?.injection?.includeWorld === true) injectSubjects.push('world');
+    memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: injectSubjects }) || null;
     res.json(memoryFiles);
   } catch (error) {
     console.error('[MemoryAPI] Error loading memory files:', error.message);

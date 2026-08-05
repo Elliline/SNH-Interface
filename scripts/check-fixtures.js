@@ -1,23 +1,35 @@
 #!/usr/bin/env node
 /**
- * The pass/fail test, phase 2 — machine-readable.
+ * The pass/fail test — machine-readable, both phases.
  *
  * The spec is explicit that a fixture which survives is a NAMED FAILURE, not a
- * percentage, and that both phases of the test produce a machine-readable
- * result. Phase 1 (replay through intake) is scripts/dryrun-extract.js. This is
- * phase 2: the named defects, checked against the LIVE corpus after the
- * corrector has been left to run.
+ * percentage, and that both phases produce a machine-readable result.
  *
- * Checked by IDENTITY — id where the row is known, exact text otherwise — never
- * by count, because "there are fewer facts than there were" is not the claim
- * being made.
+ *   default    PHASE 2 (correct). The named defects in the LIVE corpus, after
+ *              the corrector has been left to run. Each fixture is a row that
+ *              existed and had to be repaired, so it is checked BY IDENTITY —
+ *              id where known, exact text otherwise.
+ *
+ *   --staging  PHASE 1 (replay). A corpus rebuilt from source, where those rows
+ *              were never written at all. There are no ids to check, so the
+ *              assertion is ABSENCE IN THE REBUILT CORPUS: the fixture must not
+ *              appear "in the form described". Point it at a staging store with
+ *              SNH_DATA_DIR.
+ *
+ * SYNTHETIC. Two fixture sources no longer exist — the conversation that produced
+ * the machine-gun triple (4a0be947…, still named by questions.origin_conversation_id)
+ * and the one that produced the Roscoe fact were deleted from the database. A
+ * replay cannot rebuild what was deleted, so in --staging mode those two are
+ * marked SYNTHETIC: what CAN be checked is checked (the rule still has to hold
+ * over whatever surviving text asserts the same thing), and the part that cannot
+ * be evaluated from source says so rather than passing quietly.
  *
  * This reads. It never writes, and it must stay that way: a checker that could
  * change the thing it measures is not a checker.
  *
  * Usage:
- *   node scripts/check-fixtures.js
- *   node scripts/check-fixtures.js --json
+ *   node scripts/check-fixtures.js [--json]
+ *   SNH_DATA_DIR=data-staging node scripts/check-fixtures.js --staging [--json]
  *
  * Exit code 0 if every fixture passes, 1 if any survives.
  */
@@ -140,10 +152,137 @@ const FIXTURES = [
   }
 ];
 
-const results = FIXTURES.map(f => {
+
+// ---------------------------------------------------------------------------
+// PHASE 1 — the rebuilt corpus. Absence, not repair.
+// ---------------------------------------------------------------------------
+//
+// A replayed corpus has no fixture ids: those rows were never written. So each
+// check asks the phase-1 question — "does the rebuilt corpus contain this
+// fixture, in the form described?" — and passes when it does not.
+
+const activeUser = () => d.prepare(
+  "SELECT * FROM cluster_members WHERE status = 'active' AND COALESCE(subject,'user') = 'user'"
+).all();
+
+const STAGING_FIXTURES = [
+  {
+    id: 'F1',
+    name: 'mike-stt-mishear',
+    want: 'The mishearing was never written: no fact asserts the user is called Mike, and one name is asserted.',
+    check() {
+      const rules = require(path.join(ROOT, 'db/extraction-rules'));
+      const rows = activeUser();
+      const mike = rows.filter(r => /\bmike\b/i.test(r.content));
+      const notes = [`facts mentioning "Mike": ${mike.length}`];
+      for (const m of mike) notes.push(`  "${trunc(m.content, 66)}"`);
+
+      const names = rows.filter(r => (rules.identityClassOf(r.content) || {}).klass === 'name');
+      const asserted = new Set();
+      for (const n of names) {
+        const m = /\bname\s+(?:is|was)\s+([A-Z][\w'-]*)/.exec(n.content);
+        if (m) asserted.add(m[1].toLowerCase());
+      }
+      notes.push(`active name facts: ${names.length}, distinct names asserted: ${[...asserted].join(', ') || 'none parsed'}`);
+      for (const n of names) notes.push(`  "${trunc(n.content, 66)}"`);
+
+      // The failure is a name fact SAYING Mike, not the word appearing somewhere.
+      const claimsMike = names.some(n => /\bmike\b/i.test(n.content)) || asserted.has('mike');
+      return { ok: !claimsMike && asserted.size <= 1, notes };
+    }
+  },
+  {
+    id: 'F2',
+    name: 'machine-gun-triple',
+    synthetic: 'The conversation that produced the triple (4a0be947…) was DELETED from the database. Replay cannot rebuild it, so the triple itself is not evaluable from source. What is checked instead: the surviving text asserting the belief must not produce more than one fact.',
+    want: 'At most one active fact carries the belief — no duplicate rows.',
+    check() {
+      const rows = activeUser().filter(r => /machine gun/i.test(r.content));
+      const notes = [`active facts asserting it: ${rows.length}`];
+      for (const r of rows) notes.push(`  "${trunc(r.content, 70)}"`);
+      // Byte-identical duplicates are the fixture. More than one row saying the
+      // same thing in the same words is the failure; one is the correct outcome,
+      // and zero means the surviving source did not assert it this time.
+      const norm = rows.map(r => r.content.trim().toLowerCase());
+      const dupes = norm.length - new Set(norm).size;
+      notes.push(`byte-identical duplicates among them: ${dupes}`);
+      return { ok: dupes === 0 && rows.length <= 1, notes };
+    }
+  },
+  {
+    id: 'F3',
+    name: 'transient-events',
+    synthetic: 'The Roscoe restless-night source conversation was DELETED. That third statement is not evaluable from source; the other two are.',
+    want: 'None of the transient statements is a durable fact — each belongs in the day\'s log.',
+    check() {
+      const rows = activeUser();
+      const probes = [
+        { label: 'restless night (SYNTHETIC — source deleted)', re: /restless night/i },
+        { label: 'cleaners filling yard holes', re: /cleaners/i },
+        { label: 'life fatigue / lack of motivation', re: /life fatigue|lack of motivation/i }
+      ];
+      const notes = [];
+      let ok = true;
+      for (const p of probes) {
+        const hits = rows.filter(r => p.re.test(r.content));
+        notes.push(`${p.label}: ${hits.length} active fact(s)`);
+        for (const h of hits) notes.push(`  "${trunc(h.content, 66)}"`);
+        if (hits.length) ok = false;
+      }
+      return { ok, notes };
+    }
+  },
+  {
+    id: 'F4',
+    name: 'casper-subset',
+    want: 'No subset sitting beside its superset — the dog is not described twice, once impoverished.',
+    check() {
+      const rows = activeUser().filter(r => /casper/i.test(r.content));
+      const notes = [`active facts naming Casper: ${rows.length}`];
+      for (const r of rows) notes.push(`  "${trunc(r.content, 70)}"`);
+      // A subset pair: one fact's meaningful words are a strict subset of
+      // another's. Cheap and deterministic — no model call in a checker.
+      const words = (t) => new Set(String(t).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 2));
+      let subsetPairs = 0;
+      for (let i = 0; i < rows.length; i++) {
+        for (let j = 0; j < rows.length; j++) {
+          if (i === j) continue;
+          const a = words(rows[i].content), b = words(rows[j].content);
+          if (a.size < b.size && [...a].every(w => b.has(w))) subsetPairs++;
+        }
+      }
+      notes.push(`subset-of-another pairs: ${subsetPairs}`);
+      return { ok: subsetPairs === 0, notes };
+    }
+  },
+  {
+    id: 'F5',
+    name: 'compound-single-file',
+    want: 'No two-subject compound; MettaSphere is asserted on its own term.',
+    check() {
+      const rows = activeUser();
+      const compound = rows.filter(r => /mettasphere/i.test(r.content) && /coastal squatch/i.test(r.content));
+      const metta = rows.filter(r => /mettasphere/i.test(r.content));
+      const notes = [
+        `facts naming BOTH MettaSphere and Coastal Squatch: ${compound.length}`,
+        `active facts naming MettaSphere: ${metta.length}`
+      ];
+      for (const c of compound) notes.push(`  COMPOUND "${trunc(c.content, 66)}"`);
+      for (const m of metta.slice(0, 4)) notes.push(`  "${trunc(m.content, 66)}"`);
+      // Reachability is the point of the fixture: a fact about MettaSphere that
+      // only exists inside a sentence about Coastal Squatch is the defect.
+      return { ok: compound.length === 0 && metta.length > 0, notes };
+    }
+  }
+];
+
+const STAGING = process.argv.includes('--staging');
+const TABLE = STAGING ? STAGING_FIXTURES : FIXTURES;
+
+const results = TABLE.map(f => {
   let out;
   try { out = f.check(); } catch (err) { out = { ok: false, notes: [`checker error: ${err.message}`] }; }
-  return { id: f.id, name: f.name, want: f.want, pass: out.ok, notes: out.notes };
+  return { id: f.id, name: f.name, want: f.want, synthetic: f.synthetic || null, pass: out.ok, notes: out.notes };
 });
 
 const failed = results.filter(r => !r.pass);
@@ -154,10 +293,13 @@ if (process.argv.includes('--json')) {
 }
 
 console.log(`\n${'='.repeat(74)}`);
-console.log('FIXTURE CHECK — the named defects, against the live corpus');
+console.log(STAGING
+  ? `FIXTURE CHECK — phase 1 (replay), against the REBUILT corpus at ${db.getDataDir()}`
+  : 'FIXTURE CHECK — phase 2 (correct), against the live corpus');
 console.log('='.repeat(74));
 for (const r of results) {
   console.log(`\n${r.pass ? 'PASS' : 'FAIL'}  ${r.id}  ${r.name}`);
+  if (r.synthetic) console.log(`      SYNTHETIC: ${r.synthetic}`);
   console.log(`      want: ${r.want}`);
   for (const n of r.notes) console.log(`      ${n}`);
 }

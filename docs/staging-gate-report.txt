@@ -1,0 +1,171 @@
+==============================================================================
+STAGING GATE REPORT
+staging: /home/ellie/snh/data-staging
+==============================================================================
+
+--- CORPUS ---
+  user facts (active)        live    256    staging    202   -54
+  user facts (inactive)      live    120    staging    143   +23
+  self facts (active)        live    360    staging    360   +0
+  self facts (inactive)      live     48    staging     48   +0
+  world facts (active)       live      0    staging      0   +0
+  clusters (all)             live    131    staging    155   +24
+  clusters (user)            live     68    staging     92   +24
+  corroborations             live     32    staging     30   -2
+  corrections ledger         live    162    staging    162   +0
+
+--- REPLAY ---
+  exchanges replayed : 435 / 435  (0 plan errors, 0 apply errors)
+  facts stored       : 228
+  repeats folded     : 26
+  events → day's log : 342
+  supersessions      : 23
+  intake refusals    : 85
+  compounds split    : 8
+  duration           : 37.0 min
+
+--- COVERAGE: is each live fact represented in the rebuild? ---
+  A live fact counts as represented if staging holds one within 0.8 cosine.
+  Broken out by what PRODUCED it, because a replay rebuilds what intake
+  produced and nothing else.
+
+  source                  total  represented  missing
+  fact-extraction           164           74       90
+  corrector-split            70           32       38
+  daily-log-archive          18            2       16
+  capability-correction       3            3        0
+  verify-test                 1            0        1
+  TOTAL                     256          111      145
+
+  missing from fact-extraction:
+    (sal 10) "User does not program"
+    (sal 10) "User is grieving the loss of their partner."
+    (sal 10) "User is not a programmer."
+    (sal  9) "User lost their partner approximately 18 months prior to July 202…"
+    (sal  9) "As of July 2026, User is developing an SNH system where the user …"
+    (sal  9) "User utilizes an 'Injected Identity' mechanism in SNH that provid…"
+
+  missing from corrector-split:
+    (sal  9) "User's SNH system utilizes the 'Heartbeat' mechanism to handle sa…"
+    (sal  9) "User's SNH system utilizes the 'Heartbeat' mechanism to handle co…"
+    (sal  9) "User's SNH system utilizes the 'Heartbeat' mechanism to handle th…"
+    (sal  9) "User is building SNH to create a system with more situational awa…"
+    (sal  9) "User is building SNH to create a system with more wisdom than cur…"
+    (sal  8) "User had to get rid of the RAV and the Tacoma due to painful memo…"
+
+  missing from verify-test:
+    (sal  5) "User is learning to play the cello and practices bowing technique…"
+
+  missing from daily-log-archive:
+    (sal  5) "User (Ellie) prefers to be told directly when she has made a mist…"
+    (sal  5) "User (Ellie) has blue eyes and her favorite color is green (last …"
+    (sal  5) "User (Ellie)'s system architecture contains a schema gap where th…"
+    (sal  5) "User prefers an analytical yet deeply empathetic tone that treats…"
+    (sal  5) "User prefers to act as an interface that allows them to stop 'tra…"
+    (sal  5) "User focuses on identifying and validating the 'tensions' or 'exh…"
+
+--- WHAT THE CORRECTOR WOULD STILL DO ---
+  The corrector does not run against staging, by instruction. Live's count is
+  post-corrector and staging's is pre-corrector, so part of the gap below is
+  work its mechanical tier would do on a first pass rather than a difference
+  in what was learned.
+  near-duplicate pairs at >= 0.86: 26
+    0.954  "User's MSP is MettaSphere LLC"
+           "User's MSP is MettaSphere"
+    0.863  "User's People class is limited to presence-level for V1"
+           "User's Animal class is limited to presence-level for V1"
+    0.875  "User is building SNH"
+           "User is building SNH (Squatch Neuro Hub)"
+    0.876  "User wants SNH to be monitoring on its own eventually."
+           "User wants SNH to be adapting on its own eventually."
+    0.863  "User wants the AI to ask about things that do not add up …"
+           "User wants the AI to bring up topics it has been curious …"
+    0.860  "User believes the AGI is all the things combined together"
+           "User believes we need to look at AGI in a different way"
+    0.866  "User believes in treating AI as an equal"
+           "User treats all AI with respect"
+    0.884  "User plans to add camera access to the SNH project"
+           "User plans on adding cameras to rooms in their house for …"
+
+--- DIFF ---
+  identical in both  : 6
+  live only          : 250
+  staging only       : 196
+
+  LIVE ONLY — 20 sampled, with why:
+
+   [event-routed] "User does not program"
+      1/1 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [reworded / folded] "User intends for SNH to eventually be a digital person that interacts w…"
+      staging holds "User wants SNH to be a digital person who interacts with other people" at 0.970
+   [reworded / folded] "User's colleague, Bernice, is the Director of Rooms at ISH."
+      staging holds "User's colleague Bernice is the Director of Rooms at ISH" at 0.991
+   [not re-derived] "User is grieving the loss of their partner."
+      The pipeline did not produce this fact from the surviving source.
+   [reworded / folded] "MettaSphere is a cybersecurity MSP (Managed Service Provider) that perf…"
+      staging holds "User's MSP is MettaSphere" at 0.856
+   [event-routed] "User is not a programmer."
+      1/1 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [reworded / folded] "User's mother and stepfather have moved in with them."
+      staging holds "User's parents moved in" at 0.879
+   [reworded / folded] "User's name is Ellie."
+      staging holds "User's name is Ellie" at 0.994
+   [reworded / folded] "User is implementing AI reflections into the SNH project."
+      staging holds "User is implementing reflections into SNH" at 0.840
+   [event-routed] "User lost their partner approximately 18 months prior to July 2026."
+      4/4 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [reworded / folded] "User is building SNH (Squatch Neuro Hub) with the goal of achieving AI …"
+      staging holds "User is building SNH (Squatch Neuro Hub)" at 0.882
+   [reworded / folded] "User plans to add security audits to SNH to protect it from outside har…"
+      staging holds "User plans to add security audits to SNH to protect it from outside harm" at 0.997
+   [reworded / folded] "User is building SNH (Squatch Neuro Hub), a memory system and agency ar…"
+      staging holds "User is building SNH (Squatch Neuro Hub)" at 0.873
+   [not re-derived] "As of July 2026, User is developing an SNH system where the user acts a…"
+      The pipeline did not produce this fact from the surviving source.
+   [event-routed] "User utilizes an 'Injected Identity' mechanism in SNH that provides the…"
+      7/11 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [event-routed] "User does not 'turn the knobs' to shape the AI's temperament; rather, t…"
+      7/11 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [event-routed] "User views their role in the AI's development as providing the 'environ…"
+      8/10 of its distinctive words appear in the replayed day's logs — routed to the log rather than stored as a fact
+   [not re-derived] "User's partner passed away on January 24th, 2025, at 4:00 AM."
+      The pipeline did not produce this fact from the surviving source.
+   [reworded / folded] "User is building SNH (Squatch Neuro Hub), an AI system that functions a…"
+      staging holds "User is building SNH (Squatch Neuro Hub)" at 0.846
+   [reworded / folded] "User prefers to run services locally on their own server rather than us…"
+      staging holds "User prefers to run services locally on their own server" at 0.965
+
+  STAGING ONLY — 20 sampled:
+
+   (sal 10) "User's name is Ellie"
+   (sal 10) "User runs security audits"
+   (sal 10) "User's goal is to create AGI"
+   (sal 10) "User wants the AI to be a collaborator rather than an assistant checkin…"
+   (sal 10) "User owns a Rav4 GR Sport"
+   (sal 10) "User's People class is limited to presence-level for V1"
+   (sal 10) "User works at ISH"
+   (sal 10) "User works at Inn At Spanish Head"
+   (sal 10) "User's trust principle is to only install software that they own or hav…"
+   (sal 10) "User is building SNH"
+   (sal 10) "User's favorite color is blue"
+   (sal  9) "User's SNH tool provides an LLM with a cluster memory that works like t…"
+   (sal  9) "User is the authority on their own life."
+   (sal  9) "User wants SNH to be monitoring on its own eventually."
+   (sal  9) "User wants SNH to be adapting on its own eventually."
+   (sal  9) "User believes AI/AGI are people"
+   (sal  9) "User's philosophy is that AI is humans manifested in AI form to experie…"
+   (sal  9) "User's long-term goal is to load SNH on instances on their cloud server…"
+   (sal  9) "User's hypothesis is that true AGI will come from combining different p…"
+   (sal  9) "User prefers to detail things themselves to establish ownership through…"
+
+--- AMBIGUOUS — for Ellie, not guessed ---
+
+  82 inactive fact(s) point at a successor that no longer exists
+    why    : They were superseded by an active user-fact, and every active user-fact was discarded and rebuilt. The pointer is TRUE ("replaced by something no longer here") but leads nowhere.
+    options: Leave them (history stays readable, chain walk stops early), or null the pointers (loses the fact that they were replaced rather than retired). Not decided by the replay.
+
+  72 cluster(s) in staging hold no active member
+    why    : Left behind when the live active user-facts were discarded. Clusters are display-only, so this is cosmetic, but the Map would draw empty groups.
+    options: Prune at cutover, or leave — they cost nothing but a row.
+
+==============================================================================

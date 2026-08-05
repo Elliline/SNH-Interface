@@ -1049,6 +1049,12 @@ async function runPass(opts = {}) {
     const userSem = await resolveContradictions(pass, { subject: 'user' });
     result.superseded = userSem.applied;
 
+    // World facts get the same semantic tier as user facts, with no extra gate:
+    // they are knowledge about external things, not a view of anyone, so there
+    // is nothing here that a joint curation session needs to be present for.
+    const worldSem = await resolveContradictions(pass, { subject: 'world' });
+    result.superseded += worldSem.applied;
+
     if (c.selfFactSemantic === true) {
       const selfSem = await resolveContradictions(pass, { subject: 'self' });
       result.superseded += selfSem.applied;

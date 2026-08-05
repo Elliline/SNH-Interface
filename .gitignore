@@ -22,3 +22,9 @@ Thumbs.db
 *.db-shm
 *.sqlite
 *.sqlite3
+
+# Replay staging store and its log — build artefacts, rebuilt by
+# scripts/replay-to-staging.js. Never a system of record.
+data-staging/
+data-staging-*/
+data-staging-replay.log

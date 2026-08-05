@@ -854,3 +854,53 @@ pronoun atom the corrector split out of a mis-subjected daily-log-archive fact
 about Aurelius, before the identity-atom rule landed in Phase 2c. The rule stops
 new ones; this one predates it. It is in the ledger and revertible from the Self
 tab, which is Ellie's call, not an automatic one.
+
+---
+
+## Phase 2d — the replay, BUILT TO STAGING 2026-08-05 (awaiting sign-off)
+
+Not shipped. The staging corpus exists, the report is `docs/staging-gate-report.txt`,
+and nothing has been cut over.
+
+| | Change |
+|---|---|
+| A | `subject='world'` (slim): knowledge about external things, relational to neither of them. Excluded from the injected block by default (`memory.injection.includeWorld`), reachable through the inspect tools, same contradiction/corrector machinery as any other subject. Relational facts are NOT re-taxonomised |
+| B | `SNH_DATA_DIR` redirects a whole PROCESS's store, so the replay runs the real pipeline with no staging flag threaded anywhere. It refuses to run against live |
+| C | `scripts/replay-to-staging.js` — seeds staging from live (self-facts, locked rows, ALL inactive rows, the ledger and surviving corroborations carry over; active user facts are discarded), then replays every stored exchange through `planExtraction`/`applyExtraction`. Planning runs at `memory.replay.concurrency`; applies are strictly serial |
+| D | `appendToDailyLog` takes a date, so an event pulled out of a July conversation lands in July's log rather than manufacturing a day that never happened |
+| E | `check-fixtures.js --staging` — phase 1 of the pass/fail test, asserting ABSENCE in the rebuilt corpus, with the two deleted-source fixtures marked SYNTHETIC |
+| F | `scripts/staging-report.js` — the gate artefact |
+
+### Result
+
+435/435 exchanges replayed, 0 plan errors, 0 apply errors, 37 minutes. Phase 1 of
+the pass/fail test: **5/5**, F2 and F3-restless-night SYNTHETIC as the spec
+requires. No heartbeat fired during the run, and the live corpus was byte-for-byte
+unchanged (256 active user facts before and after, zero rows updated).
+
+**The finding that matters is coverage.** The rebuilt corpus holds 202 active user
+facts against live's 256, and 145 of the live facts have no equivalent in staging
+within 0.80 cosine:
+
+| producer | live | represented | missing |
+|---|---|---|---|
+| `fact-extraction` | 164 | 74 | 90 |
+| `corrector-split` | 70 | 32 | 38 |
+| `daily-log-archive` | 18 | 2 | 16 |
+| `capability-correction` | 3 | 3 | 0 |
+
+Two different things are mixed in that column and they need separating before any
+cutover:
+
+1. **Facts no conversation produced cannot come back by this route.** The
+   `daily-log-archive` import and the corrector's splits were never written by
+   intake, so replaying conversations has nothing to rebuild them from. This is
+   structural, not a pipeline failure.
+2. **The current pipeline is markedly more conservative than the one that built
+   the live corpus.** 342 events routed to the day's log and 85 intake refusals
+   against 228 facts stored. That is the spec's chosen trade working as designed
+   — but at this scale it means a replace-style cutover drops real things,
+   including `"User is grieving the loss of their partner."` (salience 10).
+
+A replay that loses that fact is not a replay anyone should accept silently. The
+gate is where that decision belongs.

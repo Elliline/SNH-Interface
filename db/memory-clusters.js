@@ -1139,8 +1139,16 @@ function getClusters(subject = null) {
  * salient fact and facts by salience within a cluster, so when budgetText cuts
  * the tail it drops the least important facts rather than an arbitrary slice.
  *
+ * SUBJECT is a list, because 'world' exists. World facts — knowledge about
+ * external things that is not relational to either of them — are excluded from
+ * the injected block by default (`memory.injection.includeWorld`), so the
+ * caller asks for the subjects it wants rather than this function deciding.
+ * Passing several renders them into one block; the cluster headings already
+ * separate them, and a fact's subject is not something the reader needs spelled
+ * out to use it.
+ *
  * @param {Object} [opts]
- * @param {string} [opts.subject='user'] - which corpus to render
+ * @param {string|string[]} [opts.subject='user'] - which corpus (or corpora) to render
  * @returns {string} markdown, or '' when there are no active facts
  */
 function renderLongTermMemory({ subject = 'user' } = {}) {
@@ -1148,13 +1156,18 @@ function renderLongTermMemory({ subject = 'user' } = {}) {
     const db = getSqliteDb();
     if (!db) return '';
 
+    const subjects = (Array.isArray(subject) ? subject : [subject])
+      .map(s => String(s || '').trim())
+      .filter(Boolean);
+    if (!subjects.length) return '';
+
     const rows = db.prepare(`
       SELECT cm.content, cm.salience, cm.created_at,
              COALESCE(mc.name, 'Other') AS cluster_name
       FROM cluster_members cm
       LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
-      WHERE cm.subject = ? AND cm.status = 'active'
-    `).all(subject);
+      WHERE cm.subject IN (${subjects.map(() => '?').join(',')}) AND cm.status = 'active'
+    `).all(...subjects);
     if (rows.length === 0) return '';
 
     const byCluster = new Map();

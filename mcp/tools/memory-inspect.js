@@ -61,8 +61,8 @@ class BaseInspectTool {
 // Shared argument shapes, so the four tools describe the same filter the same way.
 const SUBJECT_ARG = {
   type: 'string',
-  enum: ['user', 'self'],
-  description: 'Whose facts. "user" = facts about Ellie. "self" = facts about you. Omit for both.'
+  enum: ['user', 'self', 'world'],
+  description: 'Whose facts. "user" = facts about Ellie. "self" = facts about you. "world" = knowledge about external things that is about neither of you — how a service behaves, a tool\'s quirk. World facts are NOT in your injected context, so search for them rather than assuming you would already know. Omit for all.'
 };
 const STATUS_ARG = {
   type: 'string',
@@ -175,8 +175,8 @@ class MemoryCorrectionsTool extends BaseInspectTool {
         id: { type: 'string', description: 'A correction id, from a list result or from memory_get on a fact. The first 8 characters are enough. Omit to list.' },
         subject: {
           type: 'string',
-          enum: ['user', 'self'],
-          description: 'Whose facts the change was to. "user" = facts about Ellie. "self" = facts about you. Omit for both.'
+          enum: ['user', 'self', 'world'],
+          description: 'Whose facts the change was to. "user" = facts about Ellie. "self" = facts about you. "world" = external knowledge about neither of you. Omit for all.'
         },
         action: {
           type: 'string',

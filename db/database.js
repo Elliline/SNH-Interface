@@ -11,10 +11,27 @@ const { randomUUID } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
 const { getLocalDateStamp } = require('./datetime');
 
-// Database paths
-const DATA_DIR = path.join(__dirname, '../data');
+// Database paths.
+//
+// SNH_DATA_DIR redirects the WHOLE store — SQLite and the vector index together
+// — and exists for one reason: the replay. The spec's rule is that replay runs
+// the same code path as live intake, and "if replay needs a special case, the
+// pipeline is wrong". A staging flag threaded through fact-store, memory-clusters
+// and the extractor would be exactly that special case, in a dozen places, with
+// the failure mode that one of them forgets and writes to the live corpus.
+// Pointing a whole PROCESS at a different data directory needs no special case
+// anywhere: every module below reads the same handle it always did.
+//
+// The server never sets it. Only scripts/replay-to-staging.js does, and it
+// refuses to run against the live directory.
+const DATA_DIR = process.env.SNH_DATA_DIR
+  ? path.resolve(process.env.SNH_DATA_DIR)
+  : path.join(__dirname, '../data');
 const SQLITE_PATH = path.join(DATA_DIR, 'chat.db');
 const LANCEDB_PATH = path.join(DATA_DIR, 'lancedb');
+
+/** Where this process's store lives. The replay uses it to find its memory dir. */
+function getDataDir() { return DATA_DIR; }
 
 // Ensure data directories exist
 function ensureDirectories() {
@@ -1593,6 +1610,7 @@ module.exports = {
   // Initialization
   initDatabase,
   initVectorStore,
+  getDataDir,
 
   // SQLite functions
   getConversations,

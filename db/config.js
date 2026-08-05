@@ -209,7 +209,18 @@ const DEFAULTS = {
       dailyTodayTokens: 1500,    // today's most-recent entries injected verbatim
       dailySummaryTokens: 400,   // brief digest of older-today + yesterday
       clusterTokens: 1200,       // associated cluster memory cap
-      pastConvoTokens: 800       // hybrid-search past-conversation snippets cap
+      pastConvoTokens: 800,      // hybrid-search past-conversation snippets cap
+      // subject='world' facts — knowledge about external things that is not
+      // relational to Ellie or to him (how a service behaves, a tool's quirk,
+      // task knowledge a future agent job leaves behind).
+      //
+      // OFF by default, and the default is the design rather than caution. The
+      // injected block runs to a ~2.9k diet that everything else competes
+      // inside; world knowledge is unbounded in a way personal facts are not,
+      // so letting it in by default would crowd out the facts the block exists
+      // for. It stays reachable on demand through the inspect tools and
+      // topic-relevant retrieval, which is where unbounded knowledge belongs.
+      includeWorld: false
     },
     // Contradiction-candidate recall (Phase 2a). These replace two bare literals
     // that made the check unreliable: a `.limit(15)` on the RAW vector search and
@@ -221,6 +232,13 @@ const DEFAULTS = {
     // Selection is now threshold-based, not fixed-k: every ACTIVE, same-subject
     // fact above the floor is a candidate, and maxCandidates is only a cost
     // ceiling. When the ceiling truncates, that is logged — never silent.
+    // The replay (Phase 2d). Concurrency applies to the PLAN half only —
+    // planExtraction decides and writes nothing, so it parallelises safely;
+    // applies stay strictly serial in source order so repeat-folding and
+    // supersession always see a consistent corpus. A knob, not a ceiling.
+    replay: {
+      concurrency: 6
+    },
     contradiction: {
       // How many raw vector neighbours to pull before filtering. Large on
       // purpose: the filter must run against a superset, not a top-k that

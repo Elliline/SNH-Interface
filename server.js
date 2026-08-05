@@ -1615,7 +1615,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     let memoryFiles = { memory: null, user: null, dailyToday: null, dailyYesterday: null };
     try {
       memoryFiles = db.loadMemoryFiles();
-      memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: 'user' }) || null;
+      // World facts are excluded unless config says otherwise: the injected
+      // block runs to a tight diet, and unbounded external knowledge would
+      // crowd out the personal facts it exists for. They stay reachable through
+      // the inspect tools.
+      const injectSubjects = ['user'];
+      if (appConfig.memory?.injection?.includeWorld === true) injectSubjects.push('world');
+      memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: injectSubjects }) || null;
       console.log('Memory loaded:', {
         longTerm: memoryFiles.memory ? `${memoryFiles.memory.length} chars (rendered from SQLite)` : 'none',
         user: memoryFiles.user ? `${memoryFiles.user.length} chars` : 'none',

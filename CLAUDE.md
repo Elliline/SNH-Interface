@@ -185,6 +185,28 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+## ⚠️ The replay redirects a PROCESS, not a call
+
+`db/database.js` resolves its SQLite and LanceDB paths from `SNH_DATA_DIR` when
+that variable is set. `scripts/replay-to-staging.js` is the only thing that sets
+it, and it refuses to run if the path resolves to the live `data/`.
+
+This is how the spec's rule — *replay is the same code path as live intake; if
+replay needs a special case, the pipeline is wrong* — is actually kept. The
+alternative was a `staging: true` flag threaded through fact-store,
+memory-clusters and the extractor, which is a special case in a dozen places
+with one obvious failure mode: the call site that forgets, and writes to the
+live corpus. Redirecting the whole process needs no special case anywhere,
+because every module reads the same handle it always did.
+
+Two consequences worth knowing. **A new module that hardcodes
+`path.join(__dirname, '../data')` for a STORE silently escapes the redirect** —
+paths under `data/memory` are passed explicitly instead (`applyExtraction`'s
+`opts.memoryDir`), so follow that pattern rather than adding a second constant.
+And **the replay must never be given a writable handle on live**: the seed copies
+with `VACUUM INTO` from a READONLY connection, deliberately without a
+`wal_checkpoint` first, because checkpointing is a write.
+
 ## ⚠️ Never re-add a vector for an inactive fact
 
 `db/fact-store.js` drops the embedding when a fact goes inactive, so retrieval
