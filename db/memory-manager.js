@@ -1,12 +1,14 @@
 /**
  * Memory Manager Heartbeat
- * Scheduled background job that maintains and optimizes the memory system.
- * Runs every 2 hours (configurable) with a 4-step audit pipeline + cleanup tasks:
+ * Scheduled background job that maintains the memory system.
+ *
+ * The cluster pipeline runs ONLY when a cluster is oversized; on an idle memory
+ * the pass does no model work at all. (Before 2026-08-02 the cross-link audit ran
+ * unconditionally and dominated pass duration; it and cleanupFacts are gone —
+ * see the tombstones below.)
  *   Step 1: auditClusterCoherence — per-cluster LLM coherence check, flags splits
  *   Step 2: executeSplits         — apply flagged splits, re-embed moved facts
- *   Step 3: auditCrossLinks       — LLM-driven batch link scoring across all cluster pairs
- *   Step 4: generateReport        — build report object, log to console + daily file
- *   Task B: cleanupFacts          — LLM-driven fact dedup/reword/merge in MEMORY.md
+ *   Step 3: generateReport        — build report object, log to console + ops file
  *   Task B2: sweepPendingQuestions — retire pending questions memory already answers
  *   Task C: summarizeDailyLogs    — archive daily logs older than retention window
  */
@@ -78,14 +80,235 @@ function memberIdFilter(id) {
   return `member_id = "${id}"`;
 }
 
+// ============ Background tool budget ============
+
+/**
+ * A per-step tool budget.
+ *
+ * Created by runStep when a step declares a tool allowlist, and threaded into
+ * callLLM. Nothing declares one today: this is the scaffold the corrector
+ * (Phase 2c) inherits, built now so the first consumer is not also the thing
+ * that invents its own bounds.
+ *
+ * Two limits, both enforced. A call cap alone lets a step spend twenty minutes
+ * on three slow lookups; a wall clock alone lets a fast loop make two hundred
+ * calls. When either binds, the step keeps running — it just stops being offered
+ * tools — and the fact that it was cut short is recorded rather than inferred
+ * from a suspiciously thin result.
+ */
+function createToolSession(stepName, allowedTools = [], overrides = {}) {
+  const cfg = (getConfig().heartbeat && getConfig().heartbeat.toolBudget) || {};
+  return {
+    stepName,
+    allowedTools,
+    // Overrides exist for the corrector, which legitimately makes far more calls
+    // than any other background role. A single shared number would either starve
+    // it or over-grant everything else, so its budget lives in corrector.* and is
+    // handed in here — one session, one set of limits, no second accounting.
+    maxCalls: Math.max(1, overrides.maxCalls ?? cfg.maxCallsPerStep ?? 12),
+    maxWallMs: Math.max(1000, overrides.maxWallMs ?? cfg.maxWallClockMsPerStep ?? 120000),
+    maxRounds: Math.max(1, overrides.maxRounds ?? cfg.maxRoundsPerCall ?? 5),
+    calls: 0,
+    startedMs: Date.now(),
+    exhaustedReason: null,
+
+    /** @returns {string|null} the reason the budget is spent, or null */
+    spent() {
+      if (this.calls >= this.maxCalls) return `call budget spent (${this.calls}/${this.maxCalls} tool calls)`;
+      const elapsed = Date.now() - this.startedMs;
+      if (elapsed >= this.maxWallMs) return `time budget spent (${Math.round(elapsed / 1000)}s of ${Math.round(this.maxWallMs / 1000)}s)`;
+      return null;
+    },
+
+    /** Record that the budget bound. Loud by construction — never silent. */
+    exhaust(reason) {
+      if (this.exhaustedReason) return;
+      this.exhaustedReason = reason;
+      const line = `Heartbeat step "${this.stepName}" hit its tool budget: ${reason}. It carried on without tools for the rest of the step.`;
+      console.warn(`[Heartbeat] ${line}`);
+      try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch (e) { /* console line is the floor */ }
+    },
+
+    summary() {
+      return {
+        step: this.stepName,
+        tools: this.allowedTools,
+        calls: this.calls,
+        maxCalls: this.maxCalls,
+        elapsedMs: Date.now() - this.startedMs,
+        maxWallMs: this.maxWallMs,
+        exhausted: this.exhaustedReason
+      };
+    }
+  };
+}
+
+/**
+ * Execute one tool call on behalf of a background step.
+ *
+ * Routed through the SHARED MCP registry, so a background step calls the exact
+ * same tool implementation the chat path does — the spec's rule for INSPECT is
+ * "same tools, same contract", and two implementations would be two contracts.
+ * The allowlist is intersected with MCPClient.BACKGROUND_TOOLS, which is
+ * read-only: a background agent that can write is one that can change what the
+ * entity believes about itself with nobody in the room.
+ */
+async function executeBackgroundTool(session, name, args) {
+  const MCPClient = require('../mcp/mcp-client');
+  const client = MCPClient.shared();
+  if (!session.allowedTools.includes(name)) {
+    return { error: `Tool "${name}" is not available to this background step.` };
+  }
+  session.calls++;
+  try {
+    return await client.executeTool(name, args, { caller: `heartbeat:${session.stepName}` });
+  } catch (err) {
+    return { error: `Tool execution failed: ${err.message}` };
+  }
+}
+
+/**
+ * Strip channel/control markers from a tool-loop response.
+ *
+ * Observed on the live engine (vLLM serving Gemma-4-26B-A4B-NVFP4, 2026-08-03):
+ * a plain callLLM returns "OK.", but the same model answering after a tool call
+ * returns "<|channel>thought\n<channel|>I hold 6 active facts…". The markers
+ * appear only on the tool path, so nothing upstream ever had to handle them —
+ * and the corrector will be parsing this content, where a stray control token is
+ * the difference between a parsed verdict and a skipped one.
+ *
+ * Deliberately narrow: only angle-bracket control tokens carrying a pipe. Real
+ * prose does not contain "<|…>" and a broader strip would eat comparisons.
+ */
+function stripChannelMarkers(text) {
+  return String(text || '')
+    // The whole header span, name included: "<|channel>thought\n<channel|>".
+    // Stripping only the two markers would leave the bare channel name
+    // ("thought") glued to the front of the answer, which reads as content.
+    .replace(/<\|channel>[\s\S]{0,40}?<channel\|>/g, '')
+    // Any remaining lone control token.
+    .replace(/<\|[^>|]*\|?>/g, '')
+    .replace(/<[^<>|\s]*\|>/g, '')
+    .trim();
+}
+
+/**
+ * The background tool loop.
+ *
+ * Same shape as the chat path's loop, deliberately: model turn → tool calls →
+ * results appended → model turn again, until it stops asking or the budget
+ * binds. Kept here rather than shared with server.js because the two differ in
+ * every way that matters — no streaming, no per-tool sub-caps, no user-visible
+ * source cards — and a shared abstraction would have to be told which of those
+ * it was doing on every call.
+ *
+ * When the budget binds mid-loop the tools are withdrawn and ONE more turn runs
+ * without them, so the step gets an answer built from what it managed to look up
+ * rather than nothing at all.
+ */
+async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutMs, providerName }) {
+  const MCPClient = require('../mcp/mcp-client');
+  const client = MCPClient.shared();
+  const specs = client.getToolsForOpenAISubset(session.allowedTools);
+  const convo = [...messages];
+  const toolCalls = [];
+
+  if (specs.length === 0) {
+    session.exhaust('no allowed tools are registered');
+  }
+
+  for (let round = 0; round < session.maxRounds; round++) {
+    const spentReason = session.spent();
+    if (spentReason) session.exhaust(spentReason);
+    const offerTools = specs.length > 0 && !session.exhaustedReason;
+
+    const roundBody = { ...body, messages: convo };
+    if (offerTools) roundBody.tools = specs;
+
+    console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
+                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.calls}/${session.maxCalls} used)` : ' (no tools — budget spent)'}`);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(roundBody),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+
+    const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
+    const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
+    const requested = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+
+    if (requested.length === 0 || !offerTools) {
+      closeCircuit();
+      return {
+        content: stripChannelMarkers(msg.content),
+        provider: providerName,
+        truncated: finishReason === 'length',
+        toolCalls,
+        budget: session.summary()
+      };
+    }
+
+    convo.push(msg);
+    for (const call of requested) {
+      const name = call.function?.name;
+      // OpenAI-style providers send arguments as a JSON STRING; Ollama sends an
+      // object. Handle both rather than assuming, because "arguments is a
+      // string" is exactly the sort of thing that differs per engine build.
+      let args = call.function?.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      args = args || {};
+
+      const spent = session.spent();
+      if (spent) {
+        session.exhaust(spent);
+        convo.push({
+          role: 'tool', tool_call_id: call.id, name,
+          content: JSON.stringify({ error: `Not run — ${spent}. Answer with what you already have and say you could not look further.` })
+        });
+        continue;
+      }
+
+      const result = await executeBackgroundTool(session, name, args);
+      toolCalls.push({ name, args, ok: !result?.error });
+      convo.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
+    }
+  }
+
+  // Rounds exhausted with the model still asking. Return what it last said
+  // rather than throwing — a step that looked things up and ran out of rounds
+  // has done real work.
+  session.exhaust(`round budget spent (${session.maxRounds} rounds)`);
+  closeCircuit();
+  return {
+    content: '', provider: providerName, truncated: false,
+    toolCalls, budget: session.summary()
+  };
+}
+
 // ============ LLM Helper ============
 
 /**
  * Call an LLM with system + user prompts.
  * Uses the heartbeat model/provider from config.
+ *
+ * TOOLS (2026-08-03). Pass `options.toolSession` — from createToolSession — to
+ * run this call as a tool loop. Without it the request body is exactly what it
+ * has always been: no `tools` key on either provider branch, which is why no
+ * background role could call anything. Every existing caller omits it, so every
+ * existing step is byte-identical to before.
+ *
  * @param {string} systemPrompt
  * @param {string} userPrompt
- * @returns {Promise<{content: string, provider: string, truncated: boolean}>}
+ * @param {Object} [options]
+ * @param {number} [options.maxTokens]
+ * @param {Object} [options.toolSession] - per-step budget from createToolSession
+ * @returns {Promise<{content: string, provider: string, truncated: boolean, toolCalls?: Array}>}
  */
 async function callLLM(systemPrompt, userPrompt, options = {}) {
   // Fast-fail while the mid-cycle breaker is open — the brain is wedged, so
@@ -121,6 +344,18 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
     body = { model: heartbeatModel.model, messages, stream: false, options: { num_predict: maxTokens } };
     extract = (data) => data.message?.content || '';
     extractFinishReason = (data) => data.done_reason || '';
+  }
+
+  // === Tool loop, when a step declared one. Everything below this block is the
+  // === original single-shot path, byte-for-byte, and that is what every
+  // === existing caller still runs: no toolSession, no `tools` key, no change.
+  if (options.toolSession) {
+    return runToolLoop({
+      session: options.toolSession,
+      openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
+      url, body, messages, timeoutMs,
+      providerName: `${heartbeatModel.provider}/${heartbeatModel.model}`
+    });
   }
 
   const providers = [
@@ -502,12 +737,31 @@ async function executeSplits(auditResults) {
         for (const rawFactId of split.factIds) {
           // Strip "id:" prefix the LLM echoes back from the audit prompt
           const factId = rawFactId.replace(/^id:/, '');
-          const member = db.prepare('SELECT * FROM cluster_members WHERE id = ? AND cluster_id = ?')
-            .get(factId, clusterId);
+          // ACTIVE ONLY (2026-08-03). This had no status filter, and the move
+          // below deletes each member's vector and then RE-ADDS it — so a split
+          // that happened to include an inactive fact resurrected its embedding
+          // and put a superseded belief back into semantic retrieval. That is
+          // the LanceDB-drift class the Phase 1 notes recorded as historical;
+          // it was not historical, it had a live source. Found by reconcile()
+          // reporting three superseded self-facts with vectors eight hours after
+          // the same three had been cleared.
+          //
+          // memoryClusters.getCluster (which feeds the audit that proposes these
+          // splits) deliberately returns inactive members too — the Memory Map
+          // draws them as ghosts. So the filter belongs HERE, at the write, not
+          // on the read. Same rule as the identity lock: guard the write path.
+          const member = db.prepare(
+            "SELECT * FROM cluster_members WHERE id = ? AND cluster_id = ? AND status = 'active'"
+          ).get(factId, clusterId);
           if (member) {
             membersToMove.push(member);
           } else {
-            results.anomalies.push(`Fact id "${factId}" not found in cluster "${clusterName}"`);
+            const inactive = db.prepare(
+              "SELECT id FROM cluster_members WHERE id = ? AND cluster_id = ? AND status != 'active'"
+            ).get(factId, clusterId);
+            results.anomalies.push(inactive
+              ? `Fact id "${factId}" in cluster "${clusterName}" is inactive — not moved, and its embedding left alone`
+              : `Fact id "${factId}" not found in cluster "${clusterName}"`);
           }
         }
 
@@ -609,270 +863,25 @@ async function executeSplits(auditResults) {
   console.log(`[Heartbeat] Split execution complete: ${results.clustersSplit} cluster(s) split`);
   return results;
 }
-
-// ============ Step 3: Audit Cross-Links ============
-
-/**
- * Re-evaluate ALL cluster pair link strengths using batched LLM calls.
- * Processes up to 10 pairs per LLM call to avoid O(n²) individual calls.
- * Creates, updates, or removes links based on LLM scores vs. config threshold.
- *
- * @returns {Promise<{linksUpdated: number, linksAdded: number, linksRemoved: number, anomalies: Array}>}
- */
-async function auditCrossLinks() {
-  console.log('[Heartbeat] Step 3: Auditing cross-cluster links...');
-
-  const results = { linksUpdated: 0, linksAdded: 0, linksRemoved: 0, anomalies: [] };
-  const db = getSqliteDb();
-  if (!db) {
-    results.anomalies.push('SQLite not available — skipping cross-link audit');
-    return results;
-  }
-
-  const config = getConfig();
-  const linkThreshold = config.memory.clusterLinkThreshold || 0.50;
-  // Hysteresis: only tear down an existing link when the score drops clearly
-  // below the create threshold. Scores in [dropThreshold, linkThreshold) leave
-  // the current link state untouched.
-  const dropThreshold = Number.isFinite(config.memory.clusterLinkDropThreshold)
-    ? config.memory.clusterLinkDropThreshold
-    : Math.max(0, linkThreshold - 0.10);
-
-  const clusters = memoryClusters.getClusters();
-  if (clusters.length < 2) {
-    console.log('[Heartbeat] Fewer than 2 clusters — no links to audit');
-    return results;
-  }
-
-  // Build brief summaries for each cluster (first 5 facts, truncated)
-  // label disambiguates duplicate cluster names by appending the cluster's index
-  const clusterSummaries = {};
-  for (let i = 0; i < clusters.length; i++) {
-    const cluster = clusters[i];
-    try {
-      const detail = memoryClusters.getCluster(cluster.id);
-      const label = cluster.name + '#' + i;
-      if (!detail || !Array.isArray(detail.members)) {
-        clusterSummaries[cluster.id] = { name: cluster.name, label, summary: '(no members)' };
-        continue;
-      }
-      const snippets = detail.members.slice(0, 5).map(m => m.content.slice(0, 120)).join('; ');
-      clusterSummaries[cluster.id] = { name: cluster.name, label, summary: snippets || '(empty)' };
-    } catch (err) {
-      clusterSummaries[cluster.id] = { name: cluster.name, label: cluster.name + '#' + i, summary: '(error loading)' };
-    }
-  }
-
-  // Generate all unique pairs, tagging each with the id-ordered key and a hash of
-  // the exact summaries we would feed the LLM. The hash lets us skip pairs whose
-  // content is unchanged since they were last judged.
-  const pairs = [];
-  for (let i = 0; i < clusters.length; i++) {
-    for (let j = i + 1; j < clusters.length; j++) {
-      const a = clusters[i];
-      const b = clusters[j];
-      const [lowId, highId] = a.id < b.id ? [a.id, b.id] : [b.id, a.id];
-      const sLow = clusterSummaries[lowId].summary;
-      const sHigh = clusterSummaries[highId].summary;
-      const hash = createHash('sha1').update(`${sLow} ${sHigh}`).digest('hex');
-      pairs.push({ a, b, lowId, highId, hash });
-    }
-  }
-
-  // Skip pairs whose content hash matches the last stored judgment — the verdict
-  // would be identical, so the existing link state is already correct. Only new
-  // or content-changed pairs go to the LLM. This removes the flip-flop churn and
-  // the O(n²) LLM cost on an idle system.
-  const toJudge = [];
-  let reused = 0;
-  for (const p of pairs) {
-    const prior = db.prepare(
-      'SELECT content_hash FROM cluster_link_judgments WHERE cluster_a = ? AND cluster_b = ?'
-    ).get(p.lowId, p.highId);
-    if (prior && prior.content_hash === p.hash) {
-      reused++;
-    } else {
-      toJudge.push(p);
-    }
-  }
-
-  // This is what actually decides how long a heartbeat pass takes. Every judged
-  // pair is an LLM call; a cache-hit pair costs nothing. On idle memory every
-  // pair hashes the same and the pass finishes in under a minute, while a pass
-  // after real fact churn re-judges hundreds of pairs and runs 10-20x longer.
-  // The link add/update/remove counts are NOT a usable proxy for this — a pass
-  // can judge many pairs and change no links (observed: 260.8s, 0 link changes).
-  results.pairsTotal = pairs.length;
-  results.pairsReused = reused;
-  results.pairsJudged = toJudge.length;
-
-  console.log(`[Heartbeat] ${pairs.length} cluster pair(s): ${reused} unchanged (skipped), ${toJudge.length} to (re)evaluate in batches of 10`);
-  if (toJudge.length === 0) {
-    console.log('[Heartbeat] Cross-link audit complete: no content changes, nothing re-judged');
-    return results;
-  }
-
-  const BATCH_SIZE = 10;
-
-  const systemPrompt = `You are a memory cluster link evaluator. For each cluster pair listed, decide how strongly related they are on a scale from 0.0 (completely unrelated) to 1.0 (extremely closely related).
-
-Return ONLY valid JSON in this exact format:
-{
-  "links": [
-    {"pair": "ClusterA|ClusterB", "strength": 0.7, "reason": "brief reason"},
-    ...
-  ]
-}
-
-Rules:
-- Use the pipe character | to separate cluster labels in the "pair" field, exactly as given.
-- strength 0.0–0.3: unrelated or barely connected.
-- strength 0.4–0.6: loosely related, share some context.
-- strength 0.7–1.0: closely related, topics naturally co-occur.
-- Return one entry per pair, in the same order as input.
-- Keep "reason" under 15 words.`;
-
-  // Persist a fresh judgment for a pair (order-independent key).
-  const recordJudgment = (p, strength) => {
-    db.prepare(`
-      INSERT INTO cluster_link_judgments (cluster_a, cluster_b, content_hash, strength, judged_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(cluster_a, cluster_b) DO UPDATE SET
-        content_hash = excluded.content_hash,
-        strength = excluded.strength,
-        judged_at = excluded.judged_at
-    `).run(p.lowId, p.highId, p.hash, strength, new Date().toISOString());
-  };
-
-  for (let batchStart = 0; batchStart < toJudge.length; batchStart += BATCH_SIZE) {
-    const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
-    const batch = toJudge.slice(batchStart, batchStart + BATCH_SIZE);
-
-    const pairDescriptions = batch.map(({ a, b }) => {
-      const sa = clusterSummaries[a.id];
-      const sb = clusterSummaries[b.id];
-      return `Pair "${sa.label}|${sb.label}":\n  ${sa.label}: ${sa.summary}\n  ${sb.label}: ${sb.summary}`;
-    }).join('\n\n');
-
-    const hasLinks = (p) => p && Array.isArray(p.links);
-
-    let parsed = null;
-    let rawContent = '';
-    let wasTruncated = false;
-    try {
-      // Scale max_tokens: ~200 tokens per pair (80 visible + model reasoning overhead) + 300 buffer
-      const batchMaxTokens = Math.min(8192, Math.max(1024, batch.length * 200 + 300));
-      const result = await callLLM(systemPrompt, pairDescriptions, { maxTokens: batchMaxTokens });
-      rawContent = result.content;
-      wasTruncated = result.truncated;
-      parsed = parseJSON(rawContent);
-
-      // Zero-cost recovery first: the observed batch-41 failure is a structurally
-      // unterminated object (finish_reason 'stop', not 'length') — the model emits
-      // `{"links":[ {...}, {...},` and stops before the closing brackets. Repair it
-      // in-process before spending another LLM call.
-      if (!hasLinks(parsed)) {
-        const repaired = repairTruncatedJSON(rawContent);
-        if (hasLinks(repaired)) {
-          parsed = repaired;
-          console.log(`[Heartbeat] Cross-link batch ${batchNum} recovered by repairing truncated JSON (${rawContent.length} chars, ${repaired.links.length} links)`);
-        }
-      }
-
-      if (!hasLinks(parsed)) {
-        // Still bad — retry once with the strict-format recovery auditCluster
-        // Coherence uses (demand raw JSON only, double the token budget) in case
-        // this batch's failure is instead prose/<think> wrapping.
-        console.warn(`[Heartbeat] Parse failure for cross-link batch ${batchNum} (${rawContent.length} chars, truncated: ${wasTruncated}) — retrying with stricter format. Raw tail: ...${rawContent.slice(-300)}`);
-        const strictSystem = systemPrompt + `
-
-CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no reasoning, no <think> blocks, no markdown code fences, no text before or after. Your entire response must begin with { and end with }.`;
-        const retryTokens = Math.min(12288, batchMaxTokens * 2);
-        const retry = await callLLM(strictSystem, pairDescriptions, { maxTokens: retryTokens });
-        rawContent = retry.content;
-        wasTruncated = retry.truncated;
-        parsed = parseJSON(rawContent) || repairTruncatedJSON(rawContent);
-        if (hasLinks(parsed)) {
-          console.log(`[Heartbeat] Cross-link batch ${batchNum} recovered on stricter-format retry`);
-        }
-      }
-    } catch (err) {
-      console.error(`[Heartbeat] Cross-link batch ${batchNum} LLM call failed:`, err.message);
-      results.anomalies.push(`Cross-link batch LLM failed (${batch.length} pairs): ${err.message}`);
-      continue;
-    }
-
-    if (!parsed || !Array.isArray(parsed.links)) {
-      console.warn(`[Heartbeat] Parse failure persisted after retry for cross-link batch ${batchNum}: ${rawContent.length} chars, truncated: ${wasTruncated}. Raw tail: ...${rawContent.slice(-500)}`);
-      results.anomalies.push(`Cross-link batch ${batchNum} returned unparseable JSON after retry (${rawContent.length} chars, truncated: ${wasTruncated})`);
-      continue;
-    }
-
-    // Index the LLM results by pair key (both orderings)
-    const linkMap = {};
-    for (const entry of parsed.links) {
-      if (typeof entry.pair === 'string') {
-        linkMap[entry.pair] = entry;
-        // Also store reversed key so lookup is order-independent
-        const pipeIdx = entry.pair.lastIndexOf('|');
-        if (pipeIdx > 0) {
-          const left = entry.pair.slice(0, pipeIdx);
-          const right = entry.pair.slice(pipeIdx + 1);
-          linkMap[`${right}|${left}`] = entry;
-        }
-      }
-    }
-
-    for (const p of batch) {
-      const { a, b } = p;
-      const nameA = clusterSummaries[a.id].name;
-      const nameB = clusterSummaries[b.id].name;
-      const labelA = clusterSummaries[a.id].label;
-      const labelB = clusterSummaries[b.id].label;
-      const key = `${labelA}|${labelB}`;
-      const entry = linkMap[key];
-
-      if (!entry || typeof entry.strength !== 'number') {
-        results.anomalies.push(`No LLM rating for pair "${key}"`);
-        continue;
-      }
-
-      const strength = Math.min(1.0, Math.max(0.0, entry.strength));
-
-      // Look up existing link (either direction)
-      const existing = db.prepare(`
-        SELECT id, strength FROM cluster_links
-        WHERE (cluster_a = ? AND cluster_b = ?)
-           OR (cluster_a = ? AND cluster_b = ?)
-      `).get(a.id, b.id, b.id, a.id);
-
-      if (existing) {
-        if (strength < dropThreshold) {
-          db.prepare('DELETE FROM cluster_links WHERE id = ?').run(existing.id);
-          results.linksRemoved++;
-          console.log(`[Heartbeat] Removed link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)} below drop threshold ${dropThreshold})`);
-        } else if (strength >= linkThreshold && Math.abs(existing.strength - strength) >= 0.01) {
-          db.prepare('UPDATE cluster_links SET strength = ? WHERE id = ?')
-            .run(strength, existing.id);
-          results.linksUpdated++;
-        }
-        // Deadband [dropThreshold, linkThreshold): keep the existing link as-is.
-      } else if (strength >= linkThreshold) {
-        db.prepare('INSERT INTO cluster_links (id, cluster_a, cluster_b, strength) VALUES (?, ?, ?, ?)')
-          .run(randomUUID(), p.lowId, p.highId, strength);
-        results.linksAdded++;
-        console.log(`[Heartbeat] Added link "${nameA}" ↔ "${nameB}" (strength ${strength.toFixed(2)})`);
-      }
-      // No existing link and below threshold — nothing to do.
-
-      recordJudgment(p, strength);
-    }
-  }
-
-  console.log(`[Heartbeat] Cross-link audit complete: ${results.linksAdded} added, ${results.linksUpdated} updated, ${results.linksRemoved} removed (${reused} unchanged pairs skipped)`);
-  return results;
-}
-
+// ============ Cross-link audit — DELETED 2026-08-02 ============
+//
+// auditCrossLinks used to live here and ran on EVERY pass, oversized clusters or
+// not. It scored how related each pair of clusters was and maintained
+// cluster_links from the verdicts.
+//
+// Removed because the cost was O(n²) in clusters over a corpus that is O(n) in
+// facts: 112 clusters = 6,216 pairs judged for 658 facts. It was the single
+// biggest driver of pass duration (observed 736s at 438 pairs re-judged vs 51s
+// when every pair was a cache hit), and the content-hash cache it needed was a
+// mitigation of a cost that should not have existed.
+//
+// The tables (cluster_links, cluster_link_judgments) are KEPT and are now
+// READ-ONLY: the Memory Map still renders the links it already has, and the
+// supersede edges beside them are still live. Nothing maintains them anymore, so
+// treat their strengths as a frozen snapshot, not as current judgments.
+//
+// Associations become query-time vector neighbours in a later phase — computed
+// when asked, never stored. See docs/memory-mvp-spec.md (RETRIEVE).
 // ============ Step 4: Generate Report ============
 
 /**
@@ -882,10 +891,9 @@ CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no 
  * @param {number}  opts.cycleStartMs          - Date.now() at cycle start
  * @param {Array}   opts.auditResults          - Per-cluster audit result objects
  * @param {Object}  opts.splitResults          - Result from executeSplits
- * @param {Object}  opts.crossLinkResults      - Result from auditCrossLinks
  * @returns {Object} The report object
  */
-function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps = [] }) {
+function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }) {
   const totalDurationMs = Date.now() - cycleStartMs;
   const totalDuration = (totalDurationMs / 1000).toFixed(1) + 's';
 
@@ -900,7 +908,7 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
   const anomalies = [
     ...auditResults.filter(r => r.error).map(r => `Audit error for "${r.clusterName}": ${r.error}`),
     ...(splitResults.anomalies || []),
-    ...(crossLinkResults.anomalies || [])
+
   ];
 
   const report = {
@@ -908,15 +916,22 @@ function generateReport({ cycleStartMs, auditResults, splitResults, crossLinkRes
     clustersAudited,
     clustersSplit,
     splitDetails: splitResults.splitDetails || [],
-    linksUpdated: crossLinkResults.linksUpdated || 0,
-    linksRemoved: crossLinkResults.linksRemoved || 0,
-    linksAdded: crossLinkResults.linksAdded || 0,
+    // Always 0 from 2026-08-02: the cross-link audit is deleted and nothing
+    // maintains cluster_links. Kept in the report shape so historical rows in
+    // heartbeat_reports stay comparable with new ones.
+    linksUpdated: 0,
+    linksRemoved: 0,
+    linksAdded: 0,
     // Cross-link LLM workload — the actual driver of pass duration. See the
     // comment in auditCrossLinks: this, not the link deltas, is why a pass is
     // 55s or 17 minutes.
-    pairsTotal: crossLinkResults.pairsTotal ?? null,
-    pairsReused: crossLinkResults.pairsReused ?? null,
-    pairsJudged: crossLinkResults.pairsJudged ?? null,
+    pairsTotal: null,
+    pairsReused: null,
+    pairsJudged: null,
+    // Marks a pass as running the post-cross-link pipeline, so the Activity view
+    // can tell "no pairs judged because there was nothing to do" apart from
+    // "no pairs judged because the step no longer exists".
+    crossLinkAudit: 'deleted',
     totalDuration,
     // Numeric ms alongside the display string so the Activity view can trend
     // pass duration (the 2026-07-26 pass took 1062s — ~15% of the 2h interval).
@@ -1088,9 +1103,9 @@ function recordHeartbeatOutcome({ status, reason, cycleStartMs, partial = {} }) 
       statusReason: reason,
       clustersAudited: (partial.auditResults || []).length,
       clustersSplit: partial.splitResults?.clustersSplit || 0,
-      linksAdded: partial.crossLinkResults?.linksAdded || 0,
-      linksUpdated: partial.crossLinkResults?.linksUpdated || 0,
-      linksRemoved: partial.crossLinkResults?.linksRemoved || 0,
+      linksAdded: 0,
+      linksUpdated: 0,
+      linksRemoved: 0,
       totalDurationMs: durationMs,
       totalDuration: durationMs != null ? (durationMs / 1000).toFixed(1) + 's' : null,
       anomalies: [reason].filter(Boolean)
@@ -1142,204 +1157,24 @@ function getHeartbeatReports(limit = 30) {
   }
 }
 
-// ============ Task B: Cleanup Facts ============
-
-async function cleanupFacts() {
-  console.log('[Heartbeat] Task B: Cleaning up facts...');
-  const results = { removed: 0, reworded: 0, merged: 0 };
-
-  try {
-    const memoryFile = path.join(MEMORY_DIR, 'MEMORY.md');
-    if (!fs.existsSync(memoryFile)) {
-      console.log('[Heartbeat] No MEMORY.md found');
-      return results;
-    }
-
-    let content = fs.readFileSync(memoryFile, 'utf8');
-    const facts = factExtractor.extractAllFactLines(content);
-
-    if (facts.length < 3) {
-      console.log('[Heartbeat] Too few facts to clean up');
-      return results;
-    }
-
-    const systemPrompt = `You are a memory maintenance system. Review the facts below and suggest cleanup actions. Return ONLY valid JSON:
-{"actions":[]}
-
-Action types:
-- remove: {"type":"remove","fact":"exact fact text","reason":"..."}
-  Use for outdated, trivial, or clearly wrong facts.
-- reword: {"type":"reword","original":"exact original text","replacement":"improved text","reason":"..."}
-  Use for awkward phrasing, typos, or facts that could be clearer.
-- merge: {"type":"merge","originals":["fact1","fact2"],"replacement":"merged fact","reason":"..."}
-  Use when two or more facts say essentially the same thing.
-
-Rules:
-- Only suggest confident actions. When in doubt, leave facts alone.
-- The "fact" and "original" fields must match the input EXACTLY (verbatim).
-- Prefer merging duplicates over removing them.
-- Do NOT remove facts just because they seem mundane — the user chose to remember them.
-- If the facts look clean, return {"actions":[]}.`;
-
-    const numberedFacts = facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
-    // Scale max_tokens: ~75 tokens per fact (30 visible + model reasoning overhead) + 512 buffer
-    const cleanupMaxTokens = Math.min(8192, Math.max(1024, facts.length * 75 + 512));
-    const { content: llmResponse, truncated: cleanupTruncated } = await callLLM(systemPrompt, numberedFacts, { maxTokens: cleanupMaxTokens });
-    const parsed = parseJSON(llmResponse);
-
-    if (!parsed || !Array.isArray(parsed.actions) || parsed.actions.length === 0) {
-      if (!parsed) {
-        console.warn(`[Heartbeat] Parse failure for cleanupFacts: ${llmResponse.length} chars, truncated: ${cleanupTruncated}, last 200: ...${llmResponse.slice(-200)}`);
-      }
-      console.log('[Heartbeat] No fact cleanup actions suggested');
-      return results;
-    }
-
-    console.log(`[Heartbeat] LLM suggested ${parsed.actions.length} fact cleanup actions`);
-
-    const db = getSqliteDb();
-    const clusterTable = await getClusterEmbeddingsTable();
-    const lines = content.split('\n');
-
-    // Process actions in reverse order of line position to preserve indices
-    // Build a list of line operations first
-    const lineOps = []; // { lineIndex, op: 'delete' | 'replace', newText? }
-    const claimedLines = new Set(); // prevent duplicate ops on the same line
-
-    for (const action of parsed.actions) {
-      try {
-        if (action.type === 'remove' && action.fact) {
-          const lineIdx = lines.findIndex(l => l === `- ${action.fact}`);
-          if (lineIdx >= 0 && !claimedLines.has(lineIdx)) {
-            claimedLines.add(lineIdx);
-            lineOps.push({ lineIndex: lineIdx, op: 'delete' });
-            console.log(`[Heartbeat] Removing fact: "${action.fact}" — ${action.reason}`);
-            results.removed++;
-          }
-
-        } else if (action.type === 'reword' && action.original && action.replacement) {
-          const lineIdx = lines.findIndex(l => l === `- ${action.original}`);
-          if (lineIdx >= 0 && !claimedLines.has(lineIdx)) {
-            claimedLines.add(lineIdx);
-            lineOps.push({ lineIndex: lineIdx, op: 'replace', newText: `- ${action.replacement}` });
-            console.log(`[Heartbeat] Rewording: "${action.original}" → "${action.replacement}"`);
-            results.reworded++;
-
-            // Update cluster_members content + re-embed
-            if (db) {
-              const member = db.prepare('SELECT id, cluster_id FROM cluster_members WHERE content = ?')
-                .get(action.original);
-              if (member) {
-                db.prepare('UPDATE cluster_members SET content = ? WHERE id = ?')
-                  .run(action.replacement, member.id);
-                if (clusterTable) {
-                  try {
-                    await clusterTable.delete(memberIdFilter(member.id));
-                    const embedding = await memoryClusters.generateEmbedding(action.replacement);
-                    if (embedding) {
-                      await clusterTable.add([{
-                        id: randomUUID(),
-                        member_id: member.id,
-                        cluster_id: member.cluster_id,
-                        content: action.replacement,
-                        vector: Array.from(embedding)
-                      }]);
-                    }
-                  } catch (e) {
-                    console.error('[Heartbeat] LanceDB re-embed error:', e.message);
-                  }
-                }
-              }
-            }
-          }
-
-        } else if (action.type === 'merge' && Array.isArray(action.originals) && action.replacement) {
-          const lineIndices = [];
-          for (const orig of action.originals) {
-            const idx = lines.findIndex((l, li) => l === `- ${orig}` && !claimedLines.has(li));
-            if (idx >= 0) lineIndices.push({ idx, text: orig });
-          }
-          if (lineIndices.length < 2) continue;
-
-          // Replace first occurrence, delete the rest
-          claimedLines.add(lineIndices[0].idx);
-          lineOps.push({ lineIndex: lineIndices[0].idx, op: 'replace', newText: `- ${action.replacement}` });
-          for (let i = 1; i < lineIndices.length; i++) {
-            claimedLines.add(lineIndices[i].idx);
-            lineOps.push({ lineIndex: lineIndices[i].idx, op: 'delete' });
-          }
-
-          console.log(`[Heartbeat] Merging ${lineIndices.length} facts into: "${action.replacement}"`);
-          results.merged++;
-
-          // Update first cluster member, delete others
-          if (db) {
-            let keptMember = null;
-            for (const { text } of lineIndices) {
-              const member = db.prepare('SELECT id, cluster_id FROM cluster_members WHERE content = ?').get(text);
-              if (!member) continue;
-
-              if (!keptMember) {
-                keptMember = member;
-                db.prepare('UPDATE cluster_members SET content = ? WHERE id = ?')
-                  .run(action.replacement, member.id);
-                if (clusterTable) {
-                  try {
-                    await clusterTable.delete(memberIdFilter(member.id));
-                    const embedding = await memoryClusters.generateEmbedding(action.replacement);
-                    if (embedding) {
-                      await clusterTable.add([{
-                        id: randomUUID(),
-                        member_id: member.id,
-                        cluster_id: member.cluster_id,
-                        content: action.replacement,
-                        vector: Array.from(embedding)
-                      }]);
-                    }
-                  } catch (e) {
-                    console.error('[Heartbeat] LanceDB re-embed error:', e.message);
-                  }
-                }
-              } else {
-                // Delete duplicate member
-                db.prepare('DELETE FROM cluster_members WHERE id = ?').run(member.id);
-                if (clusterTable) {
-                  try {
-                    await clusterTable.delete(memberIdFilter(member.id));
-                  } catch (e) {
-                    console.error('[Heartbeat] LanceDB delete error:', e.message);
-                  }
-                }
-              }
-            }
-          }
-        }
-      } catch (actionErr) {
-        console.error(`[Heartbeat] Error executing ${action.type} fact action:`, actionErr.message);
-      }
-    }
-
-    // Apply line operations (sort by line index descending to preserve positions)
-    lineOps.sort((a, b) => b.lineIndex - a.lineIndex);
-    for (const op of lineOps) {
-      if (op.op === 'delete') {
-        lines.splice(op.lineIndex, 1);
-      } else if (op.op === 'replace') {
-        lines[op.lineIndex] = op.newText;
-      }
-    }
-
-    // Write back
-    fs.writeFileSync(memoryFile, lines.join('\n'), 'utf8');
-
-  } catch (error) {
-    console.error('[Heartbeat] cleanupFacts error:', error.message);
-  }
-
-  console.log(`[Heartbeat] Fact cleanup complete: ${results.removed} removed, ${results.reworded} reworded, ${results.merged} merged`);
-  return results;
-}
-
+// ============ Fact cleanup — DELETED 2026-08-02 ============
+//
+// cleanupFacts asked the model to dedup/reword/merge facts, then applied the
+// verdicts to MEMORY.md. It returned {removed:0, reworded:0, merged:0} on all 39
+// recorded passes, at 30-72s of model time each, for two independent reasons:
+//
+//   1. It fed the model fact text with the "(learned ...)" annotation STRIPPED,
+//      then matched the model's verbatim reply against the RAW file line, which
+//      still carried the annotation. 242 of 244 lines carried one, so at most 2
+//      lines in the file could ever match. A miss incremented nothing and logged
+//      nothing, so the failure was invisible.
+//   2. It only ever looked at MEMORY.md. The duplicates are in SQLite —
+//      MEMORY.md had zero byte-identical fact lines while cluster_members had six
+//      duplicate groups, including three identical machine-gun facts.
+//
+// Dedup now happens at the SQLite write inside db/fact-store.js, where the record
+// of truth is. Semantic merge/reword belongs to the corrector agent, which does
+// not exist yet — see docs/memory-mvp-spec.md (CORRECT).
 // ============ Task C: Summarize Daily Logs ============
 
 async function summarizeDailyLogs() {
@@ -1370,8 +1205,6 @@ async function summarizeDailyLogs() {
     }
 
     console.log(`[Heartbeat] Found ${oldFiles.length} daily logs to archive`);
-
-    const memoryFile = path.join(MEMORY_DIR, 'MEMORY.md');
 
     for (const file of oldFiles) {
       try {
@@ -1409,9 +1242,29 @@ Rules:
         if (parsed && Array.isArray(parsed.remainingFacts) && parsed.remainingFacts.length > 0) {
           const validFacts = parsed.remainingFacts.filter(f => typeof f === 'string' && f.trim().length > 0);
           if (validFacts.length > 0) {
-            await factExtractor.appendToMemory(validFacts, memoryFile);
-            results.factsExtracted += validFacts.length;
-            console.log(`[Heartbeat] Extracted ${validFacts.length} facts from ${file}`);
+            // Into SQLite, not into a file. These go through assignToCluster like
+            // any other fact, so they get the same exact-match dedup guard —
+            // archival used to append straight to MEMORY.md, which meant a fact
+            // already in the database could be re-added as a line with no row.
+            const config = getConfig();
+            const ext = config.models.extraction;
+            const extInst = getProviderInstance(ext.provider, ext.instance);
+            const extHost = extInst ? extInst.host : 'http://localhost:11434';
+            let written = 0;
+            for (const vf of validFacts) {
+              const res = await memoryClusters.assignToCluster(
+                vf, ext.provider, ext.model, '', extHost,
+                'daily-log-archive', 5, 'user', null,
+                {
+                  verbatimSourceText: `(summarised from daily log ${file})`,
+                  inputModality: 'unknown',
+                  salienceRationale: 'Preserved while archiving an old daily log'
+                }
+              );
+              if (res && res.memberId && !res.duplicateOf) written++;
+            }
+            results.factsExtracted += written;
+            console.log(`[Heartbeat] Preserved ${written}/${validFacts.length} fact(s) from ${file} (rest already held)`);
           }
         }
 
@@ -1524,13 +1377,41 @@ async function runReflection(opts = {}) {
     // own datetime() so the fallback matches messages.timestamp's UTC format.
     const baseline = lastAt || db.prepare("SELECT datetime('now','-1 day') AS t").get().t;
 
+    // A thread SNH wrote to itself is not a conversation. Unanswered initiative
+    // and greeting messages are stored as ordinary assistant messages, so without
+    // this filter reflection read its own unprompted output back as evidence of
+    // how it behaves — observing itself observing itself. 13 such threads exist,
+    // all one message, all conversations.initiated_by='snh'.
+    //
+    // The test is "does any human ever speak here", not initiated_by: a thread SNH
+    // opened that Ellie then replied to IS a conversation and must stay in.
     const rows = db.prepare(`
       SELECT m.conversation_id, m.role, m.content, m.timestamp, c.title
       FROM messages m
       LEFT JOIN conversations c ON c.id = m.conversation_id
-      WHERE m.role IN ('user','assistant') AND m.timestamp > ?
+      WHERE m.role IN ('user','assistant')
+        AND m.timestamp > ?
+        AND EXISTS (
+          SELECT 1 FROM messages u
+          WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
+        )
       ORDER BY m.timestamp ASC
     `).all(baseline);
+
+    // Say plainly what was left out, so a quiet reflection pass is never mistaken
+    // for "nothing happened".
+    const selfOnly = db.prepare(`
+      SELECT COUNT(DISTINCT m.conversation_id) AS n
+      FROM messages m
+      WHERE m.timestamp > ?
+        AND NOT EXISTS (
+          SELECT 1 FROM messages u
+          WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
+        )
+    `).get(baseline).n;
+    if (selfOnly > 0) {
+      console.log(`[Reflection] Excluded ${selfOnly} self-only thread(s) — my own unanswered messages are not conversations`);
+    }
 
     if (rows.length === 0) {
       console.log('[Reflection] No new conversations since last reflection — skipping');
@@ -1552,8 +1433,9 @@ async function runReflection(opts = {}) {
       }
       transcript += block;
     }
-    if (transcript.length > REFLECTION_TRANSCRIPT_BUDGET) {
-      transcript = transcript.slice(-REFLECTION_TRANSCRIPT_BUDGET);
+    const transcriptBudget = getConfig().reflection?.transcriptBudgetChars ?? REFLECTION_TRANSCRIPT_BUDGET;
+    if (transcript.length > transcriptBudget) {
+      transcript = transcript.slice(-transcriptBudget);
     }
 
     const conversationCount = byConvo.size;
@@ -1684,10 +1566,10 @@ Respond with ONLY that message, or exactly NONE.`;
 
 /**
  * Run the full cluster audit pipeline (steps 1–3) on the given cluster list.
- * Returns { auditResults, splitResults, crossLinkResults }.
+ * Returns { auditResults, splitResults }.
  *
  * @param {Array} clusters - Array of cluster rows from getClusters(). Pass all for rebuildClusters, filtered for runMaintenance.
- * @returns {Promise<{auditResults: Array, splitResults: Object, crossLinkResults: Object}>}
+ * @returns {Promise<{auditResults: Array, splitResults: Object}>}
  */
 async function runAuditPipeline(clusters) {
   // Step 1: per-cluster coherence audit. Each audit is self-contained and only
@@ -1731,10 +1613,7 @@ async function runAuditPipeline(clusters) {
   // Step 2: execute splits
   const splitResults = await executeSplits(auditResults);
 
-  // Step 3: cross-link audit (always runs across ALL clusters, not just audited subset)
-  const crossLinkResults = await auditCrossLinks();
-
-  return { auditResults, splitResults, crossLinkResults };
+  return { auditResults, splitResults };
 }
 
 // ============ Orchestration ============
@@ -1761,14 +1640,40 @@ async function runMaintenance() {
   // generateReport at the end. Instrumentation only — the steps themselves are
   // untouched and still run in the same order.
   const steps = [];
-  const runStep = async (name, gate, fn) => {
+  /**
+   * @param {string} name
+   * @param {string} gate - human-readable condition, for the report
+   * @param {(session: Object|null) => Promise<any>} fn - receives the step's tool
+   *   session when it declared tools, otherwise null
+   * @param {Object} [opts]
+   * @param {Object} [opts.budget] - {maxCalls, maxWallMs, maxRounds} overriding
+   *   heartbeat.toolBudget for this step. The corrector uses it.
+   * @param {string[]} [opts.tools] - tool allowlist for this step. Omit (the
+   *   default, and what every step does today) and the step runs exactly as
+   *   before: callLLM gets no session, sends no `tools` key, and the step cannot
+   *   call anything. The corrector in Phase 2c is the first step to declare one.
+   */
+  const runStep = async (name, gate, fn, opts = {}) => {
     const t0 = Date.now();
+    let session = null;
+    if (Array.isArray(opts.tools) && opts.tools.length) {
+      const MCPClient = require('../mcp/mcp-client');
+      const allowed = MCPClient.shared().backgroundToolsAmong(opts.tools);
+      const denied = opts.tools.filter(t => !allowed.includes(t));
+      if (denied.length) {
+        // Loud: a step that asked for a tool it cannot have is a step whose
+        // author believed something false about what it could do.
+        console.warn(`[Heartbeat] step "${name}" requested unavailable tool(s): ${denied.join(', ')}`);
+        try { factExtractor.appendToOpsLog(`Heartbeat step "${name}" asked for tool(s) it is not allowed or that are not registered: ${denied.join(', ')}. It ran without them.`, OPS_DIR); } catch (e) { /* best effort */ }
+      }
+      session = createToolSession(name, allowed, opts.budget || {});
+    }
     try {
-      const result = await fn();
-      steps.push({ name, gate, ok: true, ms: Date.now() - t0, result });
+      const result = await fn(session);
+      steps.push({ name, gate, ok: true, ms: Date.now() - t0, result, ...(session ? { toolBudget: session.summary() } : {}) });
       return result;
     } catch (err) {
-      steps.push({ name, gate, ok: false, ms: Date.now() - t0, error: err.message });
+      steps.push({ name, gate, ok: false, ms: Date.now() - t0, error: err.message, ...(session ? { toolBudget: session.summary() } : {}) });
       throw err;
     }
   };
@@ -1812,14 +1717,13 @@ async function runMaintenance() {
 
     let auditResults = [];
     let splitResults = { clustersSplit: 0, splitDetails: [], anomalies: [] };
-    let crossLinkResults = { linksUpdated: 0, linksAdded: 0, linksRemoved: 0, anomalies: [] };
 
     if (oversizedClusters.length > 0) {
-      ({ auditResults, splitResults, crossLinkResults } = await runAuditPipeline(oversizedClusters));
+      ({ auditResults, splitResults } = await runAuditPipeline(oversizedClusters));
     } else {
-      console.log('[Heartbeat] No oversized clusters to audit — skipping steps 1–3');
-      // Still run cross-link audit to keep link table healthy
-      crossLinkResults = await auditCrossLinks();
+      // Nothing to do. This used to fall through to the cross-link audit, which
+      // is why an idle memory still cost a full pass; that step is gone.
+      console.log('[Heartbeat] No oversized clusters to audit — cluster pipeline skipped entirely');
     }
 
     // Mid-cycle breaker: if the brain wedged during the audit phase (its heaviest
@@ -1835,9 +1739,9 @@ async function runMaintenance() {
         status: 'aborted',
         reason: 'brain wedged mid-cycle — remaining tasks skipped',
         cycleStartMs,
-        partial: { auditResults, splitResults, crossLinkResults }
+        partial: { auditResults, splitResults }
       });
-      return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults, crossLinkResults };
+      return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults };
     }
 
     // Merge any clusters sharing the same name (catches duplicates from
@@ -1851,8 +1755,6 @@ async function runMaintenance() {
       console.error('[Heartbeat] mergeByName error:', err.message);
     }
 
-    // Task B & C unchanged
-    const cleanup = await runStep('cleanupFacts', 'always', () => cleanupFacts());
     const archive = await runStep('summarizeDailyLogs', 'always', () => summarizeDailyLogs());
 
     // Task B2: retire pending questions the memory already answers. The
@@ -1937,7 +1839,7 @@ async function runMaintenance() {
       console.error('[Heartbeat] Capability drift check error:', driftErr.message);
     }
 
-    // Task H: memory-store reconciliation — do MEMORY.md, SQLite and LanceDB
+    // Task H: memory-store reconciliation — do SQLite and LanceDB
     // still agree? A fact can be superseded in the DB while its line survives in
     // the injected file, or while its embedding stays retrievable, and either
     // way the entity keeps reading a fact it has retired. REPORT ONLY: this
@@ -1960,13 +1862,63 @@ async function runMaintenance() {
       console.error('[Heartbeat] Memory reconciliation error:', reconErr.message);
     }
 
+    // === The corrector (Phase 2c) — first consumer of the tool plumbing. ===
+    //
+    // Its OWN cadence, not every heartbeat: a pass costs a judge call per
+    // candidate pair, and a corpus does not rot by the hour. Gated on
+    // corrector.enabled and on enough time having passed since the last PASS —
+    // read off disk (`corrector.lastPassAt()`) rather than held in memory, so a
+    // restart does not hand it a fresh turn, and measured against passes rather
+    // than against corrections, so a clean corpus does not leave the gate
+    // permanently overdue.
+    //
+    // It runs AFTER memoryReconcile, so the report above describes the corpus as
+    // the corrector found it, and the corrector's own reconcile-by-acting step
+    // leaves it clean afterwards.
+    try {
+      const corrCfg = getConfig().corrector || {};
+      if (corrCfg.enabled !== false) {
+        const intervalMs = Math.max(1, corrCfg.intervalHours ?? 6) * 3600_000;
+        const last = require('./corrector').lastPassAt();
+        const dueIn = last ? (new Date(last).getTime() + intervalMs) - Date.now() : -1;
+        if (dueIn > 0) {
+          console.log(`[Heartbeat] corrector not due for another ${Math.round(dueIn / 60000)} min`);
+        } else {
+          await runStep('corrector', `every ${corrCfg.intervalHours ?? 6}h`, async (session) => {
+            const corrector = require('./corrector');
+            const res = await corrector.runPass({ session });
+            return {
+              merged: res.merged, expired: res.expired, split: res.split,
+              superseded: res.superseded, unresolved: res.unresolved,
+              refusedLocked: res.refusedLocked, writes: res.writes,
+              stopped: res.stopped, reconciled: res.reconciled
+            };
+          }, {
+            // The allowlist. Reads so it can inspect, writes so it can act —
+            // and the writes are backgroundOnly tools, so declaring them here is
+            // the ONLY way anything reaches them.
+            tools: [
+              'memory_search', 'memory_list', 'memory_count', 'memory_get',
+              'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
+            ],
+            budget: {
+              maxCalls: corrCfg.maxToolCallsPerPass ?? 60,
+              maxWallMs: corrCfg.maxWallClockMsPerPass ?? 300000
+            }
+          });
+        }
+      }
+    } catch (corrErr) {
+      console.error('[Heartbeat] Corrector error:', corrErr.message);
+    }
+
     // Step 4: report
-    const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults, steps });
+    const report = generateReport({ cycleStartMs, auditResults, splitResults, steps });
 
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, cleanup, archive, questionSweep, reflection, selfAudit: selfAuditResult, initiative };
+    return { report, archive, questionSweep, reflection, selfAudit: selfAuditResult, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     recordHeartbeatOutcome({
@@ -2003,13 +1955,12 @@ async function rebuildClusters() {
         cycleStartMs,
         auditResults: [],
         splitResults: { clustersSplit: 0, splitDetails: [], anomalies: [] },
-        crossLinkResults: { linksUpdated: 0, linksAdded: 0, linksRemoved: 0, anomalies: [] }
       });
       return { report };
     }
 
-    const { auditResults, splitResults, crossLinkResults } = await runAuditPipeline(allClusters);
-    const report = generateReport({ cycleStartMs, auditResults, splitResults, crossLinkResults });
+    const { auditResults, splitResults } = await runAuditPipeline(allClusters);
+    const report = generateReport({ cycleStartMs, auditResults, splitResults });
 
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Cluster rebuild complete in ${elapsed} ===`);
@@ -2146,4 +2097,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON };
+module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };

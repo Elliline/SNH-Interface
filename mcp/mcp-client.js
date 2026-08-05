@@ -5,48 +5,85 @@
  * - Execute tool calls by routing to the correct tool implementation
  */
 
-const fs = require('fs');
-const path = require('path');
 const SearXNGTool = require('./tools/searxng');
 const WebFetchTool = require('./tools/web-fetch');
 const CreateCronJobTool = require('./tools/create-cron-job');
-const { getConfig } = require('../db/config');
+const WriteMemoryTool = require('./tools/write-memory');
+const {
+  MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool
+} = require('./tools/memory-inspect');
+const {
+  MergeFactsTool, ExpireFactTool, SupersedeFactTool
+} = require('./tools/memory-correct');
+const { getConfig, getSearxngConfig } = require('../db/config');
+
+/**
+ * Tools a BACKGROUND step may be handed.
+ *
+ * The heartbeat had no tool access at all until 2026-08-03 — callLLM built its
+ * request body as {messages, stream, max_tokens} with no tools key on either
+ * provider branch, so every background role (cluster audit, reflection,
+ * self-audit, initiative) was structurally incapable of calling anything. This
+ * list is what a background step is ALLOWED to ask for; declaring the allowlist
+ * is still per-step, and no existing step declares one.
+ *
+ * READ-ONLY BY DEFAULT, and the three exceptions are named rather than assumed.
+ * A background agent that can write is a background agent that can change what
+ * the entity believes about itself while nobody is in the room, so the only
+ * writes on this list are the corrector's three narrow actions — merge, expire,
+ * supersede — each of which goes through the fact-store funnel with the tier
+ * table deciding autonomy. `write_memory` is deliberately NOT here: the general
+ * power to write an arbitrary fact stays on the chat path, where a person is in
+ * the room. Adding a fourth write tool is a decision, not a convenience.
+ */
+const BACKGROUND_TOOLS = [
+  'memory_search', 'memory_list', 'memory_count', 'memory_get',
+  // Phase 2c: the corrector's write actions. Background-only — see
+  // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
+  'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
+];
+
+/**
+ * The subset of BACKGROUND_TOOLS that WRITE.
+ *
+ * Kept as its own list so "does this step change anything" is answerable without
+ * reading three tool files. A step declaring any of these is a step that mutates
+ * the corpus, and today exactly one does: the corrector.
+ */
+const BACKGROUND_WRITE_TOOLS = ['memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'];
+
+let sharedInstance = null;
 
 class MCPClient {
   constructor() {
     this.tools = new Map(); // tool name -> tool instance
-    this.config = null;
   }
 
   /**
-   * Load tool configuration from tools.json and initialize enabled tools
+   * Register the enabled tools. Every tool's on/off state and endpoint comes from
+   * db/config.js — the SINGLE source of truth.
+   *
+   * There used to be a second one. mcp/tools.json carried its own `enabled` flag
+   * that decided REGISTRATION, while config.tools.searxng.enabled decided ROUTING
+   * (server.js) and whether the capability manifest claimed web search. Two
+   * independent flags for one capability meant they could disagree, and in the
+   * disagreeing direction the tool registered, appeared in the model's tool list,
+   * and was then never routed to — available-looking and inert. tools.json also
+   * carried a duplicate `endpoint`, already dead because the chat path overrides
+   * it with getSearxngConfig().url on every call. The file is gone; one flag per
+   * capability, in config, which is the pattern create_cron_job already used.
    */
-  loadConfig(configPath) {
-    const resolvedPath = configPath || path.join(__dirname, 'tools.json');
-    console.log(`MCP: Loading config from ${resolvedPath}`);
-    try {
-      const raw = fs.readFileSync(resolvedPath, 'utf-8');
-      this.config = JSON.parse(raw);
-      console.log(`MCP: Config loaded, ${this.config.tools?.length || 0} tool(s) defined`);
-    } catch (error) {
-      console.warn('MCP: Could not load tools.json:', error.message);
-      this.config = { tools: [] };
-    }
-
+  loadConfig() {
     this.tools.clear();
 
-    for (const toolConfig of this.config.tools) {
-      if (!toolConfig.enabled) {
-        console.log(`MCP: Skipping disabled tool "${toolConfig.name}"`);
-        continue;
-      }
-
-      if (toolConfig.name === 'searxng') {
-        const tool = new SearXNGTool(toolConfig.endpoint);
-        this.tools.set(tool.name, tool);
-        console.log(`MCP: Registered tool "${tool.name}" -> endpoint ${toolConfig.endpoint}`);
-      }
-      // web_fetch is always available when tools are enabled
+    // web_search — same flag the chat path and the manifest read, same URL.
+    const searxng = getSearxngConfig();
+    if (searxng.enabled) {
+      const tool = new SearXNGTool(searxng.url);
+      this.tools.set(tool.name, tool);
+      console.log(`MCP: Registered tool "${tool.name}" -> endpoint ${searxng.url}`);
+    } else {
+      console.log('MCP: Skipping "web_search" — config.tools.searxng.enabled is false');
     }
 
     // web_fetch rides along with SEARCH tools specifically — fetching a page is
@@ -69,7 +106,59 @@ class MCPClient {
       console.log(`MCP: Registered action tool "${cronTool.name}" (tier=${cronTool.tier}, propose-only)`);
     }
 
+    const memWriteCfg = (getConfig().tools && getConfig().tools.memoryWrite) || {};
+    if (memWriteCfg.enabled !== false) {
+      const writeTool = new WriteMemoryTool();
+      this.tools.set(writeTool.name, writeTool);
+      console.log(`MCP: Registered action tool "${writeTool.name}" (tier=${writeTool.tier}, direct-execute)`);
+    }
+
+    // Read tools. Registered as a set — they share one config flag, one rate cap
+    // and one backing module, so a half-registered set would only ever be a bug.
+    const memInspectCfg = (getConfig().tools && getConfig().tools.memoryInspect) || {};
+    if (memInspectCfg.enabled !== false) {
+      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool]) {
+        const t = new Tool();
+        this.tools.set(t.name, t);
+      }
+      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get] (tier=read, no writes)');
+    }
+
+    // Corrector write actions. Registered unconditionally so the corrector can
+    // always reach them, and marked backgroundOnly so they never appear in a
+    // chat turn's tool schema. Their gate is corrector.enabled, checked by the
+    // heartbeat step that declares them — not by registration, because a tool
+    // that exists but is unreachable is easier to reason about than one that
+    // vanishes from the registry and takes the manifest's drift-check with it.
+    for (const Tool of [MergeFactsTool, ExpireFactTool, SupersedeFactTool]) {
+      const t = new Tool();
+      this.tools.set(t.name, t);
+    }
+    console.log('MCP: Registered corrector write actions [memory_merge_facts, memory_expire_fact, memory_supersede_fact] (background only, never offered in chat)');
+
     console.log(`MCP: ${this.tools.size} tool(s) ready: [${this.getToolNames().join(', ')}]`);
+  }
+
+  /**
+   * OpenAI-format specs for a NAMED SUBSET of the registered tools.
+   *
+   * The background path needs this: a heartbeat step declares the tools it may
+   * use, and handing it the whole registry instead would give a cluster-coherence
+   * audit the ability to propose a cron job. Unknown or unregistered names are
+   * dropped silently — the allowlist is a ceiling, not a request.
+   */
+  getToolsForOpenAISubset(names = []) {
+    const wanted = new Set(names);
+    const specs = [];
+    for (const [name, tool] of this.tools) {
+      if (wanted.has(name)) specs.push(tool.getOpenAIFunctionSpec());
+    }
+    return specs;
+  }
+
+  /** Which of `names` are both registered and allowed to background steps. */
+  backgroundToolsAmong(names = []) {
+    return names.filter(n => BACKGROUND_TOOLS.includes(n) && this.tools.has(n));
   }
 
   /**
@@ -79,6 +168,11 @@ class MCPClient {
   getToolsForOpenAI() {
     const specs = [];
     for (const tool of this.tools.values()) {
+      // backgroundOnly tools are structurally unavailable to chat. This is the
+      // one place that boundary is enforced, so it cannot be forgotten at a
+      // call site: the corrector's write actions are simply not in the schema
+      // any conversation is handed.
+      if (tool.backgroundOnly) continue;
       specs.push(tool.getOpenAIFunctionSpec());
     }
     return specs;
@@ -143,5 +237,25 @@ class MCPClient {
     return Array.from(this.tools.keys());
   }
 }
+
+/**
+ * The one registry, shared by the chat path and the heartbeat.
+ *
+ * Two instances would mean two answers to "which tools exist", and the
+ * capability drift-check reads that answer — a background registry that
+ * registered a different set from the chat one would make the manifest true of
+ * one of them and false of the other. `loadConfig()` on the shared instance is
+ * what the settings route already calls, so a config change reaches both.
+ */
+MCPClient.shared = function shared() {
+  if (!sharedInstance) {
+    sharedInstance = new MCPClient();
+    sharedInstance.loadConfig();
+  }
+  return sharedInstance;
+};
+
+MCPClient.BACKGROUND_TOOLS = BACKGROUND_TOOLS;
+MCPClient.BACKGROUND_WRITE_TOOLS = BACKGROUND_WRITE_TOOLS;
 
 module.exports = MCPClient;

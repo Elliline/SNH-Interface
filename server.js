@@ -28,7 +28,7 @@ const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent } = require('./db/tool-routing');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -246,6 +246,17 @@ app.put('/api/config', (req, res) => {
     return res.status(400).json({ error: 'Request body must be a JSON object' });
   }
   const updated = updateConfig(req.body);
+  // Config is the single source of truth for which tools are REGISTERED, not just
+  // which ones route — so a toggle has to re-register, or the two drift apart
+  // again within the one process. (Turning search on without this left the
+  // routing gate open onto a registry with no web_search in it: intent-classified
+  // into the tool loop, nothing there to call.) Cheap and idempotent: it just
+  // re-reads config and rebuilds a 3-entry Map.
+  try {
+    mcpClient.loadConfig();
+  } catch (e) {
+    console.error('[MCP] tool re-registration after config update failed:', e.message);
+  }
   // Several manifest entries are config-gated (voice, web search, cron
   // proposals), so toggling one changes what SNH actually offers. Injection is
   // unaffected — buildInjectionBlock() recomputes from live config on every
@@ -921,9 +932,11 @@ app.post('/api/openai/chat', chatLimiter, async (req, res) => {
 const SQUATCHSERVE_HOST = process.env.SQUATCHSERVE_HOST || 'http://localhost:8111';
 const LLAMACPP_HOST = process.env.LLAMACPP_HOST || 'http://localhost:8080';
 
-// Initialize MCP tool client
-const mcpClient = new MCPClient();
-mcpClient.loadConfig();
+// Initialize MCP tool client. SHARED with the heartbeat (2026-08-03) so there is
+// exactly one answer to "which tools exist" — the capability drift-check reads
+// that answer, and two registries could make the manifest true of one and false
+// of the other.
+const mcpClient = MCPClient.shared();
 
 // Fetch SquatchServe models dynamically (Ollama-compatible API)
 app.get('/api/squatchserve/models', async (req, res) => {
@@ -1496,7 +1509,7 @@ function isMindQuery(messageText) {
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   let chatMarked = false;
   try {
-    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled, superSearch } = req.body;
+    const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled, superSearch, inputModality } = req.body;
 
     // Read tool enabled state from config instead of per-request flag
     const appConfig = getConfig();
@@ -1505,6 +1518,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // which is the default.
     const toolsEnabled = !!(appConfig.tools && appConfig.tools.searxng && appConfig.tools.searxng.enabled);
     const cronToolEnabled = !!(appConfig.tools && appConfig.tools.cron && appConfig.tools.cron.enabled !== false);
+    const memoryWriteEnabled = !!(appConfig.tools && appConfig.tools.memoryWrite && appConfig.tools.memoryWrite.enabled !== false);
+    const memoryInspectEnabled = !!(appConfig.tools && appConfig.tools.memoryInspect && appConfig.tools.memoryInspect.enabled !== false);
 
     // SECURITY: Validate inputs
     if (!isValidModelName(model)) {
@@ -1545,18 +1560,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     console.log('TTS enabled:', ttsEnabled, '(type:', typeof ttsEnabled, ')');
     console.log('Super Search:', !!superSearch);
 
-    // Smart tool routing. Two independent reasons to enter the tool loop:
+    // Smart tool routing. Three independent reasons to enter the tool loop:
     //   - search intent, gated on the SearXNG stack being enabled
     //   - scheduling intent, gated on the create_cron_job action tool
-    // Either one pulls the turn into the loop; the model is handed the whole
+    //   - memory-write intent, gated on the write_memory action tool
+    // Any one pulls the turn into the loop; the model is handed the whole
     // registered tool set and picks. Scheduling intent is matched narrowly
-    // (see classifySchedulingIntent) so ordinary conversation never routes here.
+    // (see classifySchedulingIntent) so ordinary conversation never routes here;
+    // memory-write intent is matched the other way round, because missing the
+    // ask is the failure that tool exists to fix.
     const needsSearchTools = toolsEnabled && mcpClient.hasTools() && classifyToolNeed(userMessage.content, !!superSearch);
     const needsActionTools = cronToolEnabled && mcpClient.hasTool('create_cron_job')
       && classifySchedulingIntent(userMessage.content);
-    const needsTools = needsSearchTools || needsActionTools;
+    const needsMemoryWrite = memoryWriteEnabled && mcpClient.hasTool('write_memory')
+      && classifyMemoryWriteIntent(userMessage.content);
+    // Memory-READ intent gates the four inspection tools. Matched narrowly (see
+    // classifyMemoryReadIntent): a false positive here has him rummaging through
+    // the fact store during ordinary conversation, which is a worse failure than
+    // missing a lookup he can be asked for again.
+    const needsMemoryRead = memoryInspectEnabled && mcpClient.hasTool('memory_search')
+      && classifyMemoryReadIntent(userMessage.content);
+    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead;
     console.log('Tool routing:', needsTools
-      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling'].filter(Boolean).join(' + ')})`
+      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read'].filter(Boolean).join(' + ')})`
       : 'DIRECT (conversational, skipping tool loop)');
 
     // Should-I-search honesty guard: if the question is about current/changeable
@@ -1568,20 +1594,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const timeSensitiveUnsearched = isTimeSensitive(userMessage.content) && !needsTools;
 
     // Save user message to database
-    const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model);
+    // Modality rides from the client: 'stt' when the text came from a whisper
+    // transcription, 'typed' from the keyboard. addMessage normalises anything
+    // else to 'unknown' rather than assuming typed.
+    const userMsgId = db.addMessage(convoId, 'user', userMessage.content, model, null, inputModality);
 
-    // === UPGRADE 1: Load durable memory files (MEMORY.md, USER.md, daily logs) ===
+    // === UPGRADE 1: Durable memory ===
+    // Long-term memory is RENDERED FROM SQLITE per request (2026-08-02). It used
+    // to be read from data/memory/MEMORY.md, which made that file a second system
+    // of record and let the injected block drift from the database. USER.md and
+    // the daily logs are still files — they are written by hand or as a log, not
+    // derived from the fact store.
     let memoryFiles = { memory: null, user: null, dailyToday: null, dailyYesterday: null };
     try {
       memoryFiles = db.loadMemoryFiles();
-      console.log('Memory files loaded:', {
-        memory: memoryFiles.memory ? `${memoryFiles.memory.length} chars` : 'none',
+      memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: 'user' }) || null;
+      console.log('Memory loaded:', {
+        longTerm: memoryFiles.memory ? `${memoryFiles.memory.length} chars (rendered from SQLite)` : 'none',
         user: memoryFiles.user ? `${memoryFiles.user.length} chars` : 'none',
         dailyToday: memoryFiles.dailyToday ? `${memoryFiles.dailyToday.length} chars` : 'none',
         dailyYesterday: memoryFiles.dailyYesterday ? `${memoryFiles.dailyYesterday.length} chars` : 'none'
       });
     } catch (memFileError) {
-      console.error('Memory file load error:', memFileError.message);
+      console.error('Memory load error:', memFileError.message);
     }
 
     // === UPGRADE 2: Hybrid search (vector + BM25) ===
@@ -1626,7 +1661,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const memoryParts = [];
     const injCfg = (getConfig().memory && getConfig().memory.injection) || {};
 
-    // Add durable memory (MEMORY.md + USER.md), long-term capped.
+    // Add durable memory (rendered long-term facts + USER.md), long-term capped.
     if (memoryFiles.memory) {
       const { text: ltm } = injectionBudget.budgetText(
         memoryFiles.memory, injCfg.longTermTokens ?? 3000, 'long-term memory');
@@ -1797,6 +1832,50 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       });
     }
 
+    // Did-I-actually-save-it honesty guard. The exact sibling of the search guard
+    // above, and it exists because routing alone did not fix the bug it was built
+    // for: on 2026-07-27, with write_memory registered and the turn correctly
+    // routed into the tool loop, the model declined to call it and replied "I've
+    // updated my memory to reflect that your favorite color is blue." Nothing was
+    // written. Offering the tool is not the same as it being used, and a claim of
+    // remembering is exactly the kind of thing nobody verifies in the moment.
+    if (needsMemoryWrite) {
+      enhancedMessages.push({
+        role: 'system',
+        content:
+          'The user is asking you to remember something. You have a write_memory tool, and it is the ONLY way anything reaches your long-term memory in this turn — nothing is saved automatically as you talk. ' +
+          'Call write_memory now, passing her statement through with its original pronouns ("your name is X" and "my name is X" mean different things and the tool routes on that difference). ' +
+          'Do NOT say you have remembered, saved, noted, or updated anything unless the tool call actually ran and came back successful. If it fails or you do not call it, say plainly that you could not save it.'
+      });
+    }
+
+    // Did-I-actually-look honesty guard. Third of its family, after the
+    // scheduling one and the write one, and it exists before the bug does
+    // because the shape is now well understood: a tool that is offered and not
+    // called, followed by a fluent claim that it was. "I searched my memory and
+    // found three facts about that" is unfalsifiable in the moment, sounds like
+    // diligence, and costs nothing to say — the perfect phantom.
+    //
+    // The numeric clause is the specific one. Estimating a count about your own
+    // memory reads exactly like knowing it.
+    if (needsMemoryRead) {
+      enhancedMessages.push({
+        role: 'system',
+        content:
+          'The user is asking about what you hold in your own memory. You have tools for exactly this: ' +
+          'memory_search (find facts on a topic), memory_list (browse facts, or mode:"clusters" for your cluster names), ' +
+          'memory_count (how many — always count, never estimate), memory_get (one fact in full: why you believe it, ' +
+          'when you learned it, the exact words that were said, and what has changed since). ' +
+          'Call the right one now. What is injected above you is a small excerpt chosen by relevance, not your memory — ' +
+          'answering from it alone and calling that a search is false. ' +
+          'Do NOT say you searched, looked up, checked or counted anything unless the tool call actually ran and came back. ' +
+          'If a result says facts were not shown, say so rather than presenting what you got as everything you have. ' +
+          'Report a fact\'s record EXACTLY as the tool returned it. Facts learned before 2026-08-02 have no recorded source — ' +
+          'for those, never name the conversation they came from and never quote what was said, because no wording was stored ' +
+          'and any quote would be invented. Say the original wording was not kept.'
+      });
+    }
+
     // Follow-up source recall: give the entity the links it found in the most
     // recent search turn of THIS conversation, so "give me the link for [S3]" is
     // answered by reading the stored URL instead of refusing or fabricating. Most
@@ -1879,6 +1958,18 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const identityBlock = identity.buildIdentityBlock();
       enhancedMessages.unshift({ role: 'system', content: identityBlock.text });
       console.log(`[Identity] Injected seed + ${identityBlock.selfFacts.length} self-fact(s)`);
+
+      // Correction notices are marked seen only AFTER they are in the message
+      // that is about to be sent. Stamping them when they were read would lose a
+      // notice to any failure between here and the request — and the one thing
+      // this channel promises is that a change to his self-view is never made
+      // silently, which a lost notice would break in exactly the quiet way that
+      // is hardest to notice.
+      if (identityBlock.notices && identityBlock.notices.length) {
+        const seen = require('./db/corrections-ledger')
+          .markNoticesSeen(identityBlock.notices.map(n => n.id), convoId);
+        console.log(`[Identity] Delivered ${seen} correction notice(s) to him`);
+      }
     } catch (identityErr) {
       console.error('[Identity] Injection error:', identityErr.message);
     }
@@ -1908,7 +1999,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         else if (c.startsWith('Links you found earlier in this conversation')) breakdown.sourcesRecall += t;
         else if (c.includes('Use this as the current date/time')) breakdown.datetime += t;
         else if (c.startsWith('The user is asking about current')) breakdown.other += t; // time-sensitive guard
-        else breakdown.memory += t; // MEMORY.md / daily logs / clusters / past-convo
+        else breakdown.memory += t; // long-term facts / daily logs / clusters / past-convo
       }
       console.log(`[Injection] Total system-context: ~${injectedTokens} tokens across ${sys.length} system message(s)`);
       console.log(`[Injection] Breakdown: identity=${breakdown.identity} epistemic=${breakdown.epistemic} manifest=${breakdown.manifest} memory=${breakdown.memory} sourcesRecall=${breakdown.sourcesRecall} datetime=${breakdown.datetime} other=${breakdown.other}`);
@@ -2023,7 +2114,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         // the per-request client host — settings and reality now agree.
         // conversationId travels with the context so action tools can record
         // which conversation proposed them (create_cron_job stores it).
-        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId };
+        //
+        // userMessage travels too, and write_memory depends on it. The model
+        // paraphrases when it fills in a tool argument, and on 2026-07-27 it
+        // paraphrased "remember that YOU prefer X" into statement:"I prefer X" —
+        // which reads as Ellie speaking about herself, so a self-fact was filed
+        // as her preference. That is the misattribution bug, re-entering through
+        // the tool layer. The verbatim message is the only place the speaker
+        // frame survives, so the classifier is given it rather than the model's
+        // rewrite.
+        // messageId + inputModality ride along as provenance for write_memory,
+        // so a fact Ellie asked for records which message asked and whether she
+        // spoke or typed it.
+        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId, userMessage: userMessage.content, messageId: userMsgId, inputModality };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
@@ -2209,7 +2312,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         // the per-request client host — settings and reality now agree.
         // conversationId travels with the context so action tools can record
         // which conversation proposed them (create_cron_job stores it).
-        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId };
+        //
+        // userMessage travels too, and write_memory depends on it. The model
+        // paraphrases when it fills in a tool argument, and on 2026-07-27 it
+        // paraphrased "remember that YOU prefer X" into statement:"I prefer X" —
+        // which reads as Ellie speaking about herself, so a self-fact was filed
+        // as her preference. That is the misattribution bug, re-entering through
+        // the tool layer. The verbatim message is the only place the speaker
+        // frame survives, so the classifier is given it rather than the model's
+        // rewrite.
+        // messageId + inputModality ride along as provenance for write_memory,
+        // so a fact Ellie asked for records which message asked and whether she
+        // spoke or typed it.
+        const toolContext = { searxngHost: getSearxngConfig().url, conversationId: convoId, userMessage: userMessage.content, messageId: userMsgId, inputModality };
         const MAX_TOOL_ROUNDS = superSearch ? 15 : 8;
         const MAX_WEB_SEARCHES = superSearch ? 5 : 3;
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
@@ -2501,7 +2616,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         model,
         providerKey,
         providerHost,
-        convoId
+        convoId,
+        undefined,
+        // Provenance for every fact this exchange produces: which message said
+        // it, and whether it was spoken or typed.
+        { messageId: userMsgId, inputModality }
       ).catch(err => {
         console.warn('[FactExtractor] Background extraction error:', err.message);
       });
@@ -2567,7 +2686,8 @@ app.listen(PORT, () => {
   console.log('  - Fact extraction: Auto-extract after each exchange');
   console.log('  - Memory flush: Auto-compact at 80% context usage');
   console.log('  - Memory clusters: Associative cluster-aware retrieval');
-  console.log(`  - Memory files: data/memory/ (MEMORY.md, USER.md, daily/)`);
+  console.log(`  - Long-term memory: rendered from SQLite per request`);
+  console.log(`  - Memory files: data/memory/ (USER.md, daily/)`);
   console.log(`  - MCP tools: ${mcpClient.hasTools() ? mcpClient.getToolNames().join(', ') : 'None'}`);
   console.log(`  - Memory heartbeat: ${startupConfig.heartbeat.enabled ? `Every ${startupConfig.heartbeat.intervalHours}h (first run in ${startupConfig.heartbeat.warmupMinutes}min)` : 'Disabled'}`);
   if (ALLOWED_OLLAMA_HOSTS.length > 0) {

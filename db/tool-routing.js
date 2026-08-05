@@ -319,4 +319,150 @@ function classifySchedulingIntent(text) {
   return SCHEDULE_REQUEST_PATTERNS.some(r => r.test(t));
 }
 
-module.exports = { classifyToolNeed, isTimeSensitive, classifySchedulingIntent };
+/**
+ * Memory-write intent — is this message asking the entity to REMEMBER something?
+ * Gates the write_memory action tool into the tool loop.
+ *
+ * Tuned the opposite way from classifySchedulingIntent. A false positive there
+ * puts an unasked-for decision in front of Ellie; here it only means the model
+ * is handed a tool it can decline to call, and it still chooses. A false
+ * NEGATIVE, though, is the exact bug this tool was built to fix: she asks it to
+ * remember something, the turn never enters the tool loop, and it agrees warmly
+ * and writes nothing. So this leans toward catching the ask.
+ *
+ * Still requires an explicit instruction, not any mention of memory —
+ * "I remember when we set that up" is reminiscence, not a request.
+ */
+const MEMORY_WRITE_PATTERNS = [
+  // Direct instructions to store something.
+  /\b(remember|memorize|memorise) (that|this|it|i|you|my|your|we|to|the|a|an)\b/,
+  /\b(write|save|add|commit|note|put) (this|that|it|the following)?\s*(down)?\s*(in ?to|to|in)? ?(your |long[- ]?term )?(memory|memories|notes)\b/,
+  /\bmake a note\b/,
+  /\bnote (this|that) down\b/,
+  /\bkeep (this|that) in mind\b/,
+  /\bdon'?t forget\b/,
+  /\bnever forget\b/,
+  /\bfor future reference\b/,
+  /\bstore (this|that|it)\b/,
+  // Bare imperative openers: "remember: …", "remember, …"
+  /^\s*(remember|note)\b\s*[:,]/,
+];
+
+// Reminiscence and questions ABOUT memory are not write instructions.
+const MEMORY_WRITE_NEGATIVES = [
+  /\bi remember\b/,
+  /\bdo you remember\b/,
+  /\bdon'?t you remember\b/,
+  /\bremember when\b/,
+  /\bcan you remember\b.*\?/,
+  /\bwhat do you remember\b/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message asks for something to be remembered
+ */
+function classifyMemoryWriteIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (MEMORY_WRITE_NEGATIVES.some(r => r.test(t))) return false;
+  return MEMORY_WRITE_PATTERNS.some(r => r.test(t));
+}
+
+/**
+ * Memory-READ intent — is this message asking about what he holds in memory?
+ * Gates the four inspection tools into the tool loop.
+ *
+ * Tuned like classifySchedulingIntent (narrow), not like classifyMemoryWriteIntent
+ * (broad), and the asymmetry is deliberate. A missed read is recoverable in the
+ * next sentence — she asks again, or he offers to look. A false positive puts a
+ * memory-tool schema in front of him during ordinary conversation, and the
+ * failure mode there is not a wasted call: it is him rummaging through the fact
+ * store mid-sentence and answering a casual remark with a database report.
+ *
+ * The hard part is the difference between a question about his MEMORY and a
+ * question about the WORLD. "What do you know about the Roman Empire" is not a
+ * memory question; "what do you know about my dogs" is. Where a phrase is
+ * ambiguous on its own, a PERSONAL REFERENT is required — the question has to be
+ * about her, about them, or about a belief he holds.
+ *
+ * Bare imperatives, no hedging. Hedged phrasing measured 0/20 on this brain.
+ */
+
+// Referents that make an otherwise-general question a question about memory.
+const PERSONAL_REF = String.raw`(i|i'm|i am|me|my|mine|we|us|our|she|her|hers|ellie|myself)`;
+
+const MEMORY_READ_PATTERNS = [
+  // --- explicit instruction to consult memory ---
+  /\b(search|look (in|through|inside)|check|query|go through|dig through)\s+(your|the)\s+(long[- ]?term\s+)?(memory|memories|notes|facts|fact store)\b/,
+  /\b(what'?s|what is|what do you have)\s+(in|stored in|saved in)\s+your\s+(memory|notes|facts)\b/,
+  /\b(list|show me|show)\b.{0,25}\byour\s+(memory|memories|facts|clusters)\b/,
+  /\bwhat (are|is)\b.{0,15}\byour\s+(memory\s+)?clusters\b/,
+
+  // --- "what do you remember/recall" — 'remember' always means HIS memory ---
+  /\bwhat (do|can) you (remember|recall)\b/,
+  /\bwhat else do you (remember|recall|know)\b/,
+  /\bdo you (remember|recall)\b/,
+  /\bwhat have i (told|said to) you\b/,
+
+  // --- "what do you know/have about <personal>" — referent required ---
+  new RegExp(String.raw`\bwhat (do|did) you (know|have|hold)\b.{0,25}\babout\b.{0,30}\b${PERSONAL_REF}\b`),
+  new RegExp(String.raw`\btell me what you (know|remember|have)\b.{0,30}\b${PERSONAL_REF}\b`),
+  /\bwhat (facts?|memories)\b.{0,30}\b(do )?you (have|hold|store|keep)\b/,
+
+  // --- counts: never estimate a number about your own memory ---
+  /\bhow many\b.{0,40}\b(facts?|memories|clusters|entries)\b/,
+  /\bhow many\b.{0,30}\bdo you (have|hold|know|remember|store)\b/,
+
+  // --- provenance: why do you believe / where did you learn ---
+  new RegExp(String.raw`\bwhy do you (believe|think|say|have)\b.{0,30}\b${PERSONAL_REF}\b`),
+  new RegExp(String.raw`\bwhat makes you (think|believe|say)\b.{0,30}\b${PERSONAL_REF}\b`),
+  new RegExp(String.raw`\bhow do you know\b.{0,30}\b${PERSONAL_REF}\b`),
+  /\bwhere did you (learn|get|hear|find out)\b/,
+  /\bwhen did (i|we) (tell|say|mention)\b/,
+  /\bwhen did you learn\b/,
+  /\b(is|are) that still (true|the case|right)\b/,
+
+  // --- provenance, asked about the RECORD rather than about him ---
+  // Found live on 2026-08-03: "where exactly did it come from? Which
+  // conversation, and what were my actual words?" is as direct a provenance
+  // question as exists, matched nothing above, went DIRECT with no tools, and he
+  // answered by inventing a quote. Asking about the record is asking to read it.
+  // "where did IT come from" is provenance; "where did YOU come from" is
+  // philosophy, and he gets asked that. The subject has to be the record.
+  /\bwhere (did|does)\s+(it|that|this|the fact|the record|the memory|(that|this|the) belief)\b.{0,15}\bcome(s)? from\b/,
+  /\bwhat (were|was) (my|her) (actual |exact |original )?words\b/,
+  // "which conversation topic do you enjoy most" is small talk. Require the
+  // clause to be asking which conversation something came from.
+  /\bwhich conversation\b.{0,30}\b(did|was|came?|from|told|said|learn|hear)\b/,
+  /\bwhat did i (actually |exactly )?say\b/,
+  /\bwhat does (the|your) (record|memory) (say|show)\b/,
+  /\b(open|pull up|look at)\b.{0,20}\b(the |that )?(fact|record|memory|entry)\b/,
+  /\bhow (did|do) you (come to )?(know|learn|have) (that|this|it)\b/,
+];
+
+/**
+ * Reminiscence that is not a lookup request, and phrasings whose subject is
+ * plainly the world rather than the record.
+ */
+const MEMORY_READ_NEGATIVES = [
+  /\bi remember\b/,
+  /\bremember when we\b/,
+  // "remember that X" / "remember to X" are WRITE instructions; the write
+  // classifier owns them, and firing both would hand him eight tools for one ask.
+  /\bremember (that|to)\b/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message asks about what he holds in memory
+ */
+function classifyMemoryReadIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (MEMORY_READ_NEGATIVES.some(r => r.test(t))) return false;
+  return MEMORY_READ_PATTERNS.some(r => r.test(t));
+}
+
+module.exports = {
+  classifyToolNeed, isTimeSensitive, classifySchedulingIntent,
+  classifyMemoryWriteIntent, classifyMemoryReadIntent
+};
