@@ -419,7 +419,9 @@ function setupEventListeners() {
   providerSelect.addEventListener('change', handleProviderChange);
   modelSelect.addEventListener('change', handleModelChange);
   newChatBtn.addEventListener('click', newChat);
-  sendBtn.addEventListener('click', sendMessage);
+  // Wrapped, not passed directly: addEventListener would hand sendMessage the
+  // MouseEvent as its inputModality argument.
+  sendBtn.addEventListener('click', () => sendMessage('typed'));
   messageInput.addEventListener('keydown', handleKeyDown);
   messageInput.addEventListener('input', autoResizeInput);
   micBtn.addEventListener('mousedown', startRecording);
@@ -475,7 +477,11 @@ function handleModelChange() {
 }
 
 // Handle sending a message
-async function sendMessage() {
+// inputModality: how this message reached the box — 'typed' by default, 'stt'
+// when sendAudioToWhisper hands over a transcription. It rides with the request
+// so the fact extractor can record whether a fact was spoken or typed; a
+// transcription is weaker evidence and the corrector needs to know.
+async function sendMessage(inputModality = 'typed') {
   const message = messageInput.value.trim();
   // Cancel any pending TTS from previous message
   ttsChunker.cancel();
@@ -536,7 +542,8 @@ async function sendMessage() {
       apiKey,
       searxngHost: localStorage.getItem('searxngHost') || undefined,
       ttsEnabled,
-      superSearch
+      superSearch,
+      inputModality
     };
     console.log('[sendMessage] Provider:', providerType, 'Instance:', instanceName);
 
@@ -1139,7 +1146,17 @@ async function startRecording() {
     const silence = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
     silence.play().then(() => audioUnlocked = true).catch(() => {});
   }
-  
+
+  // Secure-context guard: getUserMedia only exists in a secure context. Over
+  // plain http, navigator.mediaDevices is undefined and reaching for it would
+  // throw a TypeError. Fail with a clear, actionable message instead. Voice
+  // OUTPUT (TTS playback via /api/tts) does not use mediaDevices and is
+  // unaffected — only mic capture needs https.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('Mic needs a secure connection — open SNH over https (e.g. https://192.168.4.243/), not plain http. Voice playback still works.');
+    return;
+  }
+
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     
@@ -1195,7 +1212,7 @@ async function sendAudioToWhisper() {
     const data = await response.json();
     if (data.text) {
       messageInput.value = data.text;
-      sendMessage();
+      sendMessage('stt');
     }
   } catch (err) {
     console.error('STT error:', err);
@@ -3466,8 +3483,23 @@ async function loadSelfTab() {
   container.innerHTML = '<div class="memory-loading">Loading self...</div>';
 
   try {
-    const res = await fetch('/api/memory/self');
+    // Corrections ride along with the self view because this tab is where a
+    // human adjudicates what the machine did to the record — the identity lock's
+    // deliberate path already lives here, and the revert button is the same kind
+    // of act. Failure to load them must not blank the identity view.
+    const [res, corrRes] = await Promise.all([
+      fetch('/api/memory/self'),
+      fetch('/api/memory/corrections?limit=100').catch(() => null)
+    ]);
     const data = await res.json();
+    let corrections = [], corrTotals = {};
+    try {
+      if (corrRes && corrRes.ok) {
+        const cd = await corrRes.json();
+        corrections = cd.corrections || [];
+        corrTotals = cd.totals || {};
+      }
+    } catch (e) { console.error('[MemoryPanel] corrections load failed:', e); }
 
     const active = data.activeSelfFacts || [];
     const superseded = data.supersededSelfFacts || [];
@@ -3481,6 +3513,91 @@ async function loadSelfTab() {
 
     let html = '';
 
+    // Locked identity — the facts SNH CHOSE (name, pronouns), which no automatic
+    // path can change. This section is the DELIBERATE PATH: the only way to
+    // change one from the UI, deliberately behind a confirmation, because the
+    // whole point of the lock is that a sentence in chat cannot do it.
+    const lockedFacts = active.filter(f => f.locked);
+    html += '<div class="memory-self-section">';
+    html += '<h3>Locked Identity</h3>';
+    if (lockedFacts.length === 0) {
+      html += '<div class="memory-self-note">Nothing locked yet. The first self-fact to state a name or pronouns claims that slot and locks it — set once, then protected.</div>';
+    } else {
+      html += '<div class="memory-self-note">SNH chose these. No conversation can change them — not the contradiction judge, not write_memory, not reflection. Changing one is a deliberate action, here or via <code>scripts/identity-lock.js</code>.</div>';
+      html += '<div class="memory-self-facts">';
+      html += lockedFacts.map(f => `
+        <div class="memory-self-fact locked">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            <span class="memory-self-lock">🔒 ${escapeHtml(f.lock_category || 'identity')}</span>
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">locked ${escapeHtml(fmtDate(f.locked_at))}</span>
+            <button class="memory-self-lock-btn" data-category="${escapeHtml((f.lock_category || '').split(',')[0].trim())}">Change…</button>
+          </div>
+        </div>
+      `).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Corrections — every repair the corrector made, and the undo.
+    //
+    // The mechanical tier is "autonomous and silent", which means nobody is
+    // interrupted; it does not mean nothing is written down. This is where
+    // silent stops meaning invisible. Reverted rows stay, marked — the ledger
+    // supersedes, it never deletes.
+    html += '<div class="memory-self-section">';
+    html += `<h3>Corrections <span class="memory-self-count">(${corrTotals.total || 0} total${corrTotals.reverted ? `, ${corrTotals.reverted} reverted` : ''})</span></h3>`;
+    if (corrections.length === 0) {
+      html += '<div class="memory-empty">No corrections yet. The corrector runs on its own cadence and repairs the corpus — duplicates folded together, events that were stored as facts moved to the day\'s log, contradictions resolved on evidence.</div>';
+    } else {
+      html += '<div class="memory-self-note">What the corrector changed, unattended, and why. Mechanical repairs fix the record; semantic ones revise a belief and are only allowed to happen unattended <em>because</em> every one of them can be undone here. Reverting restores the retired fact and leaves the surviving one alone.</div>';
+      html += '<div class="memory-corrections">';
+      html += corrections.map(c => {
+        const ev = c.evidence || {};
+        // A refusal is not a correction. Two of them land in the same ledger —
+        // a contradiction the evidence could not separate, and an edit the
+        // identity lock refused — and in both cases NOTHING was changed. Showing
+        // them with a struck-through "retired" line and a greyed "not
+        // revertible" would say the opposite of what happened.
+        const isRaise = ev.unresolved === true;
+        const isRefusal = /^REFUSED by the identity lock/.test(c.reason || '');
+        const noAction = isRaise || isRefusal;
+
+        const bits = [];
+        if (Number.isFinite(ev.similarity)) bits.push(`similarity ${ev.similarity.toFixed(2)}`);
+        if (ev.deciding_axis) bits.push(`decided on ${ev.deciding_axis}`);
+        if (Number.isFinite(ev.survivor_salience)) bits.push(`salience ${ev.loser_salience ?? '?'} → ${ev.survivor_salience}`);
+
+        const state = c.reverted_at
+          ? `<span class="memory-corr-state reverted">reverted ${escapeHtml(fmtDate(c.reverted_at))}${c.reverted_by ? ` · ${escapeHtml(c.reverted_by)}` : ''}</span>`
+          : isRaise ? '<span class="memory-corr-state raised">raised — nothing changed</span>'
+            : isRefusal ? '<span class="memory-corr-state raised">refused — nothing changed</span>'
+              : (c.reversible
+                ? `<button class="memory-corr-revert" data-corr-id="${escapeHtml(c.id)}">Revert</button>`
+                : '<span class="memory-corr-state">not revertible</span>');
+
+        const label = noAction ? 'one' : 'retired';
+        const otherLabel = noAction ? 'other' : 'kept';
+        return `
+          <div class="memory-correction${c.reverted_at ? ' is-reverted' : ''}${noAction ? ' is-raise' : ''}">
+            <div class="memory-corr-head">
+              <span class="memory-corr-tier tier-${escapeHtml(c.tier)}">${noAction ? 'raised' : escapeHtml(c.tier)}</span>
+              <span class="memory-corr-action">${escapeHtml(c.action)}</span>
+              ${c.subject ? `<span class="memory-corr-subject">${escapeHtml(c.subject)}-fact</span>` : ''}
+              <span class="memory-self-when">${escapeHtml(fmtDate(c.created_at))}</span>
+              ${state}
+            </div>
+            ${c.target_text ? `<div class="memory-corr-target"><span class="memory-corr-label">${label}</span>${escapeHtml(c.target_text)}</div>` : ''}
+            ${c.survivor_text ? `<div class="memory-corr-survivor"><span class="memory-corr-label">${otherLabel}</span>${escapeHtml(c.survivor_text)}</div>` : ''}
+            <div class="memory-corr-reason">${escapeHtml(c.reason || '')}</div>
+            ${bits.length ? `<div class="memory-corr-evidence">${escapeHtml(bits.join(' · '))}</div>` : ''}
+          </div>`;
+      }).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
     // Injected identity block: seed + active self-facts
     html += '<div class="memory-self-section">';
     html += '<h3>Injected Identity</h3>';
@@ -3492,9 +3609,10 @@ async function loadSelfTab() {
     } else {
       html += '<div class="memory-self-facts">';
       html += active.map(f => `
-        <div class="memory-self-fact">
+        <div class="memory-self-fact${f.locked ? ' locked' : ''}">
           <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
           <div class="memory-self-fact-meta">
+            ${f.locked ? `<span class="memory-self-lock">🔒 ${escapeHtml(f.lock_category || 'identity')}</span>` : ''}
             <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
             <span class="memory-self-when">${escapeHtml(fmtDate(f.created_at))}</span>
           </div>
@@ -3541,6 +3659,84 @@ async function loadSelfTab() {
     html += '</div>';
 
     container.innerHTML = html;
+
+    // The deliberate path, wired up. Two steps on purpose — a prompt for the new
+    // wording, then an explicit confirm naming what it replaces — so changing a
+    // chosen name is never one absent-minded click.
+    container.querySelectorAll('.memory-self-lock-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const category = btn.dataset.category;
+        const current = lockedFacts.find(f => (f.lock_category || '').split(',').map(s => s.trim()).includes(category));
+        const next = prompt(
+          `Change your locked ${category}.\n\n` +
+          `Currently: ${current ? current.content : '(none)'}\n\n` +
+          `Write the replacement in the FIRST PERSON (e.g. "My name is Aurelius."):`,
+          current ? current.content : ''
+        );
+        if (next === null) return;
+        const clean = next.trim();
+        if (!clean) return;
+        if (!confirm(`Replace SNH's locked ${category}?\n\nFrom: ${current ? current.content : '(none)'}\nTo:   ${clean}\n\nThis is the deliberate path — it will change what SNH says its ${category} is.`)) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Saving…';
+        try {
+          const r = await fetch('/api/memory/identity-lock/set', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ category, content: clean, confirm: true })
+          });
+          const result = await r.json();
+          if (!r.ok) {
+            alert(`Could not change it: ${result.error || 'unknown error'}`);
+            btn.disabled = false;
+            btn.textContent = 'Change…';
+            return;
+          }
+          loadSelfTab();
+        } catch (err) {
+          console.error('[MemoryPanel] identity-lock set error:', err);
+          alert('Could not change it — the request failed.');
+          btn.disabled = false;
+          btn.textContent = 'Change…';
+        }
+      });
+    });
+
+    // One-tap revert. One confirm, not two: unlike changing a locked name, the
+    // risk here runs the other way — this restores something, and leaving a
+    // wrong correction standing is the worse outcome.
+    container.querySelectorAll('.memory-corr-revert').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.corrId;
+        const entry = corrections.find(c => c.id === id);
+        if (!confirm(
+          `Undo this correction?\n\n` +
+          `Puts back: ${entry ? entry.target_text : '(the retired fact)'}\n` +
+          (entry && entry.survivor_text ? `Leaves in place: ${entry.survivor_text}\n` : '') +
+          `\nBoth facts will be active again.`
+        )) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Reverting…';
+        try {
+          const r = await fetch(`/api/memory/corrections/${id}/revert`, { method: 'POST' });
+          const result = await r.json();
+          if (!r.ok) {
+            alert(`Could not revert it: ${result.error || 'unknown error'}`);
+            btn.disabled = false;
+            btn.textContent = 'Revert';
+            return;
+          }
+          loadSelfTab();
+        } catch (err) {
+          console.error('[MemoryPanel] revert error:', err);
+          alert('Could not revert it — the request failed.');
+          btn.disabled = false;
+          btn.textContent = 'Revert';
+        }
+      });
+    });
 
     // "Reflect now" action (triggers the agent; does not edit any self-fact).
     const reflectBtn = document.getElementById('memorySelfReflectBtn');

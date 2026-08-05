@@ -16,6 +16,18 @@ const heavyLimiter = rateLimit({
   message: { error: 'Too many requests — this operation can only run once per 10 minutes' }
 });
 
+// Deliberate human actions that are cheap to perform but must not be scriptable
+// in bulk. The heavy limiter is wrong here: reverting a correction costs one
+// SQLite update and one embedding, and someone reviewing a corrector pass may
+// reasonably undo several in a sitting. One-per-ten-minutes would make the
+// "one-tap revert" the semantic tier's autonomy is conditional on unusable
+// exactly when it is needed most.
+const deliberateLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many requests — slow down' }
+});
+
 const db = require('../db/database');
 const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
@@ -45,11 +57,13 @@ function sanitizeString(str, maxLength = 1000) {
 
 /**
  * GET /api/memory
- * Load all memory files (MEMORY.md, USER.md, daily logs)
+ * Durable memory as the chat path sees it: long-term facts rendered from SQLite,
+ * plus the USER.md profile and daily logs (still files).
  */
 router.get('/', (req, res) => {
   try {
     const memoryFiles = db.loadMemoryFiles();
+    memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: 'user' }) || null;
     res.json(memoryFiles);
   } catch (error) {
     console.error('[MemoryAPI] Error loading memory files:', error.message);
@@ -170,6 +184,8 @@ router.get('/self', (req, res) => {
     // budgeted subset here would hide genuinely-active self-facts (e.g. ones
     // just reclassified from user territory) below the salience cutoff.
     const activeSelfFacts = memoryClusters.getSelfFacts({ status: 'active' });
+    // 'superseded' is accepted by getSelfFacts as a legacy alias and resolves to
+    // inactive rows whose reason is supersession.
     const supersededSelfFacts = memoryClusters.getSelfFacts({ status: 'superseded' });
     const reflections = memoryManager.getReflections(10);
 
@@ -184,6 +200,132 @@ router.get('/self', (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error loading self view:', error.message);
     res.status(500).json({ error: 'Failed to load self view' });
+  }
+});
+
+/**
+ * GET /api/memory/identity-lock
+ * The locked identity facts — what the entity CHOSE (name, pronouns) and which
+ * no automatic path may change. Read-only.
+ */
+router.get('/identity-lock', (req, res) => {
+  try {
+    const identityLock = require('../db/identity-lock');
+    res.json({
+      categories: identityLock.DEFAULT_CATEGORIES,
+      locked: identityLock.getLockedFacts({ status: 'active' })
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading identity locks:', error.message);
+    res.status(500).json({ error: 'Failed to load identity locks' });
+  }
+});
+
+/**
+ * POST /api/memory/identity-lock/set
+ * THE DELIBERATE PATH (settings action) — change a locked identity fact.
+ *
+ * The lock exists so that a sentence in conversation cannot take away a name the
+ * entity chose. That protection is only real if the way around it is something a
+ * human does on purpose: this route requires `confirm: true` in the body and is
+ * reachable only from the Self tab, never from the chat pipeline or any tool.
+ * Every change is written to the ops ledger and the daily log.
+ *
+ * Body: { category: 'name'|'pronouns', content: '<first-person fact>', confirm: true }
+ */
+router.post('/identity-lock/set', heavyLimiter, async (req, res) => {
+  try {
+    const { category, content, confirm } = req.body || {};
+    if (confirm !== true) {
+      return res.status(400).json({
+        error: 'Changing a locked identity fact requires explicit confirmation (confirm: true).'
+      });
+    }
+    const cleanContent = sanitizeString(content, 500);
+    if (!cleanContent) return res.status(400).json({ error: 'Content is required' });
+
+    const identityLock = require('../db/identity-lock');
+    const result = await identityLock.setLockedFact({
+      category: String(category || ''),
+      content: cleanContent,
+      actor: 'settings action (Self tab, confirmed)'
+    });
+    if (!result.ok) return res.status(400).json({ error: result.reason });
+
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[MemoryAPI] Error setting locked identity fact:', error.message);
+    res.status(500).json({ error: 'Failed to set identity fact' });
+  }
+});
+
+// ============ corrections (the corrector's ledger, with one-tap revert) ============
+
+/**
+ * GET /api/memory/corrections
+ * Every change the corrector made — what it retired, what it kept, on what
+ * evidence, and whether it can still be undone. Read-only.
+ *
+ * The mechanical tier is silent, not invisible: silent means nobody is
+ * interrupted, and this is the surface where "silent" stops meaning "no record".
+ * Reverted entries are kept and marked, never removed.
+ *
+ * ?tier=mechanical|semantic  ?subject=user|self  ?limit=n
+ */
+router.get('/corrections', (req, res) => {
+  try {
+    const ledger = require('../db/corrections-ledger');
+    const tier = ['mechanical', 'semantic'].includes(req.query.tier) ? req.query.tier : null;
+    const subject = ['user', 'self'].includes(req.query.subject) ? req.query.subject : null;
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
+
+    const rows = ledger.list({ tier, subject, limit }).map(r => {
+      let evidence = null;
+      try { evidence = r.evidence ? JSON.parse(r.evidence) : null; } catch { evidence = null; }
+      return { ...r, evidence, reversible: !!r.reversible, announced: !!r.announced };
+    });
+
+    const { getSqliteDb } = require('../db/database');
+    const db = getSqliteDb();
+    const totals = db
+      ? db.prepare(`
+          SELECT COUNT(*) AS total,
+                 SUM(CASE WHEN tier = 'mechanical' THEN 1 ELSE 0 END) AS mechanical,
+                 SUM(CASE WHEN tier = 'semantic'   THEN 1 ELSE 0 END) AS semantic,
+                 SUM(CASE WHEN reverted_at IS NOT NULL THEN 1 ELSE 0 END) AS reverted,
+                 MAX(created_at) AS lastAt
+          FROM corrections_ledger
+        `).get()
+      : {};
+
+    res.json({ corrections: rows, totals });
+  } catch (error) {
+    console.error('[MemoryAPI] Error listing corrections:', error.message);
+    res.status(500).json({ error: 'Failed to list corrections' });
+  }
+});
+
+/**
+ * POST /api/memory/corrections/:id/revert
+ * THE ONE-TAP UNDO the semantic tier's autonomy is conditional on.
+ *
+ * Restores the fact the corrector retired and marks the ledger entry reverted.
+ * The survivor is left alone — undoing a judgement is not the same as making the
+ * opposite one. Like the identity-lock setter this is a deliberate human action
+ * reachable only from the Self tab; nothing in the chat or heartbeat path can
+ * call it.
+ */
+router.post('/corrections/:id/revert', deliberateLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUUID(id)) return res.status(400).json({ error: 'Invalid correction ID' });
+    const ledger = require('../db/corrections-ledger');
+    const result = await ledger.revert(id, { by: 'Self tab (confirmed)' });
+    if (!result.ok) return res.status(400).json({ error: result.reason });
+    res.json({ success: true, restored: result.entry.target_text, sqlite: result.sqlite, vector: result.vector });
+  } catch (error) {
+    console.error('[MemoryAPI] Error reverting correction:', error.message);
+    res.status(500).json({ error: 'Failed to revert correction' });
   }
 });
 
@@ -355,7 +497,13 @@ router.get('/activity', (req, res) => {
       const judged = parsed.pairsJudged;
       const known = Number.isFinite(judged);
       let pathLabel, pathKind;
-      if (!known) {
+      if (parsed.crossLinkAudit === 'deleted') {
+        // Passes recorded from 2026-08-02 onward. The step that used to make a
+        // pass fast or slow no longer exists, so duration is no longer bimodal
+        // and there is nothing to attribute it to.
+        pathLabel = 'cross-link audit removed — no pair scoring on this pass';
+        pathKind = 'light';
+      } else if (!known) {
         pathLabel = 'cross-link workload not recorded for this pass';
         pathKind = 'unknown';
       } else if (judged === 0) {
@@ -424,19 +572,8 @@ router.get('/activity', (req, res) => {
                                 result: lastHb.clusterPipeline
                                   ? `${lastHb.clustersAudited} audited, ${lastHb.clustersSplit} split`
                                   : 'skipped — no oversized clusters' } : null }),
-      sub('crossLinks', 'Cross-link audit',
-          'Scores how related each pair of clusters is and maintains the links between them. Pairs whose content has not changed are served from a cached judgment; only changed pairs go to the model. This step is what makes a pass fast or slow.',
-          'always — but only re-judges pairs whose content changed',
-          { derived: true,
-            isDurationDriver: true,
-            lastRun: lastHb ? { at: lastHb.at, ok: lastHb.status === 'ok', durationMs: null,
-                                result: (lastHb.pairsJudged != null
-                                  ? `${lastHb.pairsJudged} pair(s) re-judged, ${lastHb.pairsReused ?? 0} cached · `
-                                  : '') + `links +${lastHb.linksAdded} / ~${lastHb.linksUpdated} / -${lastHb.linksRemoved}` } : null }),
       sub('mergeByName', 'Merge duplicate-name clusters',
           'Collapses clusters that ended up sharing a name.', 'always'),
-      sub('cleanupFacts', 'Fact cleanup',
-          'Dedups, rewords and merges facts in long-term memory.', 'always'),
       sub('summarizeDailyLogs', 'Daily log archival',
           'Archives daily logs older than the retention window, keeping a digest.', 'always'),
       sub('sweepPendingQuestions', 'Pending-question sweep',
@@ -451,7 +588,7 @@ router.get('/activity', (req, res) => {
           'Probes the services behind config-gated organs and reconciles the capability manifest against the live tool registry. Any disagreement is raised in the bell, because the manifest is authoritative for capability questions — a stale entry makes SNH deny something it can do, or offer something that is down.',
           'always'),
       sub('memoryReconcile', 'Memory store reconciliation',
-          'Checks that MEMORY.md, the fact database and the vector store still agree — a fact retired in one but not the others keeps being read or stays searchable. Reports only; it never edits a store.',
+          'Checks that the fact database and the vector store still agree — a fact retired in one but not the other stays searchable. Reports only; it never edits a store.',
           'always'),
       sub('initiativeLayer', 'Initiative layer',
           'Turns findings into candidate initiatives, re-scores them, and may reach out once.',
@@ -663,7 +800,7 @@ router.get('/graph', (req, res) => {
 
     const memberRows = sqliteDb.prepare(`
       SELECT id, cluster_id, content, salience, importance, status, subject,
-             superseded_by, source, created_at, updated_at
+             superseded_by, inactive_reason, successor_id, source, created_at, updated_at
       FROM cluster_members
     `).all();
 
@@ -693,9 +830,9 @@ router.get('/graph', (req, res) => {
     const clusterIds = new Set(clusterRows.map(c => c.id));
 
     const nodes = memberRows.map(m => {
-      // Any non-active state is a ghost: 'superseded' (replaced by a newer
-      // fact) and 'retired' (deleted by the user, kept for history) both mean
-      // the fact no longer reaches context.
+      // Any non-active state is a ghost. Since 2026-08-02 that is status
+      // 'inactive' plus a reason ('superseded' | 'expired' | 'retracted'); the
+      // check stays reason-agnostic because the Map draws all ghosts the same.
       const superseded = (m.status && m.status !== 'active') || !!m.superseded_by;
       bump(m.cluster_id, superseded ? 'superseded' : 'active');
       const pendingQuestions = pendingByMember.get(m.id) || 0;
@@ -705,8 +842,9 @@ router.get('/graph', (req, res) => {
         content: m.content,
         salience: Number.isFinite(m.salience) ? m.salience : (Math.round((m.importance || 0.5) * 10) || 5),
         status: m.status || 'active',
+        inactiveReason: m.inactive_reason || null,
         subject: m.subject || 'user',
-        supersededBy: m.superseded_by || null,
+        supersededBy: m.successor_id || m.superseded_by || null,
         source: m.source || null,
         createdAt: m.created_at || null,
         updatedAt: m.updated_at || null,
@@ -757,7 +895,9 @@ router.get('/graph', (req, res) => {
       stats: {
         clusters: clusters.length,
         facts: nodes.length,
-        superseded: nodes.filter(n => n.status === 'superseded' || n.supersededBy).length,
+        // Counted off the lifecycle column, not a status string: an 'inactive'
+        // fact is a ghost whatever its reason.
+        superseded: nodes.filter(n => (n.status && n.status !== 'active') || n.supersededBy).length,
         pendingQuestions: questionRows.length
       }
     });
@@ -920,7 +1060,7 @@ router.post('/search', async (req, res) => {
 
 /**
  * POST /api/memory/add
- * Add a new fact to memory (cluster assignment + MEMORY.md append)
+ * Add a new fact to memory (cluster assignment; the injected block re-renders from SQLite)
  */
 router.post('/add', async (req, res) => {
   try {
@@ -937,13 +1077,17 @@ router.post('/add', async (req, res) => {
     const embeddingModel = config.models.embedding.model;
     const embInst = getProviderInstance(embeddingProvider, config.models.embedding.instance);
     const embeddingHost = embInst ? embInst.host : 'http://localhost:11434';
+    // Typed into the Memory tab by Ellie — the strongest modality there is, and
+    // its own verbatim source.
     const clusterResult = await memoryClusters.assignToCluster(
-      cleanFact, embeddingProvider, embeddingModel, '', embeddingHost, 'manual'
+      cleanFact, embeddingProvider, embeddingModel, '', embeddingHost, 'manual',
+      5, 'user', null,
+      {
+        verbatimSourceText: cleanFact,
+        inputModality: 'typed',
+        salienceRationale: 'Added by hand in the Memory tab'
+      }
     );
-
-    // Append to MEMORY.md
-    const memoryFile = path.join(MEMORY_DIR, 'MEMORY.md');
-    await factExtractor.appendToMemory([cleanFact], memoryFile);
 
     res.status(201).json({
       fact: cleanFact,
@@ -984,11 +1128,20 @@ router.put('/edit', async (req, res) => {
       return res.status(404).json({ error: 'Fact not found' });
     }
 
-    // One write path across SQLite + MEMORY.md + LanceDB. This route used to
-    // update the first and last only, so an edited fact kept its ORIGINAL line
-    // in MEMORY.md — the file that is actually injected — indefinitely.
+    // One write path across SQLite + LanceDB. (Historically there was a third
+    // store, MEMORY.md, which this route did not update — so an edited fact kept
+    // its original line in the injected file indefinitely. That file is gone;
+    // the injected block re-renders from SQLite on the next request.)
     const factStore = require('../db/fact-store');
     const result = await factStore.reword(memberId, cleanContent);
+    if (result.locked) {
+      return res.status(409).json({
+        error: `That is a locked identity fact (${result.category}) and cannot be edited here.`,
+        locked: true,
+        category: result.category,
+        hint: 'Use the Self tab\'s "Change locked identity fact" control, which is the deliberate path.'
+      });
+    }
     if (!result.ok) {
       return res.status(400).json({ error: result.reason || 'Could not edit fact' });
     }
@@ -1024,30 +1177,53 @@ router.delete('/fact/:id', async (req, res) => {
 
     // Delete from SQLite
     // RETIRE, never hard-delete. This was the one path in the system that broke
-    // supersede-never-delete: the row vanished, taking its history with it, and
-    // MEMORY.md kept the line anyway. Now the row is kept as status='retired'
-    // (still visible as a ghost in the Map) while the two stores that feed the
-    // model — MEMORY.md and LanceDB — are cleared.
+    // supersede-never-delete: the row vanished, taking its history with it. Now
+    // the row is kept as inactive/retracted (still visible as a ghost in the Map)
+    // while its vector — the thing that could still surface it in an answer — is
+    // cleared.
     const factStore = require('../db/fact-store');
     const retired = await factStore.retire(id, { reason: 'deleted by user' });
     if (!retired.ok && retired.reason === 'no such fact') {
       return res.status(404).json({ error: 'Fact not found' });
     }
+    // A locked identity fact isn't deletable from the Map either — deleting it
+    // is just another way of changing it. Use the Self tab's change control (or
+    // unlock it first) if that is really the intent.
+    if (retired.locked) {
+      return res.status(409).json({
+        error: `That is a locked identity fact (${retired.category}) and cannot be deleted here.`,
+        locked: true,
+        category: retired.category,
+        hint: 'Change it from the Self tab, or run: node scripts/identity-lock.js unlock <id> --confirm'
+      });
+    }
 
-    // Check if cluster is now empty and clean up
-    // Count ACTIVE members: retired rows are kept for history, so a cluster
-    // whose facts have all been retired is empty for injection purposes even
-    // though rows remain.
-    const remainingMembers = sqliteDb.prepare(
-      "SELECT COUNT(*) as count FROM cluster_members WHERE cluster_id = ? AND (status = 'active' OR status IS NULL)"
-    ).get(member.cluster_id);
+    // Clean up a cluster that has no rows left AT ALL.
+    //
+    // This used to count only ACTIVE members and then delete the cluster, which
+    // has been throwing FOREIGN KEY constraint failed ever since deletion became
+    // RETIREMENT: the retired rows are kept for history and still reference the
+    // cluster, so the delete can never succeed. The fact was retired correctly
+    // and the caller got a 500 anyway. Counting ALL rows makes the condition
+    // honest — a cluster holding retired history is not empty, and keeping it is
+    // what supersede-never-delete means.
+    //
+    // Wrapped so cleanup can never fail the request either: the retirement above
+    // is the operation the caller asked for and it has already committed.
+    try {
+      const remainingMembers = sqliteDb.prepare(
+        'SELECT COUNT(*) as count FROM cluster_members WHERE cluster_id = ?'
+      ).get(member.cluster_id);
 
-    if (remainingMembers.count === 0) {
-      sqliteDb.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
-        .run(member.cluster_id, member.cluster_id);
-      sqliteDb.prepare('DELETE FROM memory_clusters WHERE id = ?')
-        .run(member.cluster_id);
-      console.log(`[MemoryAPI] Cleaned up empty cluster ${member.cluster_id}`);
+      if (remainingMembers.count === 0) {
+        sqliteDb.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
+          .run(member.cluster_id, member.cluster_id);
+        sqliteDb.prepare('DELETE FROM memory_clusters WHERE id = ?')
+          .run(member.cluster_id);
+        console.log(`[MemoryAPI] Cleaned up empty cluster ${member.cluster_id}`);
+      }
+    } catch (cleanupError) {
+      console.error('[MemoryAPI] Cluster cleanup after retire failed (fact IS retired):', cleanupError.message);
     }
 
     res.json({ success: true, deletedId: id });

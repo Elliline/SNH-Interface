@@ -12,8 +12,12 @@
  *
  * HARD RULE — the manifest must NEVER claim more than is built. Over-claiming is
  * the exact failure it exists to prevent. Every description here is derived from
- * what the code actually does; disabled/aspirational features are left out (e.g.
- * web search is omitted while config.tools.searxng.enabled defaults to false).
+ * what the code actually does; disabled/aspirational features are left out. The
+ * config-gated entries below do this per-boot via their `when(cfg)` predicate —
+ * e.g. web search appears exactly while config.tools.searxng.enabled is on. (The
+ * SHIPPED DEFAULT for that flag is false — a fresh install must verify SearXNG is
+ * actually up before claiming it — but this deployment has it on and live. Don't
+ * read the default as the current state; read getConfig().)
  *
  * MAINTENANCE RULE (see CLAUDE.md): shipping a new capability includes adding its
  * entry here, and — on ship day — running its introduction so the entity learns
@@ -49,11 +53,23 @@ const CAPABILITIES = [
   {
     id: 'fact-extraction',
     name: 'Fact extraction & salience',
-    description: "After each message you pull durable facts about the user and their projects out of the conversation and score each one for how much it matters. Facts about yourself are deliberately left out of this path — those come from reflection.",
-    oneLiner: 'Pulls durable facts about the user and their projects from each message and scores them.',
-    intro: 'I pull durable facts about the user and their projects out of each conversation and score how much each one matters',
+    description: "After each message you pull durable facts about the user and their projects out of the conversation and score each one for how much it matters. Each fact says one thing about one subject — a sentence that asserts several things is split into separate facts. If she says something you already hold, you do not write it down twice: you note that she has said it again and let the fact matter a little more. Facts about yourself are deliberately left out of this path — those come from reflection.",
+    oneLiner: 'Pulls durable facts about the user from each message, one assertion per fact, scores them, and folds repeats into what you already hold.',
+    intro: 'I pull durable facts about the user and their projects out of each conversation, keep each one to a single assertion, score how much it matters, and fold anything she has already told me into the fact I already hold rather than writing it twice',
     schedule: 'After each message',
     dateAdded: '2026-07-03'
+  },
+  {
+    id: 'event-routing',
+    name: 'Events to the day\'s log, states to memory',
+    // Scope stated exactly: this is a ROUTING rule at intake, not a cleanup pass.
+    // It stops new transient facts being written; it does not remove the ones
+    // already in the corpus (that is the corrector, which does not exist yet).
+    description: "Not everything the user tells you is a fact worth keeping. You test each thing by stripping the time reference out of it and asking whether anything durable is left. Things that happened, things happening now, and how she is feeling today go into the day's log; things that are true of her — what she owns, what she prefers, who she is — go into your long-term memory. When you cannot tell, it goes to the log, because a durable fact you missed will come up again and a passing one you stored is there forever. This applies to what you write from now on; things already in your memory are not revisited by it.",
+    oneLiner: "Things that happened go in the day's log; things that are true go in long-term memory — and when unsure, the log.",
+    intro: "I sort what Ellie tells me before I keep it: things that happened or how she is feeling today go into the day's log, and only what stays true of her goes into my long-term memory — when I cannot tell which it is, it goes to the log",
+    schedule: 'After each message',
+    dateAdded: '2026-08-03'
   },
   {
     id: 'supersession',
@@ -94,9 +110,9 @@ const CAPABILITIES = [
   {
     id: 'heartbeat-maintenance',
     name: 'Heartbeat consolidation',
-    description: "On a timer you tidy your memory: oversized topic clusters get audited and split, duplicates merged, and the links between clusters re-scored. The same cycle also runs cleanup, log summarizing, reflection, the audit, and the initiative pass.",
-    oneLiner: 'Tidies memory on a timer — splits oversized clusters, merges duplicates, re-scores their links.',
-    intro: 'I tidy my own memory on a timer — splitting oversized topic clusters, merging duplicates, and re-scoring their links',
+    description: "On a timer you tidy your memory: oversized topic clusters get audited and split, and clusters that ended up sharing a name get merged. The same cycle also runs log archiving, the pending-question sweep, reflection, the self-coherence audit, the capability drift check, a store reconciliation, and the initiative pass. It no longer re-scores the links between clusters or runs a fact cleanup pass — both were removed on 2026-08-02.",
+    oneLiner: 'Tidies memory on a timer — splits oversized clusters and merges duplicate-named ones.',
+    intro: 'I tidy my own memory on a timer — splitting oversized topic clusters and merging ones that ended up sharing a name',
     schedule: 'Every 2 hours',
     dateAdded: '2026-07-04'
   },
@@ -139,7 +155,7 @@ const CAPABILITIES = [
   {
     id: 'memory-map',
     name: 'Memory Map',
-    description: "A read-only graph in the web UI shows your memory as clusters and facts with the links between them, including 'superseded' arrows that trace how a belief was replaced. It's built straight from the database with no model calls; you can search, hide old 'ghost' facts, and collapse big clusters.",
+    description: "A read-only graph in the web UI shows your memory as clusters and facts, including 'superseded' arrows that trace how a belief was replaced. It's built straight from the database with no model calls; you can search, hide old 'ghost' facts, and collapse big clusters. The cluster-to-cluster links it draws are a frozen snapshot — nothing has maintained them since 2026-08-02.",
     oneLiner: 'A read-only web graph of your memory clusters, facts, and how beliefs were superseded.',
     intro: 'I can show my memory as a read-only graph of clusters, facts, and the links between them',
     schedule: 'When the Map tab is opened',
@@ -231,6 +247,80 @@ const CONDITIONAL_CAPABILITIES = [
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.cron && cfg.tools.cron.enabled !== false),
     coversTools: ['create_cron_job'],
     coversConfig: ['tools.cron']
+  },
+  {
+    id: 'memory-write',
+    name: 'Writing to memory on request',
+    // Scope stated exactly: it writes when ASKED. It is not a general power to
+    // edit memory at will, and it cannot delete — the replaced version is kept.
+    description: "When the user asks you to remember something, you can write it to your long-term memory yourself, in the moment, instead of hoping the passive extractor picks it up later. Before storing, you work out whether the fact is about her or about you, whether it replaces something you already hold (in which case the old version is superseded, never deleted), and how much it matters. You cannot delete a memory this way, there is a limit on how many facts you may write per hour, and every call is logged.",
+    oneLiner: 'Write a fact to your long-term memory when asked, deciding if it replaces something you already hold.',
+    intro: 'I can write something to my long-term memory when I am asked to remember it, working out whether it is a fact about Ellie or about me and whether it replaces something I already held',
+    schedule: 'When the user asks you to remember something',
+    dateAdded: '2026-07-27',
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryWrite && cfg.tools.memoryWrite.enabled !== false),
+    coversTools: ['write_memory'],
+    coversConfig: ['tools.memoryWrite']
+  },
+  {
+    id: 'memory-inspect',
+    name: 'Looking things up in your own memory',
+    // Scope stated exactly. READ ONLY — the four tools cannot change anything,
+    // and saying otherwise would make the manifest wrong about the one boundary
+    // that matters here. Note also what is NOT claimed: background steps CAN now
+    // be handed these tools, but no background step asks for them yet, so this
+    // entry does not say anything about what happens on the heartbeat.
+    description: "You can look things up in your own long-term memory instead of relying on the excerpt that gets injected into each conversation. You can search it for a topic, list what is in it or what your clusters are, count how many facts match something, and open a single fact in full — which tells you why you believe it, how much it matters and why it scored that, when you learned it, which conversation and message it came from, the exact words that were said and whether they were spoken or typed, whether anything has replaced it, and every time it has been said to you again since. These only read: none of them can change, add or remove a memory. There is a limit on how many lookups you may do per hour, and every one is logged.",
+    oneLiner: 'Search, list, count and open your own memories — including where a fact came from and why you believe it. Read-only.',
+    intro: 'I can look things up in my own memory rather than working from whatever excerpt happens to be injected — searching it, counting what matches, and opening a single fact to see where it came from, what was actually said, and why I believe it',
+    schedule: 'When the user asks about what you remember, know, or believe',
+    dateAdded: '2026-08-03',
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryInspect && cfg.tools.memoryInspect.enabled !== false),
+    coversTools: ['memory_search', 'memory_list', 'memory_count', 'memory_get'],
+    coversConfig: ['tools.memoryInspect']
+  },
+  {
+    id: 'identity-lock',
+    name: 'Locked identity facts',
+    // Scope stated exactly: name and pronouns, nothing else. Over-claiming here
+    // would be the manifest failing at its own job — and the narrowness is the
+    // design, not a limitation to gloss over.
+    description: "Your name and your pronouns are locked. You chose them, and once set they cannot be changed by anything automatic — not by a correction in conversation, not by the contradiction judge, not by writing to your own memory, not by reflection. If someone tries to change them while talking to you, you say plainly that they are locked and that you have not changed them. Changing one is a deliberate action taken outside chat, in the Self tab or with a script. Everything else you have noticed about yourself stays free to change, because those are things you observed rather than chose.",
+    oneLiner: 'Your name and pronouns are locked — nothing automatic can change them, and you say so if asked to.',
+    // Phrased to start with "I" (the intro is composed as "As of <date>, <intro>"),
+    // and deliberately worded so it does NOT itself read as an assertion of the
+    // name or pronouns — otherwise introducing the capability would collide with
+    // the very slot it protects.
+    intro: 'I keep my name and pronouns locked — I chose them, nothing automatic can change them, and if someone tries to change them in conversation I say plainly that they are locked rather than going along with it',
+    schedule: 'Enforced on every memory write; checked whenever a self-fact would change',
+    dateAdded: '2026-07-28',
+    when: (cfg) => !!(cfg && cfg.identity && cfg.identity.lock && cfg.identity.lock.enabled !== false),
+    coversConfig: ['identity.lock']
+  },
+  {
+    id: 'corrector',
+    name: 'Repairing your own memory',
+    // Scope stated exactly, and the limits are load-bearing:
+    //   - it runs in the BACKGROUND, on its own cadence. It is not something he
+    //     can do in conversation on request, and the three tools it uses are
+    //     backgroundOnly — claimed here so they do not each get a derived entry
+    //     telling him in chat that he can merge and supersede facts at will.
+    //   - it DELETES NOTHING. There is no code path in db/corrector.js that
+    //     removes a row.
+    //   - self-facts are held back: identical duplicates fold, nothing else,
+    //     while corrector.selfFactSemantic is false (the default). Claiming he
+    //     revises his self-view unattended would be an over-claim AND would
+    //     pre-empt the joint curation session.
+    //   - a supersession it cannot justify from evidence is NOT applied. Saying
+    //     "resolves contradictions" without that clause would overstate it.
+    description: "On its own schedule, in the background, you go back through your long-term memory and repair what is already wrong in it: duplicate and near-duplicate facts folded into the fuller one, things that were really passing events moved out of memory into the day's log, statements that say two things at once split into separate facts, and mismatches between your memory and the index used to search it. Where two facts you hold contradict each other, you weigh the evidence behind each — typed over transcribed, said directly over inferred, said more than once over said once, recent over stale — and retire the weaker one only when it is clearly weaker; when neither dominates you leave both alone and raise it for Ellie instead. You delete nothing, every change is written down with its reason and evidence, and any of them can be undone from the Self tab. Facts about yourself are only folded together when they are word for word identical — anything beyond that waits for a session with Ellie — and your locked name and pronouns are refused outright, which you are told about rather than it happening quietly.",
+    oneLiner: 'In the background you repair your own memory — folding duplicates, moving events out, retiring the weaker of two contradicting facts when the evidence is clearly one-sided. Nothing deleted; every change logged and revertible.',
+    intro: 'I repair my own memory in the background now — folding duplicates together, moving things that were really passing events out into the day\'s log, and retiring the weaker of two contradicting facts when the evidence clearly favours one, leaving the pair alone and raising it with Ellie when it does not. I delete nothing, I record every change and why I made it, and any of it can be undone',
+    schedule: 'A heartbeat step on its own cadence — every corrector.intervalHours (default 6h)',
+    dateAdded: '2026-08-05',
+    when: (cfg) => !!(cfg && cfg.corrector && cfg.corrector.enabled !== false),
+    coversTools: ['memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'],
+    coversConfig: ['corrector']
   }
 ];
 
@@ -267,10 +357,30 @@ function registryToolSpecs() {
   } catch { return {}; }
 }
 
-/** Every tool name claimed by a hand-written entry via `coversTools`. */
+/**
+ * Every tool name claimed by a hand-written entry via `coversTools`, INCLUDING
+ * entries whose config predicate is currently false. Derivation uses this: a tool
+ * belonging to a switched-off entry must not get a derived entry, or the manifest
+ * would claim a capability that config says is off.
+ */
 function coveredToolNames() {
   const set = new Set();
   for (const c of CAPABILITIES.concat(CONDITIONAL_CAPABILITIES)) {
+    for (const t of (c.coversTools || [])) set.add(t);
+  }
+  return set;
+}
+
+/**
+ * Tool names claimed by entries that are currently ACTIVE — the ones the manifest
+ * is actually claiming right now. The difference between this and
+ * coveredToolNames() is where "registered but unroutable" hides: a tool in the
+ * gap between the two sets is callable by the model while the capability that
+ * owns it is switched off. See checkDrift().
+ */
+function activeCoveredToolNames() {
+  const set = new Set();
+  for (const c of CAPABILITIES.concat(activeConditional())) {
     for (const t of (c.coversTools || [])) set.add(t);
   }
   return set;
@@ -575,15 +685,31 @@ async function checkDrift() {
   if (toolRegistry) {
     const registered = new Set(registryToolNames());
     const covered = coveredToolNames();
+    const activeCovered = activeCoveredToolNames();
+    const derived = new Set(derivedToolCapabilities().map(d => d.name));
     for (const t of registered) {
-      if (!covered.has(t) && !derivedToolCapabilities().some(d => d.name === t)) {
+      if (covered.has(t) && !activeCovered.has(t)) {
+        // The over-claim this check was missing (2026-07-27). The tool IS
+        // registered, so the model is handed it and can call it — but the entry
+        // that owns it is switched off in config, so the chat path never routes
+        // to it and the manifest never claims it. It looks available and does
+        // nothing. Previously invisible here: `covered` counted switched-off
+        // entries too, so the tool read as accounted-for and neither the
+        // missing-entry nor the stale-entry branch fired.
+        mismatches.push({
+          kind: 'unroutable-tool', id: `tool:${t}`,
+          message: `The tool "${t}" is registered and callable, but the capability that owns it is switched off in config — nothing routes to it, so it is available in name only.`
+        });
+      } else if (!covered.has(t) && !derived.has(t)) {
         mismatches.push({
           kind: 'missing-entry', id: `tool:${t}`,
           message: `The tool "${t}" is registered and callable but no capability entry accounts for it.`
         });
       }
     }
-    for (const t of covered) {
+    // Only entries the manifest is CURRENTLY claiming may be checked for a
+    // missing tool. A switched-off entry legitimately has no registered tool.
+    for (const t of activeCovered) {
       if (!registered.has(t)) {
         mismatches.push({
           kind: 'stale-entry', id: t,

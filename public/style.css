@@ -1784,6 +1784,137 @@ a.msg-source:hover {
   font-weight: 600;
 }
 
+/* Locked identity facts — the things SNH chose, which no automatic path may
+   change. Marked distinctly so it's obvious at a glance which self-facts are
+   settled and which are still evolving. */
+.memory-self-fact.locked {
+  border-color: var(--accent-color);
+  background: var(--surface-mid);
+}
+
+.memory-self-lock {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.memory-self-lock-btn {
+  margin-left: auto;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-self-lock-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.memory-self-lock-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Corrections — what the corrector did to the record, and the undo it is
+   allowed to act unattended because of. A reverted entry stays visible and
+   greyed rather than disappearing: the ledger supersedes, it never deletes. */
+.memory-corrections {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-correction {
+  padding: 8px 10px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.memory-correction.is-reverted {
+  opacity: 0.55;
+}
+
+.memory-corr-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.memory-corr-tier {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-color);
+}
+/* Mechanical repairs the record; semantic revises a belief. The colour
+   difference is the tier difference — the second one is the one to look at. */
+.memory-corr-tier.tier-mechanical { color: var(--text-secondary); }
+.memory-corr-tier.tier-semantic {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.memory-corr-action { font-weight: 600; color: var(--text-color); }
+
+.memory-corr-target,
+.memory-corr-survivor {
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-color);
+  margin-bottom: 3px;
+}
+.memory-corr-target { text-decoration: line-through; text-decoration-color: var(--text-secondary); }
+/* A raise or a refusal changed nothing, so neither fact is struck through. */
+.memory-correction.is-raise .memory-corr-target { text-decoration: none; }
+
+.memory-corr-label {
+  display: inline-block;
+  min-width: 52px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.memory-corr-reason {
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  margin-top: 5px;
+}
+
+.memory-corr-evidence {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+  font-family: var(--mono-font, monospace);
+}
+
+.memory-corr-state { margin-left: auto; }
+.memory-corr-state.reverted { color: var(--accent-color); }
+.memory-corr-state.raised { color: var(--warning-color); font-weight: 600; }
+
+.memory-corr-revert {
+  margin-left: auto;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-corr-revert:hover:not(:disabled) { background: var(--surface-hover); }
+.memory-corr-revert:disabled { opacity: 0.5; cursor: default; }
+
 .memory-self-reflect-btn {
   font-size: 0.72rem;
   padding: 4px 10px;
