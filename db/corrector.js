@@ -38,11 +38,27 @@
 
 const { randomUUID } = require('crypto');
 const path = require('path');
-const { getSqliteDb } = require('./database');
+const { getSqliteDb, getDataDir } = require('./database');
 const { getConfig } = require('./config');
 const { getLocalDateStamp } = require('./datetime');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+/**
+ * Resolved from the PROCESS's data directory, not from __dirname.
+ *
+ * This module writes three things outside SQLite: the pass-state file, the day's
+ * log it moves an expired event into, and its ops-ledger line. A constant here
+ * would send all three to `data/memory/` no matter which corpus the process is
+ * pointed at — the "silently escapes the redirect" failure the replay's design
+ * note warns about, and the worst of the three is not the logs. `lastPassAt` is
+ * read by the live heartbeat to decide whether the corrector is due, so a pass
+ * run against staging would tell the LIVE corrector it had just run and suppress
+ * its next real one. Found when the first staging pass was about to be made.
+ *
+ * A function rather than a constant because SNH_DATA_DIR is read at
+ * database.js's load time and this module can be required before or after it;
+ * asking each time costs a path join and cannot be stale.
+ */
+function memoryDir() { return path.join(getDataDir(), 'memory'); }
 
 function cfg() {
   return getConfig().corrector || {};
@@ -64,10 +80,10 @@ function ledger() { return require('./corrections-ledger'); }
 // is one timestamp, and the audit and manifest steps already keep theirs this
 // way. Survives restarts, which is the point: a redeploy must not hand it a
 // fresh turn.
-const STATE_FILE = path.join(MEMORY_DIR, 'corrector-state.json');
+function stateFile() { return path.join(memoryDir(), 'corrector-state.json'); }
 
 function readState() {
-  try { return JSON.parse(require('fs').readFileSync(STATE_FILE, 'utf8')) || {}; } catch { return {}; }
+  try { return JSON.parse(require('fs').readFileSync(stateFile(), 'utf8')) || {}; } catch { return {}; }
 }
 
 /** ISO timestamp of the last completed pass, or null if none has ever run. */
@@ -86,8 +102,8 @@ function lastPassAt() {
 function recordPassRan(result) {
   try {
     const fs = require('fs');
-    fs.mkdirSync(MEMORY_DIR, { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify({
+    fs.mkdirSync(memoryDir(), { recursive: true });
+    fs.writeFileSync(stateFile(), JSON.stringify({
       lastPassAt: new Date().toISOString(),
       lastPassId: result.passId,
       lastPassChanges: (result.merged || 0) + (result.expired || 0) + (result.split || 0) + (result.superseded || 0),
@@ -629,7 +645,7 @@ async function expireDatedEvents(pass, { subject = null } = {}) {
         const learnedDate = row.created_at ? getLocalDateStamp(new Date(row.created_at)) : getLocalDateStamp();
         factExtractor().prependDailyEntry(
           `### (recorded later)\n- ${row.content} [moved out of long-term memory ${getLocalDateStamp()}: this was something that happened, not something that stays true]\n\n`,
-          path.join(MEMORY_DIR, 'daily'), learnedDate
+          path.join(memoryDir(), 'daily'), learnedDate
         );
       } catch (err) {
         // If the move fails, do NOT expire — that would lose it outright.
@@ -1090,7 +1106,7 @@ async function runPass(opts = {}) {
       `${result.split} compound(s) split, ${result.superseded} contradiction(s) resolved, ` +
       `${result.unresolved} left for Ellie${result.refusedLocked ? `, ${result.refusedLocked} refused by the identity lock` : ''}` +
       `${result.stopped ? ` — stopped early: ${result.stopped}` : ''}.`;
-    try { factExtractor().appendToOpsLog(line, path.join(MEMORY_DIR, 'ops')); } catch { /* best effort */ }
+    try { factExtractor().appendToOpsLog(line, path.join(memoryDir(), 'ops')); } catch { /* best effort */ }
     console.log(`[Corrector] ${line}`);
   }
 

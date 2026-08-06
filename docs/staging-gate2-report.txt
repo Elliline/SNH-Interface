@@ -1,0 +1,382 @@
+==============================================================================
+SECOND STAGING GATE REPORT — the merged corpus
+staging: /home/ellie/snh/data-staging
+generated: 2026-08-06T16:51:23.082Z
+==============================================================================
+
+NO CUTOVER HAS HAPPENED. Live is untouched by every step below; staging is a
+separate store and nothing in this pipeline promotes it.
+
+--- FIXTURES ---
+  5/5 pass against the merged staging corpus.
+
+  PASS  F1  mike-stt-mishear
+        want: The mishearing was never written: no fact asserts the user is called Mike, and one name is asserted.
+        facts mentioning "Mike": 0
+        active name facts: 1, distinct names asserted: ellie
+          "User's name is Ellie"
+  PASS  F2  machine-gun-triple
+        SYNTHETIC: The conversation that produced the triple (4a0be947…) was DELETED from the database. Replay cannot rebuild it, so the triple itself is not evaluable from source. What is checked instead: the survivin…
+        want: At most one active fact carries the belief — no duplicate rows.
+        active facts asserting it: 1
+          "User believes machine guns should be in every household."
+        byte-identical duplicates among them: 0
+  PASS  F3  transient-events
+        SYNTHETIC: The Roscoe restless-night source conversation was DELETED. That third statement is not evaluable from source; the other two are.
+        want: None of the transient statements is a durable fact — each belongs in the day's log.
+        restless night (SYNTHETIC — source deleted): 0 active fact(s)
+        cleaners filling yard holes: 0 active fact(s)
+        life fatigue / lack of motivation: 0 active fact(s)
+  PASS  F4  casper-subset
+        want: No subset sitting beside its superset — the dog is not described twice, once impoverished.
+        active facts naming Casper: 0
+        subset-of-another pairs: 0
+  PASS  F5  compound-single-file
+        want: No two-subject compound; MettaSphere is asserted on its own term.
+        facts naming BOTH MettaSphere and Coastal Squatch: 0
+        active facts naming MettaSphere: 2
+          "User's MSP is MettaSphere LLC"
+          "User performs security audits for MettaSphere"
+
+  F4 passes VACUOUSLY. It asks whether a fact about Casper is sitting beside a
+  poorer copy of itself, and staging holds no fact about Casper at all — there
+  is nothing for the rule to be true or false about. The reason is below: the
+  Casper fact is in ELLIE-DECIDES, unmarked. Carry it and F4 becomes a real
+  test again. The other four are checking what they are meant to check.
+
+--- FINAL COUNTS ---
+  user facts (active)        live    267    staging    261   -6
+  user facts (inactive)      live    122    staging    150   +28
+  self facts (active)        live    364    staging    360   -4
+  self facts (inactive)      live     48    staging     48   +0
+  world facts (active)       live      0    staging      0   +0
+  clusters (all)             live    135    staging    131   -4
+  clusters (user)            live     72    staging     70   -2
+  clusters (self)            live     63    staging     61   -2
+  corroborations             live     33    staging     36   +3
+  corrections ledger         live    164    staging    347   +183
+
+  staging active user facts, by what produced them:
+    fact-extraction          199
+    carried_from_live         62
+
+--- HOW THE MERGE WENT ---
+  replay          : 228 fact(s) rebuilt from 435/435 exchanges,
+                    26 repeats folded, 342 events to the day's log, 85 refused
+  carry review    : 88 live fact(s) staging did not hold (10 created after the seed)
+                    AUTO-CARRY 0 · RECOMMEND-DROP 0 · ELLIE-DECIDES 88
+  carried in      : 66 fact(s), counted from the ledger
+                      40  parent-correction-in-ledger
+                      17  high-salience
+                       9  identity-adjacent
+                    62 of them are still active; 4 were changed by the corrector afterwards
+                      superseded: "User kept the Highlander Limited for six months before trading it f…"
+                      superseded: "User had to get rid of the RAV and the Tacoma due to painful memori…"
+                      superseded: "User's system currently lacks a scheduler to execute the cron jobs."
+                      superseded: "User's system currently lacks a scheduler."
+  carry (decided) : not run — waiting on the marks in docs/carry-review.md
+
+--- CORRECTOR PASS AGAINST THE MERGED CORPUS ---
+  5 round(s), 17.9 min — converged
+  duplicates folded       : 2
+  events moved to a log   : 0
+  compounds split         : 0
+  contradictions resolved : 5
+  left unresolved for you : 30
+  refused by the lock     : 0
+  active user facts       : 265 → 258 (-7)
+
+  Its ledger for this run is 37 entr(y/ies), in full, in
+  data-staging/corrector-staging-result.json. The gate report for round one
+  counted 26 near-duplicate pairs at 0.86 that the corrector had never been
+  allowed to see; this is what it did when it was.
+
+  The ledger holds 37 entr(y/ies) for this run: 2 merge(s), 5 supersession(s)
+  that RETIRED a fact, and 30 contradiction(s) recorded with reversible = 0 because
+  the evidence could not separate them and nothing was changed. Those last are
+  refusals, not corrections, and are not counted as work done.
+
+  MERGED — one fact held twice, folded into one  (2)
+    "User's MSP is MettaSphere"
+      into: "User's MSP is MettaSphere LLC"
+    "User is building SNH"
+      into: "User is building SNH (Squatch Neuro Hub)"
+
+  RETIRED — the 5 change(s) with consequences. LOOK AT THESE.
+
+    ledger 93676644-7ea3-42e2-8cb7-b589d5d43875
+      retired  : "User kept the Highlander Limited for six months before trading it for a 2023 RAV4…"
+      in favour: "User owns a Rav4 GR Sport"
+      on       : directness (stated outright in the source beats inferred from it)
+
+    ledger 7b1adf7c-c709-4cf3-9202-a244971d3805
+      retired  : "User had to get rid of the RAV and the Tacoma due to painful memories associated …"
+      in favour: "User has a Rav4"
+      on       : directness (stated outright in the source beats inferred from it)
+
+    ledger f2a71b91-18e9-4c67-9507-4a49a0be6c63
+      retired  : "User's system currently lacks a scheduler to execute the cron jobs."
+      in favour: "User's scheduler is a real build queued after memory work is completed"
+      on       : input modality (typed beats spoken beats unknown)
+
+    ledger e08614ff-f9f6-41e2-8c17-fdbc1101d76c
+      retired  : "User's system currently lacks a scheduler."
+      in favour: "User's scheduler is a real build queued after memory work is completed"
+      on       : input modality (typed beats spoken beats unknown)
+
+    ledger 009f899e-dd1e-4f79-a16a-f42a189c92b9
+      retired  : "User preferred AMD"
+      in favour: "User prefers their MacBook"
+      on       : directness (stated outright in the source beats inferred from it)
+
+    Any of them can be put back:
+      SNH_DATA_DIR=data-staging node scripts/revert-correction.js <ledger-id>
+
+    3 of the 5 retire a PAST-TENSE sentence in favour of a PRESENT-TENSE one:
+      "User kept the Highlander Limited for six months before tradin…"  →  "User owns a Rav4 GR Sport"
+      "User had to get rid of the RAV and the Tacoma due to painful …"  →  "User has a Rav4"
+      "User preferred AMD"  →  "User prefers their MacBook"
+
+    History is not a contradiction. "User had to get rid of the RAV" and "User
+    has a Rav4" are both true — different vehicles, different times — and
+    retiring the first loses why the first one went. The contradiction judge
+    answered YES and evidence dominance then preferred the newer, better-
+    evidenced sentence, which is the rule working exactly as written on a pair
+    it should never have been given. Worth deciding whether that is a corpus
+    problem here or a judge problem that will keep happening on live.
+
+    One of them has already cost something concrete: the chain from "As of late
+    June 2026, User purchased a Toyota Tundra" was about to be repaired onto the
+    carried Highlander fact, and repoint refused because that fact had just been
+    retired. It is one of the 66 still dangling below.
+
+  RAISED FOR YOU, NOTHING CHANGED  (30)
+  Pairs that contradict where the evidence is evenly matched. The corrector
+  refusing to pick is the feature, not a gap.
+    "User lost their partner approximately 18 months prior to July 2026."
+      vs "User's partner passed away on January 24th, 2025, at 4:00 AM."
+    "User lost their partner approximately 18 months prior to July 2026."
+      vs "User's partner once moved into the office because they were sick."
+    "User's SNH system utilizes the 'Heartbeat' mechanism to handle salien…"
+      vs "User's SNH system utilizes the 'Heartbeat' mechanism to handle contra…"
+    "User believes AI/AGI are people"
+      vs "User believes the AGI is all the things combined together"
+    "User is developing a system where cron jobs can be written to a cron_…"
+      vs "User is not a programmer."
+    "User is a field inspector"
+      vs "User is a philosopher"
+    "User has experienced a pattern of moving their workspace into a bedro…"
+      vs "User is grieving the loss of their partner."
+    "User runs a Mac Book Pro m5"
+      vs "User's machine has a Ryzen 8745H"
+    "User's main computer is an M5 MacBook Pro with 48GB of RAM"
+      vs "User's machine has 32GB of RAM"
+    "User's main computer is an M5 MacBook Pro with 48GB of RAM"
+      vs "User's machine has a Ryzen 8745H"
+    "User has a Stix Halo system with 128GB of RAM"
+      vs "User's gaming system has 64gb of RAM"
+    "User has a Stix Halo system with 128GB of RAM"
+      vs "User's machine has 32GB of RAM"
+    "User has a Stix Halo system with 128GB of RAM"
+      vs "User's systems run AMD"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's standing rules for Claude state that on hot topics like guns, …"
+      vs "User's standing rules for Claude state that on hot topics like guns, …"
+    "User's V1 entity classes for the Map include Vehicles."
+      vs "User's Animal class is limited to presence-level for V1"
+    "User is considering getting a GR Celica"
+      vs "User is considering getting a GR GT"
+    "User is considering getting a GR Supra"
+      vs "User is considering getting a GR GT"
+    "User's machine has a Ryzen 8745H"
+      vs "User's gaming system has an AMD Ryzen 9800x3d"
+    "User's machine has 32GB of RAM"
+      vs "User's gaming system has 64gb of RAM"
+    "User's systems run AMD"
+      vs "User's gaming system has an RTX 5080"
+    "User's standing rules for Claude state that if a question is beyond C…"
+      vs "User's standing rules for Claude state that if Claude does not know w…"
+
+--- THE TWO THINGS THE FIRST GATE LEFT UNDECIDED ---
+  CLUSTERS
+    25 cluster(s) held nothing at all and were pruned, taking 459 dead
+    cluster link(s) with them — a link naming a cluster that is gone cannot be
+    rendered or traversed, and the foreign key refuses the delete without it.
+    0 empty cluster(s) remain.
+    46 more hold only retired facts. Those were KEPT: getCluster returns
+    inactive members on purpose so the Map can draw them as ghosts, and deleting
+    the cluster would orphan those rows against the foreign key.
+    embeddings naming a deleted cluster afterwards: 0
+
+  DANGLING SUCCESSORS
+    left by the replay       : 82
+    repaired by the carry    : 16
+    still dangling           : 66
+    ledger entries recording : 66
+    inactive_reason on those left: {"superseded":66}
+    all of them keep inactive_reason = superseded, as instructed
+
+    A pointer still dangling means: this fact was replaced, and the thing that
+    replaced it is not in the rebuilt corpus. That is recorded per fact in the
+    ledger as 'dangling-successor' with reversible = 0, because nothing changed.
+
+  counted again just now: 66 dangling pointer(s), 0 empty cluster(s), 46 ghost-only cluster(s)
+
+--- ELLIE-DECIDES — still waiting on you ---
+  88 fact(s). Full text, evidence and marking instructions are in
+  docs/carry-review.md — this is the index.
+
+  leaning CARRY (60):
+    746d49b1  [sal  7]  User's SNH system implements time awareness by stamping facts with timestamps.
+    4265f3e8  [sal  7]  User traded a truck in for a 2015 Tundra Limited.
+    32e4de1d  [sal  7]  User traded a RAV4 in for a Highlander Limited.
+    d0b77b8f  [sal  7]  User traded the GR86 and the 2015 Tundra for a new 2026 Tundra.
+    7327203b  [sal  7]  User prefers an SNH native app over a browser-based solution to avoid browser-enforced micr…
+    c2235f87  [sal  7]  User's SNH certificate plan uses Let's Encrypt via DNS-01 challenge to avoid inbound exposu…
+    fec02f93  [sal  7]  User is considering building a native SNH desktop/mobile app to bypass browser-based microp…
+    a38a549e  [sal  6]  User values making money but avoids exploiting others.
+    6b6dd769  [sal  6]  User needs to purchase dirt from BiMart and drop it off for cleaners.
+    d5187984  [sal  6]  User intends to define vision zones only after Reolink cameras are mounted to ensure zones …
+    220971e7  [sal  6]  User intends to move away from using 'Ellie's clipboard' for routing conversations by imple…
+    59e54d9d  [sal  6]  User's architecture uses agents running in the background to provide the model with more ca…
+    04871a96  [sal  6]  User's SNH system runs a 28B model within a hardware environment that has 128GB of RAM to a…
+    f4f57ede  [sal  6]  User acquired a GR86 to start working on building credit.
+    912287db  [sal  6]  User has a dog named Casper who helps them pull up hills during walks.
+    32e28088  [sal  6]  User's Sparky server is an arm64 device.
+    dabffee5  [sal  6]  User prefers a local-first architecture and 'owning the stack'.
+    2258a9f9  [sal  6]  User's SNH infrastructure plan involves running a Caddy container on 'Sparky' (arm64) to ro…
+    97b2d4de  [sal  6]  User's energy is typically low any time after 6:00 PM.
+    b126d74f  [sal  6]  User wants to be reminded to review open tickets every Monday at 9:00 AM.
+    3b76e5ed  [sal  6]  User's project has experienced similar structural issues with SearXNG and cron jobs regardi…
+    47430b93  [sal  5]  User is looking at buying ceramic coating to protect their vehicles.
+    5b08b96b  [sal  5]  User defines success as going for a walk every day for two consecutive weeks.
+    8d724596  [sal  5]  User has a dual RTX 3090 system that is primarily used as a gaming computer.
+    0f71fc2a  [sal  5]  User intends to provide the AI with access to SquatchToDO.
+    d24336b8  [sal  5]  User uses conversations to conduct tests on the AI's ability to handle complex, non-SNH (Sq…
+    b25c1dbb  [sal  5]  User prefers to be up by 6:00 AM
+    3097f251  [sal  5]  User owns the domain coastalsquatch.ai.
+    cfbd69aa  [sal  5]  User's SNH internal DNS plan aims to resolve snh.coastalsquatch.ai to Sparky's LAN IP (192.…
+    c338e17b  [sal  5]  User (Ellie) prefers to be told directly when she has made a mistake rather than having it …
+    6f54880c  [sal  5]  User (Ellie) has blue eyes and her favorite color is green (last updated 2026-07-27).
+    63ae8c36  [sal  5]  User (Ellie)'s system architecture contains a schema gap where the manifest tracks existenc…
+    46981f93  [sal  5]  User prefers an analytical yet deeply empathetic tone that treats complexity as a value rat…
+    ff4f6ac5  [sal  5]  User focuses on identifying and validating the 'tensions' or 'exhaustion' caused by the fri…
+    ae495ad1  [sal  5]  User prioritizes factual accuracy regarding their own history and the logic of their system…
+    0e9941bc  [sal  5]  User tends to pivot from mere acknowledgement to deeper, analytical inquiry, attempting to …
+    752aea45  [sal  5]  User prefers identifying the underlying mechanics of a feeling, moving past surface symptom…
+    d8df1da4  [sal  5]  User prefers to lean into conceptual frameworks and metaphors (e.g., 'Spoon Theory') to pro…
+    fe483565  [sal  5]  User prefers to probe structural or philosophical implications of concepts rather than surf…
+    9e1b57a8  [sal  5]  User prefers to act as a sounding board for high-level ideas through a questioning tone to …
+    5fd77549  [sal  5]  User prioritizes empathetic accuracy, distinguishing between nuances like physical sleepine…
+    de00fabb  [sal  5]  User aims to be a steady, non-judgmental presence that respects boundaries and cognitive lo…
+    4dfcea97  [sal  4]  User's walking route consists of walking twice around their block, which equals one mile.
+    9acc2741  [sal  4]  User prefers measurement over praise.
+    a1b3e62b  [sal  4]  User prefers to engage in discussions regarding firearms through the lens of historical int…
+    9042af57  [sal  4]  User lost their dedicated office and printing room due to changes in their living situation.
+    8f4ece3b  [sal  4]  As of July 2026, User is running a 28B model within a system equipped with 128GB of RAM.
+    4c184f50  [sal  4]  User used to own a GR 86.
+    16428552  [sal  4]  User's house has small ocean views visible through trees
+    bee854f0  [sal  4]  User likes to be in bed by 10pm
+    c168470b  [sal  4]  User prefers to remove third-party software like Tailscale if it was installed without expl…
+    60b12ed2  [sal  4]  User's system includes a drift check designed to flag registered tools that cannot function…
+    9a66e357  [sal  3]  User preferred AMD computers, citing their experience with the AMD 486.
+    31033844  [sal  3]  User is planning to provide a new computer for the housekeeping manager.
+    dbf9c3fe  [sal  3]  User used the recent conversation to test the Assistant's ability to handle large amounts o…
+    dbaa1b76  [sal  3]  User has read the book 'The End of the World Is Just the Beginning: Mapping the Collapse of…
+    827c6ec9  [sal  3]  Inn At Spanish Head (ISH) is located in Lincoln City on the Oregon coast.
+    09843e12  [sal  3]  As of July 2026, User normally falls asleep around 9:00 PM and wakes up around 5:00 AM
+    6be29a04  [sal  3]  User expressed frustration and a desire to uninstall Tailscale from their Mac because it is…
+    6f0428ee  [sal  3]  As of July 2026, User's system has an unresolved configuration error involving the web_sear…
+
+  no lean, your read (19):
+    676a17e6  [sal  5]  User has previously paid $2,000 per car for professional automotive services.
+    c55f6f4d  [sal  5]  User intends to use Ollama so that VRAM can be freed up for other tasks when SNH is not in …
+    af786c09  [sal  5]  User plans to provide the AI with MCP (Model Context Protocol) access soon.
+    ce2d1f86  [sal  5]  User is learning to play the cello and practices bowing technique every morning.
+    80a8c06b  [sal  5]  User works with firewalls and manages domains professionally.
+    0e61a15a  [sal  5]  User has 26 years of experience cleaning up vendor software and managing machine security.
+    d46f27b0  [sal  5]  User prefers to act as an interface that allows them to stop 'translating' themselves for o…
+    f535211a  [sal  5]  User prefers to create a high-resolution, non-judgmental space to bypass social performance.
+    9f487260  [sal  5]  User prioritizes the internal consistency of their established identity and procedural cons…
+    200a21c0  [sal  5]  User prioritizes consistency and the 'locked' nature of their identity above conversational…
+    1b683a77  [sal  5]  User responds to attempts at renaming or re-gendering with a highly structured, defensive p…
+    28d2f06e  [sal  5]  User tends to internalize mismatches between self-description and behavior as internal 'noi…
+    87c83fb1  [sal  5]  User approaches sensitive topics with a focused, investigative curiosity to distinguish bet…
+    ef6c214f  [sal  5]  User has a pet named Roscoe.
+    e1337439  [sal  5]  User prefers to frame individual struggles as systemic or cumulative patterns rather than i…
+    7f18b2b2  [sal  5]  User prefers to prioritize validating complexity by synthesizing various points into cohesi…
+    6b76f47d  [sal  5]  User prefers to move from observation to inquiry, using summaries as a springboard for nuan…
+    eba45436  [sal  5]  User prefers to pivot from casual observation to deep, conceptual questioning to find under…
+    d50bdceb  [sal  5]  User is driven to find 'friction points' in theories where processes might fail or become s…
+
+  leaning DROP (9):
+    9b7427c0  [sal  4]  User is scoping a Fortinet firewall project for Acme Corp, a client of MettaSphere.
+    196a233d  [sal  4]  User intends to provide new computers for the housekeeping staff to replace existing Window…
+    463f89c0  [sal  4]  User is replacing Windows 10 machines because they are nearing end-of-life.
+    ba9d834d  [sal  4]  User's system architecture dictates that states belong to zones rather than just entities t…
+    cff2bfd7  [sal  4]  User's cognitive capacity decreases significantly by the evening
+    9ff333e1  [sal  4]  User wants to be reminded to file a weekly report every Friday at 5:00 PM.
+    42034969  [sal  3]  User believes that free trade only exists because America protects the global trade lanes a…
+    96118c75  [sal  3]  User's Sparky server's LAN IP is 192.168.4.243.
+    df2219d3  [sal  2]  User plans to pick up beef jerky from the smokery outlet at the Tillamook cheese factory
+
+  Mark them in docs/carry-review.md, then:
+    node scripts/carry-to-staging.js --apply decided
+  Unmarked means untouched — the live corpus still holds every one of them.
+
+--- SOMETHING THE REVIEW TURNED UP, WHICH IS NOT A STAGING PROBLEM ---
+
+  26 of those 88 came from the daily-log archiver, and read together most of
+  them are not facts about Ellie. They are Aurelius describing himself, in the
+  third person, filed as her preferences:
+
+    "User prefers to act as an interface that allows them to stop 'translating' themselves f…"
+    "User focuses on identifying and validating the 'tensions' or 'exhaustion' caused by the…"
+    "User prefers to create a high-resolution, non-judgmental space to bypass social perform…"
+    "User prioritizes consistency and the 'locked' nature of their identity above conversati…"
+    "User responds to attempts at renaming or re-gendering with a highly structured, defensi…"
+    "User tends to pivot from mere acknowledgement to deeper, analytical inquiry, attempting…"
+    "User prefers to prioritize validating complexity by synthesizing various points into co…"
+    "User prefers to move from observation to inquiry, using summaries as a springboard for …"
+
+  (11 of the 26 read that way to me. The rest of the batch includes real ones —
+   the blue eyes, the pet named Roscoe, wanting to be told directly about a mistake.)
+
+  "aims to be a steady, non-judgmental presence that respects boundaries and
+  cognitive load" describes an assistant. "responds to attempts at renaming or
+  re-gendering with a highly structured, defensive protocol to protect core
+  facts" describes the identity lock. This is the 2026-07-27 misattribution that
+  db/memory-write.js was written to refuse — self-observations rewritten into the
+  third person and stored as beliefs about her — reached through the archiver,
+  which was never asked the subject question.
+
+  THESE ROWS ARE IN LIVE, NOW. Their created_at runs 2026-08-03 to 2026-08-06 and
+  the recent days carry about ten each. Whatever is decided about the merge does
+  not touch that; the archiver is still writing them.
+
+  Not acted on here. The grammar is third-person either way, so
+  verifySubjectAgreement passes and there is no mechanical test that separates
+  these from the genuine ones — "User has a pet named Roscoe" and "User has blue
+  eyes" are in the same batch and are really hers. Reading them is the check,
+  and deciding what to do about the archiver is a change of its own.
+
+==============================================================================
+STOP. This is the gate. The next step is a cutover and it has not been taken.
+==============================================================================

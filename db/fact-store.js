@@ -32,9 +32,15 @@
 
 const { randomUUID } = require('crypto');
 const path = require('path');
-const { getSqliteDb, getClusterEmbeddingsTable, reopenClusterEmbeddingsTable } = require('./database');
+const { getSqliteDb, getClusterEmbeddingsTable, reopenClusterEmbeddingsTable, getDataDir } = require('./database');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+/**
+ * Resolved from the PROCESS's data directory — same reason as db/corrector.js.
+ * The only thing this module writes outside the two stores is the vector-failure
+ * line below, and a constant here would file a staging run's failures in the live
+ * ops ledger, where they would read as drift in a corpus that never had it.
+ */
+function memoryDir() { return path.join(getDataDir(), 'memory'); }
 
 /** Lazy requires — fact-extractor pulls in memory-clusters, which pulls in this. */
 function factExtractor() { return require('./fact-extractor'); }
@@ -322,7 +328,7 @@ function reportVectorFailure(op, memberId, content) {
     `it is retired in SQLite but its embedding is still live, so it can still surface ` +
     `in a memory search. "${String(content || '').slice(0, 100)}"`;
   console.error(`[FactStore] ${line}`);
-  try { factExtractor().appendToOpsLog(line, path.join(MEMORY_DIR, 'ops')); }
+  try { factExtractor().appendToOpsLog(line, path.join(memoryDir(), 'ops')); }
   catch { /* best effort — the console line above is the floor */ }
 }
 
