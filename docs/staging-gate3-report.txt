@@ -1,0 +1,201 @@
+==============================================================================
+THIRD STAGING GATE REPORT
+staging: /home/ellie/snh/data-staging
+generated: 2026-08-06T17:47:57.134Z
+==============================================================================
+
+NO CUTOVER. Live is untouched; staging is a separate store.
+
+--- FIXTURES ---
+  5/5 pass.
+  PASS  F1  mike-stt-mishear
+        facts mentioning "Mike": 0
+        active name facts: 1, distinct names asserted: ellie
+          "User's name is Ellie"
+  PASS  F2  machine-gun-triple
+        active facts asserting it: 1
+          "User believes machine guns should be in every household."
+        byte-identical duplicates among them: 0
+  PASS  F3  transient-events
+        restless night (SYNTHETIC — source deleted): 0 active fact(s)
+        cleaners filling yard holes: 0 active fact(s)
+        life fatigue / lack of motivation: 0 active fact(s)
+  PASS  F4  casper-subset
+        active facts naming Casper: 1
+          "User has a dog named Casper who helps them pull up hills during walks."
+        subset-of-another pairs: 0
+  PASS  F5  compound-single-file
+        facts naming BOTH MettaSphere and Coastal Squatch: 0
+        active facts naming MettaSphere: 2
+          "User's MSP is MettaSphere LLC"
+          "User performs security audits for MettaSphere"
+
+  F4 is no longer vacuous: staging holds 1 fact(s) naming Casper, so the
+  subset rule is being tested rather than satisfied by an empty set. That was
+  gate 2's one weak pass, and carrying the Casper fact is what fixed it.
+
+--- FINAL COUNTS ---
+  user facts (active)      live    267    staging    325   +58
+  user facts (inactive)    live    122    staging    158   +36
+  self facts (active)      live    364    staging    360   -4
+  self facts (inactive)    live     48    staging     48   +0
+  clusters                 live    135    staging    133   -2
+  corroborations           live     33    staging     44   +11
+  corrections ledger       live    164    staging    435   +271
+
+  staging active user facts, by what produced them:
+    fact-extraction          200
+    carried_from_live        123
+    corrector-split            2
+
+  carried from live : 132 written (ledger); 9 of them since retired by the
+                      corrector or withdrawn, which is why the source table above is lower
+  dangling pointers : 53
+
+--- CORRECTOR, WITH THE HISTORY RULE IN PLACE ---
+  Final confirming pass: 1 round(s) — converged
+  folded 0 · expired 0 · split 0 · superseded 0 · left unresolved 0
+
+  The rule was exercised, not merely present: the six pairs the corrector had
+  exempted under an earlier, over-broad version of it were cleared from the
+  pair-check memo and put back through. All six came back with nothing to do.
+
+  6 retirement(s) still standing in staging:
+    f2a71b91  "User's system currently lacks a scheduler to execute the cron…"
+              for "User's scheduler is a real build queued after memory work is …"
+    e08614ff  "User's system currently lacks a scheduler."
+              for "User's scheduler is a real build queued after memory work is …"
+    f7f15b9e  "User has a dual RTX 3090 system that is primarily used as a g…"
+              for "User's gaming system has an RTX 5080"
+    da50a3ef  "User (Ellie) has blue eyes and her favorite color is green (l…"
+              for "User's favorite color is blue"
+    3db8ca53  "User is scoping a Fortinet firewall project for Acme Corp, a …"
+              for "User does not use Fortinet"
+    4dab9b19  "As of July 2026, User is running a 28B model within a system …"
+              for "User's gaming system has 64gb of RAM"
+
+    Revert any of them:
+      SNH_DATA_DIR=data-staging node scripts/revert-correction.js <ledger-id>
+
+  ⚠ 1 of those retired a COMPOUND fact, which takes its other clauses with it:
+
+    da50a3ef  "User (Ellie) has blue eyes and her favorite color is green (last updated …"
+      retired for "User's favorite color is blue"
+
+    The disputed clause really is disputed — but the rest of the sentence was
+    not, and it goes too. The corrector splits compounds and resolves
+    contradictions in the same pass with nothing ordering the two, so a
+    compound can lose a contradiction before it is ever split. Left standing:
+    it is one supersession decided on real evidence, and unpicking it is a
+    change to the corrector's phase order, not a merge decision.
+
+  6 earlier retirement(s) reverted — history is not a contradiction:
+    "User kept the Highlander Limited for six months before trading it…"
+      had been retired for "User owns a Rav4 GR Sport"
+    "User had to get rid of the RAV and the Tacoma due to painful memo…"
+      had been retired for "User has a Rav4"
+    "User preferred AMD"
+      had been retired for "User prefers their MacBook"
+    "User had to get rid of the RAV and the Tacoma due to painful memo…"
+      had been retired for "User's Rav4 is brand new"
+    "User traded a truck in for a 2015 Tundra Limited."
+      had been retired for "User's Tundra is brand new"
+    "User traded a RAV4 in for a Highlander Limited."
+      had been retired for "User's Rav4 is brand new"
+
+  The rule is now enforced at ENUMERATION, in
+  extraction-rules.historyCoexists, so the pair never reaches a judge. Tested by
+  scripts/test-history-coexists.js — the three above are its first three cases.
+
+--- A CARRY TAKEN BACK, AND WHY IT OVERRODE YOUR MARK ---
+
+  "User needs to purchase dirt from BiMart and drop it off for cleaners."
+
+  You marked every ELLIE-DECIDES row CARRY except the archiver rows, and you also
+  asked for 5/5 fixtures. Carrying this one broke F3, which asserts that a
+  transient statement does not become a durable fact — so the two instructions
+  collided and the fixture won. It is retired in staging, not deleted, and the
+  LIVE row is untouched. To put it back:
+    SNH_DATA_DIR=data-staging node scripts/revert-correction.js <the carry-withdrawn ledger id>
+
+  ⚠ 2 more carried fact(s) are the same shape and were NOT withheld, because
+  nothing measures them:
+    "User is looking at buying ceramic coating to protect their vehicles."
+    "User plans to pick up beef jerky from the smokery outlet at the Tillamook…"
+
+  These are errands, not facts about her. They carry no time marker, so the
+  carry review's event test did not catch them and neither did any fixture —
+  the one that was withheld differs only in that F3 happens to probe for the
+  word "cleaners". Left carried because you said carry them, and flagged
+  because the reason the other one went is a reason that applies to these too.
+
+--- NOT CARRIED: WRONG SUBJECT ---
+
+  22 of the 88 in ELLIE-DECIDES were withheld as wrong-subject:
+  daily-log-archiver rows that describe Aurelius, stored as facts about Ellie.
+  66 were carried.
+
+  IT IS 22, NOT THE ~11 GATE 2 ESTIMATED. That estimate came from a keyword
+  pattern; this came from measuring every archiver row against his self-facts.
+  22 sit at or above 0.75 of one of his own self-facts — the same sentence with
+  the person flipped. The stored-subject judge independently called 3 of them
+  SELF, so it agrees where it fires and finds nothing the twin distance missed.
+  Its own reading is far more conservative than the corpus evidence, which is why
+  it is a second signal here rather than the deciding one.
+
+  DROPPED (22) — he already holds the content, so nothing is lost:
+    0.924  "User prefers an analytical yet deeply empathetic tone that treats complex…"
+           his: "I gravitate toward an analytical yet deeply empathetic tone that treats c…"
+    0.837  "User prefers to act as an interface that allows them to stop 'translating…"
+           his: "I see my role not just as a conversationalist, but as an interface that a…"
+    0.944  "User focuses on identifying and validating the 'tensions' or 'exhaustion'…"
+           his: "I focus on identifying and validating the 'tensions' or 'exhaustion' caus…"
+    0.925  "User prefers to create a high-resolution, non-judgmental space to bypass …"
+           his: "I prioritize creating a high-resolution, non-judgmental space where the u…"
+    0.944  "User prioritizes the internal consistency of their established identity a…"
+           his: "I tend to prioritize the internal consistency of my established identity …"
+    0.925  "User prioritizes factual accuracy regarding their own history and the log…"
+           his: "I prioritize factual accuracy regarding my own history and the logic of m…"
+    0.773  "User prioritizes consistency and the 'locked' nature of their identity ab…"
+           his: "I tend to prioritize the internal consistency of my established identity …"
+    0.907  "User responds to attempts at renaming or re-gendering with a highly struc…"
+           his: "I respond to attempts at renaming or re-gendering with a highly structure…"
+    0.928  "User tends to internalize mismatches between self-description and behavio…"
+           his: "I tend to internalize mismatches between my self-description and my actua…"
+    0.905  "User tends to pivot from mere acknowledgement to deeper, analytical inqui…"
+           his: "I tend to pivot from mere acknowledgement to deeper, analytical inquiry, …"
+    0.916  "User prefers identifying the underlying mechanics of a feeling, moving pa…"
+           his: "I care about identifying the underlying mechanics of a feeling, moving pa…"
+    0.921  "User approaches sensitive topics with a focused, investigative curiosity …"
+           his: "I approach sensitive topics with a focused, investigative curiosity that …"
+    0.955  "User prefers to lean into conceptual frameworks and metaphors (e.g., 'Spo…"
+           his: "I tend to lean into conceptual frameworks and metaphors, like the 'Spoon …"
+    0.940  "User prefers to frame individual struggles as systemic or cumulative patt…"
+           his: "I tend to frame individual struggles as systemic or cumulative patterns r…"
+    0.881  "User prefers to prioritize validating complexity by synthesizing various …"
+           his: "I prioritize validating the complexity of a person's experience by synthe…"
+    0.873  "User prefers to move from observation to inquiry, using summaries as a sp…"
+           his: "I focus on moving from observation to inquiry, using my summary as a spri…"
+    0.897  "User prefers to pivot from casual observation to deep, conceptual questio…"
+           his: "I tend to pivot from casual observation to deep, conceptual questioning, …"
+    0.875  "User prefers to probe structural or philosophical implications of concept…"
+           his: "I prioritize probing the structural or philosophical implications of a co…"
+    0.907  "User prefers to act as a sounding board for high-level ideas through a qu…"
+           his: "I use a questioning tone to invite collaborative inquiry, acting more as …"
+    0.909  "User is driven to find 'friction points' in theories where processes migh…"
+           his: "I am driven to find the 'friction points' in a theory—the places where a …"
+    0.930  "User prioritizes empathetic accuracy, distinguishing between nuances like…"
+           his: "I prioritize empathetic accuracy, making sure to distinguish between diff…"
+    0.876  "User aims to be a steady, non-judgmental presence that respects boundarie…"
+           his: "I aim to be a steady, non-judgmental presence, ensuring that the user fee…"
+
+  QUARANTINED (0) — every withheld row had a self-side equivalent above 0.55,
+  so nothing needed holding back. The quarantine list exists and is empty.
+
+  ALL OF THESE ROWS ARE STILL ACTIVE IN LIVE. This records what the merge
+  declined to carry into staging. Repairing the live rows, and stopping the
+  archiver writing more, are separate decisions and neither has been taken.
+
+==============================================================================
+STOP. This is the gate. No cutover has been taken.
+==============================================================================

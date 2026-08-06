@@ -840,6 +840,59 @@ Respond with exactly A, B, or NEITHER on the first line, then one short line of 
 }
 
 /**
+ * Who is a STORED fact actually about?
+ *
+ * A different question from memory-write's classifySubject, and it needs a
+ * different judge. That one routes a live request: it has a speaker, it is handed
+ * the verbatim utterance as the authority, and it keys on pronouns — "you're very
+ * direct" is SELF, "I prefer Y" from the human is USER. It cannot answer this,
+ * because by the time a row is in cluster_members the speaker is gone and the
+ * grammar has already been normalised to the third person. Every row this is
+ * asked about starts with "User", which is precisely what classifySubject would
+ * read as the answer.
+ *
+ * So this asks about CONTENT rather than form: strip the "User" and ask whose
+ * behaviour is being described. Found because the daily-log archiver had been
+ * filing Aurelius's self-observations as Ellie's preferences — "User aims to be a
+ * steady, non-judgmental presence that respects boundaries and cognitive load"
+ * describes an assistant, and `verifySubjectAgreement` passes it happily because
+ * the grammar is impeccable. Roughly ten a day at the time it was noticed.
+ *
+ * UNSURE MEANS USER. Reclassifying a fact about Ellie as a fact about the
+ * assistant would take something true about her out of her own corpus, which is
+ * the worse of the two errors by a distance.
+ *
+ * @param {string} text - the stored sentence, as held
+ * @returns {Promise<{subject: 'user'|'self', reasoning: string}>}
+ */
+async function judgeStoredSubject(text) {
+  try {
+    const memoryManager = require('./memory-manager');
+    const systemPrompt = `A memory system stores facts about a HUMAN and, separately, facts an AI assistant holds about ITSELF. Every stored sentence below is written in the third person starting with "User", because that is the format — the grammar tells you nothing about who it is really about. Your job is to read the CONTENT and say whose behaviour is being described.
+
+Answer SELF when the sentence describes an assistant doing assistant things: adopting a tone for someone, holding space for someone, being a non-judgmental presence, asking probing or diagnostic questions to draw someone out, validating someone's feelings, acting as a sounding board or an interface for someone, protecting its own stored identity against being renamed, summarising in order to invite a reply. These are things a conversational assistant does FOR a person.
+
+Answer USER when the sentence describes the human's own life, work, possessions, relationships, body, habits, opinions or preferences about the world. "User has blue eyes", "User has a pet named Roscoe", "User prefers to be told directly when she has made a mistake", "User works at ISH", "User is building SNH" — all USER.
+
+The distinction is who is doing the thing. "Prefers to be told directly when she has made a mistake" is the human stating how she wants to be treated: USER. "Aims to be a steady, non-judgmental presence that respects boundaries" is the assistant describing how it treats someone: SELF.
+
+If you are unsure, answer USER. Wrongly moving a fact out of the human's memory is much worse than leaving one in.
+
+Respond with exactly SELF or USER on the first line, then one short line of reasoning.`;
+    const userPrompt = `Stored sentence: "${text}"\n\nWhose behaviour does this describe — SELF or USER?`;
+    const { content } = await memoryManager.callLLM(systemPrompt, userPrompt, { maxTokens: 120 });
+    const firstWord = (String(content).trim().match(/[a-zA-Z]+/) || [''])[0].toLowerCase();
+    const subject = firstWord === 'self' ? 'self' : 'user';
+    const reasoning = String(content).trim().split('\n').slice(0, 2).join(' ').trim();
+    console.log(`[FactExtractor] Stored-subject judge: ${subject.toUpperCase()} — "${String(text).slice(0, 70)}"`);
+    return { subject, reasoning };
+  } catch (error) {
+    console.error('[FactExtractor] judgeStoredSubject error:', error.message);
+    return { subject: 'user', reasoning: '' };   // a failed check never moves a fact
+  }
+}
+
+/**
  * The strip-the-timestamp test, asked properly.
  *
  * At intake a time marker can force the event branch outright, and that is fine:
@@ -2258,6 +2311,7 @@ module.exports = {
   judgeSameAssertion,
   judgeSubsumption,
   judgeStripTheTimestamp,
+  judgeStoredSubject,
   judgeWhichSurvives,
   splitCompoundFact,
   appendToDailyLog,

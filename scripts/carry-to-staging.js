@@ -118,7 +118,8 @@ const argVal = (name, dflt) => {
 };
 const MODE = args.includes('--plan') ? 'plan'
   : args.includes('--rewrite') ? 'rewrite'
-    : (args.includes('--apply') ? `apply:${argVal('--apply', 'auto')}` : null);
+    : args.includes('--withdraw') ? 'withdraw'
+      : (args.includes('--apply') ? `apply:${argVal('--apply', 'auto')}` : null);
 
 const TWIN_FLOOR = 0.80;        // the gate report's definition of "represented"
 const BAND_LO = 0.70;           // near-equivalent band, lower edge
@@ -1146,6 +1147,67 @@ async function apply(which) {
       carriedTotal: plan.carriedTotal || 0
     });
     console.log(`[Carry] re-rendered from the plan frozen at ${plan.generatedAt} — no facts were re-classified`);
+    process.exit(0);
+  }
+
+  /**
+   * Take back a carry.
+   *
+   * A carry ADDS a row, so revert-correction.js cannot undo one — it restores
+   * losers, it does not retire winners, and its ledger entry is recorded
+   * reversible = 0 for exactly that reason. This is the other half, and it is a
+   * deliberate path: a person names the fact and gives a reason.
+   *
+   * It retires rather than deletes, like everything else in the funnel. The row
+   * stays as history with inactive_reason = 'retracted' and the vector goes, so
+   * it can no longer reach an answer by either route. The withdrawal is its own
+   * ledger entry, pointing at the carry it undoes.
+   */
+  if (MODE === 'withdraw') {
+    const target = argVal('--withdraw', '');
+    const reason = argVal('--reason', '');
+    if (!target || !reason) {
+      console.error('Usage: carry-to-staging.js --withdraw <staging-id-or-prefix> --reason "why"');
+      process.exit(2);
+    }
+    const db = require(path.join(ROOT, 'db/database'));
+    db.initDatabase();
+    await db.initVectorStore();
+    const d = db.getSqliteDb();
+    const factStore = require(path.join(ROOT, 'db/fact-store'));
+    const ledger = require(path.join(ROOT, 'db/corrections-ledger'));
+
+    const row = d.prepare(
+      "SELECT * FROM cluster_members WHERE id LIKE ? AND source = 'carried_from_live' AND status = 'active'"
+    ).get(`${target}%`);
+    if (!row) {
+      console.error(`ABORT: no active carried fact matching "${target}".`);
+      process.exit(2);
+    }
+    const carryEntry = d.prepare(
+      "SELECT id, target_id, evidence FROM corrections_ledger WHERE action = 'carry' AND survivor_id = ?"
+    ).get(row.id);
+
+    const res = await factStore.retire(row.id, { reason, deliberate: true });
+    if (!res.ok) { console.error(`ABORT: retire failed — ${res.reason}`); process.exit(1); }
+
+    ledger.record({
+      passId: `withdraw-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+      tier: 'mechanical', action: 'carry-withdrawn', subject: row.subject || 'user',
+      targetId: row.id, targetText: row.content,
+      reason: `This fact was carried across from the live corpus during the merge and then taken back out. ${reason} It is retired in staging, not deleted, and the live corpus still holds it unchanged.`,
+      evidence: {
+        undoes_carry: carryEntry ? carryEntry.id : null,
+        live_id: carryEntry ? carryEntry.target_id : null,
+        withdrawn_reason: reason
+      },
+      // Retiring is reversible through the normal path.
+      reversible: true
+    });
+
+    console.log(`[Carry] withdrawn ${row.id.slice(0, 8)} "${trunc(row.content, 70)}"`);
+    console.log(`[Carry] reason: ${reason}`);
+    console.log(`[Carry] the live row is untouched; staging keeps this as inactive history.`);
     process.exit(0);
   }
 

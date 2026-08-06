@@ -956,6 +956,27 @@ async function resolveContradictions(pass, { subject = 'user' } = {}) {
       const other = db.prepare('SELECT * FROM cluster_members WHERE id = ?').get(cand.memberId);
       if (!other || other.status !== 'active') continue;
 
+      // HISTORY IS NOT A CONTRADICTION — excluded before the judge, not after.
+      //
+      // A past-tense fact and a present-tense one about the same subject matter
+      // are two true statements about two different times. Handed such a pair the
+      // judge says YES and dominance retires the older one, which is both parts
+      // working as written on a question they should not have been asked. See
+      // extraction-rules.historyCoexists for the three that got through on
+      // 2026-08-06 before this existed.
+      //
+      // Marked as checked so the pair is not re-enumerated on every future pass,
+      // with a verdict of its own rather than a borrowed 'no' — the record should
+      // say it was exempted, not that a judge looked at it and disagreed.
+      const coexist = require('./extraction-rules').historyCoexists(row.content, other.content);
+      if (coexist.exempt) {
+        if (!pass.dryRun) {
+          try { markStmt.run(key, new Date().toISOString(), 'history-coexists', row.id, other.id); } catch { /* non-fatal */ }
+        }
+        console.log(`[Corrector] not a contradiction — ${coexist.reason}: "${trim(row.content, 50)}" / "${trim(other.content, 50)}"`);
+        continue;
+      }
+
       const { verdict } = await factExtractor().judgeContradiction(row.content, other.content);
       if (!pass.dryRun) {
         try { markStmt.run(key, new Date().toISOString(), verdict, row.id, other.id); } catch { /* non-fatal */ }

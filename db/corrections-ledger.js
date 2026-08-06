@@ -157,11 +157,27 @@ async function revert(idOrPrefix, { by = 'unknown' } = {}) {
   // The daily log, not the ops ledger: a fact coming back into memory is a
   // change to what he knows, which is cognitively meaningful rather than
   // operational telemetry.
+  //
+  // Resolved from the PROCESS's data directory, like db/corrector.js and
+  // db/fact-store.js. This one was left as a constant on the reasoning that it
+  // was not on any staging path, and that was wrong within the hour: reverting
+  // three corrections against the staging corpus wrote three "is back in memory"
+  // notes into the LIVE daily log — a log that IS injected — describing facts
+  // that had never moved in the corpus those notes belong to. The notes were
+  // removed by hand.
+  //
+  // Four modules are now redirect-safe because all four are reachable from the
+  // staging tools: this one, db/corrector.js, db/fact-store.js and
+  // db/identity-lock.js. The rest of db/ still resolves its log paths from
+  // __dirname — memory-manager, memory-write, self-audit, capability-manifest,
+  // cron-jobs, initiative-engine, agent-pool, brain-watchdog — and that is not a
+  // claim they are safe, only that no staging script reaches them today. Anything
+  // new that runs a server path under SNH_DATA_DIR needs this checked first.
   try {
     const text = String(entry.target_text || '').replace(/\s+/g, ' ').trim();
     require('./fact-extractor').appendToDailyLog(
       `Reverted a correction: "${text.slice(0, 120)}" is back in memory. It had been retired because: ${String(entry.reason || '').slice(0, 160)}`,
-      require('path').join(__dirname, '../data/memory/daily')
+      require('path').join(require('./database').getDataDir(), 'memory', 'daily')
     );
   } catch { /* best effort */ }
 

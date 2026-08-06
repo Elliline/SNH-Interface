@@ -56,9 +56,14 @@ const path = require('path');
 const { getSqliteDb } = require('./database');
 const { getConfig } = require('./config');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
-const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
-const OPS_DIR = path.join(MEMORY_DIR, 'ops');
+// Resolved from the PROCESS's data directory, like db/corrector.js,
+// db/fact-store.js and db/corrections-ledger.js. This module is reachable from
+// the staging tools: every lock refusal goes through fact-store.lockRefusal,
+// which calls recordRefusal here, so a corrector pass against staging that hit a
+// locked fact would have filed the refusal in the LIVE ops ledger.
+function memoryDir() { return path.join(require('./database').getDataDir(), 'memory'); }
+function dailyDir() { return path.join(memoryDir(), 'daily'); }
+function opsDir() { return path.join(memoryDir(), 'ops'); }
 
 /** Provenance tag for facts written through the deliberate path. */
 const LOCK_SOURCE = 'identity-lock';
@@ -68,10 +73,10 @@ function factExtractor() { return require('./fact-extractor'); }
 function memoryClusters() { return require('./memory-clusters'); }
 
 function opsLog(msg) {
-  try { factExtractor().appendToOpsLog(msg, OPS_DIR); } catch { /* best effort */ }
+  try { factExtractor().appendToOpsLog(msg, opsDir()); } catch { /* best effort */ }
 }
 function dailyLog(msg) {
-  try { factExtractor().appendToDailyLog(msg, DAILY_DIR); } catch { /* best effort */ }
+  try { factExtractor().appendToDailyLog(msg, dailyDir()); } catch { /* best effort */ }
 }
 
 // ============ config ============

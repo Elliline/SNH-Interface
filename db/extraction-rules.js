@@ -239,6 +239,127 @@ function grammaticalSubject(text) {
   return null;
 }
 
+// ============ 5. HISTORY vs CURRENT STATE ============
+
+/**
+ * Verbs and phrasings that put a sentence in the PAST — something that happened
+ * or was once so, rather than something that is so now.
+ *
+ * Deliberately anchored to the sentence's main verb rather than searching for a
+ * past-tense word anywhere, because "User has a dog that was born in 2019" is a
+ * present-tense fact with a past-tense clause inside it.
+ */
+const PAST_VERBS = 'had|kept|traded|sold|bought|purchased|acquired|owned|used|preferred|liked|wanted|worked|lived|studied|drove|got rid of|was|were';
+const PRESENT_VERBS = 'has|have|owns|drives|prefers|likes|uses|works|lives|runs|is|are|keeps|holds';
+
+/**
+ * A noun phrase between the possessive and the verb: "User's RAV4 is…",
+ * "User's gaming system has…". Bounded so it cannot swallow a whole sentence and
+ * match a verb three clauses away.
+ *
+ * The negative lookahead is what stops it eating a PRESENT-tense auxiliary on the
+ * way to a past participle. Without it, "User's RAV4 has not had wax applied"
+ * consumed "RAV4 has not" as the noun phrase, matched "had", and was filed as
+ * history — a present-perfect statement about the car's current condition, read
+ * as something that used to be true. Seen firing live in a corrector pass.
+ */
+const POSSESSED = "(?:(?!\\b(?:has|have|is|are|was|were|does|do|did|not)\\b)[\\w''-]+\\s+){0,3}";
+
+const HISTORICAL_MARKERS = [
+  new RegExp(`^(the\\s+)?user\\s+(${PAST_VERBS})\\b`, 'i'),
+  // "User's Tundra was totalled", "User's old truck had 200k miles"
+  new RegExp(`^(the\\s+)?user'?s\\s+${POSSESSED}(${PAST_VERBS})\\b`, 'i'),
+  /^(the\s+)?user\s+has\s+(previously|formerly|since)\b/i,
+  /\bused to\b/i,
+  /\bno longer\b/i,
+  /\b(before|prior to|until)\s+(trading|selling|moving|leaving|switching)\b/i
+];
+
+/**
+ * Present-tense possession, state or preference — what is so NOW.
+ *
+ * The possessed-noun form is not optional garnish. Without it the rule missed
+ * "User's Rav4 is brand new" and "User's Tundra is brand new", and on the very
+ * next corrector pass "User had to get rid of the RAV and the Tacoma due to
+ * painful memories associated with a death" was retired for a SECOND time — the
+ * rule had exempted it against "User has a Rav4" and "User owns a Rav4 GR Sport"
+ * and then let the same pairing through in a different grammatical dress.
+ */
+const CURRENT_STATE_MARKERS = [
+  new RegExp(`^(the\\s+)?user\\s+(${PRESENT_VERBS})\\b`, 'i'),
+  new RegExp(`^(the\\s+)?user'?s\\s+${POSSESSED}(${PRESENT_VERBS})\\b`, 'i'),
+  /^(the\s+)?user\s+is\s+(a|an|the)?\s*\w+/i
+];
+
+/**
+ * Is this sentence about what WAS, rather than what IS?
+ * @returns {{historical: boolean, marker: string|null}}
+ */
+function isHistorical(text) {
+  const t = String(text || '');
+  for (const re of HISTORICAL_MARKERS) {
+    const m = t.match(re);
+    if (m) return { historical: true, marker: m[0].trim() };
+  }
+  return { historical: false, marker: null };
+}
+
+/** Is this sentence about what is so now? */
+function isCurrentState(text) {
+  const t = String(text || '');
+  if (isHistorical(t).historical) return false;   // past wins — "used to have" is not "has"
+  return CURRENT_STATE_MARKERS.some(re => re.test(t));
+}
+
+/**
+ * HISTORY IS NOT A CONTRADICTION.
+ *
+ * A past-tense sentence and a present-tense one about the same subject matter do
+ * not compete: they are two true statements about two different times, and both
+ * belong in the corpus. "User had to get rid of the RAV and the Tacoma due to
+ * painful memories associated with a death" and "User has a Rav4" are both true —
+ * different vehicles, years apart — and one does not retire the other.
+ *
+ * The corrector proved the point on 2026-08-06, on the merged staging corpus.
+ * Three of its five supersessions were this shape:
+ *
+ *   retired "User kept the Highlander Limited for six months before trading it
+ *            for a 2023 RAV4 Prime."          for  "User owns a Rav4 GR Sport"
+ *   retired "User had to get rid of the RAV and the Tacoma due to painful
+ *            memories associated with a death."  for  "User has a Rav4"
+ *   retired "User preferred AMD"               for  "User prefers their MacBook"
+ *
+ * Nothing malfunctioned. The contradiction judge answered YES, evidence dominance
+ * preferred the newer and better-evidenced sentence, and both did exactly what
+ * they are written to do — on a pair they should never have been handed. The
+ * second one is the one that matters: it took the reason a car went with it, and
+ * that reason was a death.
+ *
+ * So the pair is excluded at ENUMERATION, before any judge sees it. That is where
+ * it belongs: the corrector's design is deterministic enumeration and model
+ * judgement, and "these two are not candidates" is an enumeration question.
+ *
+ * ONE-SIDED ON PURPOSE. Two past-tense facts CAN contradict ("User owned a Tundra
+ * in 2019" / "User never owned a Tundra"), and so can two present-tense ones.
+ * Only the mixed pair is exempt.
+ *
+ * @returns {{exempt: boolean, reason: string|null}}
+ */
+function historyCoexists(a, b) {
+  const aPast = isHistorical(a);
+  const bPast = isHistorical(b);
+  if (aPast.historical === bPast.historical) return { exempt: false, reason: null };
+
+  const past = aPast.historical ? a : b;
+  const present = aPast.historical ? b : a;
+  if (!isCurrentState(present)) return { exempt: false, reason: null };
+
+  return {
+    exempt: true,
+    reason: `one is about what was ("${(aPast.marker || bPast.marker)}") and the other about what is — history and current state coexist, so they are not a contradiction`
+  };
+}
+
 module.exports = {
   eventMarker,
   identityClassOf,
@@ -246,7 +367,11 @@ module.exports = {
   identityAnchorRefusal,
   looksCompound,
   grammaticalSubject,
+  isHistorical,
+  isCurrentState,
+  historyCoexists,
   RELATIONSHIP_TERMS,
   TEMPORAL_MARKERS,
-  INPROGRESS_MARKERS
+  INPROGRESS_MARKERS,
+  HISTORICAL_MARKERS
 };
