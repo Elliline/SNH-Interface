@@ -182,40 +182,19 @@ function initDatabase() {
     `);
 
     sqliteDb.exec(`
-      CREATE TABLE IF NOT EXISTS cluster_links (
-        id TEXT PRIMARY KEY,
-        cluster_a TEXT NOT NULL,
-        cluster_b TEXT NOT NULL,
-        strength REAL DEFAULT 0.5,
-        FOREIGN KEY (cluster_a) REFERENCES memory_clusters(id),
-        FOREIGN KEY (cluster_b) REFERENCES memory_clusters(id)
-      )
-    `);
-
-    sqliteDb.exec(`
       CREATE INDEX IF NOT EXISTS idx_cluster_members_cluster_id
       ON cluster_members(cluster_id)
     `);
 
-    // Persisted cross-link judgments. The cross-link auditor used to re-score
-    // every one of the O(n²) cluster pairs with the LLM on every pass; because
-    // the model is non-deterministic, pairs near the link threshold flip-flopped
-    // create↔drop each cycle (large link churn on an otherwise idle system) and
-    // every pass burned ~n²/10 LLM calls. This table caches the last verdict
-    // keyed by a hash of the exact summaries fed to the model, so a pair whose
-    // content is unchanged since it was last judged is skipped entirely — no LLM
-    // call, no link mutation. cluster_a/cluster_b are stored id-sorted so the key
-    // is order-independent.
-    sqliteDb.exec(`
-      CREATE TABLE IF NOT EXISTS cluster_link_judgments (
-        cluster_a TEXT NOT NULL,
-        cluster_b TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        strength REAL NOT NULL,
-        judged_at DATETIME,
-        PRIMARY KEY (cluster_a, cluster_b)
-      )
-    `);
+    // cluster_links and cluster_link_judgments were DROPPED at the 2026-08-06
+    // cutover. They held a weighted cluster<->cluster graph and the memo that fed
+    // it; the writer was disabled on 2026-08-02 and everything after could only
+    // delete rows, so what remained described a corpus that no longer existed —
+    // 2225 links, 459 of them naming clusters that had been deleted, still drawn
+    // on the Map as if current. Association is answered at query time now, from
+    // the vector index, for the one cluster a person has selected:
+    // GET /api/memory/graph/neighbours/:clusterId. A computed answer cannot go
+    // stale. Do not re-create these tables.
 
     // Question queue: gaps/oddities in the facts become questions the model
     // may ask the user at a natural moment. cluster_id/member_id are the

@@ -816,8 +816,6 @@ async function executeSplits(auditResults) {
 
       if (remainingCount === 0) {
         // All facts moved out — delete original cluster and its links
-        db.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
-          .run(clusterId, clusterId);
         db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(clusterId);
         console.log(`[Heartbeat] Deleted empty original cluster "${clusterName}"`);
         splitDetail.originalDeleted = true;
@@ -875,10 +873,12 @@ async function executeSplits(auditResults) {
 // when every pair was a cache hit), and the content-hash cache it needed was a
 // mitigation of a cost that should not have existed.
 //
-// The tables (cluster_links, cluster_link_judgments) are KEPT and are now
-// READ-ONLY: the Memory Map still renders the links it already has, and the
-// supersede edges beside them are still live. Nothing maintains them anymore, so
-// treat their strengths as a frozen snapshot, not as current judgments.
+// The tables were DROPPED at the 2026-08-06 cutover. Keeping them read-only was
+// the wrong call: nothing maintained them, the replay rebuilt every active user
+// fact into clusters no link had ever pointed at, and the Map went on drawing
+// those edges as if they were current. A stale association is worse than none —
+// it looks like knowledge. The supersede edges beside them are still live, and
+// association is now computed on demand from the vector index.
 //
 // Associations become query-time vector neighbours in a later phase — computed
 // when asked, never stored. See docs/memory-mvp-spec.md (RETRIEVE).

@@ -3425,14 +3425,9 @@ async function toggleClusterExpand(clusterId) {
         .join('');
     }
 
-    if (data.linkedClusters && data.linkedClusters.length > 0) {
-      html += '<div class="memory-cluster-linked">';
-      html += '<div class="memory-cluster-linked-title">Linked clusters:</div>';
-      html += data.linkedClusters.map(lc =>
-        `<div class="memory-cluster-member">${escapeHtml(lc.name)} (strength: ${lc.strength.toFixed(2)})</div>`
-      ).join('');
-      html += '</div>';
-    }
+    // No "Linked clusters" here any more. getCluster returns an empty
+    // linkedClusters now that cluster_links is gone; association is a query-time
+    // lookup and lives on the Map, where selecting a cluster asks for it.
 
     membersEl.innerHTML = html;
     membersEl.classList.add('expanded');
@@ -3968,14 +3963,21 @@ async function loadThinkingTab() {
 // Renders each cluster as a glowing HUB node (sized by member count, labelled
 // with the cluster name); its facts are smaller dots joined to the hub by short
 // "spoke" edges, so each cluster reads as a free-floating starburst on dark
-// space. Hub-to-hub association links join neighborhoods and light up by link
-// strength when a hub is selected. No compound containers — membership is shown
-// purely by proximity + spokes. user vs self stay distinct color territories.
+// space. No compound containers — membership is shown purely by proximity +
+// spokes. user vs self stay distinct color territories.
+//
+// There are no stored association edges. `cluster_links` used to draw a weighted
+// hub-to-hub graph here; nothing had maintained that table since its writer was
+// disabled, and after the replay it described clusters that no longer existed —
+// so the Map was drawing stale edges as current knowledge. Selecting a hub now
+// ASKS the server which clusters are near it, computed from the vector index at
+// that moment, and lights those. A computed answer cannot go stale.
 // Built on vendored cytoscape.js + fcose.
 let mapCy = null;               // cytoscape instance
 let mapData = null;             // last /graph payload
 let mapSelectedHub = null;      // cluster id of the currently selected hub (or null)
-let mapLinkRange = { min: 0.5, max: 1 }; // strength range of rendered hub links
+let mapLinkRange = { min: 0.55, max: 1 }; // similarity range of the neighbours last fetched
+let mapNeighbourCache = new Map();       // clusterId -> neighbours, for the current graph load
 const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed (hubs only)
 const FACT_LABEL_MIN_ZOOM_FONT = 10; // fact labels appear only once zoomed in this far
 let mapLayoutName = 'cose';     // upgraded to 'fcose' once the extension registers
@@ -4239,26 +4241,10 @@ function renderMap() {
     }
   }
 
-  // Hub-to-hub association links. Track the live strength range so link colors
-  // and widths scale across the actual weights present.
-  let mn = Infinity, mx = -Infinity;
-  const clinks = [];
-  for (const e of mapData.edges) {
-    if (e.type !== 'cluster-link') continue;
-    if (clusterById.has(e.source) && clusterById.has(e.target)) {
-      const s = e.strength || 0.5;
-      mn = Math.min(mn, s); mx = Math.max(mx, s);
-      clinks.push(e);
-    }
-  }
-  mapLinkRange = { min: isFinite(mn) ? mn : 0.5, max: isFinite(mx) ? mx : 1 };
-  for (const e of clinks) {
-    const s = e.strength || 0.5;
-    els.push({ data: {
-      id: `clink-${e.source}-${e.target}`, source: e.source, target: e.target,
-      strength: s, w: 0.6 + 2.4 * mapNormStrength(s)
-    }, classes: 'clink' });
-  }
+  // No association edges are built here. They are not in the payload any more,
+  // and the ones a person can actually see — the selected hub's neighbours — are
+  // fetched and drawn on demand in selectHub().
+  mapNeighbourCache = new Map();
 
   mapSelectedHub = null;
   mapCy.elements().remove();
@@ -4400,17 +4386,12 @@ function mapNeighbourhood(cid) {
   return hub.union(facts).union(spokes);
 }
 
-// Strip any inline strength styling previously painted onto hub-hub links.
-function resetClinkStyles() {
-  if (!mapCy) return;
-  mapCy.edges('.clink').removeStyle('line-color opacity width z-index');
-}
-
 // Drop hub focus: un-dim everything and restore default link styling.
 function clearHubSelection() {
   if (!mapCy) return;
   mapSelectedHub = null;
-  resetClinkStyles();
+  // The association edges belong to the selection that drew them.
+  mapCy.edges('.clink').remove();
   mapCy.elements().removeClass('faded hubsel');
 }
 
@@ -4426,31 +4407,68 @@ function selectHub(clusterId) {
   const searchEl = document.getElementById('memoryMapSearch');
   if (searchEl && searchEl.value) searchEl.value = '';
   mapCy.elements().removeClass('dim match');
-  resetClinkStyles();
+  mapCy.edges('.clink').remove();
 
   mapSelectedHub = clusterId;
   mapCy.batch(() => {
     mapCy.elements().addClass('faded');
-    let lit = mapNeighbourhood(clusterId);
+    mapNeighbourhood(clusterId).removeClass('faded');
     hub.addClass('hubsel');
-
-    const linked = [];
-    mapCy.edges('.clink').forEach(e => {
-      const s = e.data('source'), t = e.data('target');
-      if (s !== clusterId && t !== clusterId) return;
-      const other = s === clusterId ? t : s;
-      const strength = e.data('strength');
-      const col = mapStrengthColor(strength);
-      e.style({ 'line-color': col, 'opacity': 0.95,
-        'width': 1.5 + 3 * mapNormStrength(strength), 'z-index': 25 });
-      lit = lit.union(e).union(mapNeighbourhood(other));
-      linked.push({ id: other, strength });
-    });
-
-    lit.removeClass('faded');
-    linked.sort((a, b) => b.strength - a.strength);
-    showClusterDetail(clusterId, linked);
   });
+
+  // Show the cluster immediately; the neighbours arrive when the server has
+  // computed them. Blocking the selection on a vector query would make clicking
+  // a hub feel broken on a cold index.
+  showClusterDetail(clusterId, null);
+  loadClusterNeighbours(clusterId);
+}
+
+// Ask the server which clusters sit near this one, right now. Draws the edges it
+// gets back and lights the neighbourhoods at the far end of each.
+async function loadClusterNeighbours(clusterId) {
+  let neighbours = mapNeighbourCache.get(clusterId);
+  if (!neighbours) {
+    try {
+      const r = await fetch(`/api/memory/graph/neighbours/${encodeURIComponent(clusterId)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      neighbours = (await r.json()).neighbours || [];
+      mapNeighbourCache.set(clusterId, neighbours);
+    } catch (err) {
+      console.warn('[Map] could not compute neighbours:', err.message);
+      // An honest empty state beats silently showing nothing as if there were
+      // nothing to show.
+      showClusterDetail(clusterId, null, { error: true });
+      return;
+    }
+  }
+
+  // The selection may have moved on while the request was in flight.
+  if (mapSelectedHub !== clusterId || !mapCy) return;
+
+  const strengths = neighbours.map(n => n.strength);
+  mapLinkRange = strengths.length
+    ? { min: Math.min(...strengths), max: Math.max(...strengths) }
+    : { min: 0.55, max: 1 };
+
+  mapCy.batch(() => {
+    mapCy.edges('.clink').remove();
+    let lit = mapNeighbourhood(clusterId);
+    for (const n of neighbours) {
+      const other = mapCy.getElementById(n.id);
+      if (other.empty()) continue;
+      const col = mapStrengthColor(n.strength);
+      mapCy.add({ data: {
+        id: `clink-${clusterId}-${n.id}`, source: clusterId, target: n.id,
+        strength: n.strength, w: 1.5 + 3 * mapNormStrength(n.strength)
+      }, classes: 'clink' });
+      mapCy.getElementById(`clink-${clusterId}-${n.id}`)
+        .style({ 'line-color': col, 'opacity': 0.95, 'z-index': 25 });
+      lit = lit.union(mapCy.getElementById(`clink-${clusterId}-${n.id}`)).union(mapNeighbourhood(n.id));
+    }
+    lit.removeClass('faded');
+  });
+
+  showClusterDetail(clusterId, neighbours);
 }
 
 function applyMapSearch() {
@@ -4499,22 +4517,14 @@ function showFactDetail(id) {
   openMapDetail(html);
 }
 
-// All clusters linked to `id`, sorted strongest-first.
-function mapLinkedClusters(id) {
-  const out = [];
-  for (const e of (mapData?.edges || [])) {
-    if (e.type !== 'cluster-link') continue;
-    if (e.source === id) out.push({ id: e.target, strength: e.strength || 0.5 });
-    else if (e.target === id) out.push({ id: e.source, strength: e.strength || 0.5 });
-  }
-  out.sort((a, b) => b.strength - a.strength);
-  return out;
-}
-
-function showClusterDetail(id, linked) {
+/**
+ * @param {Array|null} linked - neighbours from the server, or null while they are
+ *   still being computed. Null and [] mean different things and must read
+ *   differently: "asking" is not "there are none".
+ */
+function showClusterDetail(id, linked, opts = {}) {
   const c = mapData?.clusters.find(x => x.id === id);
   if (!c) return;
-  if (!linked) linked = mapLinkedClusters(id);
   let html = `<button class="memory-map-detail-close">&times;</button>`;
   html += `<div class="mmd-subject mmd-${mapEscape(c.subject)}">${mapEscape(c.subject)} cluster</div>`;
   html += `<div class="mmd-content">${mapEscape(c.name)}</div>`;
@@ -4524,20 +4534,28 @@ function showClusterDetail(id, linked) {
   html += `<dt>Active</dt><dd>${c.active}</dd>`;
   html += `<dt>Superseded</dt><dd>${c.superseded}</dd>`;
   html += `</dl>`;
-  // Linked clusters, ranked by strength, color-coded to match the lit links.
-  if (linked.length) {
-    html += `<div class="mmd-links"><div class="mmd-links-title">Linked clusters</div>`;
+  // Nearby clusters, computed at selection time from the vector index rather
+  // than read from a stored edge. Each of the three states says which it is:
+  // still computing, computed and empty, or could not be computed.
+  html += `<div class="mmd-links"><div class="mmd-links-title">Nearby clusters</div>`;
+  if (opts.error) {
+    html += `<div class="mmd-link-empty">Couldn't work out what's nearby just now.</div>`;
+  } else if (linked === null) {
+    html += `<div class="mmd-link-empty">Working out what's nearby…</div>`;
+  } else if (!linked.length) {
+    html += `<div class="mmd-link-empty">Nothing else sits close to this one.</div>`;
+  } else {
     for (const l of linked) {
       const lc = mapData.clusters.find(x => x.id === l.id);
       const col = mapStrengthColor(l.strength);
       html += `<div class="mmd-link-row">`
         + `<span class="mmd-link-dot" style="background:${col};color:${col}"></span>`
-        + `<span class="mmd-link-name">${mapEscape(lc ? lc.name : '—')}</span>`
+        + `<span class="mmd-link-name">${mapEscape(l.name || (lc ? lc.name : '—'))}</span>`
         + `<span class="mmd-link-strength" style="color:${col}">${l.strength.toFixed(2)}</span>`
         + `</div>`;
     }
-    html += `</div>`;
   }
+  html += `</div>`;
   openMapDetail(html);
 }
 

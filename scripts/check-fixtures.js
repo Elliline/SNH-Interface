@@ -276,7 +276,32 @@ const STAGING_FIXTURES = [
   }
 ];
 
-const STAGING = process.argv.includes('--staging');
+/**
+ * WHICH TABLE APPLIES IS A PROPERTY OF THE CORPUS, NOT OF A FLAG.
+ *
+ * The phase-2 table checks BY IDENTITY: "row c9a61f03 must now be inactive". That
+ * is the right assertion for a corpus where the defective row was found and
+ * repaired in place, which is what live was until the 2026-08-06 cutover.
+ *
+ * It is the wrong assertion for a corpus that was REBUILT. The replay discarded
+ * every active user fact and wrote new ones, so those ids are not inactive — they
+ * are gone, and the fact they described exists under a new id. Asked by identity,
+ * F2 reported "0 of 3 active" and F4 reported the superset "missing", which reads
+ * as two defects and was in fact the rebuild working. The corpus was correct and
+ * the checker was asking a question that no longer had a referent.
+ *
+ * So the mode is DETECTED. A corpus holding rows sourced `carried_from_live` is
+ * one the merge produced, and the assertion that applies to it is absence: the
+ * defect must not appear in the form described, whatever id it would have had.
+ * --staging still forces the absence table for a store that has not been cut over.
+ */
+const rebuilt = (() => {
+  try {
+    return d.prepare("SELECT COUNT(*) n FROM cluster_members WHERE source = 'carried_from_live'").get().n > 0;
+  } catch { return false; }
+})();
+
+const STAGING = process.argv.includes('--staging') || rebuilt;
 const TABLE = STAGING ? STAGING_FIXTURES : FIXTURES;
 
 const results = TABLE.map(f => {
@@ -288,14 +313,21 @@ const results = TABLE.map(f => {
 const failed = results.filter(r => !r.pass);
 
 if (process.argv.includes('--json')) {
-  console.log(JSON.stringify({ pass: failed.length === 0, failed: failed.map(f => f.name), results }, null, 2));
+  console.log(JSON.stringify({ pass: failed.length === 0, mode: STAGING ? 'absence' : 'identity', rebuilt, failed: failed.map(f => f.name), results }, null, 2));
   process.exit(failed.length === 0 ? 0 : 1);
 }
 
 console.log(`\n${'='.repeat(74)}`);
 console.log(STAGING
-  ? `FIXTURE CHECK — phase 1 (replay), against the REBUILT corpus at ${db.getDataDir()}`
-  : 'FIXTURE CHECK — phase 2 (correct), against the live corpus');
+  ? `FIXTURE CHECK — absence, against the REBUILT corpus at ${db.getDataDir()}`
+  : 'FIXTURE CHECK — by identity, against a corpus repaired in place');
+if (rebuilt && !process.argv.includes('--staging')) {
+  console.log('');
+  console.log('  This corpus was rebuilt and merged (it holds carried_from_live rows), so the');
+  console.log('  by-identity fixtures do not apply: the ids they name were discarded rather');
+  console.log('  than repaired. Checking absence instead — the defect must not be present in');
+  console.log('  the form described, under any id.');
+}
 console.log('='.repeat(74));
 for (const r of results) {
   console.log(`\n${r.pass ? 'PASS' : 'FAIL'}  ${r.id}  ${r.name}`);

@@ -465,9 +465,9 @@ async function renameAllClusters(options = {}) {
 // why 737 of 2,366 stored links (31%) sit at exactly 0.50 — a number that reads as a
 // judgment and never was one.
 //
-// cluster_links is now read-only: the Memory Map renders what is already there and
-// nothing writes to it. Associations become query-time vector neighbours in a later
-// phase — see docs/memory-mvp-spec.md (RETRIEVE).
+// The table itself was dropped at the 2026-08-06 cutover. Association is a
+// query-time vector lookup now, per selected cluster — see
+// routes/memory.js GET /graph/neighbours/:clusterId.
 
 /**
  * Assign a fact to a cluster (existing or new)
@@ -1026,44 +1026,13 @@ async function searchClusters(query, limit = 3) {
       // A cluster whose facts have all been superseded contributes nothing
       if (members.length === 0) continue;
 
-      // Get linked clusters
-      const linkedClusters = db.prepare(`
-        SELECT
-          CASE
-            WHEN cl.cluster_a = ? THEN cl.cluster_b
-            ELSE cl.cluster_a
-          END as linked_cluster_id,
-          cl.strength
-        FROM cluster_links cl
-        WHERE (cl.cluster_a = ? OR cl.cluster_b = ?)
-          AND cl.strength > 0.3
-        ORDER BY cl.strength DESC
-      `).all(clusterId, clusterId, clusterId);
-
-      // Get members from linked clusters
+      // No linked-cluster expansion. This used to pull three members from every
+      // cluster `cluster_links` associated with this one, on a table nothing had
+      // maintained since its writer was disabled — so it widened a search with
+      // facts related to the query only by a stale edge. Retrieval already finds
+      // related facts by similarity, which is the same question asked of data
+      // that is actually current.
       const linkedMembers = [];
-      for (const link of linkedClusters) {
-        const linkCluster = db.prepare('SELECT name FROM memory_clusters WHERE id = ?')
-          .get(link.linked_cluster_id);
-
-        const linkMembers = db.prepare(`
-          SELECT content, created_at
-          FROM cluster_members
-          WHERE cluster_id = ?
-            AND (status = 'active' OR status IS NULL)
-          ORDER BY salience DESC, importance DESC, created_at DESC
-          LIMIT 3
-        `).all(link.linked_cluster_id);
-
-        for (const member of linkMembers) {
-          linkedMembers.push({
-            content: member.content,
-            created_at: member.created_at,
-            clusterName: linkCluster?.name || 'Unknown',
-            linkStrength: link.strength
-          });
-        }
-      }
 
       clusterResults.push({
         cluster: {
@@ -1284,24 +1253,14 @@ function getCluster(id) {
       ORDER BY importance DESC, created_at DESC
     `).all(id);
 
-    // Get linked clusters
-    const linkedClusters = db.prepare(`
-      SELECT
-        mc.*,
-        cl.strength
-      FROM cluster_links cl
-      JOIN memory_clusters mc ON mc.id = CASE
-        WHEN cl.cluster_a = ? THEN cl.cluster_b
-        ELSE cl.cluster_a
-      END
-      WHERE cl.cluster_a = ? OR cl.cluster_b = ?
-      ORDER BY cl.strength DESC
-    `).all(id, id, id);
-
+    // Association is computed at query time now — GET /api/memory/graph/
+    // neighbours/:clusterId — so there is no stored edge to return. The field is
+    // kept and empty rather than removed: a caller that reads it gets "no stored
+    // links", which is true, instead of undefined.
     return {
       ...cluster,
       members,
-      linkedClusters
+      linkedClusters: []
     };
   } catch (error) {
     console.error('[Clusters] Error in getCluster:', error);
@@ -1431,8 +1390,6 @@ async function mergeSingletons(threshold) {
           }
         }
 
-        db.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
-          .run(singleton.cluster_id, singleton.cluster_id);
         db.prepare('DELETE FROM memory_clusters WHERE id = ?')
           .run(singleton.cluster_id);
         db.prepare('UPDATE memory_clusters SET updated_at = ? WHERE id = ?')
@@ -1497,8 +1454,6 @@ async function mergeSingletons(threshold) {
       }
 
       // Delete empty cluster and its links
-      db.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
-        .run(singleton.cluster_id, singleton.cluster_id);
       db.prepare('DELETE FROM memory_clusters WHERE id = ?')
         .run(singleton.cluster_id);
 
@@ -1565,7 +1520,6 @@ async function mergeSingletons(threshold) {
               await clusterTable.add([{ id: randomUUID(), member_id: s.member_id, cluster_id: targetId, content: s.content, vector: vectorArray }]);
             } catch (e) { console.error('[Clusters] LanceDB error:', e.message); }
           }
-          db.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?').run(s.cluster_id, s.cluster_id);
           db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(s.cluster_id);
           merged++;
         } else {
@@ -1584,7 +1538,6 @@ async function mergeSingletons(threshold) {
                 await clusterTable.add([{ id: randomUUID(), member_id: s.member_id, cluster_id: target.cluster_id, content: s.content, vector: vectorArray }]);
               } catch (e) { console.error('[Clusters] LanceDB error:', e.message); }
             }
-            db.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?').run(s.cluster_id, s.cluster_id);
             db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(s.cluster_id);
             merged++;
           }
@@ -1644,34 +1597,6 @@ async function mergeByName() {
         // Move members to target
         db.prepare('UPDATE cluster_members SET cluster_id = ? WHERE cluster_id = ?')
           .run(target.id, source.id);
-
-        // Re-point links (skip self-links and duplicates)
-        const links = db.prepare(
-          'SELECT * FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?'
-        ).all(source.id, source.id);
-
-        for (const link of links) {
-          const newA = link.cluster_a === source.id ? target.id : link.cluster_a;
-          const newB = link.cluster_b === source.id ? target.id : link.cluster_b;
-
-          if (newA === newB) {
-            db.prepare('DELETE FROM cluster_links WHERE id = ?').run(link.id);
-            continue;
-          }
-
-          const existing = db.prepare(`
-            SELECT id FROM cluster_links
-            WHERE ((cluster_a = ? AND cluster_b = ?) OR (cluster_a = ? AND cluster_b = ?))
-              AND id != ?
-          `).get(newA, newB, newB, newA, link.id);
-
-          if (existing) {
-            db.prepare('DELETE FROM cluster_links WHERE id = ?').run(link.id);
-          } else {
-            db.prepare('UPDATE cluster_links SET cluster_a = ?, cluster_b = ? WHERE id = ?')
-              .run(newA, newB, link.id);
-          }
-        }
 
         // Delete source cluster
         db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(source.id);

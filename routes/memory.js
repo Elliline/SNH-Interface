@@ -786,7 +786,19 @@ router.get('/followup-traces', (req, res) => {
  * Edges:
  *   - membership: fact -> its cluster (built client-side from clusterId)
  *   - supersede:  old fact -> the fact that replaced it (directed, belief history)
- *   - cluster-link: cluster <-> cluster association (cluster_links, weighted)
+ *
+ * THERE IS NO STORED ASSOCIATION EDGE ANY MORE. `cluster_links` held a weighted
+ * cluster<->cluster graph that was written once and then never maintained against
+ * the corpus it described: the writer was disabled long ago, the merge and split
+ * paths could only DELETE rows, and the replay rebuilt every active user fact
+ * into new clusters that no link had ever pointed at. By the cutover it was 2225
+ * rows describing a corpus that no longer existed, 459 of which named clusters
+ * that had been deleted — and the Map drew them as if they were current.
+ *
+ * Association is now answered at QUERY TIME, from the vector index, for the one
+ * cluster a person has selected (GET /graph/neighbours/:clusterId). That cannot
+ * go stale, because it is computed from the embeddings the corpus actually has
+ * at the moment it is asked.
  *
  * Response also includes per-cluster counts so the frontend can collapse large
  * clusters to a hub and expand members on demand.
@@ -814,10 +826,6 @@ router.get('/graph', (req, res) => {
     for (const q of questionRows) {
       pendingByMember.set(q.member_id, (pendingByMember.get(q.member_id) || 0) + 1);
     }
-
-    const linkRows = sqliteDb.prepare(
-      'SELECT cluster_a, cluster_b, strength FROM cluster_links'
-    ).all();
 
     // Per-cluster tallies (for hub sizing + collapse decisions).
     const counts = new Map(); // clusterId -> { total, active, superseded }
@@ -864,19 +872,6 @@ router.get('/graph', (req, res) => {
       }
     }
 
-    // Undirected cluster associations — only between clusters we render.
-    const linkEdges = [];
-    for (const l of linkRows) {
-      if (clusterIds.has(l.cluster_a) && clusterIds.has(l.cluster_b)) {
-        linkEdges.push({
-          source: l.cluster_a,
-          target: l.cluster_b,
-          type: 'cluster-link',
-          strength: l.strength || 1
-        });
-      }
-    }
-
     const clusters = clusterRows.map(c => {
       const cc = counts.get(c.id) || { total: 0, active: 0, superseded: 0 };
       return {
@@ -893,7 +888,7 @@ router.get('/graph', (req, res) => {
     res.json({
       clusters,
       nodes,
-      edges: [...supersedeEdges, ...linkEdges],
+      edges: supersedeEdges,
       stats: {
         clusters: clusters.length,
         facts: nodes.length,
@@ -906,6 +901,81 @@ router.get('/graph', (req, res) => {
   } catch (error) {
     console.error('[MemoryAPI] Error building memory graph:', error.message);
     res.status(500).json({ error: 'Failed to build memory graph' });
+  }
+});
+
+/**
+ * GET /api/memory/graph/neighbours/:clusterId
+ *
+ * Which other clusters is this one associated with — asked NOW, of the corpus as
+ * it currently stands, rather than read from a table somebody stopped updating.
+ *
+ * This replaces `cluster_links`. That table was written once by a maintenance
+ * pass that has been disabled for months; everything since could only delete
+ * from it. It survived the replay describing a corpus that had been discarded and
+ * rebuilt, and the Map went on drawing its edges as current. A stale association
+ * is worse than no association: it looks like knowledge.
+ *
+ * HOW: take this cluster's active members, ask the vector index for each one's
+ * nearest active neighbours, and keep the ones that live in OTHER clusters.
+ * Strength is the best single member-to-member similarity between the two
+ * clusters — a defensible number with a stated meaning, unlike the flat 0.5 the
+ * old writer stamped on every row.
+ *
+ * PER SELECTED CLUSTER, not for the whole graph. Computing this for all 133
+ * clusters on every Map load would be hundreds of vector queries; computing it
+ * for the one a person just clicked is a handful, and it is the only one they
+ * can see anyway.
+ */
+router.get('/graph/neighbours/:clusterId', async (req, res) => {
+  try {
+    const { clusterId } = req.params;
+    if (!isValidUUID(clusterId)) return res.status(400).json({ error: 'Invalid cluster id' });
+
+    const sqliteDb = db.getSqliteDb();
+    if (!sqliteDb) return res.status(503).json({ error: 'Database not ready' });
+
+    const cluster = sqliteDb.prepare('SELECT id, name, subject FROM memory_clusters WHERE id = ?').get(clusterId);
+    if (!cluster) return res.status(404).json({ error: 'No such cluster' });
+
+    // Cap the probe. A large cluster does not need every member queried to place
+    // it among its neighbours, and the highest-salience members are the ones that
+    // characterise it.
+    const members = sqliteDb.prepare(`
+      SELECT content FROM cluster_members
+      WHERE cluster_id = ? AND status = 'active'
+      ORDER BY salience DESC, datetime(created_at) ASC
+      LIMIT 12
+    `).all(clusterId);
+    if (!members.length) return res.json({ clusterId, neighbours: [], probed: 0 });
+
+    const subject = cluster.subject || 'user';
+    const best = new Map();   // other cluster id -> best similarity seen
+
+    for (const m of members) {
+      const { candidates } = await memoryClusters.findActiveNeighbours(m.content, {
+        subject, threshold: 0.55, limit: 12, includeVerbatim: true
+      });
+      for (const c of candidates) {
+        if (!c.clusterId || c.clusterId === clusterId) continue;
+        const prev = best.get(c.clusterId);
+        if (prev === undefined || c.similarity > prev) best.set(c.clusterId, c.similarity);
+      }
+    }
+
+    const names = new Map(
+      sqliteDb.prepare('SELECT id, name FROM memory_clusters').all().map(c => [c.id, c.name])
+    );
+    const neighbours = [...best.entries()]
+      .filter(([id]) => names.has(id))
+      .map(([id, strength]) => ({ id, name: names.get(id), strength }))
+      .sort((a, b) => b.strength - a.strength)
+      .slice(0, 10);
+
+    res.json({ clusterId, neighbours, probed: members.length, computedAt: new Date().toISOString() });
+  } catch (error) {
+    console.error('[MemoryAPI] Error computing cluster neighbours:', error.message);
+    res.status(500).json({ error: 'Failed to compute neighbours' });
   }
 });
 
@@ -1218,8 +1288,6 @@ router.delete('/fact/:id', async (req, res) => {
       ).get(member.cluster_id);
 
       if (remainingMembers.count === 0) {
-        sqliteDb.prepare('DELETE FROM cluster_links WHERE cluster_a = ? OR cluster_b = ?')
-          .run(member.cluster_id, member.cluster_id);
         sqliteDb.prepare('DELETE FROM memory_clusters WHERE id = ?')
           .run(member.cluster_id);
         console.log(`[MemoryAPI] Cleaned up empty cluster ${member.cluster_id}`);
