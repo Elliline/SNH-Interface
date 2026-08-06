@@ -29,6 +29,7 @@ const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
 const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent } = require('./db/tool-routing');
+const { createToolArtifactFilter, stripToolArtifacts, CANNOT_CHECK } = require('./db/tool-artifacts');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -2202,6 +2203,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
         let webSearchCount = 0;
         let webFetchCount = 0;
+        // Calls to tools that do not exist. Counted per turn, not per tool: the
+        // point is how many times the model has been corrected, and being shown
+        // the list twice is the signal that showing it a third time will not help.
+        let unknownToolCalls = 0;
+        // What was actually offered THIS turn. The registry holds every
+        // registered tool, but routing narrows it, and telling him about a tool
+        // he was not given is how the next wrong call gets made.
+        const offeredToolNames = tools.map(t => t.function.name);
 
         console.log('MCP [ollama]: Starting tool loop, tools:', JSON.stringify(tools.map(t => t.function.name)));
 
@@ -2259,6 +2268,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             } else if (fnName === 'web_fetch' && ++webFetchCount > MAX_WEB_FETCHES) {
               console.log(`MCP [ollama]: web_fetch limit reached (${webFetchCount}/${MAX_WEB_FETCHES})`);
               result = { error: `Fetch limit reached. You have used your ${MAX_WEB_FETCHES} page fetches. You must now synthesize the results you have and provide a response to the user.` };
+            } else if (!mcpClient.hasTool(fnName)) {
+              // A CALL TO A TOOL THAT DOES NOT EXIST.
+              //
+              // executeTool would return "Unknown tool: X", which tells the model
+              // nothing it can act on — so it invents an answer, which is the
+              // failure this whole section exists to stop. Hand back the real
+              // list instead, ONCE. A second miss after being shown the tools is
+              // not a mistake it is going to correct by being told again, so the
+              // instruction changes to: say you cannot check it.
+              unknownToolCalls++;
+              const realTools = mcpClient.getToolNames().filter(n => offeredToolNames.includes(n));
+              console.warn(`MCP [${providerLabel}]: model called "${fnName}", which does not exist (attempt ${unknownToolCalls})`);
+              result = unknownToolCalls === 1
+                ? {
+                  error: `There is no tool called "${fnName}". The tools you actually have in this turn are: ${realTools.join(', ')}. ` +
+                    'If one of them answers the question, call it now. If none of them does, say plainly that you cannot check ' +
+                    'it and do not guess — do not describe what the tool would have returned.'
+                }
+                : {
+                  error: `There is still no tool called "${fnName}", and you have now tried twice. Stop calling tools. ` +
+                    `Answer the user in words: say you cannot check this because you have no tool for it. ` +
+                    'Do NOT state anything you would have needed that tool to know.'
+                };
             } else {
               result = await mcpClient.executeTool(fnName, args, toolContext);
             }
@@ -2400,6 +2432,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const MAX_WEB_FETCHES = superSearch ? 5 : 3;
         let webSearchCount = 0;
         let webFetchCount = 0;
+        // Calls to tools that do not exist. Counted per turn, not per tool: the
+        // point is how many times the model has been corrected, and being shown
+        // the list twice is the signal that showing it a third time will not help.
+        let unknownToolCalls = 0;
+        // What was actually offered THIS turn. The registry holds every
+        // registered tool, but routing narrows it, and telling him about a tool
+        // he was not given is how the next wrong call gets made.
+        const offeredToolNames = tools.map(t => t.function.name);
 
         console.log(`MCP [${providerLabel}]: Starting tool loop, tools:`, JSON.stringify(tools.map(t => t.function.name)));
 
@@ -2468,6 +2508,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             } else if (fnName === 'web_fetch' && ++webFetchCount > MAX_WEB_FETCHES) {
               console.log(`MCP [${providerLabel}]: web_fetch limit reached (${webFetchCount}/${MAX_WEB_FETCHES})`);
               result = { error: `Fetch limit reached. You have used your ${MAX_WEB_FETCHES} page fetches. You must now synthesize the results you have and provide a response to the user.` };
+            } else if (!mcpClient.hasTool(fnName)) {
+              // A CALL TO A TOOL THAT DOES NOT EXIST.
+              //
+              // executeTool would return "Unknown tool: X", which tells the model
+              // nothing it can act on — so it invents an answer, which is the
+              // failure this whole section exists to stop. Hand back the real
+              // list instead, ONCE. A second miss after being shown the tools is
+              // not a mistake it is going to correct by being told again, so the
+              // instruction changes to: say you cannot check it.
+              unknownToolCalls++;
+              const realTools = mcpClient.getToolNames().filter(n => offeredToolNames.includes(n));
+              console.warn(`MCP [${providerLabel}]: model called "${fnName}", which does not exist (attempt ${unknownToolCalls})`);
+              result = unknownToolCalls === 1
+                ? {
+                  error: `There is no tool called "${fnName}". The tools you actually have in this turn are: ${realTools.join(', ')}. ` +
+                    'If one of them answers the question, call it now. If none of them does, say plainly that you cannot check ' +
+                    'it and do not guess — do not describe what the tool would have returned.'
+                }
+                : {
+                  error: `There is still no tool called "${fnName}", and you have now tried twice. Stop calling tools. ` +
+                    `Answer the user in words: say you cannot check this because you have no tool for it. ` +
+                    'Do NOT state anything you would have needed that tool to know.'
+                };
             } else {
               result = await mcpClient.executeTool(fnName, args, toolContext);
             }
@@ -2577,6 +2640,49 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
+    // ENGINE ARTIFACTS — tool-call markup written as prose.
+    //
+    // A model asked for something it has no tool for writes the call it wishes it
+    // could make, as text, in the middle of its answer. It is not in
+    // message.tool_calls, nothing executes it, and nothing used to catch it — it
+    // is ordinary content and it renders. That is what Ellie saw on 2026-08-06.
+    //
+    // Filtered HERE, in the shared streaming path, so both branches are covered:
+    // the tool branch's final answer and — the one that actually failed — the
+    // no-tool branch, which has no tool loop between the engine and the browser at
+    // all. The filter holds back only a tail that could still become an opener, so
+    // ordinary prose is delayed a few characters and never altered.
+    const artifactFilter = createToolArtifactFilter();
+
+    /** Rewrite one SSE/NDJSON frame's content, or drop it if nothing survives. */
+    const filterFrame = (raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === 'data: [DONE]') return raw;
+      const isSSE = trimmed.startsWith('data: ');
+      const jsonStr = isSSE ? trimmed.slice(6) : trimmed;
+      if (jsonStr === '[DONE]') return raw;
+      let data;
+      try { data = JSON.parse(jsonStr); } catch { return raw; }
+
+      // Where this engine puts the text. Only these carry prose; anything else
+      // (role, finish_reason, usage) passes through untouched.
+      const slots = [
+        () => data.choices?.[0]?.delta,
+        () => data.choices?.[0]?.message,
+        () => data.message,
+        () => data.delta
+      ];
+      for (const get of slots) {
+        const node = get();
+        if (!node || typeof node.content !== 'string' || node.content === '') continue;
+        const kept = artifactFilter.feed(node.content);
+        if (kept === node.content) return raw;      // untouched — send the original bytes
+        node.content = kept;
+        return isSSE ? `data: ${JSON.stringify(data)}\n\n` : `${JSON.stringify(data)}\n`;
+      }
+      return raw;
+    };
+
     // Stall watchdog: if the engine sends no bytes for this long mid-stream it's
     // wedged, not slow — abort so we don't hold the socket (and its engine slot)
     // open indefinitely. Reset on every chunk; a healthy long stream keeps ticking.
@@ -2599,11 +2705,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
         const chunk = decoder.decode(value, { stream: true });
 
-        // Write decoded text for SSE, raw bytes for NDJSON
+        // Frames go out FILTERED, not raw. Splitting on the frame delimiter and
+        // rewriting only the ones whose content changed keeps the untouched
+        // bytes byte-identical, so the common case costs a parse and nothing else.
         if (contentType === 'text/event-stream') {
-          res.write(chunk);
+          const frames = chunk.split(/(?<=\n\n)/);
+          for (const f of frames) { if (f) res.write(filterFrame(f)); }
         } else {
-          res.write(value);
+          const lines = chunk.split(/(?<=\n)/);
+          for (const l of lines) { if (l) res.write(filterFrame(l)); }
         }
 
         // Parse and accumulate response
@@ -2657,6 +2767,30 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           }
         }
       }
+      // Release whatever the filter is still holding, then decide whether
+      // anything legible survived.
+      const tail = artifactFilter.flush();
+      if (tail) res.write(contentType === 'text/event-stream'
+        ? `data: ${JSON.stringify({ choices: [{ delta: { content: tail } }] })}\n\n`
+        : `${JSON.stringify({ message: { content: tail } })}\n`);
+
+      // THE MARKUP WAS THE WHOLE ANSWER. The model wrote the call INSTEAD of a
+      // reply, so stripping it leaves nothing — and an empty message would read
+      // as answered. Say the true thing instead: there is no tool for this, and
+      // guessing is not on offer.
+      if (artifactFilter.stripped() > 0 && !artifactFilter.visible().trim()) {
+        console.warn(`[Chat] reply was ${artifactFilter.stripped()} tool-call artifact(s) and nothing else — sending the honest refusal instead`);
+        fullResponse = CANNOT_CHECK;
+        res.write(contentType === 'text/event-stream'
+          ? `data: ${JSON.stringify({ choices: [{ delta: { content: CANNOT_CHECK } }] })}\n\n`
+          : `${JSON.stringify({ message: { content: CANNOT_CHECK } })}\n`);
+      } else if (artifactFilter.stripped() > 0) {
+        // Some prose survived. Keep it, but do not let the STORED copy carry the
+        // markup — a later turn reading this conversation back would see it.
+        console.warn(`[Chat] stripped ${artifactFilter.stripped()} tool-call artifact(s) from the reply`);
+        fullResponse = stripToolArtifacts(fullResponse).text;
+      }
+
       res.end();
     } finally {
       if (stallTimer) clearTimeout(stallTimer);
