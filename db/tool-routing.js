@@ -527,7 +527,71 @@ function classifyMemoryCorrectionIntent(text) {
   return MEMORY_CORRECTION_PATTERNS.some(r => r.test(t));
 }
 
+/**
+ * Questions about SCHEDULED JOBS — what he proposed, what she decided, whether it
+ * ran. Routes to memory_jobs.
+ *
+ * Distinct from classifySchedulingIntent, which is the other direction: that one
+ * catches "remind me every Monday" and routes to create_cron_job to PROPOSE. This
+ * catches asking about jobs that already exist, and the two must not collide —
+ * a question is not a request to make another one.
+ *
+ * The failure this exists for: asked "which approved job never ran", he had no
+ * tool that could answer, reached for one that did not exist, and the malformed
+ * call rendered into the chat. The answer he finally gave was invented, because
+ * inventing was the only option left open to him.
+ *
+ * A JOB REFERENT IS REQUIRED for the generic verbs. "Did it run?" and "what's
+ * scheduled" would otherwise pull ordinary conversation into a job lookup — "did
+ * the deployment run", "what's scheduled for Tuesday" are about her week, not
+ * about his cron rows.
+ */
+const JOB_REF = String.raw`(cron|cron job|cron jobs|job|jobs|task|tasks|schedule|scheduled (job|jobs|task|tasks)|digest|reminder|reminders)`;
+
+const JOBS_PATTERNS = [
+  // --- what exists ---
+  new RegExp(String.raw`\b(what|which|any|list|show|show me|tell me)\b.{0,25}\b${JOB_REF}\b.{0,25}\b(do you have|have you|are there|exist|running|set up|scheduled|pending)\b`),
+  new RegExp(String.raw`\bwhat'?s\s+(scheduled|on the schedule|queued|pending)\b`),
+  new RegExp(String.raw`\b(list|show me)\b.{0,20}\b(your|the|my)\s+${JOB_REF}\b`),
+  new RegExp(String.raw`\b(your|the)\s+${JOB_REF}\b.{0,20}\b(status|state)\b`),
+
+  // --- what she decided ---
+  /\bwhat (did|have) (i|ellie)\s+(approve|approved|reject|rejected|turn(ed)? down)\b/,
+  new RegExp(String.raw`\b(did|has)\s+(i|ellie|she)\s+(approve|approved|reject|rejected)\b.{0,30}\b${JOB_REF}\b`),
+  new RegExp(String.raw`\b(approved|rejected|pending|proposed)\b.{0,20}\b${JOB_REF}\b`),
+  new RegExp(String.raw`\b${JOB_REF}\b.{0,25}\b(approved|rejected|proposed|waiting on me|waiting for me)\b`),
+
+  // --- did it run / when does it run ---
+  new RegExp(String.raw`\b(did|has|have)\b.{0,30}\b${JOB_REF}\b.{0,25}\b(run|ran|fired|executed|gone off|happened)\b`),
+  new RegExp(String.raw`\b${JOB_REF}\b.{0,25}\b(never (ran|run)|hasn'?t run|didn'?t run|failed to run)\b`),
+  new RegExp(String.raw`\bwh(en|at time)\b.{0,25}\b${JOB_REF}\b.{0,20}\b(run|runs|next|due|fire)\b`),
+  new RegExp(String.raw`\bnext run\b`),
+  // The exact shape of the morning failure.
+  new RegExp(String.raw`\bwhich\b.{0,20}\b(approved|scheduled)\b.{0,20}\b${JOB_REF}\b.{0,25}\b(never|not|hasn'?t|didn'?t)\b`),
+  new RegExp(String.raw`\bwhich\b.{0,25}\b${JOB_REF}\b.{0,25}\bnever ran\b`),
+];
+
+/**
+ * Not about his cron rows. "Are you scheduled to…" is conversational, and
+ * "schedule a call" is her diary.
+ */
+const JOBS_NEGATIVES = [
+  /\b(schedule|set up|create|make|add)\s+(a|an|another)\s+(call|meeting|appointment)\b/,
+  /\bscheduled to (meet|see|call|visit)\b/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message asks about his scheduled jobs
+ */
+function classifyJobsIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (JOBS_NEGATIVES.some(r => r.test(t))) return false;
+  return JOBS_PATTERNS.some(r => r.test(t));
+}
+
 module.exports = {
   classifyToolNeed, isTimeSensitive, classifySchedulingIntent,
-  classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent
+  classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent,
+  classifyJobsIntent
 };

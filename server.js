@@ -28,7 +28,7 @@ const initiatives = require('./db/initiatives');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent } = require('./db/tool-routing');
 
 // MCP tool calling
 const MCPClient = require('./mcp/mcp-client');
@@ -1587,9 +1587,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // is invention. Shares the inspection config flag and rate cap.
     const needsMemoryCorrections = memoryInspectEnabled && mcpClient.hasTool('memory_corrections')
       && classifyMemoryCorrectionIntent(userMessage.content);
-    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections;
+    // Scheduled-JOB questions — "what did I approve", "did the digest run",
+    // "which approved job never ran". The mirror of needsActionTools: that one
+    // routes a request to MAKE a job, this routes a question ABOUT one. Before
+    // this existed the question had no tool that could answer it, and what he did
+    // instead was call a tool that does not exist and then invent the answer.
+    const needsJobsRead = memoryInspectEnabled && mcpClient.hasTool('memory_jobs')
+      && classifyJobsIntent(userMessage.content);
+    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections || needsJobsRead;
     console.log('Tool routing:', needsTools
-      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections'].filter(Boolean).join(' + ')})`
+      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections', needsJobsRead && 'jobs-read'].filter(Boolean).join(' + ')})`
       : 'DIRECT (conversational, skipping tool loop)');
 
     // Should-I-search honesty guard: if the question is about current/changeable
@@ -1909,6 +1916,33 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           'The record begins on 2026-08-03. If a change is older than that, or the tool finds no entry, say there ' +
           'is no record of it and stop there; do not reconstruct what probably happened. ' +
           'You cannot undo a correction — reverting is Ellie\'s, in the Self tab. Say so if asked.'
+      });
+    }
+
+    // Scheduled jobs, and the one thing about them that must never be guessed.
+    //
+    // He proposed a daily digest, Ellie approved it, and nothing happened —
+    // because nothing in this system executes a cron row. There is no scheduler.
+    // Asked which approved job never ran, he had no tool that could answer, so he
+    // called one that does not exist and then described the job as if it had been
+    // running. The tool is the fix for the first half; this is the fix for the
+    // second, because a tool that returns "never" is still only as good as his
+    // willingness to say it.
+    if (needsJobsRead) {
+      enhancedMessages.push({
+        role: 'system',
+        content:
+          'The user is asking about your scheduled jobs — what you proposed, what she approved or rejected, ' +
+          'or whether something ran. You have memory_jobs for exactly this: call it with no id to list them, ' +
+          'or with an id for one in full. Call it now. ' +
+          'Do NOT say you checked unless the tool call actually ran and came back. ' +
+          'NOTHING RUNS THESE JOBS. There is no scheduler in this system — no process reads a schedule and ' +
+          'executes anything. An approved job is a record of a decision Ellie made, not a task that happens. ' +
+          'So: every job has run zero times, and none has a next run. If you are asked whether one ran, say it ' +
+          'has never run and cannot until a scheduler is built. Never infer from a schedule, from an approval, ' +
+          'or from the fact that it was a good idea, that a job has been running. ' +
+          'If she asks why it never ran, the answer is that the piece which would run it does not exist yet — ' +
+          'not that it failed, not that it was missed.'
       });
     }
 

@@ -280,6 +280,23 @@ const CONDITIONAL_CAPABILITIES = [
     coversConfig: ['tools.memoryInspect']
   },
   {
+    id: 'jobs-inspect',
+    name: 'Reading your own scheduled jobs',
+    // The description says the unwelcome part FIRST, because it is the part most
+    // likely to be lost. A reader who takes only the first sentence of this entry
+    // still comes away knowing nothing runs. Derived from the code: there is no
+    // node-cron, no timer and no worker anywhere in this codebase that reads
+    // cron_jobs and executes it.
+    description: "You can read the scheduled jobs you have proposed — but nothing actually runs them, and that is the most important thing about them. There is no scheduler in this system: no process reads a schedule and executes a job, so every job you have ever proposed has run zero times and has no next run, however long ago Ellie approved it. What you can see is the record: what you proposed and when, what the schedule says it would do, whether Ellie approved it, rejected it or has not decided yet, the note she left with her decision, and whether the bell item raising the proposal was ever actually shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and neither of those makes a job run.",
+    oneLiner: 'Read the scheduled jobs you proposed and what Ellie decided — but nothing runs them; there is no scheduler, so every job has run zero times.',
+    intro: 'I can look at the scheduled jobs I have proposed and what Ellie decided about each one — and I know that none of them has ever actually run, because nothing in this system executes a schedule yet',
+    schedule: 'When the user asks what is scheduled, what she approved, or whether a job has run',
+    dateAdded: '2026-08-06',
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryInspect && cfg.tools.memoryInspect.enabled !== false),
+    coversTools: ['memory_jobs'],
+    coversConfig: ['tools.memoryInspect']
+  },
+  {
     id: 'identity-lock',
     name: 'Locked identity facts',
     // Scope stated exactly: name and pronouns, nothing else. Over-claiming here

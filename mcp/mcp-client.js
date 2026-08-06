@@ -15,6 +15,7 @@ const {
 const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
+const { MemoryJobsTool } = require('./tools/jobs-inspect');
 const { getConfig, getSearxngConfig } = require('../db/config');
 
 /**
@@ -38,6 +39,7 @@ const { getConfig, getSearxngConfig } = require('../db/config');
  */
 const BACKGROUND_TOOLS = [
   'memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections',
+  'memory_jobs',
   // Phase 2c: the corrector's write actions. Background-only — see
   // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
   'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
@@ -117,11 +119,15 @@ class MCPClient {
     // and one backing module, so a half-registered set would only ever be a bug.
     const memInspectCfg = (getConfig().tools && getConfig().tools.memoryInspect) || {};
     if (memInspectCfg.enabled !== false) {
-      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool]) {
+      // memory_jobs rides with them: same tier, same rate cap, same "reads the
+      // record, changes nothing" contract. It reads a different table, which is
+      // why it has its own backing module, but it is the same capability from
+      // his side — looking at what is already written down.
+      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool, MemoryJobsTool]) {
         const t = new Tool();
         this.tools.set(t.name, t);
       }
-      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get, memory_corrections] (tier=read, no writes)');
+      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get, memory_corrections, memory_jobs] (tier=read, no writes)');
     }
 
     // Corrector write actions. Registered unconditionally so the corrector can
