@@ -4,7 +4,7 @@ const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, formatFactTimestamp, getLocalDateStamp } = require('./datetime');
 const agentPool = require('./agent-pool');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('./database').getMemoryDir();
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 
 // Cosine similarity that works for BOTH plain Arrays and Float32Arrays. The

@@ -36,7 +36,7 @@ const identity = require('../db/identity');
 const initiatives = require('../db/initiatives');
 const { getConfig, getProviderInstance } = require('../db/config');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('../db/database').getMemoryDir();
 
 // ============ Validation Helpers ============
 

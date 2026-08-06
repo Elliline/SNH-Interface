@@ -33,6 +33,25 @@ const LANCEDB_PATH = path.join(DATA_DIR, 'lancedb');
 /** Where this process's store lives. The replay uses it to find its memory dir. */
 function getDataDir() { return DATA_DIR; }
 
+/**
+ * The memory tree, and its two halves, resolved from THIS process's data dir.
+ *
+ * These exist so no other module has to write `path.join(__dirname, '../data')`
+ * again. Every time one did, it became a path SNH_DATA_DIR could not redirect,
+ * and the failure was never loud: a corrector pass against staging wrote its
+ * pass-state into live and told the live corrector it had just run; a revert
+ * against staging wrote three "is back in memory" notes into the live daily log,
+ * which is injected, about facts that had never moved. Both were found by
+ * reading output, not by anything failing.
+ *
+ * Functions rather than constants because DATA_DIR is fixed at load time but
+ * these modules are required in any order; a call costs a path join and cannot
+ * be stale.
+ */
+function getMemoryDir() { return path.join(DATA_DIR, 'memory'); }
+function getDailyDir() { return path.join(getMemoryDir(), 'daily'); }
+function getOpsDir() { return path.join(getMemoryDir(), 'ops'); }
+
 // Ensure data directories exist
 function ensureDirectories() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -1476,7 +1495,7 @@ async function hybridSearch(query, excludeConversationId, limit = 5, threshold) 
  * @param {string} memoryDir - Directory containing memory files
  * @returns {Object} Object containing memory file contents
  */
-function loadMemoryFiles(memoryDir = path.join(__dirname, '../data/memory')) {
+function loadMemoryFiles(memoryDir = getMemoryDir()) {
   try {
     console.log(`[MemoryFiles] Loading from: ${memoryDir}`);
 
@@ -1611,6 +1630,9 @@ module.exports = {
   initDatabase,
   initVectorStore,
   getDataDir,
+  getMemoryDir,
+  getDailyDir,
+  getOpsDir,
 
   // SQLite functions
   getConversations,

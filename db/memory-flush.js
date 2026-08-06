@@ -287,7 +287,7 @@ async function callLLMForFlush(provider, model, messages, apiKey, host) {
  * @returns {Promise<{compactedMessages: Array, flushSummary: string, factsExtracted: number}>}
  */
 async function performFlush(messages, provider, model, apiKey, host, memoryDir = null) {
-  const memDir = memoryDir || path.join(__dirname, '../data/memory');
+  const memDir = memoryDir || require('./database').getMemoryDir();
   const dailyDir = path.join(memDir, 'daily');
 
   try {

@@ -30,7 +30,7 @@ const { getLocalDateStamp } = require('./datetime');
 
 // Background-pass telemetry is operational, not cognitive, so it goes to the
 // ops log (Thinking tab) rather than the daily log that gets injected into chat.
-const OPS_DIR = path.join(__dirname, '../data/memory/ops');
+const OPS_DIR = require('./database').getOpsDir();
 const DEFAULT_CONCURRENCY = 3;
 
 class AgentPool {

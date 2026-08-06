@@ -799,10 +799,11 @@ async function repairCompounds(pass, { subject = null } = {}) {
   `).all(...(subject ? [subject] : []));
 
   let split = 0;
+  let pending = 0;      // compounds this pass did not get to
   for (const row of rows) {
-    if (split >= maxSplits) break;
-    if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); break; }
     if (!rules.looksCompound(row.content).compound) continue;
+    if (split >= maxSplits) { pending++; continue; }
+    if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); pending++; continue; }
 
     // Same scope gate as the near-duplicate merge. Splitting "I value
     // transparency and precision" into two self-facts is mechanically safe for
@@ -812,7 +813,20 @@ async function repairCompounds(pass, { subject = null } = {}) {
     // rest of the self-fact work.
     if ((row.subject || 'user') === 'self' && cfg().selfFactSemantic !== true) continue;
 
-    const atoms = await factExtractor().splitCompoundFact(row.content, row.subject || 'user');
+    // Strip the archiver's "User (Ellie)" annotation BEFORE splitting. It is a
+    // note about who "User" refers to, not a claim the sentence makes — but the
+    // splitter is told to lose nothing, so it renders the parenthetical as its
+    // own atom, "User's name is Ellie.", and the identity guard below then
+    // abandons the entire split. The compound survives whole, and a whole
+    // compound can lose a contradiction over one of its clauses. That is the
+    // chain that retired "User (Ellie) has blue eyes and her favorite color is
+    // green" for "User's favorite color is blue".
+    const annotated = rules.stripSubjectAnnotation(row.content);
+    if (annotated.stripped) {
+      console.log(`[Corrector] dropped the subject annotation "(${annotated.stripped})" before splitting — it names the subject, it does not assert anything`);
+    }
+
+    const atoms = await factExtractor().splitCompoundFact(annotated.text, row.subject || 'user');
     if (!atoms || atoms.length < 2) continue;
 
     // THE CORRECTOR NEVER MANUFACTURES AN IDENTITY ASSERTION.
@@ -889,7 +903,7 @@ async function repairCompounds(pass, { subject = null } = {}) {
     });
     split++;
   }
-  return { split };
+  return { split, pending };
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +996,33 @@ async function resolveContradictions(pass, { subject = 'user' } = {}) {
         try { markStmt.run(key, new Date().toISOString(), verdict, row.id, other.id); } catch { /* non-fatal */ }
       }
       if (verdict !== 'yes') continue;
+
+      // A COMPOUND MUST NOT LOSE WHOLE. The pass holds back resolution until
+      // every compound is split, so reaching here with one means the split was
+      // ABANDONED rather than skipped — the identity guard refused it, or the
+      // faithfulness check did. Either way the sentence still says several things
+      // and the contradiction is about one of them, so retiring it would discard
+      // clauses nobody disputed. Raised instead, which is what the semantic tier
+      // does with anything it cannot resolve cleanly.
+      const loserIsCompound = (r) => rules.looksCompound(r.content).compound;
+      if (loserIsCompound(row) || loserIsCompound(other)) {
+        const compound = loserIsCompound(row) ? row : other;
+        pass.unresolved.push({
+          a: { id: row.id, text: row.content }, b: { id: other.id, text: other.content }, subject
+        });
+        if (!pass.dryRun) {
+          ledger().record({
+            passId: pass.passId, tier: 'semantic', action: 'supersede', subject,
+            targetId: compound.id, targetText: compound.content,
+            survivorId: compound.id === row.id ? other.id : row.id,
+            survivorText: compound.id === row.id ? other.content : row.content,
+            reason: 'These two contradict each other, but one of them says several things at once and could not be split, so retiring it would throw away the parts nobody is arguing about. Nothing was changed. Raised for Ellie to decide.',
+            evidence: { unresolved: true, reason_code: 'compound-would-lose-whole', compound_id: compound.id },
+            reversible: false
+          });
+        }
+        continue;
+      }
 
       const dom = dominance(row, other);
       if (!dom) {
@@ -1081,22 +1122,43 @@ async function runPass(opts = {}) {
 
     const s = await repairCompounds(pass, {});
     result.split = s.split;
+    result.compoundsPending = s.pending;
 
-    // --- semantic: user facts always; self facts only behind the gate. ---
-    const userSem = await resolveContradictions(pass, { subject: 'user' });
-    result.superseded = userSem.applied;
-
-    // World facts get the same semantic tier as user facts, with no extra gate:
-    // they are knowledge about external things, not a view of anyone, so there
-    // is nothing here that a joint curation session needs to be present for.
-    const worldSem = await resolveContradictions(pass, { subject: 'world' });
-    result.superseded += worldSem.applied;
-
-    if (c.selfFactSemantic === true) {
-      const selfSem = await resolveContradictions(pass, { subject: 'self' });
-      result.superseded += selfSem.applied;
+    // --- THE SPLIT PHASE MUST COMPLETE BEFORE ANY CONTRADICTION IS RESOLVED ---
+    //
+    // The order of these calls has always been split-then-resolve, and that was
+    // not enough: repairCompounds is bounded (maxSplitsPerPass, the write budget)
+    // and could return with compounds still whole, after which resolution ran
+    // anyway. A whole compound that loses a contradiction loses ENTIRELY, taking
+    // clauses nobody disputed with it — "User (Ellie) has blue eyes and her
+    // favorite color is green" was retired over the colour, and the eye colour
+    // went with it.
+    //
+    // "Before" therefore means COMPLETES before, not merely is called before. If
+    // any compound is still standing, the semantic tier is skipped for this pass
+    // and picks up on the next one — which costs nothing, because resume is just
+    // running again and the split work is what unblocks it.
+    if (result.compoundsPending > 0) {
+      const msg = `${result.compoundsPending} compound(s) still unsplit — holding back contradiction resolution until the next pass`;
+      console.log(`[Corrector] ${msg}`);
+      result.heldBack = msg;
     } else {
-      console.log('[Corrector] self-fact semantic corrections are OFF (corrector.selfFactSemantic) — reserved for the joint curation session');
+      // --- semantic: user facts always; self facts only behind the gate. ---
+      const userSem = await resolveContradictions(pass, { subject: 'user' });
+      result.superseded = userSem.applied;
+
+      // World facts get the same semantic tier as user facts, with no extra gate:
+      // they are knowledge about external things, not a view of anyone, so there
+      // is nothing here that a joint curation session needs to be present for.
+      const worldSem = await resolveContradictions(pass, { subject: 'world' });
+      result.superseded += worldSem.applied;
+
+      if (c.selfFactSemantic === true) {
+        const selfSem = await resolveContradictions(pass, { subject: 'self' });
+        result.superseded += selfSem.applied;
+      } else {
+        console.log('[Corrector] self-fact semantic corrections are OFF (corrector.selfFactSemantic) — reserved for the joint curation session');
+      }
     }
 
     // --- reconcile last, cleaning up after this pass's own writes ---

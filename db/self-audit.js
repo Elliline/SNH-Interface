@@ -52,7 +52,7 @@ const factExtractor = require('./fact-extractor');
 // NOTE: memory-manager (callLLM) is required lazily inside functions — it
 // requires this module, so a top-level require here would be a cycle.
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('./database').getMemoryDir();
 const OPS_DIR = path.join(MEMORY_DIR, 'ops');
 const AUDIT_STATE_FILE = path.join(MEMORY_DIR, 'audit-state.json');
 const EVIDENCE_TRANSCRIPT_BUDGET = 10000; // chars of transcript fed to the judge

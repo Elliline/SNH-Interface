@@ -43,7 +43,7 @@ const path = require('path');
 const { estTokens } = require('./injection-budget');
 const { getConfig } = require('./config');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('./database').getMemoryDir();
 const OPS_DIR = path.join(MEMORY_DIR, 'ops');
 const STATE_FILE = path.join(MEMORY_DIR, 'capability-manifest-state.json');
 

@@ -27,7 +27,7 @@ const initiativeEngine = require('./initiative-engine');
 const selfAudit = require('./self-audit');
 const brainWatchdog = require('./brain-watchdog');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('./database').getMemoryDir();
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 // Operational events (liveness/heartbeat failures, circuit-breaker trips,
 // maintenance-pass telemetry) go here — surfaced in the Thinking tab, never

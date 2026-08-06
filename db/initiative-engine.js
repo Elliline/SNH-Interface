@@ -20,7 +20,7 @@ const initiatives = require('./initiatives');
 const factExtractor = require('./fact-extractor');
 const path = require('path');
 
-const DAILY_DIR = path.join(__dirname, '../data/memory/daily');
+const DAILY_DIR = require('./database').getDailyDir();
 
 function initiativeConfig() {
   const cfg = getConfig();

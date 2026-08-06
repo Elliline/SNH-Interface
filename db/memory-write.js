@@ -39,7 +39,7 @@ const path = require('path');
 const { getSqliteDb } = require('./database');
 const { getConfig } = require('./config');
 
-const MEMORY_DIR = path.join(__dirname, '../data/memory');
+const MEMORY_DIR = require('./database').getMemoryDir();
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 const OPS_DIR = path.join(MEMORY_DIR, 'ops');
 

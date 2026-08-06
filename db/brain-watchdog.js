@@ -38,7 +38,7 @@ const { execFile } = require('child_process');
 const path = require('path');
 const { getConfig } = require('./config');
 
-const OPS_DIR = path.join(__dirname, '../data/memory/ops');
+const OPS_DIR = require('./database').getOpsDir();
 const HOUR_MS = 60 * 60 * 1000;
 
 // ---- State (module-local; single brain, single watchdog) --------------------

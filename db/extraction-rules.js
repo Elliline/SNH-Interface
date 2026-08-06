@@ -239,7 +239,42 @@ function grammaticalSubject(text) {
   return null;
 }
 
-// ============ 5. HISTORY vs CURRENT STATE ============
+// ============ 5. SUBJECT ANNOTATION ============
+
+/**
+ * Strip the parenthetical name the archiver staples onto its subject.
+ *
+ * "User (Ellie) has blue eyes and her favorite color is green" — the "(Ellie)"
+ * is an ANNOTATION saying who "User" refers to. It is not a claim the sentence is
+ * making, and the corpus already holds her name as a locked identity fact, so
+ * nothing is lost by removing it.
+ *
+ * It has to be removed before a compound is split, and here is the chain that
+ * makes that non-optional. The splitter is told not to lose anything, so it
+ * faithfully renders the parenthetical as its own atom: "User's name is Ellie."
+ * The corrector then sees an atom asserting an identity slot and ABANDONS the
+ * whole split — correctly, because manufacturing a name fact from a parenthetical
+ * is the F1 defect, observed live twice. So the compound stays whole. And a
+ * compound that is still whole when contradiction resolution runs can lose
+ * ENTIRELY over a dispute about one of its clauses: this exact sentence was
+ * retired for "User's favorite color is blue", taking "has blue eyes" with it.
+ *
+ * Deliberately narrow. Only a parenthetical immediately after the subject word,
+ * only where it contains a bare name — "User (Ellie)" and "User (Ellie)'s" —
+ * never a parenthetical carrying substance ("User's system (which runs 24/7)").
+ *
+ * @returns {{text: string, stripped: string|null}}
+ */
+function stripSubjectAnnotation(text) {
+  const t = String(text || '');
+  //                       subject      (  Name  )   optional possessive
+  const re = /^(\s*(?:the\s+)?user)\s*\(\s*([A-Z][\w'-]{1,30})\s*\)(\'s)?/i;
+  const m = t.match(re);
+  if (!m) return { text: t, stripped: null };
+  return { text: t.replace(re, `${m[1]}${m[3] || ''}`), stripped: m[2] };
+}
+
+// ============ 6. HISTORY vs CURRENT STATE ============
 
 /**
  * Verbs and phrasings that put a sentence in the PAST — something that happened
@@ -370,6 +405,7 @@ module.exports = {
   isHistorical,
   isCurrentState,
   historyCoexists,
+  stripSubjectAnnotation,
   RELATIONSHIP_TERMS,
   TEMPORAL_MARKERS,
   INPROGRESS_MARKERS,

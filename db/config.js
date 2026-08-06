@@ -7,6 +7,24 @@
 const fs = require('fs');
 const path = require('path');
 
+/**
+ * DELIBERATELY NOT redirected by SNH_DATA_DIR, and the only such path left.
+ *
+ * Every other file the system writes or reads under data/ now resolves through
+ * database.getDataDir(), because a path that ignores the redirect is a path a
+ * staging run writes into the live store. Configuration is the exception, and
+ * the reason is that it is not part of the corpus. A staging run is the SAME
+ * system pointed at a different store, not a differently configured one — it has
+ * to use the same extraction model, the same similarity floors, the same
+ * corrector budgets, or what it measures is not what live would do.
+ *
+ * Redirecting this would also fail quietly rather than loudly: data-staging/
+ * holds no config.json, so getConfig() would silently return bare DEFAULTS and
+ * the replay would run on a different model than the one it is validating. That
+ * is a worse failure than the one the redirect exists to prevent.
+ *
+ * Checked by scripts/test-data-dir-redirect.js, which allows exactly this file.
+ */
 const CONFIG_PATH = path.join(__dirname, '../data/config.json');
 
 const DEFAULTS = {
