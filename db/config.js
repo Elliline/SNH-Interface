@@ -216,6 +216,16 @@ const DEFAULTS = {
     clusterLinkDropThreshold: 0.40,
     maxFactsPerCluster: 10,
     dailyLogRetentionDays: 7,
+    // The daily-log archiver is a SECOND write path into her corpus and used to
+    // have none of intake's guards. A candidate user-fact this close to a
+    // self-fact he already holds is his, not hers — the same sentence with the
+    // person flipped. 0.75 is the measured gap: the 22 misattributed rows found
+    // at the merge ran 0.773–0.955, and the genuinely-hers rows in the same batch
+    // fell to 0.695 and below. It is a property of nomic-embed-text; changing the
+    // embedding model means measuring it again rather than guessing.
+    archiver: {
+      selfSimilarityFloor: 0.75
+    },
     hybridSearchWeights: { vector: 0.6, bm25: 0.4 },
     // Per-source token budgets for what gets injected into every chat's system
     // context. Long prefill (60–90s TTFT) was caused by injecting whole daily

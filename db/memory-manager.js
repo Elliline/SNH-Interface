@@ -1177,6 +1177,67 @@ function getHeartbeatReports(limit = 30) {
 // not exist yet — see docs/memory-mvp-spec.md (CORRECT).
 // ============ Task C: Summarize Daily Logs ============
 
+/**
+ * Is this candidate really a fact about ELLIE?
+ *
+ * The same two questions intake asks, asked here because the archiver is a second
+ * write path into her corpus and had none of them. Both halves matter:
+ *
+ *   GRAMMAR — extraction-rules.grammaticalSubject, the identical check
+ *   fact-extractor.planExtraction runs. A first-person sentence is his; an
+ *   unanchored one names nobody and is how a self-observation slips in wearing no
+ *   pronoun at all.
+ *
+ *   SIMILARITY — and this is the one that would have caught the 22. Their grammar
+ *   was perfect ("User aims to be a steady, non-judgmental presence…"), so no
+ *   syntactic rule could see them. What gave them away was the corpus: each sat
+ *   within a hair of a self-fact he already held, the same sentence with the
+ *   person flipped. A candidate user-fact that close to something he says about
+ *   himself is his.
+ *
+ * The floor is 0.75 — the empirical gap measured over those 22, which ran from
+ * 0.773 to 0.955 while the genuinely-hers rows in the same batch fell to 0.695
+ * and below. It is a property of nomic-embed-text; changing the embedding model
+ * means measuring it again.
+ *
+ * REFUSALS ARE SPOKEN, not swallowed. Each one is logged with the self-fact that
+ * caught it, because a guard that silently drops facts is indistinguishable from
+ * a bug that silently drops facts.
+ *
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+async function archiverSubjectCheck(factText) {
+  const rules = require('./extraction-rules');
+
+  const grammatical = rules.grammaticalSubject(factText);
+  if (grammatical === 'self') {
+    return { ok: false, reason: 'written in the first person — it is his own reflection, not a fact about her' };
+  }
+  if (grammatical !== 'user') {
+    return { ok: false, reason: 'does not name the user, so it cannot be filed as a fact about her' };
+  }
+
+  const floor = getConfig().memory?.archiver?.selfSimilarityFloor ?? 0.75;
+  try {
+    const { candidates } = await memoryClusters.findActiveNeighbours(factText, {
+      subject: 'self', threshold: floor, limit: 1, includeVerbatim: true
+    });
+    if (candidates.length) {
+      const t = candidates[0];
+      return {
+        ok: false,
+        reason: `it is ${t.similarity.toFixed(3)} from a self-fact he already holds — "${String(t.content).slice(0, 90)}" — so it describes him, not her`
+      };
+    }
+  } catch (err) {
+    // A failed check must not become a silent accept. The archiver is the path
+    // that produced the misattribution; if its guard cannot run, it does not write.
+    return { ok: false, reason: `the self-similarity check could not run (${err.message}), so this was not stored` };
+  }
+
+  return { ok: true };
+}
+
 async function summarizeDailyLogs() {
   console.log('[Heartbeat] Task C: Summarizing old daily logs...');
   const results = { archived: 0, factsExtracted: 0 };
@@ -1221,12 +1282,30 @@ async function summarizeDailyLogs() {
           continue;
         }
 
+        // THE PROMPT USED TO MANUFACTURE THE MISATTRIBUTION.
+        //
+        // It said, flatly: 'Write facts as "User has..." or "User prefers..."
+        // style.' A daily log is not only about Ellie — it holds his reflections
+        // too ("I tend to lean into conceptual frameworks and metaphors…") — and
+        // that instruction told the summarizer to rewrite every one of them into
+        // the third person about her. It did exactly as it was told. 22 of them
+        // were still in the corpus at the merge, each sitting between 0.773 and
+        // 0.955 of the self-fact it had been copied from, and every one had
+        // impeccable grammar so nothing downstream could see it.
+        //
+        // So the prompt now asks WHOSE the fact is instead of assuming, and is
+        // told to drop his — the reflection loop already records what he notices
+        // about himself, and self-facts are curated with him rather than
+        // extracted around him.
         const systemPrompt = `You are a memory log summarizer. Review the daily log below and extract any important facts that should be preserved long-term. Return ONLY valid JSON:
 {"summary":"one-line summary of the day","remainingFacts":["fact1","fact2"]}
 
+The log contains entries about TWO different people: ELLIE, the human, and the AI ASSISTANT itself, which writes reflections about its own behaviour in the first person.
+
 Rules:
-- remainingFacts should only contain facts worth preserving permanently (user preferences, project decisions, personal info).
-- Write facts as "User has..." or "User prefers..." style.
+- remainingFacts must contain ONLY facts about ELLIE — her preferences, her work, her projects, her life, her decisions. Write each one starting with "User".
+- DROP anything the assistant wrote about ITSELF. Reflections like "I tend to lean into metaphors", "I aim to be a steady presence", "I prioritize accuracy about my own history" are the assistant describing its own behaviour. They are recorded elsewhere and must NOT be rewritten as facts about the user. If you are unsure whose a statement is, drop it.
+- A statement about how someone TALKS TO or SUPPORTS Ellie — holding space, asking probing questions, being non-judgmental, acting as a sounding board — is the assistant describing itself. Drop it.
 - Skip routine entries like "Chat exchange with model - 0 facts extracted".
 - If nothing is worth keeping, return {"summary":"...","remainingFacts":[]}.`;
 
@@ -1252,6 +1331,17 @@ Rules:
             const extHost = extInst ? extInst.host : 'http://localhost:11434';
             let written = 0;
             for (const vf of validFacts) {
+              // THE RULES DECIDE, NOT THE PROMPT. The instruction above can be
+              // skimmed on a bad night; this cannot.
+              const verdict = await archiverSubjectCheck(vf);
+              if (!verdict.ok) {
+                results.refused = (results.refused || 0) + 1;
+                (results.refusals = results.refusals || []).push({ text: vf, why: verdict.reason });
+                const line = `Daily-log archiver refused "${String(vf).slice(0, 110)}" — ${verdict.reason}`;
+                console.log(`[Heartbeat] ${line}`);
+                try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* best effort */ }
+                continue;
+              }
               const res = await memoryClusters.assignToCluster(
                 vf, ext.provider, ext.model, '', extHost,
                 'daily-log-archive', 5, 'user', null,
@@ -1264,7 +1354,7 @@ Rules:
               if (res && res.memberId && !res.duplicateOf) written++;
             }
             results.factsExtracted += written;
-            console.log(`[Heartbeat] Preserved ${written}/${validFacts.length} fact(s) from ${file} (rest already held)`);
+            console.log(`[Heartbeat] Preserved ${written}/${validFacts.length} fact(s) from ${file} (rest already held or refused)`);
           }
         }
 
@@ -2097,4 +2187,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };
