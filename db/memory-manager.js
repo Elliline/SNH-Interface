@@ -590,8 +590,21 @@ function repairTruncatedJSON(text) {
  * Designed as a self-contained unit so that future parallelization is trivial —
  * just swap the sequential loop for Promise.all().
  *
- * @param {Object} cluster - Cluster row from getClusters() (has id, name, member_count)
- * @returns {Promise<{clusterId: string, clusterName: string, coherent: boolean, splits: Array, durationMs: number, error?: string}>}
+ * ACTIVE MEMBERS ONLY (2026-08-10). getCluster returns ghosts on purpose — the
+ * Memory Map draws them — but showing them to the auditor asks it to reorganise
+ * facts nobody believes any more. It duly proposed splits made entirely of
+ * superseded rows, executeSplits refused every one (correctly: the write guard
+ * is active-only), and the refusals were logged as anomalies. Identical
+ * anomalies, every pass, for four days, while the two all-ghost clusters ate
+ * 47s of the 69s pass. The audit is a DECISION about a cluster, so it reads the
+ * live corpus; the ghost stays visible where it belongs, on the Map.
+ *
+ * Under two active members there is nothing to judge — one fact cannot be
+ * incoherent with itself — so the cluster leaves the rotation without an LLM
+ * call, and an all-ghost cluster keeps its name for the Map and goes quiet.
+ *
+ * @param {Object} cluster - Cluster row from getClusters() (has id, name, member_count, active_member_count)
+ * @returns {Promise<{clusterId: string, clusterName: string, coherent: boolean, splits: Array, durationMs: number, skipped?: string, error?: string}>}
  */
 async function auditClusterCoherence(cluster) {
   const startMs = Date.now();
@@ -604,7 +617,16 @@ async function auditClusterCoherence(cluster) {
       return base;
     }
 
-    const factLines = detail.members.map(m => {
+    const activeMembers = detail.members.filter(m => (m.status || 'active') === 'active');
+    if (activeMembers.length < 2) {
+      base.durationMs = Date.now() - startMs;
+      base.skipped = activeMembers.length === 0
+        ? 'no active members — ghosts only'
+        : 'only one active member';
+      return base;
+    }
+
+    const factLines = activeMembers.map(m => {
       const ts = m.created_at ? m.created_at.split('T')[0] : 'unknown';
       const src = m.source || 'unknown';
       return `[id:${m.id}] [date:${ts}] [source:${src}] ${m.content}`;
@@ -638,7 +660,7 @@ Rules:
 - If in doubt, return coherent: true.`;
 
     // Scale max_tokens: ~100 tokens per fact (40 visible JSON + ~60 model reasoning overhead) + 500 buffer
-    const estOutputTokens = Math.min(12288, Math.max(1024, detail.members.length * 100 + 500));
+    const estOutputTokens = Math.min(12288, Math.max(1024, activeMembers.length * 100 + 500));
     const userPrompt = `Facts in cluster "${cluster.name}":\n${factLines}`;
     const { content, truncated } = await callLLM(systemPrompt, userPrompt, { maxTokens: estOutputTokens });
     let parsed = parseJSON(content);
@@ -885,6 +907,79 @@ async function executeSplits(auditResults) {
 // ============ Step 4: Generate Report ============
 
 /**
+ * How long an anomaly may go unseen before its memo is forgotten. A condition
+ * that clears and comes back weeks later is news again; one that is still true
+ * on the next pass is not.
+ */
+const ANOMALY_STATE_TTL_DAYS = 30;
+
+/**
+ * Split this pass's anomalies into the ones worth printing and the ones already
+ * on record, and update the memo.
+ *
+ * The corrector's gate reads its last pass off disk so a restart cannot hand it
+ * a fresh turn; this is the same trick applied to reporting, so a restart cannot
+ * hand an old anomaly a fresh voice either. State lives in SQLite, which means
+ * it follows SNH_DATA_DIR — a staging replay memoises against staging and leaves
+ * the live log's history alone.
+ *
+ * Fails OPEN: if the table cannot be read, every anomaly is treated as fresh.
+ * Losing a warning to a bookkeeping error is worse than repeating one.
+ *
+ * @param {string[]} anomalies - every anomaly this pass observed
+ * @returns {{fresh: string[], suppressed: number, oldestSuppressedAt: string|null}}
+ */
+function partitionAnomalies(anomalies) {
+  if (!anomalies || anomalies.length === 0) {
+    return { fresh: [], suppressed: 0, oldestSuppressedAt: null };
+  }
+
+  const db = getSqliteDb();
+  if (!db) return { fresh: [...anomalies], suppressed: 0, oldestSuppressedAt: null };
+
+  const now = new Date().toISOString();
+  const fresh = [];
+  let suppressed = 0;
+  let oldestSuppressedAt = null;
+
+  try {
+    // Prune first, so a long-quiet anomaly is genuinely new again rather than
+    // resurfacing as "seen 40 times" with a stale first_seen_at.
+    const cutoff = new Date(Date.now() - ANOMALY_STATE_TTL_DAYS * 86400_000).toISOString();
+    db.prepare('DELETE FROM heartbeat_anomaly_state WHERE last_seen_at < ?').run(cutoff);
+
+    const get = db.prepare('SELECT first_seen_at, seen_count FROM heartbeat_anomaly_state WHERE anomaly_key = ?');
+    const insert = db.prepare(
+      'INSERT INTO heartbeat_anomaly_state (anomaly_key, first_seen_at, last_seen_at, seen_count, anomaly_text) VALUES (?, ?, ?, 1, ?)'
+    );
+    const bump = db.prepare(
+      'UPDATE heartbeat_anomaly_state SET last_seen_at = ?, seen_count = seen_count + 1 WHERE anomaly_key = ?'
+    );
+
+    // One pass may legitimately observe the same anomaly text twice; count it
+    // once so the memo tracks conditions, not occurrences.
+    for (const key of new Set(anomalies.map(a => String(a)))) {
+      const seen = get.get(key);
+      if (seen) {
+        bump.run(now, key);
+        suppressed++;
+        if (!oldestSuppressedAt || seen.first_seen_at < oldestSuppressedAt) {
+          oldestSuppressedAt = seen.first_seen_at;
+        }
+      } else {
+        insert.run(key, now, now, key);
+        fresh.push(key);
+      }
+    }
+  } catch (err) {
+    console.error('[Heartbeat] anomaly dedup failed, reporting everything:', err.message);
+    return { fresh: [...anomalies], suppressed: 0, oldestSuppressedAt: null };
+  }
+
+  return { fresh, suppressed, oldestSuppressedAt };
+}
+
+/**
  * Build a structured heartbeat report, log it to console and append to today's daily log file.
  *
  * @param {Object} opts
@@ -897,23 +992,38 @@ function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }
   const totalDurationMs = Date.now() - cycleStartMs;
   const totalDuration = (totalDurationMs / 1000).toFixed(1) + 's';
 
-  const clustersAudited = auditResults.length;
+  // "Audited" means put to the model. A cluster that left the rotation for want
+  // of two active members was not audited, and counting it as though it were is
+  // how a pass reports twenty clusters reviewed while judging eighteen.
+  const clustersAudited = auditResults.filter(r => !r.skipped).length;
+  const clustersSkipped = auditResults.filter(r => r.skipped).length;
   const clustersSplit = splitResults.clustersSplit || 0;
 
-  const perClusterTiming = auditResults.map(r => ({
-    clusterName: r.clusterName,
-    durationMs: r.durationMs || 0
-  }));
+  const perClusterTiming = auditResults
+    .filter(r => !r.skipped)
+    .map(r => ({
+      clusterName: r.clusterName,
+      durationMs: r.durationMs || 0
+    }));
 
-  const anomalies = [
+  const observedAnomalies = [
     ...auditResults.filter(r => r.error).map(r => `Audit error for "${r.clusterName}": ${r.error}`),
     ...(splitResults.anomalies || []),
 
   ];
 
+  // Only what CHANGED goes in the report. The rest is counted, not repeated.
+  const { fresh: anomalies, suppressed: anomaliesSuppressed, oldestSuppressedAt } =
+    partitionAnomalies(observedAnomalies);
+  const suppressedNote = anomaliesSuppressed > 0
+    ? `${anomaliesSuppressed} unchanged anomaly(ies) still true, already reported${oldestSuppressedAt ? ` (oldest first seen ${oldestSuppressedAt.slice(0, 10)})` : ''}`
+    : null;
+
   const report = {
     status: 'ok',
     clustersAudited,
+    // Left the rotation without an LLM call — fewer than two active members.
+    clustersSkipped,
     clustersSplit,
     splitDetails: splitResults.splitDetails || [],
     // Always 0 from 2026-08-02: the cross-link audit is deleted and nothing
@@ -941,21 +1051,27 @@ function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }
     // mergeByName all return counts that nothing persisted.
     steps,
     perClusterTiming,
-    anomalies
+    // NEW anomalies only. `anomaliesObserved` is what the pass actually saw, so
+    // nothing is lost — but a reader (human or Thinking tab) is shown change.
+    anomalies,
+    anomaliesObserved: observedAnomalies.length,
+    anomaliesSuppressed,
+    suppressedNote
   };
 
   // Console summary
   console.log('[Heartbeat] === Heartbeat Report ===');
-  console.log(`[Heartbeat]   Clusters audited : ${clustersAudited}`);
+  console.log(`[Heartbeat]   Clusters audited : ${clustersAudited}${clustersSkipped > 0 ? ` (${clustersSkipped} skipped — too few active members)` : ''}`);
   console.log(`[Heartbeat]   Clusters split   : ${clustersSplit}`);
   console.log(`[Heartbeat]   Links added      : ${report.linksAdded}`);
   console.log(`[Heartbeat]   Links updated    : ${report.linksUpdated}`);
   console.log(`[Heartbeat]   Links removed    : ${report.linksRemoved}`);
   console.log(`[Heartbeat]   Total duration   : ${totalDuration}`);
   if (anomalies.length > 0) {
-    console.log(`[Heartbeat]   Anomalies (${anomalies.length}):`);
+    console.log(`[Heartbeat]   New anomalies (${anomalies.length}):`);
     for (const a of anomalies) console.log(`[Heartbeat]     - ${a}`);
   }
+  if (suppressedNote) console.log(`[Heartbeat]   ${suppressedNote}`);
   console.log('[Heartbeat] === End Report ===');
 
   // Prepend to the OPS log (newest first) — this is maintenance telemetry, not
@@ -974,9 +1090,14 @@ function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }
       }).join('\n');
     }
 
+    // New anomalies get their line; ones already on record get one line between
+    // them. Four days of identical warnings is what this replaces.
     let anomalySection = '';
     if (anomalies.length > 0) {
-      anomalySection = '\n### Anomalies\n' + anomalies.map(a => `- ${a}`).join('\n');
+      anomalySection = '\n### Anomalies (new)\n' + anomalies.map(a => `- ${a}`).join('\n');
+    }
+    if (suppressedNote) {
+      anomalySection += `\n\n_${suppressedNote}._`;
     }
 
     const timingRows = perClusterTiming
@@ -991,6 +1112,7 @@ function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }
       `| Metric | Value |`,
       `|--------|-------|`,
       `| Clusters audited | ${clustersAudited} |`,
+      `| Clusters skipped (too few active facts) | ${clustersSkipped} |`,
       `| Clusters split | ${clustersSplit} |`,
       `| Links added | ${report.linksAdded} |`,
       `| Links updated | ${report.linksUpdated} |`,
@@ -1033,6 +1155,9 @@ function recordHeartbeatReport(report) {
       report.linksUpdated || 0,
       report.linksRemoved || 0,
       report.totalDuration || null,
+      // NEW anomalies, matching report.anomalies. The total this pass observed
+      // is in report_json as anomaliesObserved — the column is the change
+      // signal the Activity view trends, and a flat line of 29 is not one.
       (report.anomalies || []).length,
       JSON.stringify(report),
       report.totalDurationMs ?? null
@@ -1148,6 +1273,9 @@ function getHeartbeatReports(limit = 30) {
         linksRemoved: r.links_removed,
         duration: r.duration,
         anomalies: full.anomalies || [],
+        anomaliesSuppressed: full.anomaliesSuppressed || 0,
+        suppressedNote: full.suppressedNote || null,
+        clustersSkipped: full.clustersSkipped || 0,
         splitDetails: full.splitDetails || []
       };
     });
@@ -1670,7 +1798,9 @@ async function runAuditPipeline(clusters) {
   agentPool.startPass('heartbeat-cluster-audit');
   const settled = await agentPool.runBatch(
     clusters.map(cluster => async () => {
-      console.log(`[Heartbeat] Auditing cluster "${cluster.name}" (${cluster.member_count} members)`);
+      const active = cluster.active_member_count ?? cluster.member_count;
+      const ghosts = (cluster.member_count ?? active) - active;
+      console.log(`[Heartbeat] Auditing cluster "${cluster.name}" (${active} active member(s)${ghosts > 0 ? `, ${ghosts} ghost(s) not shown to the auditor` : ''})`);
       return auditClusterCoherence(cluster);
     }),
     'cluster-audit'
@@ -1801,9 +1931,11 @@ async function runMaintenance() {
     const maxFacts = config.memory.maxFactsPerCluster || 10;
 
     const allClusters = memoryClusters.getClusters();
-    const oversizedClusters = allClusters.filter(c => c.member_count > maxFacts);
+    // ACTIVE count, not the total: a cluster of thirteen superseded facts is not
+    // an oversized cluster, it is an empty one with a history. See getClusters.
+    const oversizedClusters = allClusters.filter(c => c.active_member_count > maxFacts);
 
-    console.log(`[Heartbeat] ${allClusters.length} total cluster(s), ${oversizedClusters.length} exceed maxFactsPerCluster (${maxFacts})`);
+    console.log(`[Heartbeat] ${allClusters.length} total cluster(s), ${oversizedClusters.length} exceed maxFactsPerCluster (${maxFacts}) by ACTIVE members`);
 
     let auditResults = [];
     let splitResults = { clustersSplit: 0, splitDetails: [], anomalies: [] };
@@ -2187,4 +2319,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };

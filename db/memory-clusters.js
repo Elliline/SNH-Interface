@@ -1058,7 +1058,16 @@ async function searchClusters(query, limit = 3) {
 }
 
 /**
- * Get all clusters with member counts
+ * Get all clusters with member counts.
+ *
+ * TWO counts, deliberately. `member_count` is every row, ghosts included —
+ * that is what the Memory Map draws, and dropping the ghosts from it would
+ * empty half the map. `active_member_count` is the live corpus, and it is what
+ * anything DECIDING about a cluster should read: the coherence audit spent four
+ * days re-auditing two clusters that were 100% superseded facts, because
+ * `member_count > maxFactsPerCluster` counted the ghosts. Same rule as the
+ * split guard — inactive members are for looking at, not for acting on.
+ *
  * @returns {Array} - Array of clusters with metadata
  */
 function getClusters(subject = null) {
@@ -1071,7 +1080,9 @@ function getClusters(subject = null) {
     const where = subject ? 'WHERE mc.subject = ?' : '';
     const params = subject ? [subject] : [];
     const clusters = db.prepare(`
-      SELECT mc.*, COUNT(cm.id) as member_count
+      SELECT mc.*,
+             COUNT(cm.id) as member_count,
+             COALESCE(SUM(CASE WHEN cm.status = 'active' THEN 1 ELSE 0 END), 0) as active_member_count
       FROM memory_clusters mc
       LEFT JOIN cluster_members cm ON mc.id = cm.cluster_id
       ${where}

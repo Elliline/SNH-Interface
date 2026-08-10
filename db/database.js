@@ -443,6 +443,33 @@ function initDatabase() {
       )
     `);
 
+    // Heartbeat anomalies the ops log has already reported.
+    //
+    // Same idea as corrector_pair_checks, for the same reason: a pass that
+    // re-states an unchanged condition is not telemetry, it is wallpaper. The
+    // cluster audit emitted the SAME 29 anomaly lines every two hours from
+    // 2026-08-07 to 2026-08-10 — 350 lines of ops log in which nothing had
+    // happened — and real entries (the corrector's) were buried under them.
+    //
+    // So an anomaly is reported in full the first time, then counted. The ops
+    // log gets the new ones plus one line saying how many old ones are still
+    // true. `first_seen_at` is what makes the count meaningful: "unchanged
+    // since Friday" is a different fact from "started this pass".
+    //
+    // Rows are pruned once an anomaly has gone quiet for a while (see
+    // ANOMALY_STATE_TTL_DAYS), so a condition that clears and later comes back
+    // is reported fresh rather than silently folded into a months-old count.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS heartbeat_anomaly_state (
+        anomaly_key TEXT PRIMARY KEY,
+        first_seen_at DATETIME,
+        last_seen_at DATETIME,
+        seen_count INTEGER DEFAULT 1,
+        anomaly_text TEXT
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_anomaly_state_last_seen ON heartbeat_anomaly_state(last_seen_at)');
+
     // Correction notices — the private channel to Aurelius (decision 6).
     //
     // Deliberately NOT rows in `initiatives`. Every property these need is a way

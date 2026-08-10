@@ -218,6 +218,31 @@ returns inactive members deliberately (the Memory Map draws them as ghosts), so
 the filter belongs at the WRITE, never on the read. `reconcile()` is the detector;
 if it reports `retiredWithVector > 0`, something is re-adding.
 
+**A ghost is for looking at, never for deciding on.** The same split runs both
+ways: anything that JUDGES a cluster reads active members only. The coherence
+audit did not, and spent four days re-auditing two clusters that were 100%
+superseded — the rotation picked them because `member_count` counts ghosts, the
+model was shown the ghosts and proposed splits made of dead facts, the write
+guard above refused every one, and each refusal was logged. `getClusters` now
+returns `active_member_count` beside `member_count`; `member_count` is the Map's,
+`active_member_count` is every decision's. Under two active members a cluster
+leaves the audit rotation without an LLM call and keeps its name for the Map.
+
+## ⚠️ Telemetry reports CHANGE, not state
+
+An ops entry that repeats an unchanged condition is wallpaper, and wallpaper
+hides the entries that matter — the audit's 29 identical anomalies every two
+hours buried the corrector's one-line pass reports for four days. So heartbeat
+anomalies go through `partitionAnomalies`: reported in full the first time,
+counted thereafter (`heartbeat_anomaly_state`, same shape and same reasoning as
+`corrector_pair_checks`), pruned once quiet for `ANOMALY_STATE_TTL_DAYS` so a
+condition that clears and returns is news again. It **fails open** — a memo it
+cannot read means every anomaly is fresh, because losing a warning to
+bookkeeping is worse than repeating one. `report.anomalies` is the new ones and
+the `anomaly_count` column matches it; the pass's real total stays in
+`report_json` as `anomaliesObserved`. Verify with
+`node scripts/test-cluster-audit-quiet.js`.
+
 ## Conventions worth knowing
 
 - **Plain-language norm:** bell/initiative/audit notes and capability descriptions

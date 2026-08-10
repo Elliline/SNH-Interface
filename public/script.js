@@ -3886,14 +3886,22 @@ async function loadThinkingTab() {
         parts.push((e.clustersAudited || 0) === 0
           ? 'Reviewed memory — no oversized clusters needed auditing'
           : `Audited ${pl(e.clustersAudited, 'cluster')} for coherence`);
+        if (e.clustersSkipped > 0) parts.push(`skipped ${pl(e.clustersSkipped, 'cluster')} with too few live facts to judge`);
         if (e.clustersSplit > 0) parts.push(`reorganized ${pl(e.clustersSplit, 'cluster')} into clearer topics`);
         if (e.linksAdded > 0) parts.push(`created ${pl(e.linksAdded, 'new connection')} between topics`);
         if (e.linksUpdated > 0) parts.push(`strengthened ${pl(e.linksUpdated, 'connection')}`);
         if (e.linksRemoved > 0) parts.push(`dropped ${pl(e.linksRemoved, 'stale connection')}`);
         if (e.duration) parts.push(`took ${escapeHtml(e.duration)}`);
         const sentence = parts.join(' · ');
-        const anomalies = (e.anomalies || []).length
-          ? `<div class="thinking-anomalies">${(e.anomalies || []).map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(friendlyAnomaly(a))}</div>`).join('')}</div>`
+        // Only NEW warnings get a line each. Ones already reported and still
+        // true are counted on one dim line, so the feed shows change.
+        const anomalyLines = (e.anomalies || [])
+          .map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(friendlyAnomaly(a))}</div>`);
+        if (e.anomaliesSuppressed > 0) {
+          anomalyLines.push(`<div class="thinking-anomaly thinking-dim">${escapeHtml(e.suppressedNote || `${e.anomaliesSuppressed} unchanged warning(s) still true, already reported`)}</div>`);
+        }
+        const anomalies = anomalyLines.length
+          ? `<div class="thinking-anomalies">${anomalyLines.join('')}</div>`
           : '';
         html += `
           <div class="thinking-entry thinking-heartbeat">
