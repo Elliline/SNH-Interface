@@ -1270,6 +1270,40 @@ router.delete('/fact/:id', async (req, res) => {
       });
     }
 
+    // LEDGER IT. Retiring is a change to the record, so it belongs in the same
+    // ledger as the corrector's changes, for the same reason: an edit with no
+    // entry is indistinguishable from corruption later, and "reversible" is
+    // worthless unless something actually names the fact to put back. The entry
+    // is what makes the Self tab's Revert button and scripts/revert-correction.js
+    // work on a hand-retraction — they read `target_id` and call restore, and
+    // neither cares whether a person or the corrector filed the entry.
+    //
+    // Written HERE rather than inside factStore.retire because the ledger's
+    // `reason` is the caller's to tell: the sweep scripts and the staging carry
+    // already write their own, and a generic entry from the store would either
+    // duplicate theirs or say nothing worth reading.
+    let ledgerId = null;
+    if (retired.ok) {
+      const correctionsLedger = require('../db/corrections-ledger');
+      ledgerId = correctionsLedger.record({
+        passId: `manual-retract-${new Date().toISOString().slice(0, 10)}`,
+        tier: 'mechanical',
+        action: 'retract',
+        subject: member.subject || 'user',
+        targetId: id,
+        targetText: member.content,
+        reason: 'Ellie removed this fact by hand from the Memory tab. Retired, not deleted — the row is kept as history and can be restored.',
+        evidence: {
+          reason_code: 'user-requested-removal',
+          via: 'DELETE /api/memory/fact/:id',
+          source: member.source || null,
+          cluster_id: member.cluster_id,
+          vector_dropped: retired.vector === true
+        },
+        reversible: true
+      });
+    }
+
     // Clean up a cluster that has no rows left AT ALL.
     //
     // This used to count only ACTIVE members and then delete the cluster, which
@@ -1296,7 +1330,20 @@ router.delete('/fact/:id', async (req, res) => {
       console.error('[MemoryAPI] Cluster cleanup after retire failed (fact IS retired):', cleanupError.message);
     }
 
-    res.json({ success: true, deletedId: id });
+    // `deletedId` is kept for any caller still reading it, but the response says
+    // what actually happened. It claimed `success: true` for a DELETE while the
+    // row was in fact retired and still listed — which is how a working
+    // retirement read to Ellie as a delete button that did nothing.
+    res.json({
+      success: true,
+      retired: true,
+      retiredId: id,
+      deletedId: id,
+      ledgerId,
+      alreadyRetired: !retired.ok && !retired.locked,
+      vectorDropped: retired.vector === true,
+      message: 'Retired — kept as history'
+    });
   } catch (error) {
     console.error('[MemoryAPI] Error deleting fact:', error.message);
     res.status(500).json({ error: 'Failed to delete fact' });

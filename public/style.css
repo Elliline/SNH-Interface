@@ -1493,6 +1493,42 @@ a.msg-source:hover {
   border-color: var(--primary-color);
 }
 
+/* Retired facts read as history, not as memory. Same treatment as a superseded
+   self-fact, and deliberately without hover actions — there is nothing to edit
+   or delete on a fact that is already out of memory. */
+.memory-facts-retired {
+  margin-top: 18px;
+}
+
+.memory-facts-retired-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}
+
+.memory-fact-item.retired {
+  opacity: 0.6;
+}
+
+.memory-fact-item.retired:hover {
+  border-color: var(--border-color);
+}
+
+.memory-fact-item.retired .memory-fact-content {
+  padding-right: 0;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-fact-retired-note {
+  margin-top: 5px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
 .memory-fact-item:hover .memory-fact-actions {
   opacity: 1;
 }
@@ -1587,6 +1623,19 @@ a.msg-source:hover {
 
 .memory-cluster-member:last-child {
   border-bottom: none;
+}
+
+.memory-cluster-member.retired {
+  opacity: 0.55;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-cluster-member-note {
+  text-decoration: none;
+  display: inline-block;
+  font-size: 0.7rem;
+  font-style: italic;
 }
 
 .memory-cluster-linked {

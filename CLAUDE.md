@@ -133,6 +133,28 @@ two contracts.
   Read intent is matched NARROWLY (`classifyMemoryReadIntent`) — a false positive
   has him answering a casual remark with a database report.
 
+- **And the inverse: an action that HAPPENED must be visible.** The phantom
+  family's mirror image, and it cost Ellie a fact she could not remove. Retiring
+  a fact from the Memory tab worked perfectly — row inactive/retracted, embedding
+  dropped — and the Facts tab then re-rendered the retired row identically, edit
+  and delete buttons and all, because it filtered members by subject and never by
+  status. A correct irreversible-looking operation that changes nothing on screen
+  reads as a dead button, and she pressed it again. **Anything listing
+  `cluster_members` must bucket on `status`**: the endpoint returns ghosts on
+  purpose (the Map draws them), so the reader distinguishes them. Retired facts
+  are shown as history — struck through, labelled "retired — kept as history", no
+  edit or delete — never hidden, because nothing here is deleted and hiding them
+  would be its own lie.
+
+- **A hand-retraction is ledgered like any other change.** `DELETE
+  /api/memory/fact/:id` writes a `retract` entry (`corrections_ledger`,
+  reversible, `reason_code: user-requested-removal`) so the Self tab's Revert and
+  `scripts/revert-correction.js` work on it unchanged — both read `target_id` and
+  call `restore`, and neither cares whether a person or the corrector filed it.
+  The entry is written at the ROUTE, not in `factStore.retire`: the ledger's
+  `reason` is the caller's to tell, and the sweep scripts and the staging carry
+  already write their own.
+
 ## ⚠️ The heartbeat has hands, and exactly one step uses them
 
 `callLLM` takes an optional `options.toolSession`. Without one it sends no

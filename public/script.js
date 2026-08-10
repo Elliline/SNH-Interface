@@ -3318,9 +3318,16 @@ async function loadFactsTab() {
           // Facts tab is user-facts only. Skip any self-observation that may sit
           // inside a user cluster (subject defaults to 'user' for legacy rows).
           if ((member.subject || 'user') !== 'user') continue;
+          // STATUS travels with the fact. Without it this list rendered ghosts
+          // and live facts identically, edit and delete buttons and all — so
+          // retiring a fact changed nothing visible and the delete button read
+          // as broken. The cluster endpoint returns inactive members on purpose
+          // (the Map draws them); it is the reader's job to tell them apart.
           memoryFactsCache.push({
             id: member.id,
             content: member.content,
+            status: member.status || 'active',
+            inactiveReason: member.inactive_reason || null,
             clusterName: cluster.name,
             clusterId: cluster.id
           });
@@ -3333,15 +3340,46 @@ async function loadFactsTab() {
       return;
     }
 
-    container.innerHTML = memoryFactsCache.map(fact => `
+    const live = memoryFactsCache.filter(f => f.status === 'active');
+    const retired = memoryFactsCache.filter(f => f.status !== 'active');
+
+    // Why a fact is no longer held, in the words the store uses.
+    const RETIRED_LABEL = {
+      retracted: 'retired — kept as history',
+      superseded: 'replaced by a newer fact — kept as history',
+      expired: 'was a passing event, moved to the day\'s log — kept as history'
+    };
+
+    let factsHtml = live.length === 0
+      ? '<div class="memory-empty">No facts held right now.</div>'
+      : live.map(fact => `
       <div class="memory-fact-item" data-id="${fact.id}">
         <div class="memory-fact-content">${escapeHtml(fact.content)}</div>
         <div class="memory-fact-actions">
           <button class="memory-fact-action-btn edit" data-id="${fact.id}" title="Edit">&#9998;</button>
-          <button class="memory-fact-action-btn delete" data-id="${fact.id}" title="Delete">&#128465;</button>
+          <button class="memory-fact-action-btn delete" data-id="${fact.id}" title="Retire — kept as history">&#128465;</button>
         </div>
       </div>
     `).join('');
+
+    // Retired facts are shown, because nothing here is deleted and hiding them
+    // would be its own lie — but shown as history: struck through, labelled, and
+    // with no edit or delete buttons, since neither means anything on a fact
+    // that is already out of memory. Restoring one is the Self tab's Revert.
+    if (retired.length > 0) {
+      factsHtml += `
+        <div class="memory-facts-retired">
+          <h3 class="memory-facts-retired-head">Retired <span class="memory-self-count">(${retired.length}) — kept as history, not in memory</span></h3>
+          ${retired.map(fact => `
+            <div class="memory-fact-item retired" data-id="${fact.id}">
+              <div class="memory-fact-content">${escapeHtml(fact.content)}</div>
+              <div class="memory-fact-retired-note">${escapeHtml(RETIRED_LABEL[fact.inactiveReason] || 'no longer held — kept as history')}</div>
+            </div>
+          `).join('')}
+        </div>`;
+    }
+
+    container.innerHTML = factsHtml;
 
     // Attach edit/delete handlers
     container.querySelectorAll('.memory-fact-action-btn.edit').forEach(btn => {
@@ -3419,9 +3457,14 @@ async function toggleClusterExpand(clusterId) {
     if (data.members) {
       // Clusters tab is user-facts only — never render self-observations that
       // may sit inside a user cluster (legacy rows before the subject guard).
+      // Retired members stay listed — this is the cluster's whole membership,
+      // ghosts included, same as the Map — but they are marked as history so
+      // the list cannot be read as "these are things SNH holds".
       html += data.members
         .filter(m => (m.subject || 'user') === 'user')
-        .map(m => `<div class="memory-cluster-member">${escapeHtml(m.content)}</div>`)
+        .map(m => (m.status || 'active') === 'active'
+          ? `<div class="memory-cluster-member">${escapeHtml(m.content)}</div>`
+          : `<div class="memory-cluster-member retired">${escapeHtml(m.content)} <span class="memory-cluster-member-note">retired — kept as history</span></div>`)
         .join('');
     }
 
@@ -3546,7 +3589,7 @@ async function loadSelfTab() {
     if (corrections.length === 0) {
       html += '<div class="memory-empty">No corrections yet. The corrector runs on its own cadence and repairs the corpus — duplicates folded together, events that were stored as facts moved to the day\'s log, contradictions resolved on evidence.</div>';
     } else {
-      html += '<div class="memory-self-note">What the corrector changed, unattended, and why. Mechanical repairs fix the record; semantic ones revise a belief and are only allowed to happen unattended <em>because</em> every one of them can be undone here. Reverting restores the retired fact and leaves the surviving one alone.</div>';
+      html += '<div class="memory-self-note">Every change to the record, and why — the corrector\'s unattended repairs, and facts you retired by hand from the Memory tab. Mechanical repairs fix the record; semantic ones revise a belief and are only allowed to happen unattended <em>because</em> every one of them can be undone here. Reverting restores the retired fact and leaves the surviving one alone.</div>';
       html += '<div class="memory-corrections">';
       html += corrections.map(c => {
         const ev = c.evidence || {};
@@ -4684,27 +4727,42 @@ async function editFact(memberId) {
   }
 }
 
-// ---- Delete Fact ----
+// ---- Retire Fact ----
+//
+// Named for what it does. Nothing in this system hard-deletes a fact: the row
+// is kept as inactive/retracted so the history stays readable and the Map can
+// still draw it, and only its embedding is dropped so it stops surfacing. The
+// confirm used to say "Delete this fact?" and the list then re-rendered the
+// retired row exactly as before — so the honest outcome looked like no outcome.
 async function deleteFact(memberId) {
   const fact = memoryFactsCache.find(f => f.id === memberId);
   if (!fact) return;
 
-  if (!confirm(`Delete this fact?\n\n"${fact.content.substring(0, 100)}..."`)) return;
+  if (!confirm(
+    `Retire this fact?\n\n"${fact.content.substring(0, 100)}${fact.content.length > 100 ? '…' : ''}"\n\n` +
+    `It stops being part of memory and stops surfacing in answers. ` +
+    `The record is kept as history and can be restored from the Self tab.`
+  )) return;
 
   try {
     const res = await fetch(`/api/memory/fact/${memberId}`, {
       method: 'DELETE'
     });
 
+    const result = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to delete fact');
+      throw new Error(result.error || 'Failed to retire fact');
     }
 
-    loadFactsTab();
+    await loadFactsTab();
+    // Say it plainly, and only about the fact that moved. Silence here is what
+    // made a working retirement indistinguishable from a dead button.
+    alert(result.alreadyRetired
+      ? 'That fact was already retired — it is kept as history and is not in memory.'
+      : `${result.message || 'Retired — kept as history'}. It will no longer surface in answers.`);
   } catch (error) {
-    console.error('[MemoryPanel] Error deleting fact:', error);
-    alert('Failed to delete fact: ' + error.message);
+    console.error('[MemoryPanel] Error retiring fact:', error);
+    alert('Failed to retire fact: ' + error.message);
   }
 }
 
