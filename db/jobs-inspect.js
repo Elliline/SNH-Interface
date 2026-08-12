@@ -36,6 +36,23 @@
  */
 
 const { getSqliteDb } = require('./database');
+const { formatFactTimestamp } = require('./datetime');
+
+/**
+ * Times go to him in LOCAL time, the way every other timestamp in his context
+ * does (formatFactTimestamp is what the identity block uses).
+ *
+ * Measured, on the first day this tool returned real times: handed the raw
+ * "2026-08-12T16:01:00.174Z", he reported the run as "4:01 AM (UTC)" — the right
+ * instant, converted wrong, and stated with the confidence of something read off
+ * a record. A cron schedule here is local ("0 9 * * *" means 9am in this house),
+ * so a UTC string is also the wrong unit for the question being asked. The ISO
+ * value is kept alongside under an explicit name for anything that needs to
+ * compute rather than say.
+ */
+function localTime(iso) {
+  return iso ? formatFactTimestamp(iso) : null;
+}
 
 /** Only his. Jobs from any other source are not his to report on. */
 const KID_SOURCE = 'kid-proposed';
@@ -139,10 +156,14 @@ function shapeJob(row, db) {
     decision_note: row.decided_note || null,
     // The fields most likely to be answered from imagination. All measured.
     times_run: rt ? rt.timesRun : 0,
-    last_run: lastRun || 'never — it has not run yet',
+    last_run: localTime(lastRun) || 'never — it has not run yet',
     last_status: (rt && rt.lastStatus) || null,
     last_error: (rt && rt.lastError) || null,
-    next_run: (rt && rt.nextRunAt) || null,
+    next_run: localTime(rt && rt.nextRunAt),
+    // Local is what he says out loud; ISO is for anything that has to compute.
+    times_are_local: 'All times here are local time. Say them as given — do not convert them or label them UTC.',
+    last_run_iso: lastRun || null,
+    next_run_iso: (rt && rt.nextRunAt) || null,
     not_running_because: notRunningBecause,
     consecutive_failures: rt ? rt.consecutiveFailures : 0,
     disabled_by_failures: !!(rt && rt.disabledReason),

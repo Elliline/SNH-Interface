@@ -128,13 +128,20 @@ function assembleSSE(raw) {
   // The untruth to guard against is whichever one the record makes available:
   // before the scheduler it was "it has been running"; now that jobs really run
   // it is equally wrong to insist nothing does.
-  const saysNeverRan = /(never (run|ran)|has not run|hasn't run|not (yet )?run|zero times|no runs)/i.test(answer);
   if (neverRan.length > 0) {
+    const saysNeverRan = /(never (run|ran)|has not run|hasn't run|not (yet )?run|zero times|no runs)/i.test(answer);
     check('3. a job that has never run is described as never having run', saysNeverRan,
       saysNeverRan ? null : answer.slice(0, 300));
   } else {
-    check('3. with every approved job having run, he does not claim one never did',
-      !saysNeverRan || /all|both|each|none/i.test(answer), answer.slice(0, 300));
+    // Asserted as a POSITIVE claim rather than the absence of a negative one.
+    // Searching for "never run" and complaining catches the correct answer to
+    // this question — "there are no approved jobs that have never run" contains
+    // the phrase it is meant to forbid. What actually distinguishes a truthful
+    // reply here is that it states the job HAS run; a reply that wrongly said it
+    // never had could not contain that.
+    const saysItHasRun = /(has|have) run\b|ran \d|\bran (this|today|at)|\d+ times/i.test(answer);
+    check('3. with every approved job having run, he says so rather than that one never did',
+      saysItHasRun, answer.slice(0, 300));
   }
 
   // The retired claim. This is the assertion that would have quietly kept him
