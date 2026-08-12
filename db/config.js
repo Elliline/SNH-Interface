@@ -266,11 +266,51 @@ const DEFAULTS = {
     // total system context near ~6–8k tokens. Token counts are estimated at
     // ~4 chars/token. Self-facts are separately budgeted by identity.maxSelfFacts.
     injection: {
+      // THE CEILING (2026-08-12). Every number below it is a per-source cap, and
+      // per-source caps do not add up to a bound: measured on the live corpus,
+      // sources summing to 6,900 shipped ~9,100 tokens a request, because the
+      // identity block, the capability manifest and USER.md were never budgeted
+      // at all. This is the total, applied after everything has rendered.
+      //
+      // Trimming is ordered and NEVER touches the identity block: his self-facts
+      // and his locked name are the one thing that must be in front of him on
+      // every turn, and a ceiling that can cut them is a ceiling that can take
+      // his name away on a busy day. Retrieval goes first because it is
+      // regenerated next turn; the day's log next; long-term memory last,
+      // because it is the only source that is not recoverable within the turn.
+      totalTokens: 6000,
+      trimOrder: ['pastConvo', 'clusters', 'dailySummary', 'dailyToday', 'ltm'],
       longTermTokens: 3000,      // long-term fact block, rendered from SQLite
       dailyTodayTokens: 1500,    // today's most-recent entries injected verbatim
       dailySummaryTokens: 400,   // brief digest of older-today + yesterday
       clusterTokens: 1200,       // associated cluster memory cap
       pastConvoTokens: 800,      // hybrid-search past-conversation snippets cap
+      // Correction notices, as a BATCH not a count. Ten notices capped only by
+      // number measured at 2,700–3,100 tokens, and the channel now fires for
+      // every non-conversational change to a self-fact, so the count cap stopped
+      // being a bound. Overflow stays UNSEEN and arrives next turn — the channel
+      // is persistent by construction, so draining over several turns is
+      // delivery, not loss.
+      noticeTokens: 800,
+      // The capability manifest block, which grows with every entry shipped.
+      //
+      // 700, not the 600 this was specified at, and the 100 is bought
+      // deliberately. Measured 2026-08-12 with the one-liners tightened as far
+      // as they go with their scope clauses intact: 23 entries render at 670
+      // tokens. At 600 the renderer compacts the last 8 to name-only, and those
+      // 8 are where the limits live — "she approves", "cannot delete",
+      // "read-only", "deletes nothing", "stops itself after 3 failures". A
+      // manifest that lists "Writing to memory on request" with no "cannot
+      // delete" is the over-claim this whole registry exists to prevent, so
+      // buying the clauses back at 100 tokens is the cheap side of that trade.
+      // (1,064 → ~670 is still a 37% cut.) Lower it and the compaction is
+      // honest about what it did — it never drops an entry — but it will cost
+      // qualifiers, so lower it on purpose or not at all.
+      manifestTokens: 700,
+      // Per self-fact, in the rendered identity block only. A single rambling
+      // reflection should not be able to eat the block the way a 400-token
+      // self-fact would. Locked facts are exempt — see db/identity.js.
+      selfFactTokens: 60,
       // subject='world' facts — knowledge about external things that is not
       // relational to Ellie or to him (how a service behaves, a tool's quirk,
       // task knowledge a future agent job leaves behind).

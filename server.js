@@ -1629,7 +1629,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // the inspect tools.
       const injectSubjects = ['user'];
       if (appConfig.memory?.injection?.includeWorld === true) injectSubjects.push('world');
-      memoryFiles.memory = memoryClusters.renderLongTermMemory({ subject: injectSubjects }) || null;
+      // Budgeted AT CLUSTER BOUNDARIES by the renderer itself, not sliced
+      // afterwards on a character offset: the old way left the last surviving
+      // cluster showing an arbitrary prefix of its facts, so a cluster holding
+      // sixteen could read as holding three.
+      memoryFiles.memory = memoryClusters.renderLongTermMemory({
+        subject: injectSubjects,
+        budgetTokens: appConfig.memory?.injection?.longTermTokens ?? 3000
+      }) || null;
       console.log('Memory loaded:', {
         longTerm: memoryFiles.memory ? `${memoryFiles.memory.length} chars (rendered from SQLite)` : 'none',
         user: memoryFiles.user ? `${memoryFiles.user.length} chars` : 'none',
@@ -1681,15 +1688,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // context stays small (fast prefill). Budgets live in config.memory.injection.
     const memoryParts = [];
     const injCfg = (getConfig().memory && getConfig().memory.injection) || {};
+    // Held so the TOTAL ceiling can rebuild this message after every other block
+    // has rendered — see the ceiling pass further down.
+    let memorySystemMessage = null, memoryHeader = '', memoryFooter = '';
 
     // Add durable memory (rendered long-term facts + USER.md), long-term capped.
     if (memoryFiles.memory) {
-      const { text: ltm } = injectionBudget.budgetText(
-        memoryFiles.memory, injCfg.longTermTokens ?? 3000, 'long-term memory');
-      memoryParts.push(`=== Long-Term Memory ===\n${ltm}`);
+      // No second cap here: the renderer already budgeted at cluster boundaries,
+      // and re-slicing on characters would undo exactly that. The total ceiling
+      // below is what trims this further if the sum still does not fit.
+      memoryParts.push({ kind: 'ltm', label: 'long-term memory', text: `=== Long-Term Memory ===\n${memoryFiles.memory}` });
     }
     if (memoryFiles.user) {
-      memoryParts.push(`=== User Profile ===\n${memoryFiles.user}`);
+      memoryParts.push({ kind: 'userProfile', label: 'user profile', text: `=== User Profile ===\n${memoryFiles.user}` });
     }
 
     // Daily logs for short-term continuity: inject today's most-recent entries
@@ -1703,10 +1714,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           dailySummaryTokens: injCfg.dailySummaryTokens ?? 400 }
       );
       if (recent) {
-        memoryParts.push(`=== Today's Session Log (most recent) ===\n${recent}`);
+        memoryParts.push({ kind: 'dailyToday', label: "today's log", text: `=== Today's Session Log (most recent) ===\n${recent}` });
       }
       if (summary) {
-        memoryParts.push(`=== Earlier / Yesterday (brief) ===\n${summary}`);
+        memoryParts.push({ kind: 'dailySummary', label: 'earlier/yesterday digest', text: `=== Earlier / Yesterday (brief) ===\n${summary}` });
       }
       console.log(`[Injection] Daily log budgeted: kept ${stats.todayBlocksKept}/${stats.todayBlocksTotal} today blocks (~${stats.recentTokens} tok) + digest (~${stats.summaryTokens} tok)`);
     }
@@ -1718,7 +1729,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         .join('\n');
       const { text: capped } = injectionBudget.budgetText(
         contextText, injCfg.pastConvoTokens ?? 800, 'past conversations');
-      memoryParts.push(`=== Relevant Past Conversations ===\n${capped}`);
+      memoryParts.push({ kind: 'pastConvo', label: 'past conversations', text: `=== Relevant Past Conversations ===\n${capped}` });
     }
 
     // Add cluster-aware memory context
@@ -1740,7 +1751,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }).join('\n\n');
       const { text: cappedClusters } = injectionBudget.budgetText(
         clusterText, injCfg.clusterTokens ?? 1200, 'cluster memory');
-      memoryParts.push(`=== Associated Memory Clusters ===\n${cappedClusters}`);
+      memoryParts.push({ kind: 'clusters', label: 'cluster memory', text: `=== Associated Memory Clusters ===\n${cappedClusters}` });
     }
 
     // === Conversational nudge: "what's on your mind?" ===
@@ -1755,7 +1766,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         if (pend.length > 0) {
           nudgeItems = pend;
           const list = pend.map(it => `- (${it.type}) ${it.content}`).join('\n');
-          memoryParts.push(`=== On Your Mind (the user is asking) ===\nThe user just invited you to share what's on your mind. These are the things you (SNH) have genuinely been sitting with:\n${list}\nShare what feels worth sharing, in your own voice and conversationally — you don't have to raise every one, and lead with whatever matters most. Do not present them as a bulleted list or a formal report; talk to them.`);
+          memoryParts.push({ kind: 'guidance', label: 'on your mind', text: `=== On Your Mind (the user is asking) ===\nThe user just invited you to share what's on your mind. These are the things you (SNH) have genuinely been sitting with:\n${list}\nShare what feels worth sharing, in your own voice and conversationally — you don't have to raise every one, and lead with whatever matters most. Do not present them as a bulleted list or a formal report; talk to them.` });
           console.log(`[Initiative] Nudge surfaced ${pend.length} pending item(s) (convo ${convoId})`);
         }
       }
@@ -1776,7 +1787,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const top = initiatives.getTopForGreeting({ greetingThreshold, followupThreshold });
         if (top) {
           deliveredInitiative = top;
-          memoryParts.push(`=== Something On Your Mind ===\nThere is one thing you (SNH) have been meaning to raise with the user: "${top.content}"\nIf it fits the conversation, you may open with it or weave it naturally into your first response — at most this one thing, phrased warmly and conversationally, never as a list or a formal notice. If it truly does not fit what the user said, let it go for now.`);
+          memoryParts.push({ kind: 'guidance', label: 'something on your mind', text: `=== Something On Your Mind ===\nThere is one thing you (SNH) have been meaning to raise with the user: "${top.content}"\nIf it fits the conversation, you may open with it or weave it naturally into your first response — at most this one thing, phrased warmly and conversationally, never as a list or a formal notice. If it truly does not fit what the user said, let it go for now.` });
           console.log(`[Initiative] Greeting candidate (${top.type}, priority ${top.priority}): ${top.id}`);
         }
       }
@@ -1795,7 +1806,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         const pending = questionQueue.getPendingForClusters(clusterIds);
         if (pending) {
           surfacedQuestion = pending;
-          memoryParts.push(`=== Open Question You May Ask ===\nThere is one thing you could naturally clarify with the user, if — and only if — it fits the flow of the conversation: "${pending.question}"\nYou may weave this single question in conversationally at a natural moment. Do not ask more than this one question, do not interrogate, and skip it entirely if it does not fit.`);
+          memoryParts.push({ kind: 'guidance', label: 'open question', text: `=== Open Question You May Ask ===\nThere is one thing you could naturally clarify with the user, if — and only if — it fits the flow of the conversation: "${pending.question}"\nYou may weave this single question in conversationally at a natural moment. Do not ask more than this one question, do not interrogate, and skip it entirely if it does not fit.` });
         }
       }
     } catch (qErr) {
@@ -1804,9 +1815,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     if (memoryParts.length > 0) {
       console.log('Injecting memory context:', memoryParts.length, 'sections');
-      const memorySystemMessage = {
+      // Header and footer are kept separately because the total ceiling, applied
+      // once every block has rendered, rebuilds this message from whichever
+      // parts survive the trim.
+      memoryHeader = `You have access to the following memory and context:\n\n${injectionBudget.memoryFraming(needsTools)}\n\n`;
+      memoryFooter = `\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked. A "(learned ...)" annotation on a fact shows when you first learned that fact. If the user asks when they told you something or when a fact was learned, only answer with a time that is shown in a "(learned ...)" annotation; if no such timestamp is present for that fact, say you don't know rather than estimating or inventing one.`;
+      memorySystemMessage = {
         role: 'system',
-        content: `You have access to the following memory and context:\n\n${injectionBudget.memoryFraming(needsTools)}\n\n${memoryParts.join('\n\n')}\n\nUse this context if it helps answer the current question, but don't explicitly mention that you're using memory unless asked. A "(learned ...)" annotation on a fact shows when you first learned that fact. If the user asks when they told you something or when a fact was learned, only answer with a time that is shown in a "(learned ...)" annotation; if no such timestamp is present for that fact, say you don't know rather than estimating or inventing one.`
+        content: memoryHeader + memoryParts.map(p => p.text).join('\n\n') + memoryFooter
       };
       enhancedMessages = [memorySystemMessage, ...enhancedMessages];
     } else {
@@ -2050,6 +2066,58 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
     } catch (identityErr) {
       console.error('[Identity] Injection error:', identityErr.message);
+    }
+
+    // === THE TOTAL CEILING ===
+    //
+    // Applied HERE, after identity, the manifest and every guidance block have
+    // rendered, because the thing being bounded is the sum and the sum is not
+    // knowable until they have. Per-source caps were all in place and all
+    // binding on 2026-08-12, and the request still shipped ~9,100 tokens: three
+    // blocks had no budget at all and nothing added the survivors up.
+    //
+    // The identity block is FIXED COST by construction — it is not in `parts`,
+    // so no trim order can reach it. That is the point: his self-facts and his
+    // locked name have to be in front of him on every turn, and the live half of
+    // the identity lock is that he can say a fact is locked, which he cannot do
+    // about a fact he was not shown.
+    try {
+      if (memorySystemMessage && memoryParts.length) {
+        const sysNow = enhancedMessages.filter(m => m.role === 'system');
+        const totalNow = sysNow.reduce((sum, m) => sum + injectionBudget.estTokens(m.content), 0);
+        const scaffold = injectionBudget.estTokens(memoryHeader + memoryFooter);
+        const partsNow = memoryParts.reduce((sum, p) => sum + injectionBudget.estTokens(p.text), 0);
+        const fixedTokens = totalNow - partsNow;   // everything the ceiling may not touch
+
+        const ceiling = injectionBudget.applyTotalCeiling({
+          parts: memoryParts,
+          fixedTokens,
+          totalTokens: injCfg.totalTokens ?? 6000,
+          trimOrder: Array.isArray(injCfg.trimOrder) && injCfg.trimOrder.length
+            ? injCfg.trimOrder
+            : ['pastConvo', 'clusters', 'dailySummary', 'dailyToday', 'ltm']
+        });
+
+        if (ceiling.bound) {
+          memorySystemMessage.content = ceiling.parts.length
+            ? memoryHeader + ceiling.parts.map(p => p.text).join('\n\n') + memoryFooter
+            : memoryHeader + memoryFooter;
+          const what = ceiling.trimmed
+            .map(t => `${t.kind} ${t.from}→${t.to}${t.dropped ? ' (dropped)' : ''}`).join(', ');
+          console.log(`[Injection] CEILING BOUND at ${injCfg.totalTokens ?? 6000}: ${ceiling.before} → ${ceiling.after} tokens. Trimmed: ${what}`);
+          if (ceiling.shortfall > 0) {
+            // Everything trimmable is gone and it still does not fit, which means
+            // the untouchable blocks alone exceed the ceiling. A configuration
+            // problem, not something to solve by cutting into identity.
+            console.warn(`[Injection] Still ${ceiling.shortfall} tokens over after trimming everything trimmable — ` +
+                         `fixed blocks (identity + manifest + guidance) exceed memory.injection.totalTokens on their own.`);
+          }
+        } else {
+          console.log(`[Injection] Ceiling not bound: ${ceiling.before}/${injCfg.totalTokens ?? 6000} tokens (fixed ${fixedTokens}, scaffold ${scaffold})`);
+        }
+      }
+    } catch (ceilErr) {
+      console.error('[Injection] Ceiling error (injecting untrimmed):', ceilErr.message);
     }
 
     // Observability: total injected system-context size. Exposed as the

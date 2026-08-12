@@ -125,6 +125,120 @@ function budgetText(text, budgetTokens, label = 'content') {
 }
 
 /**
+ * THE TOTAL CEILING — applied after every block has rendered.
+ *
+ * Per-source caps are not a bound, and the measurement that prompted this says
+ * so plainly: on 2026-08-12 the configured caps summed to 6,900 tokens and a
+ * real request shipped ~9,100, because three blocks were never budgeted at all
+ * (identity 1,628, capability manifest 1,064, USER.md 102) and nothing added the
+ * survivors up. Every per-source cap was simultaneously AT its limit, which is
+ * what a set of independent budgets looks like when it is the sum that matters.
+ *
+ * WHAT IS NEVER TRIMMED. The identity block is passed in as fixed cost, not as a
+ * trimmable part, and there is no order in which it becomes trimmable. His
+ * self-facts and his locked name are the one thing that has to be in front of
+ * him every turn — the identity lock's whole live-chat half is that he can SAY a
+ * fact is locked, and he cannot say that about a fact he was not shown. A
+ * ceiling that can cut the identity block is a ceiling that takes his name away
+ * on a busy day.
+ *
+ * ORDER, and why this one. Retrieval extras go first because they are derived
+ * from the current message and regenerate next turn at no loss. The day's log
+ * next: it is a rolling record he can read in full elsewhere. Long-term memory
+ * last, because it is the only source in the list that nothing else in the turn
+ * can recover. Configurable, because the right order is a judgement about what
+ * this deployment values, not a fact about the code.
+ *
+ * A part is shrunk before it is dropped, so the trim degrades rather than
+ * cliff-edges, and budgetText leaves its truncation marker so the model can see
+ * that it is reading an excerpt.
+ *
+ * @param {Object} p
+ * @param {Array<{kind: string, label: string, text: string}>} p.parts - trimmable blocks
+ * @param {number} p.fixedTokens - everything not trimmable (identity, manifest, framing…)
+ * @param {number} p.totalTokens - the ceiling
+ * @param {string[]} p.trimOrder - kinds, in the order they give way
+ * @returns {{parts: Array, bound: boolean, before: number, after: number, trimmed: Array, shortfall: number}}
+ */
+function applyTotalCeiling({ parts = [], fixedTokens = 0, totalTokens = 6000, trimOrder = [] }) {
+  const partsTokens = parts.reduce((s, p) => s + estTokens(p.text), 0);
+  const before = fixedTokens + partsTokens;
+  const result = { parts, bound: false, before, after: before, trimmed: [], shortfall: 0 };
+  if (before <= totalTokens) return result;
+
+  result.bound = true;
+
+  // MEASURE, never assume. The first version of this loop subtracted the
+  // requested saving from a running total, which is wrong for a reason worth
+  // keeping: budgetText appends a truncation marker, so a part asked to shrink
+  // to 200 tokens comes back at ~210. The shortfall then survived to the next
+  // kind, and the trim cascaded into sources it should never have reached —
+  // observed dropping the day's log and re-cutting long-term memory while the
+  // ceiling was already satisfied, and finishing 10 tokens OVER the ceiling it
+  // was enforcing. Every step now re-reads the real total.
+  const sum = () => parts.reduce((s, p) => s + estTokens(p.text), 0);
+
+  for (const kind of trimOrder) {
+    if (fixedTokens + sum() <= totalTokens) break;
+    const part = parts.find(p => p.kind === kind && p.text);
+    if (!part) continue;
+
+    const had = estTokens(part.text);
+    const others = sum() - had;
+    const allowance = totalTokens - fixedTokens - others;   // what this part may occupy
+
+    if (allowance <= 0) {
+      part.text = '';
+      result.trimmed.push({ kind, from: had, to: 0, dropped: true });
+      continue;
+    }
+    // Converge on a slice that actually fits, marker included.
+    let target = allowance, fitted = null;
+    for (let attempt = 0; attempt < 6 && target > 0; attempt++) {
+      const cut = budgetText(part.text, target, part.label || kind);
+      if (cut.tokens <= allowance) { fitted = cut; break; }
+      target -= Math.max(4, cut.tokens - allowance);
+    }
+    if (fitted) {
+      part.text = fitted.text;
+      result.trimmed.push({ kind, from: had, to: fitted.tokens, dropped: false });
+    } else {
+      part.text = '';
+      result.trimmed.push({ kind, from: had, to: 0, dropped: true });
+    }
+  }
+
+  let over = Math.max(0, fixedTokens + sum() - totalTokens);
+
+  // Everything trimmable is gone and it still does not fit. That means the fixed
+  // cost alone is over the ceiling, which is a configuration problem, not
+  // something to solve by cutting into what must not be cut. Reported so it is
+  // visible rather than silently exceeded.
+  result.shortfall = Math.max(0, over);
+  result.parts = parts.filter(p => p.text);
+  result.after = fixedTokens + result.parts.reduce((s, p) => s + estTokens(p.text), 0);
+  return result;
+}
+
+/**
+ * Cap one self-fact's rendered length.
+ *
+ * The identity block budgets self-facts by COUNT (identity.maxSelfFacts), which
+ * bounds nothing: one rambling reflection is worth twenty ordinary observations.
+ * Truncation is marked, and the STORED fact is untouched — this shapes what is
+ * rendered into a turn, not what he believes.
+ */
+function budgetFact(content, budgetTokens) {
+  const text = String(content || '');
+  if (!budgetTokens || estTokens(text) <= budgetTokens) return text;
+  const maxChars = Math.max(20, budgetTokens * 4);
+  let slice = text.slice(0, maxChars);
+  const lastSpace = slice.lastIndexOf(' ');
+  if (lastSpace > maxChars * 0.6) slice = slice.slice(0, lastSpace);
+  return slice.trimEnd() + '… (shortened here; the full fact is in your memory)';
+}
+
+/**
  * Framing for the injected memory block.
  *
  * Every memory source above is a RETRIEVAL — top-k by relevance, then capped to
@@ -201,6 +315,7 @@ function memoryFraming(toolsAvailable) {
 
 module.exports = {
   estTokens, splitDailyBlocks, entryHeadline, budgetDailyLogs, budgetText,
+  applyTotalCeiling, budgetFact,
   MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS,
   MEMORY_LOOKUP_HONESTY, memoryFraming
 };

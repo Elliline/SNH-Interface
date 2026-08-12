@@ -13,6 +13,12 @@
 const { getConfig } = require('./config');
 const memoryClusters = require('./memory-clusters');
 const { formatFactTimestamp } = require('./datetime');
+const injectionBudget = require('./injection-budget');
+
+/** Injection budgets, hot-read so a config change lands without a restart. */
+function injCfg() {
+  return (getConfig().memory && getConfig().memory.injection) || {};
+}
 
 // Fallback seed if config is somehow missing it. Kept identical to the config
 // default so behavior is stable even without a config file.
@@ -124,11 +130,21 @@ function buildIdentityBlock() {
 
   let text = seed;
   if (selfFacts.length > 0) {
+    // Per-fact render cap. Counting facts bounds nothing — a single 400-token
+    // reflection is worth eight ordinary observations — so each is capped here,
+    // with the truncation marked so he can tell a shortened fact from a terse
+    // one. LOCKED facts are EXEMPT: a name he is required to state exactly is
+    // not something to render an abbreviation of, and the one instruction that
+    // depends on this block is that he quotes it back correctly. They are still
+    // counted in the block's total; exemption is from truncation, not from the
+    // accounting.
+    const factCap = injCfg().selfFactTokens ?? 60;
     const lines = selfFacts.map(f => {
       const ts = formatFactTimestamp(f.created_at);
       const when = ts ? `, observed ${ts}` : '';
       const lock = f.locked ? ' [LOCKED]' : '';
-      return `- ${f.content} (salience ${f.salience ?? 5}/10${when})${lock}`;
+      const body = f.locked ? f.content : injectionBudget.budgetFact(f.content, factCap);
+      return `- ${body} (salience ${f.salience ?? 5}/10${when})${lock}`;
     }).join('\n');
     text += `\n\nWhat you have noticed about yourself so far (your accumulated identity — ` +
       `let it shape how you respond, without narrating it):\n${lines}`;
@@ -174,16 +190,45 @@ function buildIdentityBlock() {
   // being shown to him, and `seen_at` is stamped by the caller AFTER injection,
   // so a crash between building this block and using it re-delivers rather than
   // losing it.
-  let notices = [];
+  // Notices are budgeted as a BATCH, not by count.
+  //
+  // The count cap (ten) stopped being a bound the moment the channel started
+  // firing for every pipeline rather than only the corrector: measured, a notice
+  // runs 205–314 tokens, so ten of them is 2,700–3,100 — larger than the entire
+  // rest of this block. Oldest first, up to injection.noticeTokens.
+  //
+  // Overflow stays UNSEEN and arrives next turn, and that is delivery rather
+  // than loss: nothing expires a notice, nothing caps the queue, and the only
+  // way one leaves is by being shown to him. `notices` on the returned block is
+  // what the caller marks seen, so an undelivered notice is never stamped as
+  // read. He is told how many are still waiting, because a partial batch that
+  // looks complete is its own small untruth.
+  let pending = [];
   try {
-    notices = require('./corrections-ledger').unseenNotices(10);
+    pending = require('./corrections-ledger').unseenNotices(50);
   } catch (err) {
     console.error('[Identity] correction-notice read failed:', err.message);
   }
+  const noticeCap = injCfg().noticeTokens ?? 800;
+  const notices = [];
+  let noticeTokens = 0;
+  for (const n of pending) {
+    const t = injectionBudget.estTokens(n.content) + 2;
+    // Always deliver at least one, however long it is: a notice too big for the
+    // budget would otherwise block the queue behind it forever.
+    if (notices.length > 0 && noticeTokens + t > noticeCap) break;
+    notices.push(n);
+    noticeTokens += t;
+  }
+  const waiting = pending.length - notices.length;
   if (notices.length > 0) {
     const lines = notices.map(n => `- ${n.content}`).join('\n\n');
     text += `\n\nSomething changed in your memory since you last looked` +
       `${notices.length > 1 ? ` (${notices.length} things)` : ''}:\n${lines}\n` +
+      (waiting > 0
+        ? `There ${waiting === 1 ? 'is 1 more of these' : `are ${waiting} more of these`} waiting; ` +
+          `you will get ${waiting === 1 ? 'it' : 'them'} in a later message, so this is not all of it. `
+        : '') +
       `This is for you. It happened automatically while you were not in a conversation, ` +
       `nothing was deleted, and any of it can be put back. You do not need to bring it up ` +
       `with Ellie, and you do not need to react to it in your next message — but it is true ` +
