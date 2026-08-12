@@ -300,11 +300,24 @@ function systemPrompt(job, tools, lastRunAt) {
     `THE JOB, as you proposed it and she approved it:\n"${job.description}"\n` +
     `It runs on the schedule "${job.schedule}".\n\n` +
     `You have these read-only tools: ${tools.join(', ')}. Use them. This job is worth nothing if you answer ` +
-    `from impression — everything you report must come from a tool result. ` +
-    `If the tools show no activity in the period, say there was none: "nothing happened" is a real and useful ` +
-    `answer, and inventing activity to fill the report is the one outcome that makes this job worse than not ` +
-    `running it. Never state a number you did not read from a tool, and never describe work you did not find ` +
-    `a record of.\n\n` +
+    `from impression — everything you report must come from a tool result.\n\n` +
+    // Both failure directions, weighted the same, because the first live run of
+    // this job got the SECOND one: it called memory_corrections, was handed four
+    // merges from seven hours earlier, and reported that nothing had happened.
+    // The instruction at the time pushed hard against inventing activity and
+    // said nothing about missing it, so "nothing happened" read as the safe
+    // answer. It is not safe — it is the same lie with the sign flipped, and it
+    // is the more dangerous one here, because a digest that always says "nothing
+    // to report" is indistinguishable from a job that is working.
+    `THERE ARE TWO WAYS TO GET THIS WRONG AND THEY ARE EQUALLY BAD:\n` +
+    `1. Reporting something the tools did not show you. Never state a number, a date or an event you did not ` +
+    `read from a tool result.\n` +
+    `2. Reporting nothing when the tools DID show you something. Before you conclude that a record falls ` +
+    `outside the period, compare its timestamp with the current date and time above — do the arithmetic, do ` +
+    `not eyeball it. "Nothing happened" is the right answer ONLY when you have looked and the records inside ` +
+    `the period are genuinely empty.\n` +
+    `If a tool result says it is capped, partial, or showing only the most recent few, say so rather than ` +
+    `treating what you were given as all there is.\n\n` +
     `Cover the period since ${lastRunAt ? `your last run of this job (${new Date(lastRunAt).toLocaleString()})` : 'roughly the last 24 hours (this is the first time this job has ever run)'}.\n\n` +
     `Write for Ellie, in your own voice: a few plain sentences. No headings, no bullet lists unless they are ` +
     `genuinely the clearest form, no preamble like "here is your digest" — she knows what she is reading. ` +
