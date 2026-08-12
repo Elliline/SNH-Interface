@@ -2926,7 +2926,8 @@ async function loadInitiativeList() {
           <span class="initiative-priority" title="priority">${it.priority}/10</span>
         </div>
         <div class="initiative-content">${escapeHtml(it.content)}</div>
-        ${isProposal ? '<div class="initiative-note">Approving records the job. Nothing runs it yet — SNH has no scheduler.</div>' : ''}
+        ${isProposal ? '<div class="initiative-note">Approving schedules it: it is armed on approval and runs on its schedule until you disable it. Each run is SNH doing what the description says, with read-only memory tools, reporting back here.</div>' : ''}
+        ${it.type === 'job-result' ? '<div class="initiative-note">This is the output of a scheduled job that already ran — not something waiting on you.</div>' : ''}
         <div class="initiative-actions">${actions}</div>
       </div>`;
     }).join('');
@@ -3166,34 +3167,77 @@ async function loadActivityTab() {
       </div>`;
     }
 
-    // --- INERT ---
-    const jobs = data.inert.jobs || [];
-    html += '<div class="act-section-head act-section-inert">Inert — recorded, never executed</div>';
-    html += `
-      <div class="act-banner">
-        <strong>Nothing here runs.</strong> SNH has no scheduler. These are proposals from the
-        <code>create_cron_job</code> tool: approving one records a row and nothing more. An
-        approved job is <em>not</em> running, and will not run, on any schedule.
-      </div>`;
+    // --- SCHEDULED JOBS ---
+    // These run. The banner that used to sit here said the opposite in bold, and
+    // it was true until the scheduler shipped (2026-08-12); leaving it would make
+    // this panel the lie. What replaces it is not a reassurance — it is the run
+    // state per job, because "it is scheduled" and "it ran" are still different
+    // claims and the panel should never let one stand in for the other.
+    const scheduledJobs = (data.scheduled && data.scheduled.jobs) || [];
+    html += '<div class="act-section-head act-section-active">Scheduled jobs — approved, armed, and run by the scheduler</div>';
 
-    if (jobs.length === 0) {
-      html += '<div class="memory-empty">No proposed jobs.</div>';
+    if (scheduledJobs.length === 0) {
+      html += '<div class="memory-empty">No jobs are armed. Nothing is waiting to run.</div>';
     } else {
-      html += jobs.map(j => `
-        <div class="act-entry act-entry-inert">
+      html += scheduledJobs.map(j => {
+        const lr = j.lastRun;
+        const failing = (j.consecutiveFailures || 0) > 0;
+        return `
+        <div class="act-entry">
           <div class="act-entry-head">
             <span class="act-name">${escapeHtml(j.description)}</span>
-            <span class="act-pill act-pill-inert">${escapeHtml(j.status)} · never runs</span>
+            <span class="act-pill act-pill-armed">armed</span>
+            ${failing ? `<span class="act-pill act-pill-failed">${j.consecutiveFailures} failure${j.consecutiveFailures === 1 ? '' : 's'} in a row</span>` : ''}
             <span class="act-prov act-prov-kid">kid-proposed</span>
           </div>
           <div class="act-grid">
-            <div><span class="act-label">Mechanism</span>none — row in <code>cron_jobs</code></div>
-            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(cronToWords(j.schedule))}</span></div>
+            <div><span class="act-label">Mechanism</span>agent run — the description is the task, read-only memory tools</div>
+            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(j.scheduleInWords || cronToWords(j.schedule))}</span></div>
+            <div><span class="act-label">Last run</span>${
+              lr ? `${escapeHtml(fmtWhen(lr.at))} <span class="act-dim">${escapeHtml(fmtRelative(lr.at))}</span> ${activityStatusPill(lr.status)} <span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span>`
+                 : '<span class="act-nohist">never run yet</span>'}</div>
+            <div><span class="act-label">Next run</span>${
+              j.nextRun ? `${escapeHtml(fmtWhen(j.nextRun))} <span class="act-dim">${escapeHtml(fmtRelative(j.nextRun))}</span>` : '<span class="act-never">not armed</span>'}</div>
+            <div><span class="act-label">Times run</span>${j.timesRun || 0}</div>
+            <div><span class="act-label">Approved</span>${escapeHtml(fmtWhen(j.decided_at))}</div>
+          </div>
+          ${lr && lr.statusReason ? `<div class="act-reason">${escapeHtml(lr.statusReason)}</div>` : ''}
+          ${lr && lr.output ? `<div class="act-job-output">${escapeHtml(lr.output)}</div>` : ''}
+          ${renderActivityHistory(j)}
+        </div>`;
+      }).join('');
+    }
+
+    // --- INERT ---
+    // Still a real category, and now a more useful one: everything here says why
+    // it will not run, because "she rejected it" and "it disabled itself after
+    // failing three nights running" are not the same news.
+    const jobs = data.inert.jobs || [];
+    if (jobs.length > 0) {
+      html += '<div class="act-section-head act-section-inert">Not scheduled — recorded, but nothing will run them</div>';
+      html += jobs.map(j => {
+        const why = j.disabledReason
+          ? `disabled itself: ${j.disabledReason}`
+          : j.status === 'proposed' ? 'waiting on your decision in the bell panel'
+          : j.status === 'approved' && !j.enabled ? 'approved, but disabled'
+          : j.status === 'approved' ? 'approved, but its schedule could not be evaluated'
+          : `${j.status}`;
+        return `
+        <div class="act-entry act-entry-inert">
+          <div class="act-entry-head">
+            <span class="act-name">${escapeHtml(j.description)}</span>
+            <span class="act-pill act-pill-inert">${escapeHtml(j.status)} · not armed</span>
+            <span class="act-prov act-prov-kid">kid-proposed</span>
+          </div>
+          <div class="act-grid">
+            <div><span class="act-label">Why not running</span>${escapeHtml(why)}</div>
+            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(j.scheduleInWords || cronToWords(j.schedule))}</span></div>
             <div><span class="act-label">Proposed</span>${escapeHtml(fmtWhen(j.created_at))}</div>
-            <div><span class="act-label">Next run</span><span class="act-never">never — no scheduler exists</span></div>
+            <div><span class="act-label">Times run</span>${j.timesRun || 0}${j.timesRun ? ` <span class="act-dim">(last ${escapeHtml(fmtWhen(j.lastRun && j.lastRun.at))})</span>` : ''}</div>
           </div>
           ${j.decided_at ? `<div class="act-dim">${escapeHtml(j.status)} ${escapeHtml(fmtWhen(j.decided_at))}${j.decided_note ? ` — ${escapeHtml(j.decided_note)}` : ''}</div>` : ''}
-        </div>`).join('');
+        </div>`;
+      }).join('');
     }
 
     // --- GAPS ---

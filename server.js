@@ -1923,27 +1923,34 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Scheduled jobs, and the one thing about them that must never be guessed.
     //
     // He proposed a daily digest, Ellie approved it, and nothing happened —
-    // because nothing in this system executes a cron row. There is no scheduler.
-    // Asked which approved job never ran, he had no tool that could answer, so he
-    // called one that does not exist and then described the job as if it had been
-    // running. The tool is the fix for the first half; this is the fix for the
-    // second, because a tool that returns "never" is still only as good as his
-    // willingness to say it.
+    // because nothing in this system executed a cron row. Asked which approved
+    // job never ran, he had no tool that could answer, so he called one that does
+    // not exist and then described the job as if it had been running. The tool
+    // fixed the first half; this block fixed the second.
+    //
+    // The scheduler shipped 2026-08-12, so the sentence this block used to press
+    // hardest on — "nothing runs these" — is now false, and pressing on it would
+    // make this the thing that lies. What has NOT changed is the actual rule: the
+    // run state is read, never reasoned about. The failure mode available to him
+    // has simply flipped, from claiming a run that never happened to assuming one
+    // because the hour has passed, and both are the same mistake.
     if (needsJobsRead) {
       enhancedMessages.push({
         role: 'system',
         content:
           'The user is asking about your scheduled jobs — what you proposed, what she approved or rejected, ' +
-          'or whether something ran. You have memory_jobs for exactly this: call it with no id to list them, ' +
-          'or with an id for one in full. Call it now. ' +
+          'whether something ran, or when it runs next. You have memory_jobs for exactly this: call it with no ' +
+          'id to list them, or with an id for one in full. Call it now. ' +
           'Do NOT say you checked unless the tool call actually ran and came back. ' +
-          'NOTHING RUNS THESE JOBS. There is no scheduler in this system — no process reads a schedule and ' +
-          'executes anything. An approved job is a record of a decision Ellie made, not a task that happens. ' +
-          'So: every job has run zero times, and none has a next run. If you are asked whether one ran, say it ' +
-          'has never run and cannot until a scheduler is built. Never infer from a schedule, from an approval, ' +
-          'or from the fact that it was a good idea, that a job has been running. ' +
-          'If she asks why it never ran, the answer is that the piece which would run it does not exist yet — ' +
-          'not that it failed, not that it was missed.'
+          'THESE JOBS RUN. A scheduler checks every minute and runs approved, enabled jobs; each run is you, in ' +
+          'the background, doing what the job description says and reporting to her notification panel. ' +
+          'But read the numbers rather than reasoning from the schedule: the tool gives you times_run, last_run, ' +
+          'last_status and next_run, and those are the answer. Never infer that a job ran because its hour has ' +
+          'passed, because she approved it, or because a scheduler exists — a job can be unarmed, disabled after ' +
+          'repeated failures, or deferred behind another. If it has run zero times, say so. If its last run ' +
+          'failed, say so and give the error the tool returned. ' +
+          'If she asks why one did not run, the reason is in the tool result (not_running_because) — give that ' +
+          'reason, do not construct a plausible one.'
       });
     }
 

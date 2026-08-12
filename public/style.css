@@ -2186,6 +2186,10 @@ a.msg-source:hover {
 .initiative-type-observation { color: var(--secondary-color); }
 .initiative-type-followup { color: var(--success-color); }
 .initiative-type-proposal { color: var(--accent-color); }
+/* A job result is not a candidate SNH is raising — it is the output of
+   something that already ran, so it reads as a delivered record rather than an
+   ask. */
+.initiative-type-job-result { color: var(--success-color); }
 
 /* Cron proposals: a decision, not a read. Approve is affirmative, Reject is
    neutral-destructive, and the note under the content states plainly that
@@ -2916,6 +2920,25 @@ a.msg-source:hover {
 .act-pill-nohist   { color: var(--text-secondary); font-style: italic; }
 .act-pill-inert    { color: var(--error-color); border-color: var(--error-color); }
 .act-pill-driver   { color: var(--accent-color); border-color: var(--accent-color); }
+.act-pill-armed    { color: var(--success-color); border-color: var(--success-color); }
+.act-pill-running,
+.act-pill-deferred { color: var(--text-secondary); }
+
+/* What a scheduled job actually wrote, shown under its last run: the panel
+   should not make anyone open a database to see the output of a thing it says
+   ran. Clipped, because a digest is read in the bell, not here. */
+.act-job-output {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-left: 2px solid var(--success-color);
+  background: var(--bg-secondary, rgba(127,127,127,0.06));
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 8.5em;
+  overflow-y: auto;
+}
 
 .act-prov { font-size: 0.62rem; margin-left: auto; text-transform: uppercase; letter-spacing: 0.04em; }
 .act-prov-system { color: var(--text-secondary); }

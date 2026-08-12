@@ -2,8 +2,14 @@
  * create_cron_job — the first action tool.
  *
  * PROPOSE ONLY. Calling this does not create anything: it records a proposal and
- * raises it in the bell panel for Ellie to approve or reject. Approving records
- * the job; nothing executes it, because SNH has no scheduler yet.
+ * raises it in the bell panel for Ellie to approve or reject.
+ *
+ * What approving MEANS changed on 2026-08-12. It used to record the job and
+ * nothing more; there is a scheduler now (db/scheduler.js), so approving arms
+ * the job and it starts running on its schedule. The propose-only boundary is
+ * unchanged and is the whole point of this tool — he asks, she decides — but the
+ * stakes of her yes are higher than they were, and the description below says so
+ * rather than letting him propose as though nothing would happen.
  *
  * TIER METADATA (tier/reversible/rateCaps/requiresApproval) is declared here now
  * even though nothing reads it. The tool registry will consume it later; putting
@@ -19,7 +25,11 @@ class CreateCronJobTool {
     this.name = 'create_cron_job';
     this.description =
       'Propose a recurring scheduled job. This does NOT create the job — it sends a ' +
-      'proposal to Ellie for approval, and she decides. Use it when she asks for ' +
+      'proposal to Ellie for approval, and she decides. If she approves it, it is ' +
+      'scheduled and WILL run on the schedule you give: each run is you, in the ' +
+      'background, doing what your description says using your read-only memory ' +
+      'tools, and reporting the result to her notification panel. Propose accordingly ' +
+      '— the description IS the instruction the run follows. Use it when she asks for ' +
       'something to happen on a schedule.';
     this.parameters = {
       type: 'object',
@@ -34,7 +44,7 @@ class CreateCronJobTool {
         },
         enabled: {
           type: 'boolean',
-          description: 'Whether the job should be active as soon as it is approved.'
+          description: 'Whether the job should start running as soon as she approves it. False means it is recorded but not armed until she enables it.'
         }
       },
       required: ['schedule', 'description', 'enabled']

@@ -26,13 +26,14 @@ class MemoryJobsTool {
     this.requiresApproval = false;
     this.destructive = false;
     this.description =
-      'Read your scheduled jobs — what you proposed, what Ellie approved or rejected, and whether any of it ' +
-      'has run. Call this whenever you are asked what is scheduled, what you proposed, what she approved or ' +
-      'turned down, whether a job has run, when one runs next, or why one never ran. Leave out the id to list ' +
-      'them; pass an id for one in full. NOTHING ACTUALLY RUNS THESE — there is no scheduler — so the result ' +
-      'always says the job has never run and never will until one is built. Report that plainly; never infer ' +
-      'from a schedule that a job has been running. Read-only: proposing is create_cron_job, and approving is ' +
-      "Ellie's on the Self tab.";
+      'Read your scheduled jobs — what you proposed, what Ellie approved or rejected, when each one runs next, ' +
+      'and what happened the last time it ran. Call this whenever you are asked what is scheduled, what you ' +
+      'proposed, what she approved or turned down, whether a job has run, when one runs next, or why one has ' +
+      'not. Leave out the id to list them; pass an id for one in full. These jobs DO run — a scheduler executes ' +
+      'approved, enabled ones — so the result carries real times_run / last_run / next_run values. Report those ' +
+      'numbers; never infer that a job ran because its hour has passed or because she approved it, and never ' +
+      'infer that one did not. Read-only: proposing is create_cron_job, approving is Ellie\'s on the Self tab, ' +
+      'and running is the scheduler\'s.';
     this.parameters = {
       type: 'object',
       properties: {
@@ -40,7 +41,7 @@ class MemoryJobsTool {
         status: {
           type: 'string',
           enum: ['proposed', 'approved', 'rejected', 'reverted'],
-          description: 'Only jobs in this state. "proposed" = you asked and she has not decided. "approved" = she said yes (it still does not run). "rejected" = she said no. "reverted" = it was approved and then undone. Omit for all.'
+          description: 'Only jobs in this state. "proposed" = you asked and she has not decided. "approved" = she said yes, and it is scheduled to run. "rejected" = she said no. "reverted" = it was approved and then undone. Omit for all.'
         },
         limit: { type: 'integer', description: 'How many to list. Default 10, maximum 25.' }
       },

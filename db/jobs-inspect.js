@@ -1,6 +1,6 @@
 /**
- * The READ side of scheduled jobs — what he proposed, what Ellie decided, and
- * whether any of it has ever actually run.
+ * The READ side of scheduled jobs — what he proposed, what Ellie decided, when
+ * each one runs next, and what happened the last time it ran.
  *
  * WHY THIS EXISTS. He could propose a cron job and Ellie could approve it, and
  * then he had no way to look at either. Asked "which approved job never ran", he
@@ -8,23 +8,31 @@
  * chat, and the answer he eventually gave was invented. Every part of that failure
  * is fixed somewhere else; this is the part that gives him something true to say.
  *
- * ⚠ THE HONEST ANSWER ABOUT NEXT RUN IS "NEVER".
+ * ⚠ THE ANSWER CHANGED ON 2026-08-12, AND THAT IS THE DANGEROUS PART.
  *
- * There is no scheduler. Nothing in this codebase reads `cron_jobs` and executes
- * anything — no node-cron, no timer, no worker. `create_cron_job` writes a row,
- * the Self tab approves it, and the row sits there. An approved job is a RECORD
- * OF A DECISION, not a thing that happens.
+ * This file used to state, in every result, that there was no scheduler and that
+ * every job had run zero times. That was true, and it was load-bearing: it was
+ * the fix for him describing a job as though it had been running. There is a
+ * scheduler now (db/scheduler.js), so repeating the old warning would make this
+ * tool the thing that lies.
  *
- * So every job this returns carries `next_run: "never"` and a `scheduler_warning`
- * at the TOP LEVEL of the result, phrased as an imperative. That placement is not
- * cosmetic and was measured in Phase 2b: a warning nested inside an object reads
- * as a field, gets skimmed, and he answers around it — nested null provenance
- * produced an invented verbatim quote. Only a top-level imperative changed the
- * behaviour. "Never" also has to be stated rather than implied by an absent
- * last_run, because an absence reads as a blank to be filled.
+ * What replaces it is NOT a cheerful "yes it runs". Both directions are wrong to
+ * guess, and the new failure available to him is the opposite of the old one:
+ * assuming a job ran because a scheduler exists and its hour has passed. So every
+ * job carries REAL values — next_run and last_run computed from the job row and
+ * the run log — and the top-level imperative now says: report these numbers,
+ * never infer a run from the schedule.
+ *
+ * The top-level placement is unchanged and still not cosmetic. Measured in Phase
+ * 2b: a warning nested inside an object reads as a field, gets skimmed, and he
+ * answers around it — nested null provenance produced an invented verbatim quote.
+ * Only a top-level imperative changed the behaviour. For the same reason a job
+ * that has never run says so in words rather than by an absent last_run, because
+ * an absence reads as a blank to be filled.
  *
  * READ-ONLY, and must stay that way. Proposing goes through create_cron_job;
- * approving is Ellie's, on the Self tab. Nothing in this file writes.
+ * approving is Ellie's, on the Self tab; running is the scheduler's. Nothing in
+ * this file writes.
  */
 
 const { getSqliteDb } = require('./database');
@@ -41,12 +49,16 @@ const DEFAULT_LIMIT = 10;
  * Kept as a constant so the tool result, the manifest entry and the briefing
  * cannot drift into three different claims about the same thing.
  */
-const NO_SCHEDULER =
-  'NOTHING RUNS THESE. There is no scheduler in this system: no process reads the ' +
-  'schedule and executes the job. An approved job is a record of a decision Ellie ' +
-  'made, not a task that happens. If you are asked whether a job ran, or when it ' +
-  'runs next, say plainly that it has never run and cannot until a scheduler is ' +
-  'built — do NOT infer from the schedule that it has been running.';
+const SCHEDULER_NOTE =
+  'THESE RUN NOW — but read the numbers, do not reason from the schedule. A scheduler ' +
+  'checks every minute and runs a job that is approved, enabled and armed. So each job ' +
+  'below carries real values: `times_run`, `last_run`, `last_status` and `next_run` come ' +
+  'from the run log and the job row, not from the cron expression. Report those. NEVER ' +
+  'infer that a job ran because its hour has passed, because Ellie approved it, or because ' +
+  'a scheduler exists — a job can be unarmed, disabled after failing, or deferred. If ' +
+  '`times_run` is 0, say it has never run. If `last_status` is "failed", say it failed and ' +
+  'give the error. If `next_run` is null, say it is not scheduled to run and give the reason ' +
+  'in `not_running_because`.';
 
 /** "0 9 * * *" → "every day at 09:00", where it can be said simply. */
 function describeSchedule(expr) {
@@ -93,22 +105,47 @@ function shapeJob(row, db) {
     } catch { /* the initiative may have aged out; the job still stands */ }
   }
 
+  // Execution state, read from the job row and the run log rather than derived
+  // from the schedule. This is the half that used to be a constant "never".
+  let rt = null;
+  try { rt = require('./scheduler').runtimeState(row.id); } catch { /* the record still stands */ }
+
+  // Why a job is not going to run, when it is not — stated rather than left as a
+  // null for him to fill in. The four reasons are genuinely different and a
+  // person asking "why didn't it run" wants exactly this sentence.
+  let notRunningBecause = null;
+  if (!rt || !rt.armed) {
+    if (row.status === 'proposed') notRunningBecause = 'Ellie has not decided on it yet — a proposal is not scheduled.';
+    else if (row.status === 'rejected') notRunningBecause = 'she rejected it.';
+    else if (row.status === 'reverted') notRunningBecause = 'it was reverted after being approved.';
+    else if (rt && rt.disabledReason) notRunningBecause = `it disabled itself: ${rt.disabledReason}`;
+    else if (row.status === 'approved' && !row.enabled) notRunningBecause = 'it is approved but disabled, so the scheduler skips it.';
+    else notRunningBecause = 'it is approved but not armed — its schedule could not be evaluated.';
+  }
+
+  const lastRun = rt && rt.lastRunAt;
   return {
     id: row.id,
     description: row.description,
     schedule: sched.text,
     schedule_in_words: sched.plain,
     status: row.status,
-    // `enabled` is what HE asked for when proposing, not a statement about
-    // whether anything is running. Named so it cannot be read as the latter.
+    // `enabled` is what HE asked for when proposing, and what the scheduler now
+    // reads. Kept under the same name: it was never a statement that something
+    // was running, and it still is not — `next_run` is.
     enabled_as_proposed: !!row.enabled,
     proposed_at: row.created_at || null,
     decided_at: row.decided_at || null,
     decision_note: row.decided_note || null,
-    // The two fields most likely to be answered from imagination.
-    last_run: 'never',
-    next_run: 'never — no scheduler exists',
-    times_run: 0,
+    // The fields most likely to be answered from imagination. All measured.
+    times_run: rt ? rt.timesRun : 0,
+    last_run: lastRun || 'never — it has not run yet',
+    last_status: (rt && rt.lastStatus) || null,
+    last_error: (rt && rt.lastError) || null,
+    next_run: (rt && rt.nextRunAt) || null,
+    not_running_because: notRunningBecause,
+    consecutive_failures: rt ? rt.consecutiveFailures : 0,
+    disabled_by_failures: !!(rt && rt.disabledReason),
     proposal_notice: initiative,
     conversation_id: row.conversation_id || null
   };
@@ -133,7 +170,7 @@ function jobs(args = {}) {
     ).get(KID_SOURCE, wanted, `${wanted}%`);
     if (!row) {
       return {
-        scheduler_warning: NO_SCHEDULER,
+        scheduler_note: SCHEDULER_NOTE,
         not_found_warning:
           `There is no scheduled job with id "${wanted}". Say that you have no record of it ` +
           'rather than describing a job from memory — if it is not here, you did not propose it, ' +
@@ -141,7 +178,7 @@ function jobs(args = {}) {
         job: null
       };
     }
-    return { scheduler_warning: NO_SCHEDULER, job: shapeJob(row, db) };
+    return { scheduler_note: SCHEDULER_NOTE, job: shapeJob(row, db) };
   }
 
   const status = ['proposed', 'approved', 'rejected', 'reverted'].includes(args.status) ? args.status : null;
@@ -156,7 +193,7 @@ function jobs(args = {}) {
   ).all(KID_SOURCE).reduce((a, r) => { a[r.status] = r.n; return a; }, {});
 
   const out = {
-    scheduler_warning: NO_SCHEDULER,
+    scheduler_note: SCHEDULER_NOTE,
     total_by_status: counts,
     matched: rows.length,
     jobs: rows.map(r => shapeJob(r, db))
@@ -220,11 +257,13 @@ async function run(tool, args = {}, context = {}) {
   if (result && result.error) { log('error', String(result.error).slice(0, 200)); return result; }
 
   const detail = result.job !== undefined
-    ? (result.job ? `job ${String(result.job.id).slice(0, 8)} (${result.job.status}, never run)` : 'job not found')
+    ? (result.job
+        ? `job ${String(result.job.id).slice(0, 8)} (${result.job.status}, run ${result.job.times_run}×, next ${result.job.next_run || 'not scheduled'})`
+        : 'job not found')
     : `${result.matched} job(s)${args.status ? ` status=${args.status}` : ''}`;
   log('read', detail);
   console.log(`[JobsInspect] memory_jobs: ${detail}`);
   return result;
 }
 
-module.exports = { run, jobs, describeSchedule, NO_SCHEDULER, KID_SOURCE };
+module.exports = { run, jobs, describeSchedule, SCHEDULER_NOTE, KID_SOURCE };

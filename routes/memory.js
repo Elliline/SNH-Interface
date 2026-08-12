@@ -442,12 +442,17 @@ router.post('/initiatives/:id/discuss', async (req, res) => {
 /**
  * GET /api/memory/activity
  *
- * Read-only model of every recurring process. Two categories, kept apart on
- * purpose:
- *   ACTIVE — the two in-process timers. Everything else people call "scheduled"
- *            is a STEP inside the heartbeat pass, so sub-tasks are nested under
- *            it rather than listed as peers.
- *   INERT  — cron_jobs rows. Nothing executes them; there is no scheduler.
+ * Read-only model of every recurring process. Categories kept apart on purpose:
+ *   ACTIVE — the three in-process timers. Everything else people call
+ *            "scheduled" is a STEP inside the heartbeat pass, so sub-tasks are
+ *            nested under it rather than listed as peers.
+ *   JOBS   — cron_jobs rows that the scheduler will actually run: approved,
+ *            enabled and armed, with their real next run and last run.
+ *   INERT  — cron_jobs rows that will NOT run, each saying why. A proposal
+ *            awaiting a decision, one she rejected or reverted, and one that
+ *            disabled itself after failing are four different things, and the
+ *            panel says which. Until 2026-08-12 every job was in this category,
+ *            because nothing executed a cron row.
  *
  * Reads real state (systemd process start, the run-history tables) rather than
  * keeping a parallel record. Where a process leaves no trace, it says so
@@ -638,8 +643,77 @@ router.get('/activity', (req, res) => {
       }
     ];
 
-    // --- inert --------------------------------------------------------------
-    const jobs = cronJobs.listKidCreated({ limit: 100 });
+    // --- the scheduler timer itself -----------------------------------------
+    // Listed as its own active process rather than folded into the jobs below,
+    // because "is the scheduler running" and "is this job armed" are separate
+    // questions with separate answers, and a panel that only showed the second
+    // would look identical whether or not anything was checking.
+    {
+      const sched = require('../db/scheduler');
+      const state = sched.schedulerState();
+      const recent = sched.listRuns({ limit: 20 });
+      const lastReal = recent.find(r => r.status === 'ok' || r.status === 'failed');
+      const nextArmed = db
+        ? db.prepare("SELECT MIN(next_run_at) AS t FROM cron_jobs WHERE status='approved' AND enabled=1 AND next_run_at IS NOT NULL").get().t
+        : null;
+      active.push({
+        id: 'scheduler',
+        name: 'Job scheduler',
+        description: 'Checks every minute for an approved job whose time has come, and runs it: the job description becomes the task for a background agent run with read-only memory tools, and its output goes to the notification panel. One job at a time.',
+        mechanism: 'node setInterval (in-process, db/memory-manager.js startScheduler)',
+        schedule: `every ${state.tickSeconds}s (catch-up window ${state.catchupGraceMinutes} min, auto-disable after ${state.maxConsecutiveFailures} consecutive failures)`,
+        provenance: 'system',
+        enabled: state.enabled,
+        lastRun: lastReal
+          ? { at: lastReal.started_at, status: lastReal.status, durationMs: lastReal.duration_ms, statusReason: lastReal.error || null }
+          : null,
+        // The next thing this timer will DO, which is the next armed job — not
+        // the next tick. A tick that finds nothing due is not a run.
+        nextRun: state.enabled ? (nextArmed || null) : null,
+        history: recent.map(r => ({
+          at: r.started_at, status: r.status, durationMs: r.duration_ms,
+          statusReason: r.error || null
+        })),
+        subTasks: [],
+        retentionNote: state.armedJobs === 0 ? 'no jobs are armed, so a tick has nothing to run' : null
+      });
+    }
+
+    // --- scheduled jobs, and the ones that are not ---------------------------
+    // Split on whether the scheduler will ACTUALLY run it, not on status: an
+    // approved job that disabled itself after three failures is as inert as a
+    // rejected one, and showing it under "scheduled" with a next run would be
+    // the panel claiming a run that is not coming.
+    const scheduler = require('../db/scheduler');
+    const jobsInspect = require('../db/jobs-inspect');
+    const allJobs = cronJobs.listKidCreated({ limit: 100 }).map(j => {
+      const rt = scheduler.runtimeState(j.id) || {};
+      const runs = scheduler.listRuns({ jobId: j.id, limit: 10 }).map(r => ({
+        at: r.started_at,
+        status: r.status,
+        durationMs: r.duration_ms,
+        statusReason: r.error || null,
+        trigger: r.trigger,
+        scheduledFor: r.scheduled_for,
+        toolCalls: r.tool_calls,
+        output: r.output_text
+      }));
+      return {
+        ...j,
+        scheduleInWords: jobsInspect.describeSchedule(j.schedule).plain,
+        nextRun: rt.nextRunAt || null,
+        lastRun: runs.find(r => r.status === 'ok' || r.status === 'failed') || null,
+        timesRun: rt.timesRun || 0,
+        lastStatus: rt.lastStatus || null,
+        consecutiveFailures: rt.consecutiveFailures || 0,
+        disabledReason: rt.disabledReason || null,
+        armed: !!rt.armed,
+        history: runs
+      };
+    });
+    const scheduledJobs = allJobs.filter(j => j.armed);
+    const jobs = allJobs.filter(j => !j.armed);
+    const schedulerState = scheduler.schedulerState();
 
     // --- known gaps ---------------------------------------------------------
     // Things that run but leave no queryable trace. Listed rather than hidden.
@@ -661,6 +735,8 @@ router.get('/activity', (req, res) => {
         note: 'Both timers are created at process start, so their cadence is anchored to it rather than to the wall clock. Restarting SNH re-phases every schedule below.'
       },
       active,
+      scheduler: schedulerState,
+      scheduled: { jobs: scheduledJobs },
       inert: { jobs, caps: cronJobs.capStatus() },
       gaps
     });

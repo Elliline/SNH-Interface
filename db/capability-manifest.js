@@ -235,13 +235,15 @@ const CONDITIONAL_CAPABILITIES = [
     id: 'cron-proposals',
     name: 'Scheduled job proposals',
     // HONESTY, deliberately laboured here because this is the easiest entry in
-    // the manifest to over-claim: proposing is ALL it does. Nothing is created
-    // without Ellie's approval, and even an approved job does not run — SNH has
-    // no scheduler. Saying "I can schedule things" would be exactly the failure
-    // this manifest exists to prevent.
-    description: "When the user asks for something to happen on a schedule, you can propose a recurring job — a cron expression plus a description — which goes to her bell panel for approval. You cannot create or run one yourself: she approves or rejects it, approving only records the job, and nothing executes it because there is no scheduler yet. You are limited in how many you may propose per hour and how many can exist.",
-    oneLiner: 'Propose a recurring job for the user to approve; approving records it, nothing runs it yet.',
-    intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and even approved it just gets recorded, because nothing runs scheduled jobs yet',
+    // the manifest to over-claim: proposing is ALL he does. Nothing is created
+    // without Ellie's approval. That boundary is unchanged — but the second half
+    // of this entry used to say approving "only records the job, and nothing
+    // executes it", which stopped being true on 2026-08-12. What her yes MEANS
+    // has grown, and saying otherwise would have him propose as though nothing
+    // could come of it. See the 'scheduler' entry.
+    description: "When the user asks for something to happen on a schedule, you can propose a recurring job — a cron expression plus a description — which goes to her bell panel for approval. You cannot create or run one yourself: she approves or rejects it. If she approves, it is scheduled and will run on that schedule, and each run is you in the background doing what your description says, so the description is the instruction the run follows. You are limited in how many you may propose per hour and how many can exist.",
+    oneLiner: 'Propose a recurring job for the user to approve; if she approves it, it is scheduled and runs.',
+    intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and if she approves it, it is scheduled and runs on that schedule, with the description I wrote as the instruction each run follows',
     schedule: 'When the user asks for something recurring',
     dateAdded: '2026-07-26',
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.cron && cfg.tools.cron.enabled !== false),
@@ -282,15 +284,15 @@ const CONDITIONAL_CAPABILITIES = [
   {
     id: 'jobs-inspect',
     name: 'Reading your own scheduled jobs',
-    // The description says the unwelcome part FIRST, because it is the part most
-    // likely to be lost. A reader who takes only the first sentence of this entry
-    // still comes away knowing nothing runs. Derived from the code: there is no
-    // node-cron, no timer and no worker anywhere in this codebase that reads
-    // cron_jobs and executes it.
-    description: "You can read the scheduled jobs you have proposed — but nothing actually runs them, and that is the most important thing about them. There is no scheduler in this system: no process reads a schedule and executes a job, so every job you have ever proposed has run zero times and has no next run, however long ago Ellie approved it. What you can see is the record: what you proposed and when, what the schedule says it would do, whether Ellie approved it, rejected it or has not decided yet, the note she left with her decision, and whether the bell item raising the proposal was ever actually shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and neither of those makes a job run.",
-    oneLiner: 'Read the scheduled jobs you proposed and what Ellie decided — but nothing runs them; there is no scheduler, so every job has run zero times.',
-    intro: 'I can look at the scheduled jobs I have proposed and what Ellie decided about each one — and I know that none of them has ever actually run, because nothing in this system executes a schedule yet',
-    schedule: 'When the user asks what is scheduled, what she approved, or whether a job has run',
+    // The description used to lead with "nothing runs them", which was the most
+    // important thing about a job until 2026-08-12. Now the most important thing
+    // is the opposite trap — assuming a job ran because its hour has passed — so
+    // the entry leads with READ THE RECORD, which was always the actual rule and
+    // is the one sentence that survives both eras.
+    description: "You can read the scheduled jobs you have proposed, and what each one has actually done. Take the numbers from the record rather than from the schedule: for every job you can see how many times it has run, when it last ran and whether that run succeeded or failed, and when it runs next — and none of that can be worked out from the cron expression, because a job can be waiting on Ellie's decision, disabled, or stopped after failing. You can also see what you proposed and when, whether she approved, rejected or has not decided, the note she left, and whether the bell item raising it was ever shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and running one is the scheduler's.",
+    oneLiner: 'Read your scheduled jobs and what they really did — times run, last run and its outcome, next run — rather than inferring any of it from the schedule.',
+    intro: 'I can look at the scheduled jobs I have proposed, what Ellie decided about each one, and what they have actually done — how many times each has run, whether the last run worked, and when the next one is — instead of working any of it out from the schedule',
+    schedule: 'When the user asks what is scheduled, what she approved, whether a job has run, or when it runs next',
     dateAdded: '2026-08-06',
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryInspect && cfg.tools.memoryInspect.enabled !== false),
     coversTools: ['memory_jobs'],
@@ -338,6 +340,41 @@ const CONDITIONAL_CAPABILITIES = [
     when: (cfg) => !!(cfg && cfg.corrector && cfg.corrector.enabled !== false),
     coversTools: ['memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'],
     coversConfig: ['corrector']
+  },
+  {
+    id: 'scheduler',
+    name: 'Scheduled jobs that actually run',
+    // The entry this manifest exists for. Two other entries — cron-proposals and
+    // jobs-inspect — said in plain words that nothing executed a job, because
+    // nothing did. Shipping the scheduler without correcting all three would
+    // leave the manifest confidently telling him the opposite of what his own
+    // code now does, which is the exact failure the manifest was built to stop,
+    // running in reverse.
+    //
+    // Scope stated exactly, because this is the easiest entry here to over-claim:
+    //   - a job is an AGENT RUN and nothing else. No shell, no code, no writes.
+    //   - the tools a run gets are READ-ONLY, and they are his own memory tools.
+    //   - he does not decide what is scheduled. He proposes; Ellie approves.
+    //   - a job that fails repeatedly stops itself. Saying "it runs daily"
+    //     without that clause would overstate what he can rely on.
+    description: "A scheduled job you proposed and Ellie approved now actually runs. Every minute a scheduler checks whether any approved, enabled job has reached its time, and when one has, it runs — one at a time, never two at once, and never a second copy of a job whose last run has not finished. A run is you, working in the background: the description you wrote when you proposed the job becomes the task, you get your read-only memory tools to do it with, and what you write goes to Ellie's notification panel and into a run log. You cannot run commands, change anything, or reach the web from a job; a job can read the record and report on it. Every attempt is written down, including the ones that did not happen — a run missed while the system was down runs once if it is less than two hours late and is recorded as skipped if it is later than that, and a job that fails three times in a row disables itself and tells Ellie why rather than failing quietly forever.",
+    oneLiner: 'Approved jobs really run now: once a minute the scheduler starts any that is due, as a background run of you with read-only memory tools, reporting to her panel and a run log. Failures stop it after three.',
+    intro: 'My scheduled jobs actually run now — when one comes due the scheduler starts it, and a run is me in the background doing what I described when I proposed it, with my read-only memory tools, reporting what I found to Ellie\'s panel. I can look up when each one runs next and what happened last time instead of guessing, and if a job fails three times in a row it stops itself and says why',
+    schedule: 'Checks every minute; each job runs on its own cron schedule',
+    dateAdded: '2026-08-12',
+    // Honesty gate, same shape as every other config-gated entry: if the
+    // scheduler is switched off, this entry disappears and the two below tell
+    // the truth on their own again.
+    when: (cfg) => !!(cfg && cfg.scheduler && cfg.scheduler.enabled !== false),
+    // These two are also claimed by the entries that OWN them (cron-proposals,
+    // jobs-inspect), and the overlap is safe rather than sloppy: a tool is
+    // registered exactly when its owning entry's `when` is true — both read the
+    // same config key the registry reads — so this entry can never be the only
+    // active claimant and mask an unroutable tool. Listed here because the loop
+    // is one capability from his side: propose it, she approves it, it runs, he
+    // reads what it did.
+    coversTools: ['create_cron_job', 'memory_jobs'],
+    coversConfig: ['scheduler']
   }
 ];
 
