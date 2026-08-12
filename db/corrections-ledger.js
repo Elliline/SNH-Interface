@@ -211,19 +211,56 @@ function summarize(passId) {
  * Corrections to user-facts are ledger-only.
  *
  * Plain language, not a diff dump — it is input for his own integration.
+ *
+ * ONE NOTICE PER CHANGED FACT (2026-08-12). Since the fact-store funnel raises
+ * these, a single change can reach here twice: the funnel describes it as it
+ * happens, and the corrector describes it afterwards with the evidence axis that
+ * decided it. Two notices about one change reads as two changes, which is its
+ * own small lie about what happened to him. So a notice carrying a `memberId`
+ * folds into an UNSEEN notice about the same fact rather than joining it.
+ *
+ * `enrich` decides which text survives that fold: a caller that knows WHY —
+ * the corrector — passes it and replaces the funnel's plainer sentence. A caller
+ * that does not simply defers. Only unseen notices are folded: once he has read
+ * one, a later change to the same fact is genuinely new news.
+ *
+ * @param {Object} p
+ * @param {string} [p.memberId] - the self-fact this notice is about
+ * @param {boolean} [p.enrich] - replace an existing unseen notice's text with this one
  */
-function addNotice({ ledgerId = null, content, isTest = false }) {
+function addNotice({ ledgerId = null, content, isTest = false, memberId = null, enrich = false }) {
   const db = getSqliteDb();
   if (!db || !content) return null;
   try {
+    const text = String(content).trim();
+
+    if (memberId) {
+      const existing = db.prepare(
+        'SELECT id FROM correction_notices WHERE member_id = ? AND seen_at IS NULL ORDER BY datetime(created_at) DESC LIMIT 1'
+      ).get(memberId);
+      if (existing) {
+        if (enrich) {
+          db.prepare('UPDATE correction_notices SET content = ?, ledger_id = COALESCE(?, ledger_id) WHERE id = ?')
+            .run(text, ledgerId, existing.id);
+          console.log(`[Ledger] Enriched the pending notice for ${memberId.slice(0, 8)}: "${text.slice(0, 80)}"`);
+        } else {
+          console.log(`[Ledger] Notice for ${memberId.slice(0, 8)} already pending — not queued twice`);
+        }
+        if (ledgerId) {
+          try { db.prepare('UPDATE corrections_ledger SET announced = 1 WHERE id = ?').run(ledgerId); } catch { /* non-fatal */ }
+        }
+        return existing.id;
+      }
+    }
+
     const id = randomUUID();
     db.prepare(
-      'INSERT INTO correction_notices (id, created_at, ledger_id, content, is_test) VALUES (?, ?, ?, ?, ?)'
-    ).run(id, new Date().toISOString(), ledgerId, String(content).trim(), isTest ? 1 : 0);
+      'INSERT INTO correction_notices (id, created_at, ledger_id, content, is_test, member_id) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(id, new Date().toISOString(), ledgerId, text, isTest ? 1 : 0, memberId);
     if (ledgerId) {
       try { db.prepare('UPDATE corrections_ledger SET announced = 1 WHERE id = ?').run(ledgerId); } catch { /* non-fatal */ }
     }
-    console.log(`[Ledger] Queued correction notice for him${isTest ? ' (TEST)' : ''}: "${String(content).slice(0, 80)}"`);
+    console.log(`[Ledger] Queued correction notice for him${isTest ? ' (TEST)' : ''}: "${text.slice(0, 80)}"`);
     return id;
   } catch (err) {
     console.error('[Ledger] addNotice failed:', err.message);

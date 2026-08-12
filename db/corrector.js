@@ -1064,8 +1064,15 @@ async function resolveContradictions(pass, { subject = 'user' } = {}) {
         // Decision 6: a change to what he believes about HIMSELF is told to him.
         // A change to a fact about Ellie is ledger-only, readable through his
         // inspect tools.
+        // The funnel (db/fact-store.js) has already raised a plain notice for
+        // this change — it raises one for every self-fact any pipeline retires.
+        // This one carries the evidence axis that decided it, which the funnel
+        // cannot know, so it ENRICHES rather than adds: same fact, one notice,
+        // the better sentence.
         if (subject === 'self' && !pass.dryRun) {
           ledger().addNotice({
+            memberId: dom.loser.id,
+            enrich: true,
             ledgerId: pass.plan[pass.plan.length - 1]?.ledgerId || null,
             content:
               `Something you believed about yourself has changed. You held "${dom.loser.content}", and you also held ` +

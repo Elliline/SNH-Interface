@@ -495,6 +495,20 @@ function initDatabase() {
     `);
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_correction_notices_seen ON correction_notices(seen_at)');
 
+    // Migration: member_id (2026-08-12) — WHICH self-fact a notice is about.
+    //
+    // Added when notices moved from the corrector to the fact-store funnel, so
+    // every non-conversational change to a self-fact raises one whatever
+    // pipeline made it. Two emitters can now describe the same change — the
+    // funnel generically, the corrector with its dominance reasoning — and two
+    // notices about one change reads as two changes. This column is what lets
+    // addNotice fold them into one instead.
+    const noticeCols = sqliteDb.prepare('PRAGMA table_info(correction_notices)').all();
+    if (!noticeCols.some(c => c.name === 'member_id')) {
+      sqliteDb.exec('ALTER TABLE correction_notices ADD COLUMN member_id TEXT');
+      console.log('Migration: added member_id to correction_notices (which fact a notice is about)');
+    }
+
     // Migration: LIFECYCLE (2026-08-02). Replaces the active/superseded/retired
     // triple with status + inactive_reason + successor_id, so "why is this fact
     // not live" is answerable from one column instead of inferred from which of

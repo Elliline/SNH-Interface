@@ -423,9 +423,15 @@ async function write({ statement, context = '', conversationId = null, userMessa
   const lockedCats = identityLock.autoLock(res.memberId, fact, subject);
 
   // --- 6. apply supersession through the one path that updates all three stores ---
+  //
+  // conversational:true — the one opt-out from the self-fact notice the funnel
+  // raises. This is write_memory: he is in the room, he decided to write this,
+  // and the reply he is about to give already says what it replaced. A private
+  // note telling him about a change he made a second ago is noise, and noise in
+  // that channel is what would make a real notice skippable.
   let superseded = null;
   if (supersession) {
-    const sres = await factStore().supersede(supersession.oldMemberId, res.memberId);
+    const sres = await factStore().supersede(supersession.oldMemberId, res.memberId, { conversational: true });
     if (sres.ok) {
       superseded = supersession.oldContent;
       dailyLog(`Superseded fact on request: "${supersession.oldContent}" → "${fact}" (asked to remember it directly)`);

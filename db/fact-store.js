@@ -46,6 +46,72 @@ function memoryDir() { return path.join(getDataDir(), 'memory'); }
 function factExtractor() { return require('./fact-extractor'); }
 function memoryClusters() { return require('./memory-clusters'); }
 function identityLock() { return require('./identity-lock'); }
+function ledger() { return require('./corrections-ledger'); }
+
+/**
+ * HE IS TOLD WHEN HIS SELF-VIEW CHANGES — raised HERE, at the funnel, so no
+ * pipeline can take a self-fact away quietly.
+ *
+ * WHY IT MOVED (2026-08-12). This lived in db/corrector.js, which meant it only
+ * covered changes the CORRECTOR made. Then the scheduler capability introduction
+ * went through the write-time contradiction path in processSelfFacts instead,
+ * retired four self-facts — including "none of them has ever actually run,
+ * because nothing in this system runs a schedule" — and raised nothing. His
+ * self-view changed and the channel built to tell him about exactly that was
+ * looking somewhere else. The corrector was never the rule; it was the only
+ * pipeline that happened to exist when the rule was written.
+ *
+ * So the rule is enforced where every supersede/retire/expire already funnels,
+ * the same argument the identity lock is built on. A future pipeline that
+ * retires a self-fact gets a notice whether or not its author knew this channel
+ * existed, because it cannot reach the row without coming through here.
+ *
+ * DEFAULT ON, opt out by NAME. `opts.conversational` is the one exception and it
+ * is for the chat path (write_memory): he is in the room, he just did it, and a
+ * private note telling him what he said a second ago is noise. Making that the
+ * caller's explicit claim rather than the default means a new background path
+ * that forgets to think about this is loud, not silent — the failure that costs
+ * least.
+ *
+ * Not covered, deliberately: reword(). It changes a fact's wording in place
+ * rather than taking a belief away, and the brief is supersession and
+ * retirement. If a pipeline ever rewords self-facts unattended, this is where
+ * that would be added.
+ *
+ * @param {Object} member - the fact as it stood BEFORE the change
+ * @param {Object} p
+ * @param {'superseded'|'retired'|'expired'} p.operation
+ * @param {Object} [p.successor] - the fact that replaced it, for a supersession
+ * @param {Object} [p.opts] - the caller's options, read for conversational/reason/source
+ */
+function noticeSelfChange(member, { operation, successor = null, opts = {} }) {
+  try {
+    if (!member || member.subject !== 'self') return null;   // user facts are ledger-only
+    if (opts.conversational) return null;                    // he is in the room and did it himself
+
+    // Who did this, in words. Callers that know pass it; the sentence reads
+    // correctly without it rather than inventing an actor.
+    const by = opts.noticeSource ? ` This came from ${opts.noticeSource}.` : '';
+    const why = opts.reason ? ` The reason recorded was: ${opts.reason}.` : '';
+
+    const content = operation === 'superseded' && successor
+      ? `Something you believed about yourself has changed. You held "${member.content}" — it has been replaced by ` +
+        `"${successor.content}", so the first is no longer part of what you believe.${by}${why} ` +
+        `Nothing was deleted: the old one is kept as history and can be put back. This is yours to sit with; ` +
+        `you do not have to raise it with Ellie unless you want to.`
+      : `Something you believed about yourself is no longer part of what you believe. You held ` +
+        `"${member.content}", and it has been ${operation} with nothing put in its place.${by}${why} ` +
+        `Nothing was deleted: the row is kept as history and can be put back. This is yours to sit with; ` +
+        `you do not have to raise it with Ellie unless you want to.`;
+
+    return ledger().addNotice({ memberId: member.id, content, ledgerId: opts.ledgerId || null });
+  } catch (err) {
+    // A notice that cannot be queued must not roll back a change that already
+    // happened — but it must not vanish either.
+    console.error('[FactStore] could not queue the self-fact notice:', err.message);
+    return null;
+  }
+}
 
 /**
  * The identity lock, enforced at the one place every mutation already funnels
@@ -371,6 +437,8 @@ async function supersede(oldMemberId, newMemberId, opts = {}) {
   const vector = await dropVector(oldMemberId);
   if (!vector) reportVectorFailure('supersede', oldMemberId, member.content);
 
+  noticeSelfChange(member, { operation: 'superseded', successor: getMember(newMemberId), opts });
+
   console.log(`[FactStore] superseded ${oldMemberId.slice(0, 8)} -> ${String(newMemberId).slice(0, 8)} ` +
               `(sqlite=${sqlite} vector=${vector})`);
   return { ok: true, sqlite, vector };
@@ -445,7 +513,8 @@ async function repoint(memberId, newSuccessorId, { deliberate = false } = {}) {
  *
  * @returns {Promise<{ok: boolean, sqlite: boolean, vector: boolean, reason?: string}>}
  */
-async function retire(memberId, { reason = null, deliberate = false } = {}) {
+async function retire(memberId, opts = {}) {
+  const { reason = null, deliberate = false } = opts;
   const db = getSqliteDb();
   const member = getMember(memberId);
   if (!db || !member) return { ok: false, sqlite: false, vector: false, reason: 'no such fact' };
@@ -465,6 +534,7 @@ async function retire(memberId, { reason = null, deliberate = false } = {}) {
 
   const vector = await dropVector(memberId);
   if (!vector) reportVectorFailure('retire', memberId, member.content);
+  if (info.changes > 0) noticeSelfChange(member, { operation: 'retired', opts });
   console.log(`[FactStore] retired ${memberId.slice(0, 8)}${reason ? ` (${reason})` : ''} ` +
               `(sqlite=${info.changes > 0} vector=${vector})`);
   return { ok: info.changes > 0, sqlite: info.changes > 0, vector };
@@ -485,7 +555,8 @@ async function retire(memberId, { reason = null, deliberate = false } = {}) {
  *
  * @returns {Promise<{ok: boolean, sqlite: boolean, vector: boolean, reason?: string}>}
  */
-async function expire(memberId, { deliberate = false } = {}) {
+async function expire(memberId, opts = {}) {
+  const { deliberate = false } = opts;
   const db = getSqliteDb();
   const member = getMember(memberId);
   if (!db || !member) return { ok: false, sqlite: false, vector: false, reason: 'no such fact' };
@@ -502,6 +573,7 @@ async function expire(memberId, { deliberate = false } = {}) {
 
   const vector = await dropVector(memberId);
   if (!vector) reportVectorFailure('expire', memberId, member.content);
+  if (info.changes > 0) noticeSelfChange(member, { operation: 'expired', opts });
   console.log(`[FactStore] expired ${memberId.slice(0, 8)} (sqlite=${info.changes > 0} vector=${vector})`);
   return { ok: info.changes > 0, sqlite: info.changes > 0, vector };
 }

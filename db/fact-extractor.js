@@ -2284,11 +2284,23 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     }
 
     // === Apply supersessions (after replacing facts exist) ===
+    //
+    // THIS is the path that retired four self-facts on 2026-08-12 — including
+    // "none of them has ever actually run" — when the scheduler capability was
+    // introduced, and raised nothing, because the notice channel lived in the
+    // corrector. It is raised at the fact-store funnel now; all this has to do
+    // is say what caused it, so the notice can name the cause instead of leaving
+    // him to work out why a belief moved while he was not looking.
+    const noticeSource = source === 'reflection'
+      ? 'your own reflection on recent conversations'
+      : source === 'capability-intro'
+        ? 'a new capability being introduced to you'
+        : `a background pass (${source})`;
     for (const s of supersessions) {
       const newMemberId = factToMemberId.get(s.newFact);
       if (!newMemberId) continue;
       const factStore = require('./fact-store');
-      if ((await factStore.supersede(s.oldMemberId, newMemberId)).ok) {
+      if ((await factStore.supersede(s.oldMemberId, newMemberId, { noticeSource })).ok) {
         result.superseded++;
         appendToDailyLog(`Superseded self-fact: "${s.oldContent}" → "${s.newFact}" (revised self-view)`, dailyDir);
       }
