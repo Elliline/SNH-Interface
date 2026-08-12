@@ -2,6 +2,7 @@ const { randomUUID } = require('crypto');
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const { getConfig, getProviderInstance } = require('./config');
 const { formatFactTimestamp } = require('./datetime');
+const { estTokens } = require('./injection-budget');
 
 // UUID validation for safe LanceDB filter interpolation
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1110,6 +1111,10 @@ function getClusters(subject = null) {
  * Rendering per request means the injected block cannot disagree with the
  * database, because there is nothing left to disagree with.
  *
+ * WHAT THE BUDGET LEAVES OUT IS RECORDED — see reportLtmTruncation below. 216
+ * of 343 facts were being dropped from every single request and nothing said
+ * so, which made the cap invisible to everyone including him.
+ *
  * Shape is deliberately close to the old file so the chat system prompt's
  * contract still holds — "- fact (learned <when>)" lines under "## <heading>"
  * headings — including the rule that a "(learned ...)" annotation is the ONLY
@@ -1129,9 +1134,45 @@ function getClusters(subject = null) {
  *
  * @param {Object} [opts]
  * @param {string|string[]} [opts.subject='user'] - which corpus (or corpora) to render
+ * @param {number} [opts.budgetTokens] - cap, applied at CLUSTER boundaries. Omit
+ *   for the whole corpus (the Self tab, exports, anything not injecting).
  * @returns {string} markdown, or '' when there are no active facts
  */
-function renderLongTermMemory({ subject = 'user' } = {}) {
+function reportLtmTruncation(kept, cut) {
+  const line =
+    `Injected memory is at its budget: ${kept.length} group(s) shown, ` +
+    `${cut.length} left out (${cut.reduce((s, c) => s + c.facts, 0)} fact(s)). ` +
+    `Not shown: ${cut.slice(0, 8).map(c => `${c.name} (${c.facts} facts, top salience ${c.top})`).join('; ')}` +
+    `${cut.length > 8 ? `; and ${cut.length - 8} more` : ''}.`;
+  try {
+    const db = getSqliteDb();
+    // Keyed on the CUT SET, so a stable corpus is silent after the first render
+    // and a cluster crossing the line is news again.
+    const key = `ltm-truncation:${cut.map(c => c.name).sort().join('|')}`;
+    if (db) {
+      const now = new Date().toISOString();
+      const row = db.prepare('SELECT seen_count FROM heartbeat_anomaly_state WHERE anomaly_key = ?').get(key);
+      if (row) {
+        db.prepare('UPDATE heartbeat_anomaly_state SET last_seen_at = ?, seen_count = seen_count + 1 WHERE anomaly_key = ?')
+          .run(now, key);
+        return;   // reported once; the count is the record from here on
+      }
+      db.prepare('INSERT INTO heartbeat_anomaly_state (anomaly_key, first_seen_at, last_seen_at, seen_count, anomaly_text) VALUES (?, ?, ?, 1, ?)')
+        .run(key, now, now, line);
+    }
+  } catch (err) {
+    // Fail open, same as the heartbeat memo: losing the signal to bookkeeping
+    // is worse than repeating it.
+    console.error('[Clusters] truncation memo failed (reporting anyway):', err.message);
+  }
+  try {
+    require('./fact-extractor').appendToOpsLog(
+      line, require('path').join(require('./database').getDataDir(), 'memory', 'ops'));
+  } catch { /* the console line is the floor */ }
+  console.log(`[Clusters] ${line}`);
+}
+
+function renderLongTermMemory({ subject = 'user', budgetTokens = null } = {}) {
   try {
     const db = getSqliteDb();
     if (!db) return '';
@@ -1142,7 +1183,7 @@ function renderLongTermMemory({ subject = 'user' } = {}) {
     if (!subjects.length) return '';
 
     const rows = db.prepare(`
-      SELECT cm.content, cm.salience, cm.created_at,
+      SELECT cm.content, cm.salience, cm.created_at, cm.updated_at,
              COALESCE(mc.name, 'Other') AS cluster_name
       FROM cluster_members cm
       LEFT JOIN memory_clusters mc ON mc.id = cm.cluster_id
@@ -1156,22 +1197,90 @@ function renderLongTermMemory({ subject = 'user' } = {}) {
       byCluster.get(r.cluster_name).push(r);
     }
 
+    // ORDER, and what happens at the margin.
+    //
+    // This sort decides what he remembers. Measured on 2026-08-12: 343 active
+    // facts render to 8,770 tokens against a 3,000-token cap, so 79 clusters
+    // compete for about 15 places and the ordering is not a presentation
+    // detail — it is the selection rule.
+    //
+    // The tie-break used to be alphabetical, which meant that among clusters of
+    // equal top salience, what reached him depended on the first letter of a
+    // cluster name a background pass had chosen. "SNH Project Roadmap" was in;
+    // "SNH System Architecture", same top salience, was out. Nobody decided
+    // that. Now: top salience first, then the cluster touched most recently
+    // (a corrected or re-asserted cluster is live in a way a dormant one is
+    // not), and only then the name — kept as a final resort so the order is
+    // total and a render is reproducible.
     const sal = r => (Number.isFinite(r.salience) ? r.salience : 5);
+    const touched = f => String(f.updated_at || f.created_at || '');
     const groups = [...byCluster.entries()]
       .map(([name, facts]) => {
         facts.sort((a, b) => sal(b) - sal(a) || String(a.created_at).localeCompare(String(b.created_at)));
-        return { name, facts, top: sal(facts[0]) };
+        return {
+          name, facts,
+          top: sal(facts[0]),
+          touchedAt: facts.reduce((mx, f) => (touched(f) > mx ? touched(f) : mx), '')
+        };
       })
-      .sort((a, b) => b.top - a.top || a.name.localeCompare(b.name));
+      .sort((a, b) =>
+        b.top - a.top ||
+        b.touchedAt.localeCompare(a.touchedAt) ||
+        a.name.localeCompare(b.name));
 
-    const out = ['# Long-Term Memory', ''];
-    for (const g of groups) {
-      out.push(`## ${g.name}`);
+    const render = (g) => {
+      const lines = [`## ${g.name}`];
       for (const f of g.facts) {
         const when = formatFactTimestamp(f.created_at);
-        out.push(when ? `- ${f.content} (learned ${when})` : `- ${f.content}`);
+        lines.push(when ? `- ${f.content} (learned ${when})` : `- ${f.content}`);
       }
-      out.push('');
+      lines.push('');
+      return lines;
+    };
+
+    // TRUNCATE AT CLUSTER BOUNDARIES, never mid-list.
+    //
+    // The cap used to be applied afterwards by budgetText, which slices on a
+    // character offset: the last surviving cluster kept a heading and an
+    // arbitrary prefix of its facts, so a cluster could appear to hold three
+    // facts when it holds sixteen. Deciding here, where the groups are still
+    // groups, means a cluster is either present in full or absent — and absent
+    // is recorded rather than inferred.
+    const out = ['# Long-Term Memory', ''];
+    const kept = [];
+    const cut = [];
+    if (!budgetTokens) {
+      for (const g of groups) { out.push(...render(g)); kept.push(g.name); }
+    } else {
+      let used = estTokens(out.join('\n'));
+      let full = true;
+      for (const g of groups) {
+        const block = render(g);
+        const cost = estTokens(block.join('\n'));
+        // Always keep the first cluster, whatever it costs: an empty memory
+        // block is worse than one over-budget block, and the total ceiling
+        // downstream is what actually enforces the sum.
+        if (full && (kept.length === 0 || used + cost <= budgetTokens)) {
+          out.push(...block);
+          used += cost;
+          kept.push(g.name);
+          continue;
+        }
+        full = false;
+        cut.push({ name: g.name, facts: g.facts.length, top: g.top });
+      }
+    }
+
+    if (cut.length) {
+      const factsCut = cut.reduce((s, c) => s + c.facts, 0);
+      // Said IN the block, because the alternative is a block that reads as
+      // everything he knows. This is the same rule as the memory framing: an
+      // excerpt that does not say it is an excerpt is a false negative waiting
+      // to be stated with confidence.
+      out.push(`…and ${factsCut} more fact(s) across ${cut.length} other group(s), not shown this turn ` +
+               `to fit the context budget. They are still in your memory — look them up rather than ` +
+               `concluding you have nothing.`);
+      reportLtmTruncation(kept, cut);
     }
     return out.join('\n').trimEnd();
   } catch (err) {
