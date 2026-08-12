@@ -27,8 +27,8 @@ had shipped the day before).
    - Keep entries **dry and accurate** — facts about the code, not personality.
 2. **Introduce it to SNH** so it learns it (self-fact through reflection):
    `node scripts/introduce-capability.js <id>`. This stores a first-person
-   DECLARATION via the normal self-fact pipeline. (Do NOT bulk-introduce; one
-   capability, on its ship day.)
+   self-fact via the normal self-fact pipeline, which the classifier tags a
+   CLAIM. (Do NOT bulk-introduce; one capability, on its ship day.)
 3. **Regenerate the briefing** if the manifest changed:
    `node scripts/write-capability-briefing.js` → `capability-briefing.md`.
 
@@ -39,9 +39,14 @@ Manifest changes are logged to the ops ledger automatically on boot (`syncToOps`
 - **Manifest = machine truth** (code). Queryable at conversation time (injected
   compact form + `GET /api/memory/capabilities` for full descriptions on demand).
 - **Introductions = the entity's self-facts** (formed through reflection). Facts
-  about what's built are **declarations**, not auditable claims — the existing
-  claim/declaration classifier tags them accordingly, and identity injection still
-  excludes audit "dissonance" records.
+  about what's built are **claims**, and the classifier is right to tag them so
+  (11 introductions, 11 claims): "I repair my own memory in the background" is
+  exactly the kind of assertion the coherence audit should be able to test
+  against how he actually behaved — an over-claiming manifest entry is a thing
+  the audit ought to catch, and tagging these declarations would exempt them from
+  the one check that could. Declarations are for what he CHOSE (his name); a
+  capability is something he was given. Identity injection still excludes audit
+  "dissonance" records.
 
 ## ⚠️ Chosen vs. observed: the identity lock
 
