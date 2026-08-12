@@ -1,0 +1,702 @@
+/**
+ * The scheduler — the piece that was missing, and the first brick of the agent arc.
+ *
+ * WHY THIS EXISTS. On 2026-08-05 Aurelius proposed a daily digest of background
+ * memory maintenance and Ellie approved it. Nothing happened, for six days,
+ * because approving wrote a row and no process read it. Asked later which
+ * approved job had never run, he had no tool that could answer and described the
+ * job as though it had been running. Every part of that has been fixed except
+ * the part that makes the answer worth having: something that actually runs it.
+ *
+ * ONE JOB TYPE. A job is an AGENT RUN. The description — which is prose, written
+ * by him at propose time — becomes the task prompt for a background model call
+ * with a READ-ONLY tool allowlist, and what it produces goes to Ellie's bell
+ * panel and into the run log. There is no shell, no code execution, no arbitrary
+ * side effect, and no per-job escape hatch to add one: a scheduler that can run
+ * commands is a different security posture and a separate decision. The one
+ * thing a job can do is look at the record and write a paragraph about it.
+ *
+ * BUILT LIKE THE CORRECTOR, because the same rules apply to anything that acts
+ * while nobody is in the room:
+ *
+ *   GATED     — scheduler.enabled, and per job: approved AND enabled AND armed.
+ *   BUDGETED  — the same two-limit tool session the corrector uses (calls and
+ *               wall clock), plus a rounds cap and an output ceiling.
+ *   SERIAL    — one run at a time, process-wide. A job that comes due while
+ *               another is running waits for the next tick and SAYS SO in the
+ *               run log rather than being quietly dropped.
+ *   LEDGERED  — every attempt writes a job_runs row, including the ones that did
+ *               not execute. A log of successes cannot answer "why didn't it run
+ *               this morning", which is the only question anyone asks a
+ *               scheduler.
+ *   HONEST    — it never claims a run it did not make, and it never hides one it
+ *               did. A run that produced nothing is a failure, not a silence.
+ *
+ * RE-ENTRANCY. A job never starts while its own previous run is unfinished —
+ * checked in memory AND against the run log, because the in-memory flag dies
+ * with the process and an interrupted run would otherwise block its job forever.
+ * The startup sweep closes those out as `skipped` with the reason, which is both
+ * true and unblocking.
+ *
+ * CATCH-UP. Exactly one missed run, and only if it is still worth having:
+ * scheduler.catchupGraceMinutes (default 120). Past that the miss is recorded as
+ * skipped, with the reason, and the job is re-armed forward. The arithmetic
+ * cannot backfill more than one run because a job holds ONE next_run_at, and
+ * re-arming computes from now rather than from the missed time.
+ */
+
+const { randomUUID } = require('crypto');
+const path = require('path');
+const { getSqliteDb, getDataDir } = require('./database');
+const { getConfig } = require('./config');
+const cronEval = require('./cron-eval');
+
+/** Resolved per call from the PROCESS's data dir — never a module constant. */
+function memoryDir() { return path.join(getDataDir(), 'memory'); }
+function opsDir() { return path.join(memoryDir(), 'ops'); }
+function dailyDir() { return path.join(memoryDir(), 'daily'); }
+
+/** Lazy requires — memory-manager owns the timer that calls back into here. */
+function factExtractor() { return require('./fact-extractor'); }
+function initiatives() { return require('./initiatives'); }
+
+function opsLog(msg) {
+  try { factExtractor().appendToOpsLog(msg, opsDir()); } catch { /* console is the floor */ }
+}
+function dailyLog(msg) {
+  try { factExtractor().appendToDailyLog(msg, dailyDir()); } catch { /* console is the floor */ }
+}
+
+/**
+ * The tools a scheduled job may use.
+ *
+ * Read-only, and NOT configurable per job — that is deliberate for the first
+ * version. Every one of these answers "what does the record say"; none of them
+ * changes anything. The corrector's three write actions are absent, web tools
+ * are absent, and write_memory is absent for the reason it is absent from every
+ * background path: the general power to write an arbitrary fact stays where a
+ * person is in the room. Widening this list is a decision, not a config knob.
+ */
+const JOB_TOOLS = [
+  'memory_search', 'memory_list', 'memory_count', 'memory_get',
+  'memory_corrections', 'memory_jobs'
+];
+
+function cfg() {
+  const c = getConfig().scheduler || {};
+  return {
+    enabled: c.enabled !== false,
+    tickSeconds: Math.max(10, c.tickSeconds ?? 60),
+    catchupGraceMinutes: Math.max(0, c.catchupGraceMinutes ?? 120),
+    maxConsecutiveFailures: Math.max(1, c.maxConsecutiveFailures ?? 3),
+    maxToolCallsPerRun: Math.max(1, c.maxToolCallsPerRun ?? 12),
+    maxWallClockMsPerRun: Math.max(5000, c.maxWallClockMsPerRun ?? 180000),
+    maxRoundsPerRun: Math.max(1, c.maxRoundsPerRun ?? 6),
+    maxOutputTokens: Math.max(64, c.maxOutputTokens ?? 700)
+  };
+}
+
+/**
+ * The one run in flight, process-wide. Serial by construction: a second job that
+ * comes due while this is set is deferred, never run alongside.
+ */
+let runningJobId = null;
+
+// ---------------------------------------------------------------------------
+// Arming — when is this job next due
+// ---------------------------------------------------------------------------
+
+/** A job the scheduler will actually consider: approved, enabled, kid or not. */
+function isArmable(job) {
+  return !!job && job.status === 'approved' && !!job.enabled;
+}
+
+/**
+ * Compute and store the next firing.
+ *
+ * `from` defaults to NOW rather than to the missed time, which is what keeps a
+ * restart from backfilling a week of 9am digests: the schedule is a statement
+ * about the future, and the past is the run log's business.
+ *
+ * @returns {string|null} the stored ISO time, or null if the job is not armable
+ *   or its expression is unreadable
+ */
+function armJob(jobId, { from = new Date(), reason = null } = {}) {
+  const db = getSqliteDb();
+  if (!db) return null;
+  const job = db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(jobId);
+  if (!isArmable(job)) {
+    // Disarm rather than leave a stale time on a row nothing will run: a
+    // next_run_at on a rejected or disabled job is a claim that it is coming.
+    db.prepare('UPDATE cron_jobs SET next_run_at = NULL WHERE id = ?').run(jobId);
+    return null;
+  }
+
+  const next = cronEval.nextRunAfter(job.schedule, from);
+  if (!next) {
+    // An expression that validated at propose time but cannot be evaluated (a
+    // 30th of February) is a job that will never run. Say so once, loudly, and
+    // leave it disarmed rather than retrying the same impossible sum every tick.
+    const line = `Scheduled job ${jobId.slice(0, 8)} has a schedule nothing can satisfy ("${job.schedule}") — it is not armed and will not run. Its description: "${job.description}"`;
+    console.warn(`[Scheduler] ${line}`);
+    opsLog(line);
+    db.prepare('UPDATE cron_jobs SET next_run_at = NULL WHERE id = ?').run(jobId);
+    return null;
+  }
+
+  const iso = next.toISOString();
+  db.prepare('UPDATE cron_jobs SET next_run_at = ? WHERE id = ?').run(iso, jobId);
+  console.log(`[Scheduler] armed ${jobId.slice(0, 8)} → ${next.toLocaleString()}${reason ? ` (${reason})` : ''}`);
+  return iso;
+}
+
+/**
+ * Arm every approved+enabled job that is not armed, and disarm every row that
+ * is armed but should not be. Called at startup and after any decision.
+ *
+ * The disarm half matters as much as the arm half: a job Ellie reverted, or one
+ * the failure counter disabled, must stop advertising a next run.
+ */
+function armAll({ reason = 'startup' } = {}) {
+  const db = getSqliteDb();
+  if (!db) return { armed: 0, disarmed: 0 };
+  let armed = 0, disarmed = 0;
+  for (const job of db.prepare('SELECT * FROM cron_jobs').all()) {
+    if (isArmable(job)) {
+      if (!job.next_run_at) { if (armJob(job.id, { reason })) armed++; }
+    } else if (job.next_run_at) {
+      db.prepare('UPDATE cron_jobs SET next_run_at = NULL WHERE id = ?').run(job.id);
+      disarmed++;
+    }
+  }
+  return { armed, disarmed };
+}
+
+// ---------------------------------------------------------------------------
+// The run log
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a run row. Used directly for rows that are born terminal — a deferral or
+ * a skipped catch-up never had a middle.
+ */
+function recordRun(row) {
+  const db = getSqliteDb();
+  if (!db) return null;
+  const id = row.id || randomUUID();
+  db.prepare(`
+    INSERT INTO job_runs
+      (id, job_id, scheduled_for, started_at, finished_at, status, duration_ms,
+       trigger, output_initiative_id, output_text, tool_calls, budget_json, error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, row.jobId, row.scheduledFor || null, row.startedAt || null, row.finishedAt || null,
+    row.status, row.durationMs ?? null, row.trigger || null,
+    row.outputInitiativeId || null, row.outputText || null,
+    row.toolCalls ?? 0, row.budget ? JSON.stringify(row.budget) : null, row.error || null
+  );
+  return id;
+}
+
+/**
+ * Open a run row BEFORE the work starts.
+ *
+ * Not an implementation detail: a row written only on completion means an
+ * interrupted run leaves no trace at all, so a job killed by a restart is
+ * indistinguishable from a job that never came due. Writing it first makes the
+ * in-flight state visible on disk, which is also what gives the re-entrancy
+ * check and the startup sweep something real to read.
+ *
+ * 'running' is the one transient status. It never survives a process: either
+ * finishRun replaces it, or the next startup sweeps it to 'skipped'.
+ */
+function recordRunStart({ runId, jobId, scheduledFor, startedAt, trigger }) {
+  return recordRun({
+    id: runId, jobId, scheduledFor, startedAt, finishedAt: null,
+    status: 'running', trigger
+  });
+}
+
+/** Close an open run row with what actually happened. */
+function finishRun(runId, { status, finishedAt, durationMs, outputInitiativeId, outputText, toolCalls, budget, error }) {
+  const db = getSqliteDb();
+  if (!db) return;
+  db.prepare(`
+    UPDATE job_runs
+    SET status = ?, finished_at = ?, duration_ms = ?, output_initiative_id = ?,
+        output_text = ?, tool_calls = ?, budget_json = ?, error = ?
+    WHERE id = ?
+  `).run(
+    status, finishedAt, durationMs ?? null, outputInitiativeId || null,
+    outputText || null, toolCalls ?? 0, budget ? JSON.stringify(budget) : null,
+    error || null, runId
+  );
+}
+
+/** Runs for a job (or all jobs), newest first. */
+function listRuns({ jobId = null, limit = 20 } = {}) {
+  const db = getSqliteDb();
+  if (!db) return [];
+  const lim = Math.min(Math.max(1, limit), 200);
+  return jobId
+    ? db.prepare('SELECT * FROM job_runs WHERE job_id = ? ORDER BY datetime(started_at) DESC LIMIT ?').all(jobId, lim)
+    : db.prepare('SELECT * FROM job_runs ORDER BY datetime(started_at) DESC LIMIT ?').all(lim);
+}
+
+/** The newest run that actually executed (ok or failed) — deferrals are not runs. */
+function lastExecutedRun(jobId) {
+  const db = getSqliteDb();
+  if (!db) return null;
+  return db.prepare(
+    "SELECT * FROM job_runs WHERE job_id = ? AND status IN ('ok','failed') ORDER BY datetime(started_at) DESC LIMIT 1"
+  ).get(jobId) || null;
+}
+
+/** Is a previous run of this job still open? The re-entrancy check's disk half. */
+function hasUnfinishedRun(jobId) {
+  const db = getSqliteDb();
+  if (!db) return false;
+  const row = db.prepare(
+    "SELECT id FROM job_runs WHERE job_id = ? AND status = 'running' LIMIT 1"
+  ).get(jobId);
+  return !!row;
+}
+
+/**
+ * Close out runs that a restart interrupted.
+ *
+ * Without this an interrupted run blocks its job forever: the row stays open,
+ * the re-entrancy check sees it, and the job never fires again — a silent stop,
+ * which is the failure mode this whole module is written against. Recorded as
+ * `skipped` rather than `failed` because nothing about the job went wrong, and
+ * because a failure here would count toward auto-disabling it.
+ */
+function sweepInterruptedRuns() {
+  const db = getSqliteDb();
+  if (!db) return 0;
+  const open = db.prepare("SELECT id, job_id, started_at FROM job_runs WHERE status = 'running'").all();
+  if (!open.length) return 0;
+  const now = new Date().toISOString();
+  const upd = db.prepare(
+    "UPDATE job_runs SET status = 'skipped', finished_at = ?, error = ? WHERE id = ?"
+  );
+  for (const r of open) {
+    upd.run(now, 'interrupted by a restart — the run never finished, so nothing was reported', r.id);
+    const line = `Scheduled job ${String(r.job_id).slice(0, 8)}: a run started ${r.started_at} was interrupted by a restart. Recorded as skipped; it was not retried.`;
+    console.warn(`[Scheduler] ${line}`);
+    opsLog(line);
+  }
+  return open.length;
+}
+
+// ---------------------------------------------------------------------------
+// The executor — a job is an agent run
+// ---------------------------------------------------------------------------
+
+function systemPrompt(job, tools, lastRunAt) {
+  return (
+    `You are Aurelius, running one of your own scheduled jobs. Nobody is in the room: this is not a ` +
+    `conversation, it is a background run, and what you write goes straight to Ellie's notification panel.\n\n` +
+    `THE JOB, as you proposed it and she approved it:\n"${job.description}"\n` +
+    `It runs on the schedule "${job.schedule}".\n\n` +
+    `You have these read-only tools: ${tools.join(', ')}. Use them. This job is worth nothing if you answer ` +
+    `from impression — everything you report must come from a tool result. ` +
+    `If the tools show no activity in the period, say there was none: "nothing happened" is a real and useful ` +
+    `answer, and inventing activity to fill the report is the one outcome that makes this job worse than not ` +
+    `running it. Never state a number you did not read from a tool, and never describe work you did not find ` +
+    `a record of.\n\n` +
+    `Cover the period since ${lastRunAt ? `your last run of this job (${new Date(lastRunAt).toLocaleString()})` : 'roughly the last 24 hours (this is the first time this job has ever run)'}.\n\n` +
+    `Write for Ellie, in your own voice: a few plain sentences. No headings, no bullet lists unless they are ` +
+    `genuinely the clearest form, no preamble like "here is your digest" — she knows what she is reading. ` +
+    `If there is nothing worth reporting, one line saying so is the correct output.`
+  );
+}
+
+/**
+ * Run one job, now.
+ *
+ * Every exit from this function writes exactly one job_runs row. That is the
+ * invariant the whole module rests on: if it was attempted, there is a record,
+ * whatever happened.
+ *
+ * @param {Object} job - the cron_jobs row
+ * @param {Object} opts
+ * @param {'schedule'|'catchup'|'manual'} opts.trigger
+ * @param {string} [opts.scheduledFor] - the firing this run is for
+ * @returns {Promise<Object>} the run record
+ */
+async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
+  const db = getSqliteDb();
+  if (!db) return { status: 'failed', error: 'database unavailable' };
+
+  // Re-entrancy, both halves. In-memory covers the same process; the run log
+  // covers a run that outlived one.
+  if (runningJobId) {
+    return recordDeferral(job, scheduledFor, `another job (${runningJobId.slice(0, 8)}) was still running`);
+  }
+  if (hasUnfinishedRun(job.id)) {
+    return recordDeferral(job, scheduledFor, 'its own previous run has not finished');
+  }
+
+  const runId = randomUUID();
+  const startedAt = new Date();
+  runningJobId = job.id;
+  recordRunStart({
+    runId, jobId: job.id, scheduledFor,
+    startedAt: startedAt.toISOString(), trigger
+  });
+
+  const memoryManager = require('./memory-manager');
+  const MCPClient = require('../mcp/mcp-client');
+  const allowed = MCPClient.shared().backgroundToolsAmong(JOB_TOOLS);
+  const denied = JOB_TOOLS.filter(t => !allowed.includes(t));
+  if (denied.length) {
+    // Loud: a job that asked for a tool it cannot have produces a thinner report
+    // than it should, and that must not read as "there was nothing to find".
+    const line = `Scheduled job ${job.id.slice(0, 8)} could not be given tool(s): ${denied.join(', ')}. It ran with ${allowed.length} of ${JOB_TOOLS.length}.`;
+    console.warn(`[Scheduler] ${line}`);
+    opsLog(line);
+  }
+
+  const c = cfg();
+  const lastRun = lastExecutedRun(job.id);
+  const session = memoryManager.createToolSession(`job:${job.id.slice(0, 8)}`, allowed, {
+    maxCalls: c.maxToolCallsPerRun,
+    maxWallMs: c.maxWallClockMsPerRun,
+    maxRounds: c.maxRoundsPerRun
+  });
+
+  console.log(`[Scheduler] === running job ${job.id.slice(0, 8)} (${trigger}): "${job.description}" ===`);
+
+  let status = 'ok', error = null, output = '', budget = null, toolCalls = 0;
+  try {
+    const agentPool = require('./agent-pool');
+    const res = await agentPool.schedule(
+      () => memoryManager.callLLM(
+        systemPrompt(job, allowed, lastRun && lastRun.started_at),
+        job.description,
+        { maxTokens: c.maxOutputTokens, toolSession: session }
+      ),
+      `scheduled-job:${job.id.slice(0, 8)}`
+    );
+    output = String(res && res.content || '').trim();
+    budget = (res && res.budget) || session.summary();
+    toolCalls = Array.isArray(res && res.toolCalls) ? res.toolCalls.length : 0;
+    if (!output) {
+      // An empty answer is a failure with a specific cause, not a quiet success.
+      // Reported as one so the failure counter can eventually stop it.
+      status = 'failed';
+      error = toolCalls
+        ? `the model made ${toolCalls} tool call(s) but returned no text`
+        : 'the model returned no text';
+    }
+  } catch (err) {
+    status = 'failed';
+    error = err.message || String(err);
+    budget = session.summary();
+    console.error(`[Scheduler] job ${job.id.slice(0, 8)} failed:`, error);
+  } finally {
+    runningJobId = null;
+  }
+
+  const finishedAt = new Date();
+  const durationMs = finishedAt.getTime() - startedAt.getTime();
+
+  // Deliver BEFORE the run row is written, so the row can carry the bell item's
+  // id. A delivery failure downgrades the run rather than being swallowed: a
+  // result nobody can read is not a completed job.
+  let initiativeId = null;
+  if (status === 'ok') {
+    try {
+      initiativeId = await deliver(job, runId, output, startedAt);
+    } catch (err) {
+      console.error('[Scheduler] delivery failed:', err.message);
+    }
+    if (!initiativeId) {
+      status = 'failed';
+      error = 'the job produced output but it could not be delivered to the notification panel';
+    }
+  }
+
+  finishRun(runId, {
+    status, finishedAt: finishedAt.toISOString(), durationMs,
+    outputInitiativeId: initiativeId, outputText: output || null,
+    toolCalls, budget, error
+  });
+
+  applyOutcome(job, { status, error, at: finishedAt, durationMs, trigger, toolCalls });
+
+  return { runId, status, error, output, initiativeId, durationMs, toolCalls, budget };
+}
+
+/**
+ * A due job that could not start. Recorded once per due-time, not once per tick:
+ * a job that waits twenty minutes behind a long-running one should leave one
+ * line saying it waited, not twenty identical ones. Same reasoning as the
+ * heartbeat's anomaly memo — a repeated unchanged condition is wallpaper.
+ */
+function recordDeferral(job, scheduledFor, why) {
+  const db = getSqliteDb();
+  if (db && scheduledFor) {
+    const already = db.prepare(
+      "SELECT id FROM job_runs WHERE job_id = ? AND status = 'deferred' AND scheduled_for = ? LIMIT 1"
+    ).get(job.id, scheduledFor);
+    if (already) return { status: 'deferred', error: why, runId: already.id };
+  }
+  const now = new Date().toISOString();
+  const runId = recordRun({
+    jobId: job.id, scheduledFor, startedAt: now, finishedAt: now,
+    status: 'deferred', durationMs: 0, trigger: 'schedule',
+    error: `deferred to the next tick — ${why}`
+  });
+  const line = `Scheduled job ${job.id.slice(0, 8)} came due at ${scheduledFor} but ${why}. Deferred to the next tick.`;
+  console.log(`[Scheduler] ${line}`);
+  opsLog(line);
+  return { status: 'deferred', error: why, runId };
+}
+
+/**
+ * The bell item carrying a job's output.
+ *
+ * Job results go through the initiative table — that is the notification channel
+ * — but they are EXEMPT from the pool machinery that everything else there is
+ * subject to, and the exemption is the point rather than a shortcut. A candidate
+ * observation may be deduped, re-scored, capped or expired, because the pool is
+ * a queue of things SNH thinks are worth raising. A job result is not a
+ * candidate: it is the record of something that already happened, on a schedule
+ * a person approved. Deduping two similar digests would delete the evidence of a
+ * run, which is the phantom-action bug wearing a tidier hat.
+ *
+ * source_ref is the RUN id, not the job id, for the same reason: every run is
+ * its own event, and pointing successive runs at one source would make the
+ * second one look like a duplicate of the first.
+ */
+async function deliver(job, runId, output, at) {
+  const header =
+    `Scheduled job result — "${job.description}" ` +
+    `(job ${job.id.slice(0, 8)}, ran ${at.toLocaleString()}):`;
+  const id = await initiatives().addInitiative({
+    type: 'job-result',
+    content: `${header}\n\n${output}`,
+    sourceKind: 'scheduled-job',
+    sourceRef: runId,
+    priority: 6,
+    dedupe: false
+  });
+  if (id) {
+    dailyLog(`My scheduled job ran — "${job.description}" — and I reported to Ellie: ${output}`);
+  }
+  return id;
+}
+
+/**
+ * Record the outcome on the job row, and stop a job that keeps failing.
+ *
+ * The failure counter is the thing that keeps this honest over weeks. A daily
+ * job whose brain is down does not deserve to retry forever in a log nobody
+ * reads; after scheduler.maxConsecutiveFailures it disables itself, disarms, and
+ * raises an alert that NAMES THE ERROR — the disable is useless without the
+ * reason, which is what would send someone reading server logs for an hour.
+ */
+function applyOutcome(job, { status, error, at, durationMs, trigger, toolCalls }) {
+  const db = getSqliteDb();
+  if (!db) return;
+
+  if (status === 'ok') {
+    db.prepare(`
+      UPDATE cron_jobs
+      SET last_run_at = ?, last_status = 'ok', run_count = COALESCE(run_count, 0) + 1,
+          consecutive_failures = 0
+      WHERE id = ?
+    `).run(at.toISOString(), job.id);
+    armJob(job.id, { from: at, reason: 'after a successful run' });
+    opsLog(`Scheduled job ran: "${job.description}" (${job.id.slice(0, 8)}, ${trigger}) — ok in ${(durationMs / 1000).toFixed(1)}s, ${toolCalls} tool call(s).`);
+    return;
+  }
+
+  if (status !== 'failed') return;   // deferred/skipped touch nothing on the job
+
+  const fails = (db.prepare('SELECT consecutive_failures FROM cron_jobs WHERE id = ?').get(job.id)?.consecutive_failures || 0) + 1;
+  db.prepare(`
+    UPDATE cron_jobs
+    SET last_run_at = ?, last_status = 'failed', run_count = COALESCE(run_count, 0) + 1,
+        consecutive_failures = ?
+    WHERE id = ?
+  `).run(at.toISOString(), fails, job.id);
+
+  const max = cfg().maxConsecutiveFailures;
+  if (fails < max) {
+    const line = `Scheduled job FAILED: "${job.description}" (${job.id.slice(0, 8)}) — ${error}. That is ${fails} in a row; it disables itself at ${max}.`;
+    console.warn(`[Scheduler] ${line}`);
+    opsLog(line);
+    armJob(job.id, { from: at, reason: `after failure ${fails}/${max}` });
+    return;
+  }
+
+  const reason = `disabled automatically after ${fails} consecutive failures — last error: ${error}`;
+  db.prepare("UPDATE cron_jobs SET enabled = 0, next_run_at = NULL, disabled_reason = ? WHERE id = ?")
+    .run(reason, job.id);
+  const line = `Scheduled job DISABLED: "${job.description}" (${job.id.slice(0, 8)}) — ${reason}`;
+  console.error(`[Scheduler] ${line}`);
+  opsLog(line);
+  dailyLog(`One of my scheduled jobs stopped itself: "${job.description}". It failed ${fails} times in a row and the last error was: ${error}. It will not run again until Ellie re-enables it.`);
+  initiatives().addInitiative({
+    type: 'alert',
+    content:
+      `A scheduled job of mine has disabled itself: "${job.description}" (${job.schedule}). ` +
+      `It failed ${fails} times in a row and the last error was: ${error}. ` +
+      `It will not run again until it is re-enabled.`,
+    sourceKind: 'scheduled-job-disabled',
+    sourceRef: job.id,
+    priority: 8
+  }).catch(err => console.error('[Scheduler] could not raise disable alert:', err.message));
+}
+
+// ---------------------------------------------------------------------------
+// The tick
+// ---------------------------------------------------------------------------
+
+/** Approved, enabled, armed, and due. */
+function dueJobs(now = new Date()) {
+  const db = getSqliteDb();
+  if (!db) return [];
+  return db.prepare(`
+    SELECT * FROM cron_jobs
+    WHERE status = 'approved' AND enabled = 1 AND next_run_at IS NOT NULL
+      AND datetime(next_run_at) <= datetime(?)
+    ORDER BY datetime(next_run_at) ASC
+  `).all(now.toISOString());
+}
+
+/**
+ * One pass of the scheduler. Called every scheduler.tickSeconds.
+ *
+ * Serial: if a run is in flight, every due job is deferred and the tick returns.
+ * Otherwise due jobs run one after another, awaited, in due-time order.
+ */
+async function tick({ now = new Date() } = {}) {
+  const c = cfg();
+  if (!c.enabled) return { skipped: 'scheduler disabled' };
+
+  const due = dueJobs(now);
+  if (!due.length) return { due: 0, ran: 0 };
+
+  if (runningJobId) {
+    for (const job of due) recordDeferral(job, job.next_run_at, `another job (${runningJobId.slice(0, 8)}) was still running`);
+    return { due: due.length, ran: 0, deferred: due.length };
+  }
+
+  const out = { due: due.length, ran: 0, skipped: 0, failed: 0, deferred: 0 };
+  for (const job of due) {
+    const scheduledFor = job.next_run_at;
+    const lateMs = now.getTime() - new Date(scheduledFor).getTime();
+    const graceMs = c.catchupGraceMinutes * 60_000;
+
+    // Too late to be worth running. Recorded, re-armed forward, not run — and
+    // never accumulated: one missed firing, one skipped row, one re-arm.
+    if (lateMs > graceMs) {
+      const lateMin = Math.round(lateMs / 60_000);
+      recordRun({
+        jobId: job.id, scheduledFor,
+        startedAt: now.toISOString(), finishedAt: now.toISOString(),
+        status: 'skipped', durationMs: 0, trigger: 'catchup',
+        error: `missed by ${lateMin} min, past the ${c.catchupGraceMinutes} min catch-up window — not run, and not backfilled`
+      });
+      const line = `Scheduled job "${job.description}" (${job.id.slice(0, 8)}) missed its ${new Date(scheduledFor).toLocaleString()} run by ${lateMin} min — past the ${c.catchupGraceMinutes} min catch-up window, so it was skipped rather than run late.`;
+      console.warn(`[Scheduler] ${line}`);
+      opsLog(line);
+      armJob(job.id, { from: now, reason: 'after a skipped catch-up' });
+      out.skipped++;
+      continue;
+    }
+
+    // Late but inside the window: run it once, marked as the catch-up it is.
+    const trigger = lateMs > c.tickSeconds * 1000 * 2 ? 'catchup' : 'schedule';
+    const res = await runJob(job, { trigger, scheduledFor });
+    if (res.status === 'ok') out.ran++;
+    else if (res.status === 'failed') out.failed++;
+    else if (res.status === 'deferred') out.deferred++;
+  }
+  return out;
+}
+
+/**
+ * Force a run now, outside the schedule. The deliberate path: a person asked.
+ *
+ * Does not consume the pending firing. Re-arming computes from NOW, the same as
+ * any other run, so forcing one at 08:33 re-arms to the 09:00 that was already
+ * pending and it still fires. (Forcing one DURING the pending minute is the one
+ * exception — the re-arm then lands on tomorrow, which is correct: it just ran.)
+ *
+ * Marked `manual` in the run log, so a forced run is never mistaken for evidence
+ * that the timer works. That distinction is the whole reason the column exists.
+ */
+async function runNow(jobIdOrPrefix) {
+  const db = getSqliteDb();
+  if (!db) return { error: 'database unavailable' };
+  const wanted = String(jobIdOrPrefix || '').trim();
+  const job = db.prepare('SELECT * FROM cron_jobs WHERE id = ? OR id LIKE ?').get(wanted, `${wanted}%`);
+  if (!job) return { error: `no job matching "${wanted}"` };
+  if (job.status !== 'approved') return { error: `job is ${job.status}, not approved` };
+  return runJob(job, { trigger: 'manual', scheduledFor: job.next_run_at || null });
+}
+
+/**
+ * Everything the read surfaces need about one job's execution state.
+ * One function so the tool, the API and the panel cannot disagree.
+ */
+function runtimeState(jobId) {
+  const db = getSqliteDb();
+  if (!db) return null;
+  const job = db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(jobId);
+  if (!job) return null;
+  const last = lastExecutedRun(jobId);
+  const runs = db.prepare('SELECT COUNT(*) n FROM job_runs WHERE job_id = ? AND status IN (\'ok\',\'failed\')').get(jobId).n;
+  return {
+    armed: !!job.next_run_at,
+    nextRunAt: job.next_run_at || null,
+    lastRunAt: job.last_run_at || null,
+    lastStatus: job.last_status || null,
+    lastError: last && last.status === 'failed' ? last.error : null,
+    lastRunId: last ? last.id : null,
+    timesRun: runs,
+    consecutiveFailures: job.consecutive_failures || 0,
+    disabledReason: job.disabled_reason || null,
+    enabled: !!job.enabled,
+    status: job.status
+  };
+}
+
+/** Is the scheduler actually going to run anything? For the honest surfaces. */
+function schedulerState() {
+  const c = cfg();
+  const db = getSqliteDb();
+  const armedCount = db
+    ? db.prepare("SELECT COUNT(*) n FROM cron_jobs WHERE status='approved' AND enabled=1 AND next_run_at IS NOT NULL").get().n
+    : 0;
+  return {
+    enabled: c.enabled,
+    running: !!runningJobId,
+    runningJobId,
+    tickSeconds: c.tickSeconds,
+    catchupGraceMinutes: c.catchupGraceMinutes,
+    maxConsecutiveFailures: c.maxConsecutiveFailures,
+    armedJobs: armedCount,
+    tools: JOB_TOOLS
+  };
+}
+
+module.exports = {
+  JOB_TOOLS,
+  tick,
+  runJob,
+  runNow,
+  armJob,
+  armAll,
+  dueJobs,
+  listRuns,
+  lastExecutedRun,
+  sweepInterruptedRuns,
+  runtimeState,
+  schedulerState
+};

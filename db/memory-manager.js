@@ -38,6 +38,7 @@ const ARCHIVE_DIR = path.join(DAILY_DIR, 'archive');
 let heartbeatTimer = null;
 let warmupTimer = null;
 let livenessTimer = null;
+let schedulerTimer = null;
 // Start optimistic — only write a daily-log warning on the transition from
 // answering to not-answering (and a recovery note on the way back), so a wedged
 // engine produces one alert rather than a warning every probe interval.
@@ -2294,6 +2295,67 @@ function startLivenessProbe() {
 }
 
 /**
+ * Start the job scheduler — the third timer, and the only one that runs work a
+ * PERSON asked for rather than work the system does to itself.
+ *
+ * Its own interval rather than a heartbeat step, because it is answering a
+ * different question at a different resolution: the heartbeat asks "is it time
+ * for maintenance" every couple of hours, and a 5-field cron expression has to
+ * be asked "has any wall-clock minute arrived" at roughly the resolution of a
+ * minute. A 9am job on a 2-hour pass would fire somewhere between 9:00 and 11:00,
+ * which is not what "0 9 * * *" says.
+ *
+ * Startup order matters and is deliberate:
+ *   1. Close out runs a restart interrupted, so an open row cannot block its job
+ *      forever (the in-memory re-entrancy flag died with the old process).
+ *   2. Arm anything approved and enabled that is not armed, computing FORWARD
+ *      from now — an approved job that has been sitting unarmed since before the
+ *      scheduler existed gets its next firing, never a backlog of missed ones.
+ *   3. Tick immediately, so a genuinely-missed run inside the catch-up window is
+ *      picked up at boot instead of waiting for the next minute.
+ */
+function startScheduler() {
+  const scheduler = require('./scheduler');
+  const state = scheduler.schedulerState();
+
+  if (!state.enabled) {
+    console.log('[Scheduler] Disabled by config, skipping startup');
+    return;
+  }
+  if (schedulerTimer) {
+    console.log('[Scheduler] Already running, ignoring start');
+    return;
+  }
+
+  try {
+    const swept = scheduler.sweepInterruptedRuns();
+    const { armed, disarmed } = scheduler.armAll({ reason: 'startup' });
+    console.log(`[Scheduler] Starting: ${armed} job(s) armed, ${disarmed} disarmed, ${swept} interrupted run(s) closed out`);
+  } catch (err) {
+    console.error('[Scheduler] Startup preparation failed:', err.message);
+  }
+
+  const intervalMs = state.tickSeconds * 1000;
+  console.log(`[Scheduler] Checking for due jobs every ${state.tickSeconds}s (catch-up window ${state.catchupGraceMinutes} min)`);
+
+  const fire = () => {
+    scheduler.tick().catch(err => console.error('[Scheduler] Tick error:', err.message));
+  };
+  fire();
+  schedulerTimer = setInterval(fire, intervalMs);
+  if (schedulerTimer.unref) schedulerTimer.unref();
+}
+
+/** Stop the scheduler timer. A run already in flight finishes on its own. */
+function stopScheduler() {
+  if (schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
+  console.log('[Scheduler] Stopped');
+}
+
+/**
  * Stop the liveness probe timer.
  */
 function stopLivenessProbe() {
@@ -2319,4 +2381,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };

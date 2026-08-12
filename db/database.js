@@ -701,9 +701,12 @@ function initDatabase() {
     // row the entity proposed carries 'kid-proposed', so kid-created jobs can be
     // listed and reverted in bulk without guessing.
     //
-    // NOTE: approving records the job; nothing executes it. There is no scheduler
-    // in SNH yet. Kept deliberately explicit so this table is never mistaken for
-    // a running crontab.
+    // APPROVING NOW ARMS IT (2026-08-12). Until then this note said the opposite
+    // — "approving records the job; nothing executes it" — and it was true for
+    // six days after Ellie approved one. db/scheduler.js reads approved+enabled
+    // rows and runs them; approve() computes the first next_run_at. A row that is
+    // proposed, rejected, reverted or disabled is still inert, and next_run_at is
+    // NULL for exactly those.
     sqliteDb.exec(`
       CREATE TABLE IF NOT EXISTS cron_jobs (
         id TEXT PRIMARY KEY,
@@ -722,6 +725,76 @@ function initDatabase() {
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_status ON cron_jobs(status)`);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_source ON cron_jobs(source)`);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_cron_jobs_created ON cron_jobs(created_at)`);
+
+    // Migration: THE SCHEDULER (2026-08-12). The note above stood for six days
+    // longer than it should have — an approved job was a row nothing read.
+    // db/scheduler.js now reads it, so these columns hold the state that makes a
+    // schedule answerable without guessing from the cron expression:
+    //
+    //  next_run_at          - the computed local firing this job is waiting for.
+    //                         Set at approval and after every run. NULL means the
+    //                         job is not armed (proposed, rejected, or disabled),
+    //                         which is a different thing from "no schedule".
+    //  last_run_at          - when it last actually ran (not when it was due)
+    //  last_status          - ok | failed | skipped, mirroring the newest job_runs row
+    //  run_count            - how many times it has run, ever
+    //  consecutive_failures - reset to 0 by any successful run
+    //  disabled_reason      - why the scheduler turned `enabled` off by itself.
+    //                         Non-null is the difference between a job Ellie left
+    //                         disabled and one that disabled itself after failing.
+    const cronCols = sqliteDb.prepare('PRAGMA table_info(cron_jobs)').all();
+    for (const [col, type, note] of [
+      ['next_run_at', 'DATETIME', 'the next firing this job is armed for'],
+      ['last_run_at', 'DATETIME', 'when it last actually ran'],
+      ['last_status', 'TEXT', 'outcome of the most recent run'],
+      ['run_count', 'INTEGER DEFAULT 0', 'how many times it has run, ever'],
+      ['consecutive_failures', 'INTEGER DEFAULT 0', 'reset by any successful run'],
+      ['disabled_reason', 'TEXT', 'why the scheduler disabled it by itself']
+    ]) {
+      if (!cronCols.some(c => c.name === col)) {
+        sqliteDb.exec(`ALTER TABLE cron_jobs ADD COLUMN ${col} ${type}`);
+        console.log(`Migration: added ${col} to cron_jobs (${note})`);
+      }
+    }
+
+    // Every attempt to run a job, and what came of it.
+    //
+    // Written for the attempts that did NOT execute as much as the ones that
+    // did. A scheduler whose log holds only successes cannot answer the question
+    // people actually ask it — "why didn't it run this morning" — and the honest
+    // answers to that are all statuses of their own:
+    //
+    //  ok       - it ran and produced output
+    //  failed   - it ran and threw, or produced nothing. error holds why.
+    //  skipped  - deliberately not run: too late to catch up after a restart, or
+    //             interrupted by one. Not a failure, and not counted as one.
+    //  deferred - it came due while another job was still running. The next tick
+    //             picks it up; the row exists so the delay is visible.
+    //
+    // scheduled_for is the firing this row is about, which is not started_at when
+    // a run is late — that gap is the whole story of a catch-up. output_initiative_id
+    // points at the bell item carrying the result, so "it ran" and "she was told"
+    // are separately checkable.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS job_runs (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        scheduled_for DATETIME,
+        started_at DATETIME,
+        finished_at DATETIME,
+        status TEXT NOT NULL,               -- ok | failed | skipped | deferred
+        duration_ms INTEGER,
+        trigger TEXT,                       -- schedule | catchup | manual
+        output_initiative_id TEXT,          -- the bell item carrying the result
+        output_text TEXT,
+        tool_calls INTEGER DEFAULT 0,
+        budget_json TEXT,                   -- the tool budget as it stood at the end
+        error TEXT,
+        FOREIGN KEY (job_id) REFERENCES cron_jobs(id)
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id)');
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at)');
 
     // Every tool call the entity makes and what came of it. Operational telemetry
     // → surfaced in the Thinking tab, never injected into chat. Rejected/capped

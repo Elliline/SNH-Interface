@@ -2899,6 +2899,7 @@ app.listen(PORT, () => {
   }
   memoryManager.startHeartbeat();
   memoryManager.startLivenessProbe();
+  memoryManager.startScheduler();
 
   // Hand the LIVE MCP registry to the manifest so tool capabilities are DERIVED
   // rather than restated. A registered tool no hand-written entry claims gets an

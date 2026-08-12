@@ -83,6 +83,39 @@ const DEFAULTS = {
       maxRoundsPerCall: 5
     }
   },
+  // The scheduler (2026-08-12) — the thing that finally runs an approved job.
+  //
+  // Its own timer, beside the heartbeat and the liveness probe, because it is
+  // answering a different question: not "is it time for maintenance" but "has
+  // any job's wall-clock time arrived", which has to be asked at roughly the
+  // resolution of a cron minute.
+  //
+  // A job is an AGENT RUN — its description becomes the task prompt for a
+  // background model call with a read-only tool allowlist. That is the only job
+  // type there is. No shell, no code execution, no arbitrary side effects: a
+  // scheduler that can run commands is a different security posture, decided
+  // separately.
+  scheduler: {
+    enabled: true,
+    tickSeconds: 60,             // the resolution a 5-field cron actually needs
+    // How late a missed firing may be and still run once on restart. A digest
+    // that was due at 09:00 is worth having at 09:40; the same digest at 16:00
+    // is a confusing artifact of a deploy. Past this, the run is recorded as
+    // skipped — with the reason — and the job is re-armed forward.
+    catchupGraceMinutes: 120,
+    // Never retry forever in silence. After this many consecutive failures the
+    // job disables itself and raises a bell alert naming the error.
+    maxConsecutiveFailures: 3,
+    // Per-run tool budget, same two-limit shape as heartbeat.toolBudget and for
+    // the same reason. Sized for a summarizing run: a handful of lookups, not a
+    // corpus sweep.
+    maxToolCallsPerRun: 12,
+    maxWallClockMsPerRun: 180000,
+    maxRoundsPerRun: 6,
+    // Output ceiling. A bell item is read in a panel, so a job that writes an
+    // essay is a job nobody reads.
+    maxOutputTokens: 700
+  },
   // The corrector (Phase 2c) — the heartbeat step that repairs the corpus.
   //
   // Its own cadence, deliberately slower than the heartbeat: a pass is expensive

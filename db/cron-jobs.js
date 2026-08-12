@@ -282,6 +282,18 @@ function approve(id, { note = null } = {}) {
   db.prepare("UPDATE cron_jobs SET status = 'approved', decided_at = ?, decided_note = ? WHERE id = ?")
     .run(new Date().toISOString(), note, id);
 
+  // ARM IT. This is the line that used to be missing, and its absence was the
+  // whole of the failure: approving wrote 'approved' and nothing computed a
+  // first firing, so the row sat there and the honest answer to "when does it
+  // run" was "never". A job that is approved and enabled now leaves this
+  // function with a next_run_at on it.
+  let armedFor = null;
+  try {
+    armedFor = require('./scheduler').armJob(id, { reason: 'approved' });
+  } catch (err) {
+    console.error('[CronJobs] could not arm approved job:', err.message);
+  }
+
   try {
     const initiatives = require('./initiatives');
     if (job.initiative_id) initiatives.dismiss(job.initiative_id);
@@ -292,10 +304,18 @@ function approve(id, { note = null } = {}) {
     outcome: 'approved', detail: `approved: "${job.description}" @ ${job.schedule}`,
     refId: id, conversationId: job.conversation_id
   });
-  opsLog(`cron proposal APPROVED: "${job.description}" @ ${job.schedule} (job ${id.slice(0, 8)}) — recorded, not scheduled (no scheduler exists)`);
-  dailyLog(`Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}). It's recorded — nothing runs it yet, since there's no scheduler.`);
+  // Say which of the two things happened, rather than one sentence that is true
+  // of both: an approved-but-disabled job is recorded and NOT armed, and that
+  // distinction is exactly the sort of thing this system has been wrong about.
+  const when = armedFor
+    ? `first run ${new Date(armedFor).toLocaleString()}`
+    : (job.enabled ? 'NOT armed — its schedule could not be evaluated' : 'not armed — it was proposed as disabled');
+  opsLog(`cron proposal APPROVED: "${job.description}" @ ${job.schedule} (job ${id.slice(0, 8)}) — ${when}`);
+  dailyLog(armedFor
+    ? `Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}). It is scheduled now — the first run is ${new Date(armedFor).toLocaleString()}.`
+    : `Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}), but it is not armed: ${when}.`);
 
-  return { ok: true, job: get(id) };
+  return { ok: true, job: get(id), nextRunAt: armedFor };
 }
 
 /** Reject a proposal, and tell the entity so it learns the outcome. */
@@ -348,7 +368,11 @@ function revertAllKidCreated({ note = 'bulk revert' } = {}) {
   const db = getSqliteDb();
   if (!db) return { reverted: 0 };
   const rows = db.prepare("SELECT id, description, schedule FROM cron_jobs WHERE source = ? AND status = 'approved'").all(KID_SOURCE);
-  const stmt = db.prepare("UPDATE cron_jobs SET status = 'reverted', decided_at = ?, decided_note = ? WHERE id = ?");
+  // Disarm as well as revert: a reverted job with a next_run_at still on it is a
+  // row claiming a run that is not coming, and the scheduler selects on status
+  // so it would never actually fire — the worst combination, a false promise
+  // nothing corrects.
+  const stmt = db.prepare("UPDATE cron_jobs SET status = 'reverted', next_run_at = NULL, decided_at = ?, decided_note = ? WHERE id = ?");
   const now = new Date().toISOString();
   const tx = db.transaction(list => { for (const r of list) stmt.run(now, note, r.id); });
   tx(rows);

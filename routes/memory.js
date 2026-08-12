@@ -364,7 +364,11 @@ router.get('/initiatives', (req, res) => {
   try {
     const cfg = getConfig().initiative || {};
     const threshold = Number.isFinite(cfg.greetingThreshold) ? cfg.greetingThreshold : 7;
-    const pending = initiatives.listPending({ limit: 100 });
+    // includeRecords: the panel is where a scheduled job's output is READ, so it
+    // is the one reader that must see record types. Everything else that selects
+    // pending items is choosing something to raise, and a job result is not a
+    // candidate to raise — see initiatives.listPending.
+    const pending = initiatives.listPending({ limit: 100, includeRecords: true });
     res.json({
       initiatives: pending,
       threshold,

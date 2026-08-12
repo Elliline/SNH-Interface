@@ -21,7 +21,18 @@ const { getConfig } = require('./config');
 // Ellie (currently only create_cron_job). Unlike the other types, which are
 // things to read, a proposal carries an action waiting on a decision — the bell
 // panel renders Approve/Reject for it instead of Discuss/Dismiss.
-const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit', 'proposal']);
+// 'job-result' = the output of a scheduled job (db/scheduler.js). It is the only
+// type here that is not a CANDIDATE. Everything else in this table is something
+// SNH thinks might be worth raising, and the pool machinery — semantic dedup,
+// re-scoring, the stale sweep, the cap — exists to keep that queue from becoming
+// a nag. A job result is a record of something that already happened, on a
+// schedule Ellie approved, so every one of those passes would be destroying
+// evidence rather than tidying a queue. Exempted at each of them, by name, and
+// each exemption says why.
+const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit', 'proposal', 'job-result']);
+
+/** Types that record what happened rather than propose what might be raised. */
+const RECORD_TYPES = new Set(['job-result']);
 
 function safeParse(json, fallback) {
   try { return JSON.parse(json); } catch { return fallback; }
@@ -60,12 +71,18 @@ function getDedupThreshold() {
  *      them.
  * @returns {Promise<string|null>} id (existing match or new), or null on failure
  */
-async function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5 }) {
+async function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5, dedupe = true }) {
   try {
     const db = getSqliteDb();
     if (!db || !content || !content.trim()) return null;
     const safeType = VALID_TYPES.has(type) ? type : 'observation';
     const text = content.trim();
+
+    // dedupe:false — for records rather than candidates (see RECORD_TYPES). Two
+    // consecutive daily digests can be worded almost identically, and folding
+    // the second into the first would mean a job that ran left no notification
+    // that it had: an action that HAPPENED must be visible.
+    const skipDedup = dedupe === false || RECORD_TYPES.has(safeType);
 
     // 1. Exact dedup by source identity — against pending AND already-delivered
     // items. Checking 'delivered' too closes the re-mint loop that re-asked the
@@ -73,7 +90,7 @@ async function addInitiative({ type, content, sourceKind = null, sourceRef = nul
     // source each cycle, and once the prior initiative had been delivered a
     // pending-only check no longer matched it, so a fresh duplicate was minted
     // and surfaced again. A source we've already surfaced once is not re-queued.
-    if (sourceRef) {
+    if (sourceRef && !skipDedup) {
       const existing = db.prepare(
         "SELECT id FROM initiatives WHERE status IN ('pending','delivered') AND source_kind IS ? AND source_ref IS ?"
       ).get(sourceKind, sourceRef);
@@ -81,7 +98,7 @@ async function addInitiative({ type, content, sourceKind = null, sourceRef = nul
     }
 
     // 2. Semantic dedup against pending items of the same type.
-    try {
+    if (!skipDedup) try {
       const pending = db.prepare(
         "SELECT id, content FROM initiatives WHERE status = 'pending' AND type = ?"
       ).all(safeType);
@@ -173,17 +190,32 @@ async function dedupePending({ threshold } = {}) {
   }
 }
 
-/** All pending initiatives, highest priority first. */
-function listPending({ minPriority = 0, limit = 100 } = {}) {
+/**
+ * All pending initiatives, highest priority first.
+ *
+ * RECORD_TYPES are excluded by default, and that default is what keeps the pool
+ * machinery off them: the prioritizer's stale sweep, its re-scoring pass and its
+ * cap all select through here, and every one of those would be wrong on a
+ * scheduled job's output — expiring it, re-scoring a record of something that
+ * happened, or capping it out of existence because the queue was busy that day.
+ * It also keeps a digest from being chosen as the thing SNH opens an unprompted
+ * conversation about; it belongs in the panel, where she reads it when she
+ * looks. The panel asks for them explicitly with includeRecords.
+ */
+function listPending({ minPriority = 0, limit = 100, includeRecords = false } = {}) {
   try {
     const db = getSqliteDb();
     if (!db) return [];
+    const skip = [...RECORD_TYPES];
+    const typeClause = includeRecords || !skip.length
+      ? ''
+      : ` AND type NOT IN (${skip.map(() => '?').join(',')})`;
     return db.prepare(`
       SELECT * FROM initiatives
-      WHERE status = 'pending' AND priority >= ?
+      WHERE status = 'pending' AND priority >= ?${typeClause}
       ORDER BY priority DESC, created_at ASC
       LIMIT ?
-    `).all(minPriority, limit);
+    `).all(minPriority, ...(typeClause ? skip : []), limit);
   } catch (error) {
     console.error('[Initiatives] listPending error:', error.message);
     return [];
@@ -425,6 +457,8 @@ function listFollowupTraces({ limit = 20 } = {}) {
 }
 
 module.exports = {
+  VALID_TYPES,
+  RECORD_TYPES,
   addInitiative,
   dedupePending,
   listPending,

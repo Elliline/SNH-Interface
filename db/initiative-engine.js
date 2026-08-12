@@ -376,10 +376,19 @@ async function prioritize() {
 
   try {
     // 1. Expire stale pending initiatives.
+    //
+    // Record types are exempt (see initiatives.RECORD_TYPES). A scheduled job's
+    // output does not go stale in the sense this sweep means — it is not a thing
+    // waiting to be raised, it is what the job found. Expiring one would delete
+    // the only notification that a run happened, days after the fact, for no
+    // reason a person could see. This is the one selector here that does not go
+    // through listPending, so the exemption has to be repeated by hand.
     const staleCutoff = daysAgoIso(cfg.staleDays);
+    const recordTypes = [...initiatives.RECORD_TYPES];
     const stale = sql.prepare(
-      "SELECT id FROM initiatives WHERE status = 'pending' AND created_at < ?"
-    ).all(staleCutoff);
+      `SELECT id FROM initiatives WHERE status = 'pending' AND created_at < ?
+       AND type NOT IN (${recordTypes.map(() => '?').join(',')})`
+    ).all(staleCutoff, ...recordTypes);
     for (const s of stale) if (initiatives.expire(s.id)) result.expired++;
 
     // 2. Re-score remaining pending initiatives concurrently through the pool.
