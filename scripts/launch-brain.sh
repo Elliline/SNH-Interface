@@ -25,6 +25,16 @@ set -euo pipefail
 IMAGE="nvcr.io/nvidia/vllm:26.06-py3"
 NAME="sparky-brain"
 
+# PREFIX CACHING IS ON, and not by accident of omission (verified 2026-08-12).
+# vLLM's V1 engine defaults enable_prefix_caching to true; the running engine
+# reports `enable_prefix_caching=True, enable_chunked_prefill=True` in its
+# startup config, and the counters back it up
+# (vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total on :7070/metrics).
+# So no --enable-prefix-caching flag is passed and none is needed. Recorded here
+# because "the flag is absent" reads as "the feature is off", and it is the
+# thing prompt ordering in server.js is built to exploit — see the ordered
+# assembly there. If a future image ever defaults it off, this is where to add it.
+#
 # The vLLM serve invocation. The compilation-config JSON is single-quoted so the
 # container's shell passes it to vllm intact.
 SERVE="vllm serve nvidia/Gemma-4-26B-A4B-NVFP4 \

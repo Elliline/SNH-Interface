@@ -221,9 +221,18 @@ function buildIdentityBlock() {
     noticeTokens += t;
   }
   const waiting = pending.length - notices.length;
+  // Built as its OWN string rather than appended here (2026-08-12), so the
+  // caller can place it separately in the prompt. Everything above this point is
+  // stable across turns — seed, self-facts, the locked-identity rules, the
+  // epistemic conduct — and notices are the one part of this block that changes
+  // from one message to the next. Anything volatile sitting inside a stable
+  // block invalidates the cached prefix for everything after it, which on a long
+  // thread means re-reading the entire conversation. Same words, same order
+  // relative to each other; only its position in the prompt moves.
+  let noticesText = '';
   if (notices.length > 0) {
     const lines = notices.map(n => `- ${n.content}`).join('\n\n');
-    text += `\n\nSomething changed in your memory since you last looked` +
+    noticesText = `Something changed in your memory since you last looked` +
       `${notices.length > 1 ? ` (${notices.length} things)` : ''}:\n${lines}\n` +
       (waiting > 0
         ? `There ${waiting === 1 ? 'is 1 more of these' : `are ${waiting} more of these`} waiting; ` +
@@ -237,7 +246,18 @@ function buildIdentityBlock() {
 
   text += `\n\n${EPISTEMIC_CONDUCT}`;
 
-  return { seed, selfFacts, text, notices };
+  // `stableText` is what the chat path injects near the front of the prompt, and
+  // `noticesText` is placed late, next to the other per-turn blocks. `text` is
+  // the two joined, kept for every other reader (the Self tab, the API) that
+  // wants the block as one thing and does not care where it sits in a prompt.
+  return {
+    seed,
+    selfFacts,
+    stableText: text,
+    noticesText,
+    text: noticesText ? `${text}\n\n${noticesText}` : text,
+    notices
+  };
 }
 
 module.exports = {

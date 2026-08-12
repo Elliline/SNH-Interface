@@ -1691,6 +1691,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Held so the TOTAL ceiling can rebuild this message after every other block
     // has rendered — see the ceiling pass further down.
     let memorySystemMessage = null, memoryHeader = '', memoryFooter = '';
+    // Front-of-prompt blocks, assembled in one place once they have all been
+    // built — see the ordered assembly further down.
+    let identityMessage = null, noticesMessage = null;
 
     // Add durable memory (rendered long-term facts + USER.md), long-term capped.
     if (memoryFiles.memory) {
@@ -1824,7 +1827,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         role: 'system',
         content: memoryHeader + memoryParts.map(p => p.text).join('\n\n') + memoryFooter
       };
-      enhancedMessages = [memorySystemMessage, ...enhancedMessages];
+      // NOT inserted here any more — held for the ordered assembly below, which
+      // places blocks by how often they change rather than by the order the code
+      // happens to build them in.
     } else {
       console.log('No memory context to inject');
     }
@@ -2024,11 +2029,18 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // Date/time awareness: give the model the current date/time so it knows
     // what "today" is (e.g. building search queries, temporal reasoning).
-    // Placed first so it's the leading system context for every provider path.
-    enhancedMessages.unshift({
+    //
+    // It used to be unshifted to the FRONT, and that one line was the most
+    // expensive thing in the prompt. It changes every minute, so sitting third
+    // in the sequence it invalidated the cached prefix for everything after it —
+    // the memory block, and then the entire conversation history. On a long
+    // thread that means re-reading the whole thread on every turn to save
+    // nothing. It is a volatile block and it now sits with the other volatile
+    // blocks, immediately before the conversation.
+    const datetimeMessage = {
       role: 'system',
       content: `${getCurrentDateTimeString()}. Use this as the current date/time when the user says "today", "now", "this week", etc., and when constructing web searches for current information.`
-    });
+    };
 
     // Capability self-knowledge: a compact, machine-true list of what SNH can
     // actually do, so "what can you do / do you have a way to X" is answered from
@@ -2036,10 +2048,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // proposing to build a feature it already had). Kept small for the injection
     // diet; full descriptions are retrieved on demand (GET /api/memory/capabilities).
     // Unshifted before the identity block so identity still leads.
+    let manifestMessage = null;
     try {
       const capBlock = capabilityManifest.buildInjectionBlock();
-      enhancedMessages.unshift({ role: 'system', content: capBlock.text });
-      console.log(`[Capabilities] Injected manifest: ${capBlock.count} capabilities, ~${capBlock.tokens} tokens`);
+      manifestMessage = { role: 'system', content: capBlock.text };
+      console.log(`[Capabilities] Injected manifest: ${capBlock.count} capabilities, ~${capBlock.tokens} tokens` +
+                  `${capBlock.compacted ? `, ${capBlock.compacted} compacted to name-only` : ''}`);
     } catch (capErr) {
       console.error('[Capabilities] Injection error:', capErr.message);
     }
@@ -2050,8 +2064,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // from the self-facts the reflection agent has recorded.
     try {
       const identityBlock = identity.buildIdentityBlock();
-      enhancedMessages.unshift({ role: 'system', content: identityBlock.text });
-      console.log(`[Identity] Injected seed + ${identityBlock.selfFacts.length} self-fact(s)`);
+      // The stable half leads the prompt. The notices half is volatile and is
+      // placed with the other volatile blocks below — same words, later position.
+      identityMessage = { role: 'system', content: identityBlock.stableText };
+      if (identityBlock.noticesText) {
+        noticesMessage = { role: 'system', content: identityBlock.noticesText };
+      }
+      console.log(`[Identity] Injected seed + ${identityBlock.selfFacts.length} self-fact(s)` +
+                  `${identityBlock.notices.length ? `, ${identityBlock.notices.length} notice(s)` : ''}`);
 
       // Correction notices are marked seen only AFTER they are in the message
       // that is about to be sent. Stamping them when they were read would lose a
@@ -2066,6 +2086,51 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
     } catch (identityErr) {
       console.error('[Identity] Injection error:', identityErr.message);
+    }
+
+    // === PROMPT ASSEMBLY, ORDERED BY HOW OFTEN A BLOCK CHANGES ===
+    //
+    // vLLM caches the KV of a request's token PREFIX (block-granular, and
+    // enable_prefix_caching is on by default in the V1 engine — verified in the
+    // engine config, not assumed). The cache holds up to the first token that
+    // differs from a previous request, so the cost of a block is not only its
+    // own size: it is its size plus everything after it, every time it changes.
+    //
+    // The old order was an accident of the code's shape — each block unshifted
+    // itself to the front as it was built, so the LAST thing constructed led the
+    // prompt. That put the date/time line third. It changes every minute, so
+    // the cacheable prefix ended after ~2,270 tokens and everything past it was
+    // re-read on every turn: the memory block, and then the whole conversation.
+    // On a long thread that is the entire history, re-prefilled, to save nothing.
+    //
+    // Now: stable blocks first, volatile blocks last, conversation after them.
+    //   STABLE   identity (seed, self-facts, locked rules, epistemic conduct),
+    //            capability manifest, long-term memory — all change on the scale
+    //            of hours or days.
+    //   VOLATILE today's log (grows every message), retrieval extras (per
+    //            query), the date/time line (per minute), unseen notices (per
+    //            delivery).
+    //
+    // ORDER ONLY. No block's text changed. Two positions are load-bearing and
+    // are deliberately NOT touched: the say-so rules for locked identity stay
+    // inside the identity block where they have always been, and the tool
+    // guidance ("call it now") stays AFTER the conversation, which is what the
+    // routing and honesty probes measure.
+    {
+      const stable = [identityMessage, manifestMessage].filter(Boolean);
+      const volatileBlocks = [datetimeMessage, noticesMessage].filter(Boolean);
+      // The memory message carries both kinds, so its PARTS are ordered
+      // stable-first inside it — caching reads the token stream, not the message
+      // boundaries, so ordering within one message counts the same as ordering
+      // between two.
+      if (memorySystemMessage) {
+        const rank = { ltm: 0, userProfile: 1, dailyToday: 2, dailySummary: 3, clusters: 4, pastConvo: 5, guidance: 6 };
+        memoryParts.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9));
+        memorySystemMessage.content = memoryHeader + memoryParts.map(p => p.text).join('\n\n') + memoryFooter;
+        stable.push(memorySystemMessage);
+      }
+      enhancedMessages = [...stable, ...volatileBlocks, ...enhancedMessages];
+      console.log(`[Injection] Order: ${stable.length} stable block(s) → ${volatileBlocks.length} volatile → conversation → trailing guidance`);
     }
 
     // === THE TOTAL CEILING ===
