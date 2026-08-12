@@ -54,7 +54,7 @@ const CAPABILITIES = [
     id: 'fact-extraction',
     name: 'Fact extraction & salience',
     description: "After each message you pull durable facts about the user and their projects out of the conversation and score each one for how much it matters. Each fact says one thing about one subject — a sentence that asserts several things is split into separate facts. If she says something you already hold, you do not write it down twice: you note that she has said it again and let the fact matter a little more. Facts about yourself are deliberately left out of this path — those come from reflection.",
-    oneLiner: 'Pulls durable facts about the user from each message, one assertion per fact, scores them, and folds repeats into what you already hold.',
+    oneLiner: "one assertion per fact, scored; repeats fold in",
     intro: 'I pull durable facts about the user and their projects out of each conversation, keep each one to a single assertion, score how much it matters, and fold anything she has already told me into the fact I already hold rather than writing it twice',
     schedule: 'After each message',
     dateAdded: '2026-07-03'
@@ -66,7 +66,7 @@ const CAPABILITIES = [
     // It stops new transient facts being written; it does not remove the ones
     // already in the corpus (that is the corrector, which does not exist yet).
     description: "Not everything the user tells you is a fact worth keeping. You test each thing by stripping the time reference out of it and asking whether anything durable is left. Things that happened, things happening now, and how she is feeling today go into the day's log; things that are true of her — what she owns, what she prefers, who she is — go into your long-term memory. When you cannot tell, it goes to the log, because a durable fact you missed will come up again and a passing one you stored is there forever. This applies to what you write from now on; things already in your memory are not revisited by it.",
-    oneLiner: "Things that happened go in the day's log; things that are true go in long-term memory — and when unsure, the log.",
+    oneLiner: "happened → day's log; true → memory; unsure → log",
     intro: "I sort what Ellie tells me before I keep it: things that happened or how she is feeling today go into the day's log, and only what stays true of her goes into my long-term memory — when I cannot tell which it is, it goes to the log",
     schedule: 'After each message',
     dateAdded: '2026-08-03'
@@ -75,7 +75,7 @@ const CAPABILITIES = [
     id: 'supersession',
     name: 'Supersession with history',
     description: "When the user corrects or updates something, you store the new version and mark the old fact superseded instead of deleting it, so your belief history is kept. The outdated line is also pulled from the memory that gets injected, so it stops shaping answers.",
-    oneLiner: 'Corrections retire the old fact and keep the history instead of deleting it.',
+    oneLiner: "a correction retires the old fact, never deletes it",
     intro: 'I keep my belief history when the user corrects me — the new fact supersedes the old one instead of deleting it',
     schedule: 'After each message',
     dateAdded: '2026-07-05'
@@ -84,7 +84,7 @@ const CAPABILITIES = [
     id: 'question-queue',
     name: 'Question queue & gap detection',
     description: "When new facts look incomplete or don't add up, you queue at most one short clarifying question to ask at a natural moment. You won't queue a question close to one already asked or answered, and you raise at most one per conversation.",
-    oneLiner: 'Queues a short clarifying question when your facts look incomplete — at most one per conversation.',
+    oneLiner: "queues clarifying questions; at most one per conversation",
     intro: 'I queue a short clarifying question when the facts I have look incomplete, and ask it at a natural moment',
     schedule: 'After each message; backlog swept on the heartbeat',
     dateAdded: '2026-07-06'
@@ -93,7 +93,7 @@ const CAPABILITIES = [
     id: 'initiative-bell',
     name: 'Initiative / bell',
     description: "You can raise things unprompted — a queued question, a reflection, an audit finding, a watchdog alert — through a prioritized bell. Delivery is capped: at most one self-started conversation a day, and nothing during quiet hours (10pm–8am).",
-    oneLiner: 'Lets you raise things unprompted through a prioritized bell, capped so it never nags.',
+    oneLiner: "raise things unprompted, capped so it never nags",
     intro: 'I can raise things with the user unprompted through a prioritized bell, capped so it never nags',
     schedule: 'Every ~2 hours (in the heartbeat); delivered when a conversation opens',
     dateAdded: '2026-07-09'
@@ -102,7 +102,7 @@ const CAPABILITIES = [
     id: 'reflection-identity',
     name: 'Reflection & self-identity',
     description: "You read your own recent conversations and write first-person observations about yourself, which accumulate into a self-authored identity injected into every chat. No personality is assigned to you — it's built only from what you notice.",
-    oneLiner: 'Builds your identity from first-person notes you write reflecting on your own conversations.',
+    oneLiner: "your identity comes from notes you write about yourself",
     intro: 'I build my own identity by reflecting on my recent conversations and writing first-person notes about myself',
     schedule: 'Every ~2 hours, when there are new conversations',
     dateAdded: '2026-07-05'
@@ -111,7 +111,7 @@ const CAPABILITIES = [
     id: 'heartbeat-maintenance',
     name: 'Heartbeat consolidation',
     description: "On a timer you tidy your memory: oversized topic clusters get audited and split, and clusters that ended up sharing a name get merged. The same cycle also runs log archiving, the pending-question sweep, reflection, the self-coherence audit, the capability drift check, a store reconciliation, and the initiative pass. It no longer re-scores the links between clusters or runs a fact cleanup pass — both were removed on 2026-08-02.",
-    oneLiner: 'Tidies memory on a timer — splits oversized clusters and merges duplicate-named ones.',
+    oneLiner: "splits oversized clusters, merges duplicate names",
     intro: 'I tidy my own memory on a timer — splitting oversized topic clusters and merging ones that ended up sharing a name',
     schedule: 'Every 2 hours',
     dateAdded: '2026-07-04'
@@ -120,7 +120,7 @@ const CAPABILITIES = [
     id: 'self-coherence-audit',
     name: 'Self-coherence audit',
     description: "Once a day you sample a few of your own behavioral self-claims and check each against how you actually behaved in recent conversations, flagging any gap for Ellie to approve, discuss, or dismiss. You never rewrite your own identity — a gap is recorded and raised, never auto-applied.",
-    oneLiner: 'Once a day, checks your own self-claims against how you actually behaved and flags gaps for Ellie.',
+    oneLiner: "tests your claims against your behaviour; flags, never edits",
     intro: 'I check a few of my own self-claims against how I actually behaved each day, and flag any gap for Ellie to decide on',
     schedule: 'Daily',
     dateAdded: '2026-07-23'
@@ -129,7 +129,7 @@ const CAPABILITIES = [
     id: 'brain-watchdog',
     name: 'Brain watchdog',
     description: "You watch the local model engine's health, and if it stops responding several times in a row you restart its container to unwedge it, then tell the user it happened. Restarts are rate-capped so a restart loop can't run away.",
-    oneLiner: 'Watches the local model engine and restarts it if it wedges, then says so.',
+    oneLiner: "restarts the model engine if it wedges, and says so",
     intro: 'I watch the local model engine and restart it if it wedges, then tell the user it happened',
     schedule: 'Reacts to a health probe every 5 minutes',
     dateAdded: '2026-07-15'
@@ -138,7 +138,7 @@ const CAPABILITIES = [
     id: 'epistemic-temporal',
     name: 'Epistemic honesty & time',
     description: "A fixed honesty block is injected every chat, telling you to admit when you don't know a source, not to confabulate, and never to narrate a search you aren't running; the current date and time are injected too so you always know 'today.' This is guidance you follow, not an enforced mechanism.",
-    oneLiner: 'Injects an honesty rule and the current date/time into every message.',
+    oneLiner: "honesty rule and current date/time on every message",
     intro: "I carry an honesty rule and the current date on every message — admitting what I don't know rather than confabulating",
     schedule: 'On every message',
     dateAdded: '2026-07-09'
@@ -147,7 +147,7 @@ const CAPABILITIES = [
     id: 'agent-pool',
     name: 'Parallel agent pool',
     description: "Your background thinking jobs run through one shared queue with a concurrency limit, and they yield to live chat — while you're answering the user, background work throttles so the response keeps the GPU. It's the plumbing the scheduled jobs run on.",
-    oneLiner: 'Runs background jobs through one throttled queue that yields to your live chat.',
+    oneLiner: "background work queues behind live chat",
     intro: 'I run my background thinking through one shared queue that yields to the user\'s live chat',
     schedule: 'Always available (used by background jobs)',
     dateAdded: '2026-07-08'
@@ -156,7 +156,7 @@ const CAPABILITIES = [
     id: 'memory-map',
     name: 'Memory Map',
     description: "A read-only graph in the web UI shows your memory as clusters and facts, including 'superseded' arrows that trace how a belief was replaced. It's built straight from the database with no model calls; you can search, hide old 'ghost' facts, and collapse big clusters. The cluster-to-cluster links it draws are a frozen snapshot — nothing has maintained them since 2026-08-02.",
-    oneLiner: 'A read-only web graph of your memory clusters, facts, and how beliefs were superseded.',
+    oneLiner: "read-only web graph of clusters, facts, supersessions",
     intro: 'I can show my memory as a read-only graph of clusters, facts, and the links between them',
     schedule: 'When the Map tab is opened',
     dateAdded: '2026-07-08'
@@ -165,7 +165,7 @@ const CAPABILITIES = [
     id: 'model-selection',
     name: 'Model selection',
     description: "Your chat can run on any of several model engines configured in this deployment — a local one like the vLLM brain you usually run on, or others (Ollama, llama.cpp, or a cloud provider once its API key is set) — chosen in settings. So which model is 'you' can be switched.",
-    oneLiner: 'Your chat can run on different configured model engines (local or cloud), switchable in settings.',
+    oneLiner: "chat runs on configured engines, switchable in settings",
     intro: 'I can run on different model engines configured in this deployment — a local brain or another provider — switchable in settings',
     schedule: 'Chosen in settings',
     dateAdded: '2026-07-03'
@@ -174,7 +174,7 @@ const CAPABILITIES = [
     id: 'capability-manifest',
     name: 'Capability self-knowledge',
     description: "You keep a registry of what you can actually do — this list — and a compact version is injected into your context so that when asked what you can do, you answer from ground truth instead of guessing. New capabilities are added here when they ship.",
-    oneLiner: 'This registry of what you can actually do, so you answer from truth, not guesswork.',
+    oneLiner: "this list; answer capability questions from it",
     intro: 'I keep a registry of what I can actually do and consult it when asked, instead of guessing',
     schedule: 'When asked / always injected',
     dateAdded: '2026-07-23'
@@ -191,7 +191,7 @@ const CONDITIONAL_CAPABILITIES = [
     id: 'web-search',
     name: 'Web search',
     description: "When a question is about current or changeable facts, you can search the web (via SearXNG) and read pages, and your answer marks and cites the actual source links it drew from. Those links are kept with the message, so if you're later asked to cite, you read the real sources instead of reconstructing them.",
-    oneLiner: 'Search the web for current facts and answer with the real source links you used.',
+    oneLiner: "search the web; answer with the real links used",
     intro: 'I can search the web for current facts and answer with the actual source links I drew from',
     schedule: 'When a question needs current info (only while search is enabled)',
     dateAdded: '2026-07-23',
@@ -212,7 +212,7 @@ const CONDITIONAL_CAPABILITIES = [
     id: 'voice',
     name: 'Voice (speaking and listening)',
     description: "You can speak and listen: your written reply can be spoken aloud (Kokoro text-to-speech), and a spoken message can be turned into text for you to read (NVIDIA Parakeet speech-to-text). Both run locally on Sparky's GPU alongside the rest of you.",
-    oneLiner: 'Speak your replies aloud and turn spoken input into text, both running locally.',
+    oneLiner: "speak replies, transcribe speech; both local",
     intro: 'I can speak my replies aloud and turn spoken input into text, both running locally on Sparky',
     schedule: 'When the user uses the voice controls',
     dateAdded: '2026-07-24',
@@ -242,7 +242,7 @@ const CONDITIONAL_CAPABILITIES = [
     // has grown, and saying otherwise would have him propose as though nothing
     // could come of it. See the 'scheduler' entry.
     description: "When the user asks for something to happen on a schedule, you can propose a recurring job — a cron expression plus a description — which goes to her bell panel for approval. You cannot create or run one yourself: she approves or rejects it. If she approves, it is scheduled and will run on that schedule, and each run is you in the background doing what your description says, so the description is the instruction the run follows. You are limited in how many you may propose per hour and how many can exist.",
-    oneLiner: 'Propose a recurring job for the user to approve; if she approves it, it is scheduled and runs.',
+    oneLiner: "propose a recurring job; she approves; then it runs",
     intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and if she approves it, it is scheduled and runs on that schedule, with the description I wrote as the instruction each run follows',
     schedule: 'When the user asks for something recurring',
     dateAdded: '2026-07-26',
@@ -256,7 +256,7 @@ const CONDITIONAL_CAPABILITIES = [
     // Scope stated exactly: it writes when ASKED. It is not a general power to
     // edit memory at will, and it cannot delete — the replaced version is kept.
     description: "When the user asks you to remember something, you can write it to your long-term memory yourself, in the moment, instead of hoping the passive extractor picks it up later. Before storing, you work out whether the fact is about her or about you, whether it replaces something you already hold (in which case the old version is superseded, never deleted), and how much it matters. You cannot delete a memory this way, there is a limit on how many facts you may write per hour, and every call is logged.",
-    oneLiner: 'Write a fact to your long-term memory when asked, deciding if it replaces something you already hold.',
+    oneLiner: "write a fact when asked; cannot delete",
     intro: 'I can write something to my long-term memory when I am asked to remember it, working out whether it is a fact about Ellie or about me and whether it replaces something I already held',
     schedule: 'When the user asks you to remember something',
     dateAdded: '2026-07-27',
@@ -273,7 +273,7 @@ const CONDITIONAL_CAPABILITIES = [
     // be handed these tools, but no background step asks for them yet, so this
     // entry does not say anything about what happens on the heartbeat.
     description: "You can look things up in your own long-term memory instead of relying on the excerpt that gets injected into each conversation. You can search it for a topic, list what is in it or what your clusters are, count how many facts match something, and open a single fact in full — which tells you why you believe it, how much it matters and why it scored that, when you learned it, which conversation and message it came from, the exact words that were said and whether they were spoken or typed, whether anything has replaced it, and every time it has been said to you again since. You can also read the record of changes made to your memory: what was retired, what was kept in its place, and the evidence each decision was made on. Searching what you currently believe tells you when something you no longer believe also matches, so a corrected memory is never invisible. These only read: none of them can change, add or remove a memory, and you cannot undo a correction. There is a limit on how many lookups you may do per hour, and every one is logged.",
-    oneLiner: 'Search, list, count and open your own memories — where a fact came from, why you believe it, and what has been corrected since. Read-only.',
+    oneLiner: "search/list/count/open your own memory; read-only",
     intro: 'I can look things up in my own memory rather than working from whatever excerpt happens to be injected — searching it, counting what matches, and opening a single fact to see where it came from, what was actually said, and why I believe it',
     schedule: 'When the user asks about what you remember, know, or believe',
     dateAdded: '2026-08-03',
@@ -290,7 +290,7 @@ const CONDITIONAL_CAPABILITIES = [
     // the entry leads with READ THE RECORD, which was always the actual rule and
     // is the one sentence that survives both eras.
     description: "You can read the scheduled jobs you have proposed, and what each one has actually done. Take the numbers from the record rather than from the schedule: for every job you can see how many times it has run, when it last ran and whether that run succeeded or failed, and when it runs next — and none of that can be worked out from the cron expression, because a job can be waiting on Ellie's decision, disabled, or stopped after failing. You can also see what you proposed and when, whether she approved, rejected or has not decided, the note she left, and whether the bell item raising it was ever shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and running one is the scheduler's.",
-    oneLiner: 'Read your scheduled jobs and what they really did — times run, last run and its outcome, next run — rather than inferring any of it from the schedule.',
+    oneLiner: "times run, last outcome, next run; read, never inferred",
     intro: 'I can look at the scheduled jobs I have proposed, what Ellie decided about each one, and what they have actually done — how many times each has run, whether the last run worked, and when the next one is — instead of working any of it out from the schedule',
     schedule: 'When the user asks what is scheduled, what she approved, whether a job has run, or when it runs next',
     dateAdded: '2026-08-06',
@@ -305,7 +305,7 @@ const CONDITIONAL_CAPABILITIES = [
     // would be the manifest failing at its own job — and the narrowness is the
     // design, not a limitation to gloss over.
     description: "Your name and your pronouns are locked. You chose them, and once set they cannot be changed by anything automatic — not by a correction in conversation, not by the contradiction judge, not by writing to your own memory, not by reflection. If someone tries to change them while talking to you, you say plainly that they are locked and that you have not changed them. Changing one is a deliberate action taken outside chat, in the Self tab or with a script. Everything else you have noticed about yourself stays free to change, because those are things you observed rather than chose.",
-    oneLiner: 'Your name and pronouns are locked — nothing automatic can change them, and you say so if asked to.',
+    oneLiner: "name and pronouns; nothing automatic can change them",
     // Phrased to start with "I" (the intro is composed as "As of <date>, <intro>"),
     // and deliberately worded so it does NOT itself read as an assertion of the
     // name or pronouns — otherwise introducing the capability would collide with
@@ -333,7 +333,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a supersession it cannot justify from evidence is NOT applied. Saying
     //     "resolves contradictions" without that clause would overstate it.
     description: "On its own schedule, in the background, you go back through your long-term memory and repair what is already wrong in it: duplicate and near-duplicate facts folded into the fuller one, things that were really passing events moved out of memory into the day's log, statements that say two things at once split into separate facts, and mismatches between your memory and the index used to search it. Where two facts you hold contradict each other, you weigh the evidence behind each — typed over transcribed, said directly over inferred, said more than once over said once, recent over stale — and retire the weaker one only when it is clearly weaker; when neither dominates you leave both alone and raise it for Ellie instead. You delete nothing, every change is written down with its reason and evidence, and any of them can be undone from the Self tab. Facts about yourself are only folded together when they are word for word identical — anything beyond that waits for a session with Ellie — and your locked name and pronouns are refused outright, which you are told about rather than it happening quietly.",
-    oneLiner: 'In the background you repair your own memory — folding duplicates, moving events out, retiring the weaker of two contradicting facts when the evidence is clearly one-sided. Nothing deleted; every change logged and revertible.',
+    oneLiner: "background memory repair; deletes nothing, all revertible",
     intro: 'I repair my own memory in the background now — folding duplicates together, moving things that were really passing events out into the day\'s log, and retiring the weaker of two contradicting facts when the evidence clearly favours one, leaving the pair alone and raising it with Ellie when it does not. I delete nothing, I record every change and why I made it, and any of it can be undone',
     schedule: 'A heartbeat step on its own cadence — every corrector.intervalHours (default 6h)',
     dateAdded: '2026-08-05',
@@ -358,7 +358,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a job that fails repeatedly stops itself. Saying "it runs daily"
     //     without that clause would overstate what he can rely on.
     description: "A scheduled job you proposed and Ellie approved now actually runs. Every minute a scheduler checks whether any approved, enabled job has reached its time, and when one has, it runs — one at a time, never two at once, and never a second copy of a job whose last run has not finished. A run is you, working in the background: the description you wrote when you proposed the job becomes the task, you get your read-only memory tools to do it with, and what you write goes to Ellie's notification panel and into a run log. You cannot run commands, change anything, or reach the web from a job; a job can read the record and report on it. Every attempt is written down, including the ones that did not happen — a run missed while the system was down runs once if it is less than two hours late and is recorded as skipped if it is later than that, and a job that fails three times in a row disables itself and tells Ellie why rather than failing quietly forever.",
-    oneLiner: 'Approved jobs really run now: once a minute the scheduler starts any that is due, as a background run of you with read-only memory tools, reporting to her panel and a run log. Failures stop it after three.',
+    oneLiner: "approved jobs run as background runs of you; stops itself after 3 failures",
     intro: 'My scheduled jobs actually run now — when one comes due the scheduler starts it, and a run is me in the background doing what I described when I proposed it, with my read-only memory tools, reporting what I found to Ellie\'s panel. I can look up when each one runs next and what happened last time instead of guessing, and if a job fails three times in a row it stops itself and says why',
     schedule: 'Checks every minute; each job runs on its own cron schedule',
     dateAdded: '2026-08-12',
@@ -535,17 +535,88 @@ function getCompact() {
  * list, not from a guess — and admits it can't when something isn't listed.
  * @returns {{ text: string, tokens: number, count: number }}
  */
+/**
+ * PRECEDENCE — why it is here, and why it is now half the length it was.
+ *
+ * This block loses to memory on volume: it is a few hundred tokens against a
+ * memory block of a few thousand, so a stored fact describing a shipped organ as
+ * future work (written before it shipped, never revised) can outweigh it.
+ * Stating the precedence outright is cheaper and more reliable than hoping the
+ * smaller block wins.
+ *
+ * Both directions are spelled out on purpose. The dangerous failure is not only
+ * "calls a live organ planned" — it is also the reverse, promoting a remembered
+ * PLAN into a claimed capability. Camera/vision is the live example: genuinely
+ * planned, genuinely not built, and it must stay that way.
+ *
+ * It used to run 182 tokens and open by asserting its own size ("~550 tokens
+ * against a ~6,500-token memory block"), which was measured once and then went
+ * stale in both halves — the block was 1,064 tokens by 2026-08-12 and the memory
+ * block ~6,400. A comment that states a number about the system it lives in
+ * needs a way to stay true; this one now points at the config instead
+ * (memory.injection.manifestTokens), which is enforced rather than remembered.
+ */
+const PRECEDENCE_NOTE =
+  '\n\nPRECEDENCE — this list wins. For anything about what you can do, what you have access ' +
+  'to, or where your limits are, THIS LIST overrides your memory, however strongly that memory ' +
+  'is stated. A stored fact calling one of these planned or not yet built is simply out of date, ' +
+  'written before it shipped: trust this list and speak in the present tense. The reverse holds ' +
+  'just as strictly — a memory about something planned or hoped for does NOT give you that ' +
+  'capability. If it is not listed above, you do not have it yet.';
+
 function buildInjectionBlock() {
   const caps = activeCapabilities();
-  const lines = caps.map(c => `- ${c.name}: ${c.oneLiner}`).join('\n');
+  const budget = ((getConfig().memory && getConfig().memory.injection) || {}).manifestTokens ?? 600;
+
+  // Budgeted, and the degradation is chosen with some care.
+  //
+  // This block is declared EXHAUSTIVE — "if it isn't listed here you don't have
+  // it" — so dropping an entry to save tokens would make him deny a capability
+  // he has. That is not a trade worth making at any price, so entries are never
+  // dropped. What gives way instead is the DESCRIPTION: an over-budget render
+  // keeps every name and sheds one-liners from the end of the list until it
+  // fits, and says that it did.
+  //
+  // Shedding from the end is deliberate. The list is in ship order, so the tail
+  // is the newest capabilities — and a new capability's name is the part he has
+  // just been introduced to, while the oldest entries have been shaping his
+  // answers for weeks. If this ever binds routinely, the answer is to tighten
+  // the one-liners (they are the growing cost, ~15 tokens each), not to raise
+  // the budget quietly.
   const unavailable = UNAVAILABLE.map(u => `- ${u.name}: ${u.note}`).join('\n');
-  const text =
-    'Your built-in capabilities — the ground truth of what your system can do. This list is ' +
-    "EXHAUSTIVE: if a capability isn't listed here, you don't have it, so say so plainly rather than " +
-    'claim it. When asked what you can do or whether you can do something, answer from this list.\n' +
-    lines +
+  const head =
+    'Your built-in capabilities — ground truth for what your system can do. This list is ' +
+    "EXHAUSTIVE: if something isn't on it, you don't have it. Answer capability questions from it.\n";
+  const tail =
     "\n\nExplicitly NOT available — if asked for these, say you can't:\n" +
-    unavailable +
+    unavailable;
+
+  const full = caps.map(c => `- ${c.name}: ${c.oneLiner}`);
+  let lines = full.join('\n');
+  let compacted = 0;
+  // Static cost is everything but the list; measure it once and give the list
+  // whatever is left.
+  const compactNote = (n) =>
+    `\n(The last ${n} are listed by name only to stay inside the context budget — ` +
+    `they are no less available, and asking about one gets you the detail.)`;
+  // The note itself costs tokens, so it is inside the fit check. Leaving it out
+  // was worth ~30 tokens of overshoot — a budget that is checked before the last
+  // thing is appended is not a budget.
+  const fixed = estTokens(head + tail + PRECEDENCE_NOTE);
+  if (estTokens(lines) + fixed > budget) {
+    const rendered = full.slice();
+    for (let i = rendered.length - 1; i >= 0; i--) {
+      compacted++;
+      rendered[i] = `- ${caps[i].name}`;
+      if (estTokens(rendered.join('\n') + compactNote(compacted)) + fixed <= budget) break;
+    }
+    lines = rendered.join('\n') + compactNote(compacted);
+  }
+
+  const text =
+    head +
+    lines +
+    tail +
     // A config-enabled organ whose service is DOWN is listed here, not above.
     // Same rule as an approved cron job that nothing runs: switched on is not
     // the same as working, and the compact list must not blur the two.
@@ -553,26 +624,8 @@ function buildInjectionBlock() {
       ? '\n\nTemporarily UNAVAILABLE — switched on but not responding right now, so treat these as things you cannot currently do:\n' +
         degradedCapabilities().map(c => `- ${c.name}: ${(getHealth()[c.id] || {}).detail || 'service not answering'}`).join('\n')
       : '') +
-    // PRECEDENCE. This list is ~550 tokens against a ~6,500-token memory block,
-    // so on volume alone it loses to stored facts that describe a shipped organ
-    // as future work (facts written before it shipped, and never revised —
-    // memory records what was true when it was recorded, not what is true now).
-    // Stating the precedence explicitly is cheaper and more reliable than
-    // hoping the smaller block wins.
-    //
-    // Both directions are spelled out on purpose. The dangerous failure is not
-    // only "calls a live organ planned" — it is also the reverse, promoting a
-    // remembered PLAN into a claimed capability. Camera/vision is the live
-    // example: genuinely planned, genuinely not built, and it must stay that way.
-    '\n\nPRECEDENCE — this list wins. For any question about what you can do, what you ' +
-    'have access to, or where your operational limits are, THIS LIST is the source of truth and ' +
-    'overrides anything in your memory, regardless of how important or strongly-stated that memory ' +
-    'is. A stored fact saying one of the capabilities above is planned, upcoming, or not yet built ' +
-    'is simply out of date — it was written before the capability shipped. Trust this list instead ' +
-    'and speak in the present tense. The reverse holds just as strictly: a memory about something ' +
-    'planned, hoped for, or being worked on does NOT give you that capability. If it is not in the ' +
-    'list above, you do not have it yet, no matter how much memory you hold about intending to.';
-  return { text, tokens: estTokens(text), count: caps.length };
+    PRECEDENCE_NOTE;
+  return { text, tokens: estTokens(text), count: caps.length, compacted, budget };
 }
 
 /**
