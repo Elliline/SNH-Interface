@@ -28,39 +28,21 @@ function estimateMessagesTokens(messages) {
 }
 
 /**
- * Get context window limit for a given model
+ * Get context window limit for a given model.
+ *
+ * This is now the USABLE WINDOW, not a guess from the model's name: the engine
+ * is asked what it actually serves (see db/model-context.js) and the answer is
+ * capped by `memory.contextTokens`. The name-substring table survives inside
+ * that module as the fallback for engines that cannot be asked — it is what
+ * answered 8,192 for a model the engine was serving at 131,072.
+ *
  * @param {string} model - Model name/identifier
+ * @param {string} [provider] - narrows the lookup to one engine's cached answer
+ * @param {string} [host]
  * @returns {number} Context window size in tokens
  */
-function getModelContextLimit(model) {
-  if (!model || typeof model !== 'string') return 8192;
-
-  const modelLower = model.toLowerCase();
-
-  // Check from most specific to least specific
-  if (modelLower.includes('o1') || modelLower.includes('o3') || modelLower.includes('o4')) {
-    return 200000;
-  }
-  if (modelLower.includes('claude-opus-4')) return 200000;
-  if (modelLower.includes('claude-sonnet-4')) return 200000;
-  if (modelLower.includes('claude-haiku-4')) return 200000;
-  if (modelLower.includes('gpt-5')) return 128000;
-  if (modelLower.includes('gpt-4o')) return 128000;
-  if (modelLower.includes('gpt-4-turbo')) return 128000;
-  if (modelLower.includes('gpt-4')) return 8192;
-  if (modelLower.includes('command')) return 128000;
-  if (modelLower.includes('grok-4')) return 131072;
-  if (modelLower.includes('grok-3')) return 131072;
-  if (modelLower.includes('scout')) return 131072;
-  if (modelLower.includes('llama')) return 131072;
-  if (modelLower.includes('deepseek')) return 131072;
-  if (modelLower.includes('qwen')) return 32768;
-  if (modelLower.includes('mistral')) return 32768;
-  if (modelLower.includes('phi')) return 16384;
-  if (modelLower.includes('gemma')) return 8192;
-
-  // Default fallback
-  return 8192;
+function getModelContextLimit(model, provider = null, host = null) {
+  return require('./model-context').usableWindow(model, provider, host);
 }
 
 /**
@@ -69,7 +51,7 @@ function getModelContextLimit(model) {
  * @param {string} model - Model name
  * @returns {{needsFlush: boolean, tokenCount: number, contextLimit: number, usage: number}}
  */
-function shouldFlush(messages, model) {
+function shouldFlush(messages, model, provider = null, host = null) {
   // Only user/assistant turns are compactable. A flush KEEPS the system message
   // (the injected memory context / identity prompt) verbatim, so counting it
   // toward the threshold made flush fire on every request once the memory prompt
@@ -80,7 +62,7 @@ function shouldFlush(messages, model) {
     ? messages.filter(m => m && m.role !== 'system')
     : [];
   const tokenCount = estimateMessagesTokens(conversation);
-  const contextLimit = getModelContextLimit(model);
+  const contextLimit = getModelContextLimit(model, provider, host);
   const usage = contextLimit > 0 ? tokenCount / contextLimit : 0;
   const needsFlush = tokenCount > (contextLimit * 0.80);
 
@@ -291,7 +273,7 @@ async function performFlush(messages, provider, model, apiKey, host, memoryDir =
   const dailyDir = path.join(memDir, 'daily');
 
   try {
-    const { tokenCount, contextLimit, usage } = shouldFlush(messages, model);
+    const { tokenCount, contextLimit, usage } = shouldFlush(messages, model, provider, host);
     console.log(`[MemoryFlush] Starting flush - conversation at ${(usage * 100).toFixed(1)}% of context (${tokenCount}/${contextLimit} tokens)`);
 
     // Build conversation text for extraction (user + assistant messages only)
@@ -393,7 +375,14 @@ async function performFlush(messages, provider, model, apiKey, host, memoryDir =
  */
 async function checkAndFlush(messages, provider, model, apiKey, host, memoryDir = null) {
   try {
-    const { needsFlush, usage, tokenCount, contextLimit } = shouldFlush(messages, model);
+    // Ask the engine what it is serving before deciding anything. Cached for ten
+    // minutes and bounded at 2s, so this is a no-op on all but the first turn
+    // after a boot — and if it fails, the window falls back to the static table
+    // and the flush behaves exactly as it did before.
+    try { await require('./model-context').ensureProbed(provider, host, model); }
+    catch (probeErr) { console.warn('[MemoryFlush] Context probe failed, using fallback:', probeErr.message); }
+
+    const { needsFlush, usage, tokenCount, contextLimit } = shouldFlush(messages, model, provider, host);
 
     console.log(`[MemoryFlush] Context usage: ${(usage * 100).toFixed(1)}% (${tokenCount}/${contextLimit} tokens)`);
 

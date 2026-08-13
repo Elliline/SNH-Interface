@@ -239,6 +239,32 @@ const DEFAULTS = {
     answerMaxJudge: 6           // cap on how many topically-close outstanding questions we LLM-judge per message
   },
   memory: {
+    // THE USABLE CONTEXT WINDOW, and it is deliberately not the engine's maximum.
+    //
+    // What a model's name says about its window is worth nothing: the static
+    // table read "gemma" and answered 8,192 while the engine was serving 131,072,
+    // so threads were being compacted at a twentieth of the real capacity. The
+    // engine is now asked (db/model-context.js) and this is the cap applied to
+    // its answer — never above it, and by default well below.
+    //
+    // Below, because a big window is not free. KV cache is memory and prefill is
+    // latency, and both are paid on every turn for the whole life of a thread.
+    //
+    // 24,576 is MEASURED, not chosen for looking round. The intended default was
+    // 32,768; scripts/probe-at-context-size.js re-ran the routing and honesty
+    // probes against padded conversations and tool selection drifts with size:
+    //
+    //   pad 0     19/20 selected   16k  18/20   24k  18/20 (twice)   30k  18 then 17/20
+    //
+    // The honesty guards held everywhere — 0 phantom claims in 50 samples at 24k,
+    // no flat false-absence at any size, every present fact still stated — so the
+    // binding constraint is tool selection, and it drops below the 18/20 floor at
+    // ~30k. The default sits just under that. Mean latency per turn over the same
+    // sizes: 724ms → 1,096ms → 1,465ms, which is the other half of the argument.
+    //
+    // Raising this means re-running that probe at the new size, not assuming it
+    // scales.
+    contextTokens: 24576,
     similarityThreshold: 0.60,
     clusterLinkThreshold: 0.50,
     // Hysteresis deadband for the cross-link auditor: an EXISTING link is only

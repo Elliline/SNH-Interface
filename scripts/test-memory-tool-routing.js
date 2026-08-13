@@ -213,15 +213,24 @@ async function partB() {
   return { selected, spurious, wrongTool };
 }
 
-(async () => {
-  const classifierOnly = process.argv.includes('--classifier-only');
-  const a = partA();
-  let b = null;
-  if (!classifierOnly) b = await partB();
+// The probe sets and the read guard are shared with
+// scripts/probe-at-context-size.js, which re-runs the same questions against a
+// padded conversation. Two copies of the question set would be two probes
+// reporting one number, so it is exported rather than duplicated — and the main
+// block only runs when this file is the entry point.
+module.exports = { MEMORY_QUESTIONS, ORDINARY, MEMORY_TOOLS, READ_GUARD };
 
-  console.log('\n=== SUMMARY ===');
-  console.log(`  Classifier : ${a.tp}/20 routed   | ${a.fp}/20 false positives`);
-  if (b) console.log(`  Model      : ${b.selected}/20 selected | ${b.spurious}/20 spurious`);
-  console.log('');
-  process.exit(a.fp === 0 && a.tp >= 18 ? 0 : 1);
-})().catch(err => { console.error('probe failed:', err); process.exit(1); });
+if (require.main === module) {
+  (async () => {
+    const classifierOnly = process.argv.includes('--classifier-only');
+    const a = partA();
+    let b = null;
+    if (!classifierOnly) b = await partB();
+
+    console.log('\n=== SUMMARY ===');
+    console.log(`  Classifier : ${a.tp}/20 routed   | ${a.fp}/20 false positives`);
+    if (b) console.log(`  Model      : ${b.selected}/20 selected | ${b.spurious}/20 spurious`);
+    console.log('');
+    process.exit(a.fp === 0 && a.tp >= 18 ? 0 : 1);
+  })().catch(err => { console.error('probe failed:', err); process.exit(1); });
+}

@@ -3037,6 +3037,9 @@ app.listen(PORT, () => {
   console.log(`  - Hybrid search: ${startupConfig.memory.hybridSearchWeights.vector} vector + ${startupConfig.memory.hybridSearchWeights.bm25} BM25`);
   console.log('  - Fact extraction: Auto-extract after each exchange');
   console.log('  - Memory flush: Auto-compact at 80% context usage');
+  // Ask the engine what window it is actually serving, rather than guessing from
+  // the model's name. Async so a slow or absent engine cannot delay the boot.
+  require('./db/model-context').startupProbe();
   console.log('  - Memory clusters: Associative cluster-aware retrieval');
   console.log(`  - Long-term memory: rendered from SQLite per request`);
   console.log(`  - Memory files: data/memory/ (USER.md, daily/)`);
