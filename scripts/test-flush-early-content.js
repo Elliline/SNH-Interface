@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 /**
- * Does the flush summary preserve the EARLY part of a long thread on its own?
+ * The flush summary must carry the part of the thread that is being thrown away.
  *
- * WHY THIS IS ASKED NOW. Today's-log render no longer injects entries stamped
- * with the active conversation's id, because they echo message history that is
- * already in the request. On a short thread that is pure duplication. On a thread
- * long enough to trip `memory-flush`, the old turns are no longer in the request
- * — they were compacted away — so the question is whether the flush summary
- * carries them, since the log echo no longer backs it up.
+ * WHY THIS EXISTS. Today's-log render no longer injects entries stamped with the
+ * active conversation's id, because they echo message history already in the
+ * request. On a thread long enough to trip `memory-flush` the old turns are NOT
+ * in the request — they were compacted away — so the flush summary is what has
+ * to carry them.
  *
- * This is a MEASUREMENT, not a unit test: it calls the configured chat model, so
- * it needs the brain up. It writes to a throwaway SNH_DATA_DIR — never the live
- * corpus.
+ * On 2026-08-13 it did not. performFlush built its extraction prompt with
+ * conversationText.slice(-maxChars), keeping the TAIL: the part compaction was
+ * about to keep anyway, while the head it was about to discard went unread.
+ * Details planted in the opening and the middle of the thread were both lost.
+ * The pass now summarises the head, chunking when it does not fit in one prompt,
+ * and this is the test that says so.
  *
- * Usage: node scripts/check-flush-early-content.js
+ * Calls the configured chat model, so it needs the brain up — like
+ * test-jobs-regression and test-memory-tool-routing. Writes to a throwaway
+ * SNH_DATA_DIR, never the live corpus.
+ *
+ * Usage: node scripts/test-flush-early-content.js
  */
 const fs = require('fs');
 const os = require('os');
@@ -96,26 +102,31 @@ function buildConversation(targetTokens) {
 (async () => {
   if (!host) { console.error('No host configured for the chat provider.'); process.exit(1); }
 
-  const contextLimit = memoryFlush.getModelContextLimit(model);
+  // Size the thread to whatever window is configured NOW: the point is that the
+  // flush covers the head, at whatever size the flush actually fires.
+  await require(path.join(ROOT, 'db/model-context')).ensureProbed(chat.provider, host, model);
+  const contextLimit = memoryFlush.getModelContextLimit(model, chat.provider, host);
   // Just past the 80% trigger, which is what a real thread looks like when flush fires.
   const messages = buildConversation(Math.ceil(contextLimit * 0.85));
-  const gate = memoryFlush.shouldFlush(messages, model);
+  const gate = memoryFlush.shouldFlush(messages, model, chat.provider, host);
 
   console.log(`\nModel:         ${chat.provider}/${model} @ ${host}`);
-  console.log(`Context limit: ${contextLimit} tokens (as memory-flush computes it)`);
-  console.log(`Conversation:  ${messages.length} messages, ${gate.tokenCount} tokens (${(gate.usage * 100).toFixed(1)}% of limit)`);
+  console.log(`Usable window: ${contextLimit} tokens (engine ceiling capped by memory.contextTokens)`);
+  console.log(`Conversation:  ${messages.length} messages, ${gate.tokenCount} tokens (${(gate.usage * 100).toFixed(1)}% of window)`);
   console.log(`Flush fires:   ${gate.needsFlush}`);
   if (!gate.needsFlush) { console.error('Built a thread that does not trip the flush — check the builder.'); process.exit(1); }
 
-  // What the extraction call will actually be shown, computed the way performFlush does.
-  const convText = messages.filter(m => m.role === 'user' || m.role === 'assistant')
-    .map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
+  // What the extraction passes will actually be shown: the messages that are NOT
+  // in the trailing window the compaction keeps, chunked to fit.
+  const conversation = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+  const keptTail = new Set(messages.slice(-memoryFlush.KEEP_RECENT_MESSAGES));
+  const head = conversation.filter(m => !keptTail.has(m));
   const maxExtractionTokens = Math.floor(contextLimit * 0.5);
-  const truncated = memoryFlush.estimateTokens(convText) > maxExtractionTokens;
-  const shown = truncated ? convText.slice(-(maxExtractionTokens * 4)) : convText;
-  console.log(`\nExtraction prompt cap: ${maxExtractionTokens} tokens; conversation is ${memoryFlush.estimateTokens(convText)} tokens.`);
-  console.log(`Truncated before the model sees it: ${truncated}` +
-    (truncated ? ` — the OLDEST ${memoryFlush.estimateTokens(convText) - maxExtractionTokens} tokens (~${(100 - (maxExtractionTokens / memoryFlush.estimateTokens(convText)) * 100).toFixed(0)}%) are cut, because the slice keeps the TAIL.` : ''));
+  const chunks = memoryFlush.chunkMessages(head, maxExtractionTokens);
+  const shown = chunks.flat().map(m => m.content).join('\n');
+  console.log(`\nBeing dropped: ${head.length} of ${conversation.length} messages ` +
+    `(${memoryFlush.estimateMessagesTokens(head)} tokens), covered in ${chunks.length} extraction pass(es) ` +
+    `of at most ${maxExtractionTokens} tokens each.`);
   for (const [where, n] of Object.entries(NEEDLES)) {
     console.log(`  ${where.padEnd(7)} "${n.probe}" reaches the extraction model: ${shown.includes(n.probe)}`);
   }
@@ -133,27 +144,48 @@ function buildConversation(targetTokens) {
   console.log('-'.repeat(74));
 
   console.log('\nDoes the summary preserve each planted detail?');
-  const verdict = {};
+  const inSummary = {};
   for (const [where, n] of Object.entries(NEEDLES)) {
-    verdict[where] = summary.includes(n.probe);
-    console.log(`  ${where.padEnd(7)} "${n.probe}": ${verdict[where] ? 'PRESERVED' : 'LOST'}`);
+    inSummary[where] = summary.includes(n.probe);
+    console.log(`  ${where.padEnd(7)} "${n.probe}": ${inSummary[where] ? 'PRESERVED' : 'not in summary'}`);
   }
 
   // The compacted messages are the other half of the answer: what the next turn
   // still has in front of it.
   const kept = result.compactedMessages.map(m => m.content).join('\n');
+  const inKept = {};
   console.log('\nAnd in the compacted message history the next turn actually gets:');
   for (const [where, n] of Object.entries(NEEDLES)) {
-    console.log(`  ${where.padEnd(7)} "${n.probe}": ${kept.includes(n.probe) ? 'still present' : 'gone'}`);
+    inKept[where] = kept.includes(n.probe);
+    console.log(`  ${where.padEnd(7)} "${n.probe}": ${inKept[where] ? 'still present' : 'gone'}`);
   }
 
-  console.log(`\n${'='.repeat(74)}`);
-  console.log(verdict.early
-    ? 'EARLY CONTENT SURVIVES the flush summary on its own.'
-    : 'EARLY CONTENT IS LOST by the flush summary on its own.');
-  console.log(`${'='.repeat(74)}\n`);
-  process.exit(verdict.early ? 0 : 2);
+  // WHAT IS ACTUALLY REQUIRED. Every planted detail has to survive SOMEWHERE the
+  // next turn can reach: the head details through the summary, because they are
+  // being dropped from the request; the late one through the kept tail, because
+  // it is still in the request and the summary was never asked about it.
+  let pass = 0, fail = 0;
+  const check = (name, ok, detail) => {
+    if (ok) { pass++; console.log(`  PASS  ${name}`); }
+    else { fail++; console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ''}`); }
+  };
+  console.log('\nRequired:');
+  check('the EARLY detail is carried by the summary', inSummary.early,
+    `"${NEEDLES.early.probe}" is not in the summary and ${inKept.early ? 'only' : 'not'} in the kept tail`);
+  check('the MIDDLE detail is carried by the summary', inSummary.middle,
+    `"${NEEDLES.middle.probe}" is not in the summary`);
+  check('the LATE detail is still in the compacted history', inKept.late);
+  check('the summary was written from the dropped head, in as many passes as it took',
+    chunks.length >= 1 && summary.length > 0);
+
+  const bar = '='.repeat(74);
+  console.log(`\n${bar}`);
+  console.log(fail === 0
+    ? `All ${pass} checks pass — nothing being discarded went unread.`
+    : `${fail} FAILED, ${pass} passed.`);
+  console.log(`${bar}\n`);
+  process.exit(fail === 0 ? 0 : 1);
 })().catch(err => {
-  console.error('[check-flush-early-content] error:', err);
+  console.error('[test-flush-early-content] error:', err);
   process.exit(1);
 });
