@@ -46,17 +46,52 @@ function entryHeadline(block, maxChars = 120) {
 }
 
 /**
+ * Does this daily-log block carry the provenance marker of a given conversation?
+ *
+ * The marker is the one `applyExtraction` stamps on every log line it writes —
+ * ` [conversation 3fa5317c, message d821705a, typed]` — first eight characters of
+ * the id, so the test is on that prefix. Entries written by anything else
+ * (heartbeat, reflection, salience scoring, the flush summary) carry no marker
+ * and are therefore never matched: an untagged entry is not attributed to a
+ * conversation, and guessing at attribution would hide entries this cannot prove
+ * are duplicates.
+ */
+function blockIsFromConversation(block, conversationId) {
+  if (!conversationId) return false;
+  const short = String(conversationId).slice(0, 8).toLowerCase();
+  if (!short) return false;
+  return block.toLowerCase().includes(`[conversation ${short}`);
+}
+
+/**
  * Budget the daily logs. Returns the recent slice of today's log (verbatim, up
  * to `dailyTodayTokens`) and a brief digest of everything older (rest of today +
  * yesterday), capped at `dailySummaryTokens`.
+ *
+ * `excludeConversationId` drops today's entries that came from the conversation
+ * being rendered right now. They are an ECHO: the extractor writes one log line
+ * per message of the live thread, and that thread is already in the request
+ * verbatim as its own message history — so the same content was being paid for
+ * twice, and the second copy is the one that changes on every single turn, which
+ * is the worst thing a block near the front of a cached prefix can do. Entries
+ * from OTHER conversations today are exactly the continuity this block exists
+ * for and still render. RENDER-TIME ONLY: the log itself is written, archived and
+ * reflected on unchanged, and the excluded lines are still there for the
+ * heartbeat, the Thinking tab and tomorrow's digest.
  *
  * @returns {{recent: string, summary: string, stats: object}}
  */
 function budgetDailyLogs(todayText, yesterdayText, opts = {}) {
   const dailyTodayTokens = opts.dailyTodayTokens ?? 1500;
   const dailySummaryTokens = opts.dailySummaryTokens ?? 400;
+  const excludeConversationId = opts.excludeConversationId || null;
 
-  const { blocks: todayBlocks } = splitDailyBlocks(todayText);
+  let { blocks: todayBlocks } = splitDailyBlocks(todayText);
+  const todayBlocksBefore = todayBlocks.length;
+  if (excludeConversationId) {
+    todayBlocks = todayBlocks.filter(b => !blockIsFromConversation(b, excludeConversationId));
+  }
+  const selfExcluded = todayBlocksBefore - todayBlocks.length;
 
   // Accumulate newest-first today blocks up to the verbatim budget.
   const keptBlocks = [];
@@ -100,6 +135,7 @@ function budgetDailyLogs(todayText, yesterdayText, opts = {}) {
     stats: {
       todayBlocksTotal: todayBlocks.length,
       todayBlocksKept: keptBlocks.length,
+      todayBlocksSelfExcluded: selfExcluded,
       recentTokens: estTokens(recent),
       summaryTokens: estTokens(summary),
       digestOmitted: omitted,
@@ -314,7 +350,8 @@ function memoryFraming(toolsAvailable) {
 }
 
 module.exports = {
-  estTokens, splitDailyBlocks, entryHeadline, budgetDailyLogs, budgetText,
+  estTokens, splitDailyBlocks, entryHeadline, blockIsFromConversation,
+  budgetDailyLogs, budgetText,
   applyTotalCeiling, budgetFact,
   MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS,
   MEMORY_LOOKUP_HONESTY, memoryFraming

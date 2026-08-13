@@ -283,6 +283,12 @@ const DEFAULTS = {
       longTermTokens: 3000,      // long-term fact block, rendered from SQLite
       dailyTodayTokens: 1500,    // today's most-recent entries injected verbatim
       dailySummaryTokens: 400,   // brief digest of older-today + yesterday
+      // Today's log entries stamped with the CURRENT conversation's id are an
+      // echo of the message history that is already in the request verbatim, and
+      // they are what makes this block change on every turn. Excluded from the
+      // render only; other conversations' entries from today still inject, and
+      // nothing about how the log is written or read elsewhere changes.
+      dailyExcludeActiveConversation: true,
       clusterTokens: 1200,       // associated cluster memory cap
       pastConvoTokens: 800,      // hybrid-search past-conversation snippets cap
       // Correction notices, as a BATCH not a count. Ten notices capped only by

@@ -1709,12 +1709,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Daily logs for short-term continuity: inject today's most-recent entries
     // verbatim (up to dailyTodayTokens) plus a brief digest of the remainder +
     // yesterday (up to dailySummaryTokens), instead of both files wholesale.
+    //
+    // Entries this conversation itself produced are left out (see
+    // budgetDailyLogs): they restate the message history already in the request,
+    // and they are the reason this block used to change on every turn. Entries
+    // from other conversations today — the actual continuity this block is for —
+    // still render.
     if (memoryFiles.dailyToday || memoryFiles.dailyYesterday) {
       const { recent, summary, stats } = injectionBudget.budgetDailyLogs(
         memoryFiles.dailyToday || '',
         memoryFiles.dailyYesterday || '',
         { dailyTodayTokens: injCfg.dailyTodayTokens ?? 1500,
-          dailySummaryTokens: injCfg.dailySummaryTokens ?? 400 }
+          dailySummaryTokens: injCfg.dailySummaryTokens ?? 400,
+          excludeConversationId: (injCfg.dailyExcludeActiveConversation !== false) ? convoId : null }
       );
       if (recent) {
         memoryParts.push({ kind: 'dailyToday', label: "today's log", text: `=== Today's Session Log (most recent) ===\n${recent}` });
@@ -1722,7 +1729,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       if (summary) {
         memoryParts.push({ kind: 'dailySummary', label: 'earlier/yesterday digest', text: `=== Earlier / Yesterday (brief) ===\n${summary}` });
       }
-      console.log(`[Injection] Daily log budgeted: kept ${stats.todayBlocksKept}/${stats.todayBlocksTotal} today blocks (~${stats.recentTokens} tok) + digest (~${stats.summaryTokens} tok)`);
+      console.log(`[Injection] Daily log budgeted: kept ${stats.todayBlocksKept}/${stats.todayBlocksTotal} today blocks (~${stats.recentTokens} tok) + digest (~${stats.summaryTokens} tok)` +
+                  `${stats.todayBlocksSelfExcluded ? `, ${stats.todayBlocksSelfExcluded} echo entr${stats.todayBlocksSelfExcluded === 1 ? 'y' : 'ies'} from this conversation excluded` : ''}`);
     }
 
     // Add hybrid search results from past conversations (token-capped).
