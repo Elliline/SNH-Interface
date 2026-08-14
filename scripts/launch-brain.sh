@@ -9,13 +9,38 @@
 #
 # ROOT FIX (2026-07-23), vllm-project/vllm#40969: under sustained load the engine
 # would wedge at 0.0 tok/s with the default cudagraph_mode (FULL_AND_PIECEWISE).
-# The confirmed upstream workaround is cudagraph_mode PIECEWISE (clean over 200+
-# requests). We also drop gpu-memory-utilization 0.85 -> 0.80 (separate GB10
-# reports of hard-locks above 0.8 with Gemma 4). The brain-watchdog stays as the
-# smoke alarm; with this fix in place, a future wedge means something NEW.
+# The confirmed upstream workaround is cudagraph_mode PIECEWISE. We also drop
+# gpu-memory-utilization 0.85 -> 0.80 (separate GB10 reports of hard-locks above
+# 0.8 with Gemma 4). The brain-watchdog stays as the smoke alarm; with this fix
+# in place, a future wedge means something NEW.
+#
+# THE FIX HAS A CEILING, and it is now measured rather than assumed (2026-08-14).
+# "Clean over 200+ requests" was the upstream report, carried here without a
+# bound. Swept for real against this engine (scripts/measure-brain-concurrency.js),
+# 256 output tokens per request, ignore_eos so every request costs the same:
+#
+#     1 req   31.8 tok/s aggregate    128 req  1,615.9 tok/s   ttft p50 0.17s
+#    64 req  1,031.6 tok/s            192 req  2,040.6 tok/s   ttft p50 0.18s
+#   256 req  WEDGED — 0 of 256 completed, all read-timed-out, 609s wall
+#
+# Clean to 192: no errors, no preemptions, KV never above 7.5%. At 256 the engine
+# went to 0 tok/s with the historical signature — and it was not KV pressure or
+# preemption, because all 256 were ADMITTED (peak_running 256, peak_waiting 1) at
+# 4.5% KV. A full batch is what stops it, not a full cache.
+#
+# So the batch is now pinned below the ceiling instead of left to the engine's
+# default, which turns an over-subscription into a QUEUE instead of a wedge:
+# past --max-num-seqs, vLLM holds requests in `waiting` rather than admitting
+# them into a batch that stops. 128 is one clean step below the last good level,
+# and roughly 1.6k tok/s aggregate — far above anything SNH generates, since
+# background work is capped at agentPool.concurrency 3 plus the live chat turn.
+# The exact break between 192 and 256 is deliberately NOT bisected: each failing
+# level costs ~15 minutes of a wedged brain, and pinning the batch makes the
+# number academic.
 #
 # Previous (wedge-prone) serve args, for reference / rollback:
 #   --gpu-memory-utilization 0.85   (no --compilation-config -> default cudagraph)
+#   (no --max-num-seqs -> engine default, which admits a batch large enough to wedge)
 #
 # Usage:
 #   scripts/launch-brain.sh --print   # show the exact command, change nothing
@@ -42,6 +67,7 @@ SERVE="vllm serve nvidia/Gemma-4-26B-A4B-NVFP4 \
 --tool-call-parser gemma4 \
 --enable-auto-tool-choice \
 --max-model-len 131072 \
+--max-num-seqs 128 \
 --gpu-memory-utilization 0.80 \
 --compilation-config '{\"cudagraph_mode\": \"PIECEWISE\"}'"
 
