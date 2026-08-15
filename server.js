@@ -170,6 +170,34 @@ function extractReasoning(node) {
 }
 
 /**
+ * Generation budgets for one provider request.
+ *
+ * `thinking_token_budget` is a vLLM extension and is only included for the local
+ * OpenAI-compatible engines; sending an unknown field to a hosted provider is a
+ * 400. `reasoning_effort` is understood by both vLLM and OpenAI, and is omitted
+ * entirely when configured null so a non-reasoning model is left alone.
+ */
+function generationParams(providerType) {
+  const gen = getConfig().generation || {};
+  const thinking = Number.isFinite(gen.thinkingTokens) ? gen.thinkingTokens : null;
+  const responseT = Number.isFinite(gen.responseTokens) ? gen.responseTokens : null;
+  const body = {};
+
+  // Unset means UNSENT, not a fallback number. An engine given no max_tokens
+  // allows the rest of its window; an engine given 4096 stops at 4096 and cuts
+  // the sentence in half. Defaulting here would apply that ceiling to every box
+  // that never asked for one.
+  if (thinking !== null || responseT !== null) {
+    body.max_tokens = (thinking || 0) + (responseT || 0);
+  }
+  if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
+  if (thinking !== null && thinking > 0 && ['vllm', 'llamacpp'].includes(providerType)) {
+    body.thinking_token_budget = thinking;
+  }
+  return body;
+}
+
+/**
  * Fold + log, immediately before a provider request. Logs both sequences so the
  * shape actually sent is visible, not inferred.
  */
@@ -2680,7 +2708,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               // post-tool nudge), so the working history stays as built and only
               // the wire format is canonicalised.
               messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} tool-round ${round + 1}`),
-              tools
+              tools,
+              ...generationParams(providerType)
             }),
             signal: AbortSignal.timeout(120000) // 2 minute timeout per tool round
           });
@@ -2801,7 +2830,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const finalBody = {
         model,
         stream: true,
-        messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} final`)
+        messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} final`),
+        ...generationParams(providerType)
       };
       if (toolsUsed) {
         finalBody.tools = mcpClient.getToolsForOpenAI();
