@@ -102,6 +102,64 @@ function formatToolResult(fnName, result, sink) {
   return typeof result === 'string' ? result : JSON.stringify(result);
 }
 
+/**
+ * Compact role sequence of a messages array, for logging: "0:system 1:system 2:user".
+ * The order of roles is the thing that breaks against a strict chat template, and
+ * it was not visible anywhere in the logs when it did.
+ */
+function roleSequence(messages) {
+  return (messages || []).map((m, i) => `${i}:${m && m.role}`).join(' ');
+}
+
+/**
+ * Canonical outbound shape for a chat-completions API: AT MOST ONE system
+ * message, and it leads the array; every other message keeps conversation order.
+ *
+ * SNH builds its prompt as many separate system messages — identity, capability
+ * manifest, memory, date/time, unseen notices, and a tail of per-turn guidance
+ * blocks that are pushed AFTER the conversation on purpose. That is a fine
+ * internal representation and a bad wire format: a chat template is free to
+ * accept only one, and Qwen3's does exactly that. Its loop raises
+ * 'System message must be at the beginning.' for any system message where
+ * `not loop.first` — so the SECOND system message trips it even though every
+ * system message is still, in plain English, at the beginning. Gemma's template
+ * merged them silently, which is why this survived until the model changed.
+ *
+ * This is not a Qwen workaround. One leading system message is the shape every
+ * OpenAI-compatible provider accepts, so it is what we send to all of them, and
+ * the next template's rules cannot reach it.
+ *
+ * Concatenation order is the array's own order, which the assembly above has
+ * already arranged stable → volatile → trailing guidance, so the cacheable
+ * prefix that ordering exists to protect is preserved inside the folded message.
+ */
+function foldSystemMessages(messages) {
+  const systemParts = [];
+  const rest = [];
+  for (const m of messages || []) {
+    if (!m) continue;
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content : String(m.content ?? '');
+      if (text.trim()) systemParts.push(text.trim());
+    } else {
+      rest.push(m);
+    }
+  }
+  if (!systemParts.length) return rest;
+  return [{ role: 'system', content: systemParts.join('\n\n') }, ...rest];
+}
+
+/**
+ * Fold + log, immediately before a provider request. Logs both sequences so the
+ * shape actually sent is visible, not inferred.
+ */
+function prepareOutboundMessages(messages, label) {
+  const folded = foldSystemMessages(messages);
+  console.log(`[Outbound ${label}] roles in : ${roleSequence(messages)}`);
+  console.log(`[Outbound ${label}] roles out: ${roleSequence(folded)}`);
+  return folded;
+}
+
 // Additional allowed Ollama hosts (comma-separated in .env)
 const ALLOWED_OLLAMA_HOSTS = process.env.ALLOWED_OLLAMA_HOSTS
   ? process.env.ALLOWED_OLLAMA_HOSTS.split(',').map(h => h.trim())
@@ -2315,19 +2373,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const host = instanceName ? providerHost : getOllamaHost({ ollamaHost });
       let ollamaMessages = [...enhancedMessages];
 
-      // Ollama tool calling is strict about message format — consolidate
-      // all system messages into a single one at position 0 so the memory
-      // context doesn't create extra messages that break the tool schema
-      if (needsTools) {
-        const systemMsgs = ollamaMessages.filter(m => m.role === 'system');
-        const nonSystemMsgs = ollamaMessages.filter(m => m.role !== 'system');
-        if (systemMsgs.length > 0) {
-          ollamaMessages = [
-            { role: 'system', content: systemMsgs.map(m => m.content).join('\n\n') },
-            ...nonSystemMsgs
-          ];
-        }
-      }
+      // Consolidation into a single leading system message used to live here,
+      // gated on needsTools. It is now foldSystemMessages, applied at every
+      // dispatch below for two reasons: the tool-free path needs it just as
+      // much (the model behind Ollama has a chat template too), and folding
+      // once up front does not hold — the tool loop appends the "tool calls
+      // are complete" system nudge afterwards and would put it last again.
 
       // MCP tool calling loop for Ollama
       console.log(`MCP [ollama]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
@@ -2374,7 +2425,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model,
-              messages: ollamaMessages,
+              messages: prepareOutboundMessages(ollamaMessages, `ollama tool-round ${round + 1}`),
               tools,
               stream: false
             }),
@@ -2471,7 +2522,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
-          messages: ollamaMessages,
+          messages: prepareOutboundMessages(ollamaMessages, 'ollama final'),
           stream: true
         }),
         signal: streamAbort.signal
@@ -2517,7 +2568,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'grok')
         }),
         signal: streamAbort.signal
       });
@@ -2535,7 +2586,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'openai')
         }),
         signal: streamAbort.signal
       });
@@ -2549,7 +2600,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'squatchserve')
         }),
         signal: streamAbort.signal
       });
@@ -2604,7 +2655,11 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             body: JSON.stringify({
               model,
               stream: false,
-              messages: llamacppMessages,
+              // Folded per round, not once up front: the loop keeps appending to
+              // llamacppMessages (assistant tool_calls, tool results, and the
+              // post-tool nudge), so the working history stays as built and only
+              // the wire format is canonicalised.
+              messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} tool-round ${round + 1}`),
               tools
             }),
             signal: AbortSignal.timeout(120000) // 2 minute timeout per tool round
@@ -2726,7 +2781,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const finalBody = {
         model,
         stream: true,
-        messages: llamacppMessages
+        messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} final`)
       };
       if (toolsUsed) {
         finalBody.tools = mcpClient.getToolsForOpenAI();
