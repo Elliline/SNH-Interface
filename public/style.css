@@ -3015,3 +3015,36 @@ a.msg-source:hover {
   .act-hist-when { min-width: 0; }
   .act-label { min-width: 64px; }
 }
+
+/* ── The model's thinking, beside its answer ──────────────────────────────
+   A reasoning model streams its working out on a separate channel from the
+   reply (delta.reasoning / delta.reasoning_content). It is shown here rather
+   than concatenated into the answer, and collapsed by default: it explains the
+   reply, it is not the reply. Reuses the Thinking tab's vocabulary so the two
+   read as the same kind of thing. */
+.message-reasoning {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: var(--surface-dark);
+  opacity: 0.85;
+}
+.message-reasoning > summary {
+  cursor: pointer;
+  margin-bottom: 0;
+  list-style: none;
+}
+.message-reasoning[open] > summary { margin-bottom: 8px; }
+.message-reasoning > summary::-webkit-details-marker { display: none; }
+.message-reasoning > summary::before {
+  content: '▸';
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+}
+.message-reasoning[open] > summary::before { content: '▾'; }
+.message-reasoning .reasoning-body {
+  white-space: pre-wrap;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  max-height: 340px;
+  overflow-y: auto;
+}

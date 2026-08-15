@@ -150,6 +150,26 @@ function foldSystemMessages(messages) {
 }
 
 /**
+ * The reasoning text on a streamed delta or a whole message, whichever field
+ * this engine uses — or '' when there is none.
+ *
+ * There is no agreed field name. vLLM 0.27.1 with the qwen3 reasoning parser
+ * emits `reasoning` (verified against the raw stream bytes, both streaming
+ * delta and non-streaming message); DeepSeek-R1's API and several other engines
+ * emit `reasoning_content`. Reading both is what makes this work for the next
+ * reasoning model rather than for this one.
+ *
+ * Reasoning is deliberately NOT answer text. It never joins the reply, is never
+ * embedded, and is never stored as what SNH said — it is shown beside the answer
+ * and can be hidden.
+ */
+function extractReasoning(node) {
+  if (!node) return '';
+  const v = node.reasoning ?? node.reasoning_content;
+  return typeof v === 'string' ? v : '';
+}
+
+/**
  * Fold + log, immediately before a provider request. Logs both sequences so the
  * shape actually sent is visible, not inferred.
  */
@@ -2844,6 +2864,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // Collect full response for saving
     let fullResponse = '';
+    // The thinking channel, kept strictly apart from the answer. It is measured
+    // and logged, forwarded to the browser to show or hide, and never saved as
+    // the assistant's message — what SNH said is the answer, not the working out.
+    let fullReasoning = '';
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
@@ -2949,6 +2973,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
             try {
               const data = JSON.parse(jsonStr);
+
+              // Thinking arrives on its own field, interleaved with nothing else
+              // — during the reasoning phase there is no `content` at all. This
+              // is why an all-thinking reply used to read as a blank message.
+              const reasoned = extractReasoning(data.choices?.[0]?.delta)
+                || extractReasoning(data.choices?.[0]?.message);
+              if (reasoned) fullReasoning += reasoned;
+
               let content = null;
 
               if (providerType === 'claude' && data.delta?.text) {
@@ -2996,6 +3028,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         // markup — a later turn reading this conversation back would see it.
         console.warn(`[Chat] stripped ${artifactFilter.stripped()} tool-call artifact(s) from the reply`);
         fullResponse = stripToolArtifacts(fullResponse).text;
+      }
+
+      // THE MODEL THOUGHT AND NEVER ANSWERED.
+      //
+      // Same family as the artifact case above, and it cost the same thing: a
+      // reply that is entirely reasoning leaves `fullResponse` empty, the save
+      // below is guarded on truthiness, so nothing was stored and the browser
+      // rendered a blank turn. Measured 2026-08-15: 8,062 characters of thinking,
+      // zero of answer, finish_reason `stop`. Nothing in the logs said so.
+      //
+      // thinking_token_budget makes this rare rather than impossible, so the
+      // honest sentence stays. An empty message reads as answered.
+      if (!fullResponse.trim() && fullReasoning.trim()) {
+        const msg = 'I thought about that but never actually wrote an answer — my reasoning ran to the end of its budget without producing a reply. Ask me again and I should get there.';
+        console.warn(`[Chat] reply was ${fullReasoning.length} chars of reasoning and no answer — sending the honest note instead`);
+        fullResponse = msg;
+        res.write(contentType === 'text/event-stream'
+          ? `data: ${JSON.stringify({ choices: [{ delta: { content: msg } }] })}\n\n`
+          : `${JSON.stringify({ message: { content: msg } })}\n`);
+      }
+
+      if (fullReasoning) {
+        console.log(`[Chat] reasoning ${fullReasoning.length} chars / answer ${fullResponse.length} chars`);
       }
 
       res.end();

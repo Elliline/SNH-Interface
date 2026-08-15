@@ -38,6 +38,10 @@ let lastAssistantMessageId = null;
 let streamingMessageElement = null;
 let pendingContent = null;
 let animationFrameId = null;
+// Same rAF-coalescing pair as pendingContent/animationFrameId, for the thinking
+// panel — reasoning arrives token by token and would otherwise relayout per token.
+let pendingReasoning = null;
+let reasoningFrameId = null;
 let ttsEnabled = false;
 let isRecording = false;
 let mediaRecorder = null;
@@ -830,10 +834,28 @@ async function processClaudeStream(response) {
 }
 
 // Process Grok streaming response (OpenAI-compatible)
+/**
+ * The reasoning text on one streamed frame, whichever field the engine uses.
+ *
+ * vLLM emits `reasoning`; DeepSeek-R1 and others emit `reasoning_content`. Both
+ * are read so this holds for the next reasoning model, not just this one. The
+ * text is returned to a SEPARATE accumulator — concatenating it into the answer
+ * would put the model's working out in the reply, in the transcript, and in
+ * everything downstream that reads a message as what SNH said.
+ */
+function extractReasoningDelta(parsed) {
+  const c = parsed.choices?.[0];
+  const node = c?.delta || c?.message;
+  if (!node) return '';
+  const v = node.reasoning ?? node.reasoning_content;
+  return typeof v === 'string' ? v : '';
+}
+
 async function processGrokStream(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let fullResponse = '';
+  let fullReasoning = '';
   let buffer = ''; // Buffer for partial lines across chunks
   let chunkCount = 0;
 
@@ -875,6 +897,14 @@ async function processGrokStream(response) {
 
         try {
           const parsed = JSON.parse(jsonStr);
+
+          // THINKING — its own channel, never the answer.
+          const reasoned = extractReasoningDelta(parsed);
+          if (reasoned) {
+            fullReasoning += reasoned;
+            updateLastReasoning(fullReasoning);
+          }
+
           let content = null;
 
           // OpenAI-compatible streaming format (delta)
@@ -924,6 +954,13 @@ async function processGrokStream(response) {
       if (jsonStr && jsonStr !== '[DONE]') {
         try {
           const parsed = JSON.parse(jsonStr);
+
+          const reasonedTail = extractReasoningDelta(parsed);
+          if (reasonedTail) {
+            fullReasoning += reasonedTail;
+            updateLastReasoning(fullReasoning);
+          }
+
           let content = null;
 
           if (parsed.choices?.[0]?.delta?.content) {
@@ -954,9 +991,18 @@ async function processGrokStream(response) {
     reader.releaseLock();
   }
 
-  console.log('[processGrokStream] Final response length:', fullResponse.length);
+  console.log('[processGrokStream] Final response length:', fullResponse.length,
+              '| reasoning length:', fullReasoning.length);
   if (fullResponse.length === 0) {
-    console.log('[processGrokStream] WARNING: No content extracted! Remaining buffer:', buffer);
+    // Distinguish the two very different silences: a model that thought and
+    // never answered, versus a stream we failed to parse at all. They looked
+    // identical before, and the first one was diagnosed as the second.
+    if (fullReasoning.length > 0) {
+      console.log('[processGrokStream] NOTE: stream was all reasoning, no answer content —',
+                  fullReasoning.length, 'chars of thinking. Not a parse failure.');
+    } else {
+      console.log('[processGrokStream] WARNING: No content extracted! Remaining buffer:', buffer);
+    }
   }
 
   return fullResponse;
@@ -986,6 +1032,45 @@ function addMessage(role, content) {
   
   saveConversation();
   renderMessages();
+}
+
+// Stream the model's thinking into its own collapsed panel above the answer.
+//
+// Separate from the answer on purpose, and collapsed by default: it is working
+// out, not what SNH said. Opening it is the reader's choice, the state of that
+// choice survives further streaming, and nothing here ever touches
+// .message-content — so the answer, the TTS feed and the saved transcript are
+// all unaffected by whether thinking happened at all.
+function updateLastReasoning(reasoning) {
+  if (!streamingMessageElement || !reasoning) return;
+
+  let panel = streamingMessageElement.querySelector('.message-reasoning');
+  if (!panel) {
+    panel = document.createElement('details');
+    panel.className = 'message-reasoning thinking-entry';
+    panel.innerHTML =
+      '<summary class="thinking-head">' +
+      '<span class="thinking-kind thinking-kind-heartbeat">thinking</span>' +
+      '<span class="thinking-when"></span>' +
+      '</summary><div class="thinking-sentence reasoning-body"></div>';
+    // Above the answer, mirroring the order it was produced in.
+    streamingMessageElement.insertBefore(panel, streamingMessageElement.firstChild);
+  }
+
+  if (!reasoningFrameId) {
+    pendingReasoning = reasoning;
+    reasoningFrameId = requestAnimationFrame(() => {
+      if (pendingReasoning && streamingMessageElement) {
+        const body = streamingMessageElement.querySelector('.reasoning-body');
+        const meta = streamingMessageElement.querySelector('.message-reasoning .thinking-when');
+        if (body) body.textContent = pendingReasoning;
+        if (meta) meta.textContent = `${pendingReasoning.length} chars`;
+      }
+      reasoningFrameId = null;
+    });
+  } else {
+    pendingReasoning = reasoning;
+  }
 }
 
 // Update the last message (for streaming responses)
