@@ -151,11 +151,20 @@ async function askModel(message, tools, extraSystem) {
   const inst = getProviderInstance(chat.provider, chat.instance);
   const host = inst ? inst.host : 'http://localhost:7070';
 
+  // ONE leading system message, exactly as the server now sends (see
+  // foldSystemMessages in server.js). This used to push the read guard as a
+  // SECOND system message, which Qwen3's chat template rejects outright
+  // ('System message must be at the beginning.' fires on any system message
+  // that is not messages[0]). Every memory-question probe therefore 400'd and
+  // was scored as "the model chose no tool" — a measurement artefact that read
+  // exactly like a routing failure. The probe must send the deployed shape, or
+  // it is not measuring the deployed system.
+  const systemParts = ['You are Aurelius, a self-hosted assistant with a persistent long-term memory. Talk plainly.'];
+  if (extraSystem) systemParts.push(extraSystem);
   const messages = [
-    { role: 'system', content: 'You are Aurelius, a self-hosted assistant with a persistent long-term memory. Talk plainly.' }
+    { role: 'system', content: systemParts.join('\n\n') },
+    { role: 'user', content: message }
   ];
-  if (extraSystem) messages.push({ role: 'system', content: extraSystem });
-  messages.push({ role: 'user', content: message });
 
   const res = await fetch(`${host}/v1/chat/completions`, {
     method: 'POST',
