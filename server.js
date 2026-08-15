@@ -54,6 +54,10 @@ app.set('trust proxy', 'loopback');
 
 // Configuration from environment
 const PORT = process.env.PORT || 3000;
+// Bind address. Defaults to loopback so an unconfigured instance is never
+// exposed on the network by accident; LAN binding is opt-in by setting HOST
+// to a specific address (this box uses 192.168.4.179 via .env).
+const HOST = process.env.HOST || '127.0.0.1';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
@@ -3010,8 +3014,8 @@ db.initVectorStore()
   .then(() => console.log('LanceDB vector store initialized'))
   .catch(error => console.error('Failed to initialize LanceDB:', error.message));
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
   console.log('Security features enabled:');
   console.log('  - Rate limiting: Active');
   console.log('  - Content Security Policy: Active');
