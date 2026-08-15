@@ -1560,6 +1560,15 @@ async function planExtraction({
       continue;
     }
 
+    // CAPABILITY / DEPLOYMENT — the manifest owns this ground and is config-gated,
+    // so it cannot drift; a row here can, and would then contradict the manifest
+    // from inside the same prompt. See db/extraction-rules.js for the full case.
+    const capRefusal = rules.capabilityFactRefusal(c.text);
+    if (capRefusal) {
+      plan.refusals.push({ text: c.text, rule: capRefusal.rule, detail: capRefusal.detail });
+      continue;
+    }
+
     survivors.push(c);
   }
 

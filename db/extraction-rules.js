@@ -184,6 +184,81 @@ function identityAnchorRefusal(factText, verbatim, modality, gatedModalities) {
   };
 }
 
+// ============ 2b. CAPABILITY AND DEPLOYMENT FACTS ============
+//
+// THE MANIFEST OWNS THIS GROUND, AND A FACT IN THE STORE CANNOT BE MADE TO
+// AGREE WITH IT.
+//
+// db/capability-manifest.js is config-gated: every tool-bearing entry carries a
+// `when` that reads the same flag which registers the tool, so what SNH claims
+// it can do and what it can actually call cannot drift apart. A row in
+// cluster_members has no such gate. On 2026-08-15 extraction proposed
+//
+//   "User's system has web search tool loaded"
+//
+// from a message about testing search. Turn tools.searxng.enabled off and the
+// manifest entry disappears while that fact goes on asserting the opposite,
+// forever, with salience and provenance behind it — and the injected memory
+// block sits in the same prompt as the manifest, contradicting it. That is the
+// two-flags-for-one-capability defect of 2026-07-27 coming back through intake.
+//
+// It also is not a fact about the user. It describes the deployment she is
+// talking to, which config and the manifest already record exactly.
+//
+// The rule is deliberately narrow, because "tools" in the ordinary sense are
+// legitimate and valuable user facts — the salience prompt itself rates
+// "stable preferences/tools/hardware" at 5–7. So a refusal needs the SYSTEM to
+// be what the sentence is ABOUT, not merely a word inside it: "User is the
+// creator of SNH" is an identity fact and must survive, while "User's SNH
+// instance runs Qwen3.8-27B" is deployment state and must not.
+
+/**
+ * SNH itself, in subject position.
+ *
+ * The SUBJECT is the whole test, with no accompanying list of capability nouns
+ * or state verbs. A first version required both and let four facts through in a
+ * single conversation — "User's SNH system allows the AI to search the web when
+ * the user requests it", "...displays an alert when the user arrives at the
+ * computer", "...creates a new chat for important messages", "...allows the AI
+ * to initiate conversations on its own". Every one of those is a capability
+ * statement; none used a verb from any plausible list. Enumerating the ways a
+ * system can be described is a losing game, and each miss is a permanent row.
+ *
+ * So: if what the sentence is ABOUT is SNH, the manifest owns it and it does not
+ * belong here, whatever the sentence goes on to say.
+ *
+ * The anchor is what keeps this narrow. It matches only in subject position, so
+ * "User is the creator of SNH" and "User named the first instance Aurelius" are
+ * facts about Ellie and survive. Deliberately absent: `server`, `box`, `pc`,
+ * `laptop` — her hardware is a legitimate thing to remember about her, and the
+ * salience prompt rates it 5–7.
+ */
+const SYSTEM_SUBJECT = new RegExp(
+  '^(?:the\\s+)?(?:user\'?s?\\s+)?' +
+  '(?:(?:second|first|new|local|other|primary)\\s+)?' +
+  '(?:snh|squatch\\s+neuro\\s+hub|aurelius|sparky)?\\s*' +
+  '(?:system|instance|setup|deployment|assistant|ai|memory\\s+system|brain|engine|model|tool\\s*chain|stack)\\b',
+  'i'
+);
+
+/**
+ * Refuse a fact that describes SNH's own capabilities or deployment.
+ *
+ * @param {string} factText
+ * @returns {{rule: string, detail: string}|null} null to allow
+ */
+function capabilityFactRefusal(factText) {
+  const t = String(factText || '').trim();
+  if (!t) return null;
+  if (!SYSTEM_SUBJECT.test(t)) return null;
+
+  return {
+    rule: 'capability-manifest-owns-this',
+    detail: 'describes the assistant\'s own capabilities or deployment, which the ' +
+      'capability manifest records from config and this store cannot be kept in step with'
+  };
+}
+
 // ============ 3. COMPOUND DETECTION ============
 
 const PREDICATE_VERBS = /\b(is|are|was|were|has|have|had|owns?|runs?|uses?|prefers?|likes?|enjoys?|works?|builds?|wants?|needs?|plans?|includes?|drives?|lives?)\b/gi;
@@ -400,6 +475,7 @@ module.exports = {
   identityClassOf,
   hasIdentityAnchor,
   identityAnchorRefusal,
+  capabilityFactRefusal,
   looksCompound,
   grammaticalSubject,
   isHistorical,
