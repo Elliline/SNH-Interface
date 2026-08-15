@@ -149,25 +149,10 @@ function foldSystemMessages(messages) {
   return [{ role: 'system', content: systemParts.join('\n\n') }, ...rest];
 }
 
-/**
- * The reasoning text on a streamed delta or a whole message, whichever field
- * this engine uses — or '' when there is none.
- *
- * There is no agreed field name. vLLM 0.27.1 with the qwen3 reasoning parser
- * emits `reasoning` (verified against the raw stream bytes, both streaming
- * delta and non-streaming message); DeepSeek-R1's API and several other engines
- * emit `reasoning_content`. Reading both is what makes this work for the next
- * reasoning model rather than for this one.
- *
- * Reasoning is deliberately NOT answer text. It never joins the reply, is never
- * embedded, and is never stored as what SNH said — it is shown beside the answer
- * and can be hidden.
- */
-function extractReasoning(node) {
-  if (!node) return '';
-  const v = node.reasoning ?? node.reasoning_content;
-  return typeof v === 'string' ? v : '';
-}
+// The reasoning channel, shared with the background paths (db/memory-manager.js
+// reads the same function). Reasoning is deliberately NOT answer text: it never
+// joins the reply, is never embedded, and is never stored as what SNH said.
+const { extractReasoning } = require('./db/reasoning-channel');
 
 /**
  * Generation budgets for one provider request.

@@ -18,6 +18,7 @@ const path = require('path');
 const { randomUUID, createHash } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, getLocalDateStamp } = require('./datetime');
+const reasoningChannel = require('./reasoning-channel');
 
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
@@ -387,6 +388,10 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
       const data = await response.json();
       const content = provider.extract(data);
+      // The thinking channel, read through the one shared reader. It is never
+      // folded into content — it is returned so a caller can show it, and named
+      // in the error below so a model that thought instead of answering says so.
+      const reasoning = reasoningChannel.reasoningFromResponse(data);
       const finishReason = provider.extractFinishReason(data);
       const truncated = finishReason === 'length';
 
@@ -395,9 +400,19 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
       }
 
       if (content) {
-        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars, finish_reason: ${finishReason || 'n/a'})`);
+        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars${reasoning ? `, ${reasoning.length} chars reasoning` : ''}, finish_reason: ${finishReason || 'n/a'})`);
         closeCircuit(); // a real response means the engine is alive
-        return { content, provider: provider.name, truncated };
+        return { content, reasoning, provider: provider.name, truncated };
+      }
+      // ALL THINKING, NO ANSWER. Distinguished from a genuinely empty reply,
+      // because the two need opposite fixes and used to be the same message:
+      // this one is a budget that the reasoning consumed before the answer
+      // started, and it is fixed in config, not by retrying.
+      if (reasoning) {
+        throw new Error(
+          `Model spent the whole budget reasoning and produced no answer ` +
+          `(${reasoning.length} chars of reasoning, max_tokens ${maxTokens}, finish_reason ${finishReason || 'n/a'}).`
+        );
       }
       throw new Error('Empty response');
     } catch (err) {
