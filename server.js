@@ -2853,7 +2853,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       let errBody = '';
       try { errBody = await response.text(); } catch (e) {}
       console.error(`Provider ${providerType} returned ${response.status}:`, errBody.substring(0, 500));
-      throw new Error(`Provider returned ${response.status}: ${errBody.substring(0, 200)}`);
+      const upstreamErr = new Error(`Provider returned ${response.status}: ${errBody.substring(0, 200)}`);
+      // Marked rather than string-matched in the handler: the status this turns
+      // into is a decision about WHERE the failure was, and that is known here
+      // and nowhere else.
+      upstreamErr.upstream = true;
+      throw upstreamErr;
     }
 
     // Set up streaming response
@@ -3125,7 +3130,23 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   } catch (error) {
     console.error('Memory chat error:', error.message);
     if (!res.headersSent) {
-      res.status(503).json({ error: error.message || 'Chat service unavailable' });
+      // 502, not 503. The whole handler used to answer 503 for anything that
+      // threw, and 503 says "this service is temporarily unavailable, retry" —
+      // which is a claim about SNH, and a wrong one when the engine has rejected
+      // the request body. On 2026-08-15 that read as an outage separate from the
+      // provider's 400 it was actually carrying, and cost a round of diagnosis.
+      //
+      // Upstream failure (engine returned an error, or could not be reached) is
+      // 502 Bad Gateway. Anything else that reaches here is our own bug: 500.
+      // The body shape is unchanged — the frontend branches on response.ok and
+      // renders `error`, never on the number.
+      // A fetch that never got a response — engine down, refused, DNS — is
+      // upstream too, and arrives here as a bare TypeError with the reason on
+      // `cause`, carrying no flag of its own.
+      const networkFailure = !!error.cause?.code
+        || (error.name === 'TypeError' && /fetch failed|network|socket/i.test(error.message || ''));
+      res.status(error.upstream || networkFailure ? 502 : 500)
+        .json({ error: error.message || 'Chat service unavailable' });
     } else if (!res.writableEnded) {
       // Stream already started (e.g. the upstream request was aborted mid-stream
       // by the stall watchdog or a client disconnect) — just close it out.
