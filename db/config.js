@@ -112,10 +112,51 @@ const DEFAULTS = {
   // medium, high, xhigh, max — but a model's TEMPLATE may accept fewer (Qwen3's
   // raises on anything but xhigh/medium/low), so a wrong value is a 400, not a
   // silent misconfiguration.
+  // The BACKGROUND half of the same problem, and it is worse there than in chat.
+  //
+  // Every callLLM site sizes maxTokens for the ANSWER — 8 for a claim-type tag,
+  // 100 for a gap question, 120 for a salience score — because they were written
+  // for a model that does not think. On a reasoning model that budget covers the
+  // thinking too, and the thinking goes first. Measured on the real prompts:
+  //
+  //   scoreSalience   (answer budget 120), no thinking budget:  0/3 usable, finish=length, content ""
+  //   detectGapQuestion (answer budget 100), no thinking budget: 0/3 usable, finish=length, content ""
+  //
+  // So salience scoring and gap detection were failing on EVERY run, falling back
+  // to salience 5 with an empty rationale. The floor is low — 128 was already 3/3
+  // on both with a real rationale — and 256 is set as twice the floor, which buys
+  // roughly 1,000–1,200 characters of reasoning:
+  //
+  //   budget 128 -> 3/3, "9  This is a defining identity fact — being the creator..."
+  //   budget 256 -> 3/3, "9  Being the creator of a named project (SNH) is durable..."
+  //
+  // backgroundThinkingTokens is added ON TOP of each caller's maxTokens rather
+  // than carved out of it, so every existing call site keeps the answer budget it
+  // asked for and none of them need editing.
+  //
+  // Extraction is sized separately because it is a much larger job and the
+  // failure there was the 30s timeout, not an empty string — its call sends no
+  // max_tokens at all, so thinking simply ran long. Measured over the three
+  // longest exchanges of a real conversation, worst case of three:
+  //
+  //   no budget:  30.8s  (EXCEEDS the 30s timeout — this is the live failure)
+  //   budget 256:  8.3s  but one exchange returned unparseable JSON
+  //   budget 512: 13.2s
+  //   budget 768: 19.6s  and reproduced the uncapped result exactly (4 facts, 1 event)
+  //
+  // 768 keeps the quality of unbounded thinking at roughly two thirds of the
+  // wall-clock. extractionTimeoutMs is then 45s: 2.3x the measured worst, because
+  // these numbers came off an idle GPU and the real one is shared with live chat.
+  //
+  // null for all three, for the same reason as above — a box with a non-reasoning
+  // model must send exactly what it sends today.
   generation: {
     reasoningEffort: null,
     thinkingTokens: null,
-    responseTokens: null
+    responseTokens: null,
+    backgroundThinkingTokens: null,
+    extractionThinkingTokens: null,
+    extractionTimeoutMs: null
   },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
