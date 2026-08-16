@@ -1793,6 +1793,73 @@ async function loadSettingsBrainTab() {
       { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
     ]));
 
+    // Generation budgets. Every field here is NULLABLE and ships empty: empty
+    // means the setting is not sent to the engine at all, which is what a model
+    // without a reasoning channel needs. The placeholders say what happens when
+    // a box is left empty, because otherwise an empty box reads as an oversight.
+    container.appendChild(createConfigSection('Thinking and Answer Budgets', [
+      {
+        key: 'generation.reasoningEffort',
+        label: 'Reasoning effort',
+        type: 'select',
+        value: config.generation?.reasoningEffort,
+        nullable: true,
+        options: [
+          { value: '', label: 'Unset — let the model decide' },
+          { value: 'low', label: 'low — think briefly' },
+          { value: 'medium', label: 'medium — balanced' },
+          { value: 'high', label: 'high' },
+          { value: 'xhigh', label: 'xhigh — think hardest (slowest)' }
+        ],
+        desc: 'Only affects models that think before answering. Leaving this unset is not neutral — a thinking model applies its own default, which for Qwen3 is the most expensive setting it has.'
+      },
+      {
+        key: 'generation.thinkingTokens',
+        label: 'Thinking budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.thinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. How much the model may think before it must start answering. Too low and it runs out mid-thought and replies that it never got to an answer.'
+      },
+      {
+        key: 'generation.responseTokens',
+        label: 'Answer budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.responseTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on answer length',
+        desc: 'How long a reply may be. Empty means the engine allows as much as the context window has left; setting it too low cuts answers off mid-sentence with no warning.'
+      },
+      {
+        key: 'generation.backgroundThinkingTokens',
+        label: 'Thinking budget, background work (tokens)',
+        type: 'number', step: '64', min: 0,
+        value: config.generation?.backgroundThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Used for the small judgement calls behind the scenes — scoring how much a fact matters, deciding whether to ask a follow-up. These have tiny answer budgets, so on a thinking model they need their own room or they return nothing.'
+      },
+      {
+        key: 'generation.extractionThinkingTokens',
+        label: 'Thinking budget, fact extraction (tokens)',
+        type: 'number', step: '128', min: 0,
+        value: config.generation?.extractionThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Extraction reads each exchange and decides what is worth remembering. Unbounded thinking here is mostly a speed problem — it can run past the timeout below and the exchange is lost.'
+      },
+      {
+        key: 'generation.extractionTimeoutMs',
+        label: 'Fact extraction timeout (ms)',
+        type: 'number', step: '5000', min: 0,
+        value: config.generation?.extractionTimeoutMs,
+        nullable: true,
+        placeholder: 'Empty = 30000 (30 seconds)',
+        desc: 'How long to wait for extraction before giving up on an exchange. Anything it does not finish in time is not remembered.'
+      }
+    ]));
+
     // Build instance options for select dropdowns (only local instance-based providers)
     const instanceOptions = [];
     const instances = providersData.instances || {};
@@ -2367,9 +2434,20 @@ async function saveSettingsHandler() {
       obj = obj[keys[i]];
     }
     const lastKey = keys[keys.length - 1];
+    const isEmpty = String(input.value).trim() === '';
+
     if (input.type === 'checkbox') obj[lastKey] = input.checked;
-    else if (input.type === 'number') {
+    else if (input.dataset.configNullable === 'true' && isEmpty) {
+      // CLEARED ON PURPOSE. Skipping the key would deep-merge to "leave it as it
+      // was", which makes a nullable setting impossible to turn back off once
+      // set. Writing null is the only way to say unset, and null is what the
+      // server reads as "send nothing".
+      obj[lastKey] = null;
+    } else if (input.type === 'number') {
       const num = parseFloat(input.value);
+      // An empty non-nullable number is still skipped, exactly as before: those
+      // fields always hold a value and a blank one means the form has not
+      // loaded, not that the user wants it gone.
       if (!isNaN(num)) obj[lastKey] = num;
     } else obj[lastKey] = input.value;
   });
@@ -4927,10 +5005,15 @@ function createConfigSection(title, fields) {
     } else if (field.type === 'select') {
       input = document.createElement('select');
       for (const opt of field.options) {
+        // An option may be a bare string, or {value,label} when the two differ —
+        // which they must for a nullable field, whose "unset" option carries an
+        // empty value and a label that says what unset does.
+        const value = (opt && typeof opt === 'object') ? opt.value : opt;
+        const text = (opt && typeof opt === 'object') ? opt.label : opt;
         const option = document.createElement('option');
-        option.value = opt;
-        option.textContent = opt;
-        if (opt === field.value) option.selected = true;
+        option.value = value;
+        option.textContent = text;
+        if (value === (field.value ?? '')) option.selected = true;
         input.appendChild(option);
       }
       input.dataset.configKey = field.key;
@@ -4945,6 +5028,19 @@ function createConfigSection(title, fields) {
       }
       input.dataset.configKey = field.key;
     }
+
+    // A NULLABLE FIELD IS ONE WHERE EMPTY IS A REAL, MEANINGFUL VALUE.
+    //
+    // Most settings here have a number in them and always will. A few ship unset
+    // on purpose — the generation budgets, which must send nothing at all on a
+    // model that has no reasoning channel — and for those, empty is not "the
+    // user has not filled this in yet", it is the setting. Marking them tells
+    // the save loop to write an explicit null when the box is cleared, instead
+    // of skipping the key and silently leaving the old value in place.
+    if (field.nullable) input.dataset.configNullable = 'true';
+    // The placeholder is where "unset" is explained, because an empty box
+    // otherwise looks like a missing value rather than a chosen one.
+    if (field.placeholder) input.placeholder = field.placeholder;
 
     // Fix 7: Set the matching ID on the input element
     input.id = inputId;
