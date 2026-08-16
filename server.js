@@ -2541,8 +2541,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
         if (toolsUsed) {
           console.log('MCP [ollama]: Tools were used, making final streaming request');
+          // `user` for the same reason as the llamacpp/vllm path above: this nudge
+          // has to still be the last thing before generation after the fold.
           ollamaMessages.push({
-            role: 'system',
+            role: 'user',
             content: usedSources.length
             ? 'Tool calls are complete. Answer using the SOURCES above. For each specific fact you state, cite the [S#] link it came from, and include the relevant website links in your answer. Any specific number, date, or claim not backed by a source must be hedged or left out — do not invent specifics, and never attribute a claim to a source that does not contain it.'
             : 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
@@ -2803,9 +2805,30 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // Tools must stay in the request body so the server's Jinja template
       // can handle tool_calls/tool messages in the history.
       // Append a nudge so the model responds with text instead of attempting more tool calls.
+      // ROLE user, NOT system, AND THAT IS THE WHOLE POINT.
+      //
+      // foldSystemMessages moves every system message into the leading block, so
+      // a nudge pushed as `system` here stops being trailing — it lands in front
+      // of the conversation and the model reaches the generation point with a
+      // tool result as the last thing it saw. Measured on Gemma against this
+      // engine, 6 runs per shape, the reply to a memory question after a tool
+      // round:
+      //
+      //   all-trailing (pre-fold)          0/6 opened a thought channel
+      //   folded, this nudge left trailing 0/6
+      //   fully folded                     6/6   "thought\nI remember that you..."
+      //   fully folded, no read guard      6/6   (so it is this nudge, not the guard)
+      //   folded + this nudge as `user`    0/6
+      //
+      // The engine runs --tool-call-parser gemma4 with no --reasoning-parser, so
+      // the channel marker lands in `content` and is spoken to the user, saved to
+      // the transcript and embedded. `user` is what keeps the instruction at the
+      // generation point while still satisfying the rule foldSystemMessages
+      // exists for — Qwen3's template raises on any system message that is not
+      // messages[0], and says nothing about a trailing user message.
       if (toolsUsed) {
         llamacppMessages.push({
-          role: 'system',
+          role: 'user',
           content: usedSources.length
             ? 'Tool calls are complete. Answer using the SOURCES above. For each specific fact you state, cite the [S#] link it came from, and include the relevant website links in your answer. Any specific number, date, or claim not backed by a source must be hedged or left out — do not invent specifics, and never attribute a claim to a source that does not contain it.'
             : 'Tool calls are complete. Now provide your response to the user based on the information gathered.'
