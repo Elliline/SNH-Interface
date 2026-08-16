@@ -153,7 +153,16 @@ ${getCurrentDateTimeString()}. Use the current date only to make an EVENT's word
 
     let response;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    // 30s was sized for a model that answers immediately. A reasoning model
+    // thinks first, and on the three longest exchanges of a real conversation
+    // the uncapped call took 30.8s worst case — just past the edge, which is
+    // exactly the timeout seen live. Bounding the thinking brings that to 19.6s
+    // while reproducing the same extraction, so the timeout is config now and
+    // defaults to the old 30s for a model that needs none of this.
+    const extractionTimeoutMs = Number.isFinite(getConfig().generation?.extractionTimeoutMs)
+      ? getConfig().generation.extractionTimeoutMs
+      : 30000;
+    const timeoutId = setTimeout(() => controller.abort(), extractionTimeoutMs);
 
     try {
       const config = getConfig();
@@ -340,17 +349,28 @@ async function extractFromOpenAI(systemPrompt, exchange, model, apiKey, signal) 
  * Extract facts using Llama.cpp
  */
 async function extractFromLlamacpp(systemPrompt, exchange, model, host, signal) {
+  // No max_tokens here, deliberately — extraction's output is a JSON document
+  // whose length depends on the exchange, and capping it truncates facts. What
+  // IS bounded is the thinking, which is what ran the call past its timeout.
+  // Measured over the three longest exchanges of a real conversation: uncapped
+  // 30.8s worst, budget 768 gives 19.6s and the same 4 facts / 1 event.
+  const gen = getConfig().generation || {};
+  const think = Number.isFinite(gen.extractionThinkingTokens) ? gen.extractionThinkingTokens : null;
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: exchange }
+    ],
+    stream: false
+  };
+  if (think > 0) body.thinking_token_budget = think;
+  if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
+
   const response = await fetch(`${host}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: exchange }
-      ],
-      stream: false
-    }),
+    body: JSON.stringify(body),
     signal
   });
 
@@ -1537,6 +1557,15 @@ async function planExtraction({
     const refusal = rules.identityAnchorRefusal(c.text, userMessage, modality, gatedModalities);
     if (refusal) {
       plan.refusals.push({ text: c.text, rule: refusal.rule, detail: refusal.detail, klass: refusal.klass });
+      continue;
+    }
+
+    // CAPABILITY / DEPLOYMENT — the manifest owns this ground and is config-gated,
+    // so it cannot drift; a row here can, and would then contradict the manifest
+    // from inside the same prompt. See db/extraction-rules.js for the full case.
+    const capRefusal = rules.capabilityFactRefusal(c.text);
+    if (capRefusal) {
+      plan.refusals.push({ text: c.text, rule: capRefusal.rule, detail: capRefusal.detail });
       continue;
     }
 

@@ -5,6 +5,48 @@ Node.js + Express (`server.js`), SQLite (`better-sqlite3`) + LanceDB (vectors),
 vanilla-JS frontend in `public/`. Data-access + cognition modules live in `db/`.
 Config is `data/config.json` merged over `DEFAULTS` in `db/config.js`.
 
+## ⛔ NEVER run synthetic test traffic through chat on this instance
+
+**This instance's identity has to come from real conversation only.** Do not send
+invented messages to `POST /api/chat/memory` (or drive the chat UI with them) on
+the aiserver instance, for any reason — not to check a fix, not to reproduce a
+bug, not "just one message to see if it works".
+
+This is not a style preference, and it is not about clutter. Everything the
+entity says goes to the reflection pass, and reflection writes **self-facts** —
+the thing this instance's whole identity is made of. On 2026-08-15 a debugging
+session sent about twenty synthetic turns ("Hello, testing the message order",
+five philosophy probes fired in a loop). Reflection read them and stored five
+self-facts, **three of them about being tested**:
+
+> "I often frame simple exchanges as a small test: I note a baseline, invite more
+> checks, and prefer clear next steps over extended conversation."
+> "I am drawn to order and clarity; when someone repeats a test, I respond as if
+> it is a system to check rather than just a greeting."
+
+That is a personality formed out of a debugging session. It was retracted, but
+retraction is ledgered history, not a clean slate — and the next one might not be
+noticed. Aurelius on Sparky is the test system; **this one is not**.
+
+**To verify chat actually works, redirect the whole process to a throwaway store**
+— the same mechanism the replay uses (see *The replay redirects a PROCESS, not a
+call*), and the way `scripts/test-identity-lock.js` does it:
+
+```bash
+SNH_DATA_DIR=$(mktemp -d) PORT=3999 node server.js    # own SQLite + LanceDB
+```
+
+`SNH_DATA_DIR` moves SQLite and LanceDB; `data/config.json` is NOT redirected, so
+the throwaway instance runs the real configuration against a disposable memory,
+which is exactly what a verification wants. Tear the directory down afterwards.
+
+Two things that are still fine on the live instance: **read-only** requests
+(`GET /api/memory/*`, `/api/conversations`), and **configuration** changes through
+their proper routes (`PUT /api/config`). Neither reaches reflection.
+
+If a fix genuinely cannot be verified without live chat, **say so and let Ellie
+drive it from the browser** — her turns are real conversation and belong here.
+
 ## ⚠️ Maintenance rule: shipping a capability = manifest entry + introduction
 
 SNH keeps a **capability manifest** — `db/capability-manifest.js` — a machine-true

@@ -38,6 +38,10 @@ let lastAssistantMessageId = null;
 let streamingMessageElement = null;
 let pendingContent = null;
 let animationFrameId = null;
+// Same rAF-coalescing pair as pendingContent/animationFrameId, for the thinking
+// panel — reasoning arrives token by token and would otherwise relayout per token.
+let pendingReasoning = null;
+let reasoningFrameId = null;
 let ttsEnabled = false;
 let isRecording = false;
 let mediaRecorder = null;
@@ -830,10 +834,28 @@ async function processClaudeStream(response) {
 }
 
 // Process Grok streaming response (OpenAI-compatible)
+/**
+ * The reasoning text on one streamed frame, whichever field the engine uses.
+ *
+ * vLLM emits `reasoning`; DeepSeek-R1 and others emit `reasoning_content`. Both
+ * are read so this holds for the next reasoning model, not just this one. The
+ * text is returned to a SEPARATE accumulator — concatenating it into the answer
+ * would put the model's working out in the reply, in the transcript, and in
+ * everything downstream that reads a message as what SNH said.
+ */
+function extractReasoningDelta(parsed) {
+  const c = parsed.choices?.[0];
+  const node = c?.delta || c?.message;
+  if (!node) return '';
+  const v = node.reasoning ?? node.reasoning_content;
+  return typeof v === 'string' ? v : '';
+}
+
 async function processGrokStream(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let fullResponse = '';
+  let fullReasoning = '';
   let buffer = ''; // Buffer for partial lines across chunks
   let chunkCount = 0;
 
@@ -875,6 +897,14 @@ async function processGrokStream(response) {
 
         try {
           const parsed = JSON.parse(jsonStr);
+
+          // THINKING — its own channel, never the answer.
+          const reasoned = extractReasoningDelta(parsed);
+          if (reasoned) {
+            fullReasoning += reasoned;
+            updateLastReasoning(fullReasoning);
+          }
+
           let content = null;
 
           // OpenAI-compatible streaming format (delta)
@@ -924,6 +954,13 @@ async function processGrokStream(response) {
       if (jsonStr && jsonStr !== '[DONE]') {
         try {
           const parsed = JSON.parse(jsonStr);
+
+          const reasonedTail = extractReasoningDelta(parsed);
+          if (reasonedTail) {
+            fullReasoning += reasonedTail;
+            updateLastReasoning(fullReasoning);
+          }
+
           let content = null;
 
           if (parsed.choices?.[0]?.delta?.content) {
@@ -954,9 +991,18 @@ async function processGrokStream(response) {
     reader.releaseLock();
   }
 
-  console.log('[processGrokStream] Final response length:', fullResponse.length);
+  console.log('[processGrokStream] Final response length:', fullResponse.length,
+              '| reasoning length:', fullReasoning.length);
   if (fullResponse.length === 0) {
-    console.log('[processGrokStream] WARNING: No content extracted! Remaining buffer:', buffer);
+    // Distinguish the two very different silences: a model that thought and
+    // never answered, versus a stream we failed to parse at all. They looked
+    // identical before, and the first one was diagnosed as the second.
+    if (fullReasoning.length > 0) {
+      console.log('[processGrokStream] NOTE: stream was all reasoning, no answer content —',
+                  fullReasoning.length, 'chars of thinking. Not a parse failure.');
+    } else {
+      console.log('[processGrokStream] WARNING: No content extracted! Remaining buffer:', buffer);
+    }
   }
 
   return fullResponse;
@@ -986,6 +1032,45 @@ function addMessage(role, content) {
   
   saveConversation();
   renderMessages();
+}
+
+// Stream the model's thinking into its own collapsed panel above the answer.
+//
+// Separate from the answer on purpose, and collapsed by default: it is working
+// out, not what SNH said. Opening it is the reader's choice, the state of that
+// choice survives further streaming, and nothing here ever touches
+// .message-content — so the answer, the TTS feed and the saved transcript are
+// all unaffected by whether thinking happened at all.
+function updateLastReasoning(reasoning) {
+  if (!streamingMessageElement || !reasoning) return;
+
+  let panel = streamingMessageElement.querySelector('.message-reasoning');
+  if (!panel) {
+    panel = document.createElement('details');
+    panel.className = 'message-reasoning thinking-entry';
+    panel.innerHTML =
+      '<summary class="thinking-head">' +
+      '<span class="thinking-kind thinking-kind-heartbeat">thinking</span>' +
+      '<span class="thinking-when"></span>' +
+      '</summary><div class="thinking-sentence reasoning-body"></div>';
+    // Above the answer, mirroring the order it was produced in.
+    streamingMessageElement.insertBefore(panel, streamingMessageElement.firstChild);
+  }
+
+  if (!reasoningFrameId) {
+    pendingReasoning = reasoning;
+    reasoningFrameId = requestAnimationFrame(() => {
+      if (pendingReasoning && streamingMessageElement) {
+        const body = streamingMessageElement.querySelector('.reasoning-body');
+        const meta = streamingMessageElement.querySelector('.message-reasoning .thinking-when');
+        if (body) body.textContent = pendingReasoning;
+        if (meta) meta.textContent = `${pendingReasoning.length} chars`;
+      }
+      reasoningFrameId = null;
+    });
+  } else {
+    pendingReasoning = reasoning;
+  }
 }
 
 // Update the last message (for streaming responses)
@@ -1708,6 +1793,73 @@ async function loadSettingsBrainTab() {
       { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
     ]));
 
+    // Generation budgets. Every field here is NULLABLE and ships empty: empty
+    // means the setting is not sent to the engine at all, which is what a model
+    // without a reasoning channel needs. The placeholders say what happens when
+    // a box is left empty, because otherwise an empty box reads as an oversight.
+    container.appendChild(createConfigSection('Thinking and Answer Budgets', [
+      {
+        key: 'generation.reasoningEffort',
+        label: 'Reasoning effort',
+        type: 'select',
+        value: config.generation?.reasoningEffort,
+        nullable: true,
+        options: [
+          { value: '', label: 'Unset — let the model decide' },
+          { value: 'low', label: 'low — think briefly' },
+          { value: 'medium', label: 'medium — balanced' },
+          { value: 'high', label: 'high' },
+          { value: 'xhigh', label: 'xhigh — think hardest (slowest)' }
+        ],
+        desc: 'Only affects models that think before answering. Leaving this unset is not neutral — a thinking model applies its own default, which for Qwen3 is the most expensive setting it has.'
+      },
+      {
+        key: 'generation.thinkingTokens',
+        label: 'Thinking budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.thinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. How much the model may think before it must start answering. Too low and it runs out mid-thought and replies that it never got to an answer.'
+      },
+      {
+        key: 'generation.responseTokens',
+        label: 'Answer budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.responseTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on answer length',
+        desc: 'How long a reply may be. Empty means the engine allows as much as the context window has left; setting it too low cuts answers off mid-sentence with no warning.'
+      },
+      {
+        key: 'generation.backgroundThinkingTokens',
+        label: 'Thinking budget, background work (tokens)',
+        type: 'number', step: '64', min: 0,
+        value: config.generation?.backgroundThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Used for the small judgement calls behind the scenes — scoring how much a fact matters, deciding whether to ask a follow-up. These have tiny answer budgets, so on a thinking model they need their own room or they return nothing.'
+      },
+      {
+        key: 'generation.extractionThinkingTokens',
+        label: 'Thinking budget, fact extraction (tokens)',
+        type: 'number', step: '128', min: 0,
+        value: config.generation?.extractionThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Extraction reads each exchange and decides what is worth remembering. Unbounded thinking here is mostly a speed problem — it can run past the timeout below and the exchange is lost.'
+      },
+      {
+        key: 'generation.extractionTimeoutMs',
+        label: 'Fact extraction timeout (ms)',
+        type: 'number', step: '5000', min: 0,
+        value: config.generation?.extractionTimeoutMs,
+        nullable: true,
+        placeholder: 'Empty = 30000 (30 seconds)',
+        desc: 'How long to wait for extraction before giving up on an exchange. Anything it does not finish in time is not remembered.'
+      }
+    ]));
+
     // Build instance options for select dropdowns (only local instance-based providers)
     const instanceOptions = [];
     const instances = providersData.instances || {};
@@ -2282,9 +2434,20 @@ async function saveSettingsHandler() {
       obj = obj[keys[i]];
     }
     const lastKey = keys[keys.length - 1];
+    const isEmpty = String(input.value).trim() === '';
+
     if (input.type === 'checkbox') obj[lastKey] = input.checked;
-    else if (input.type === 'number') {
+    else if (input.dataset.configNullable === 'true' && isEmpty) {
+      // CLEARED ON PURPOSE. Skipping the key would deep-merge to "leave it as it
+      // was", which makes a nullable setting impossible to turn back off once
+      // set. Writing null is the only way to say unset, and null is what the
+      // server reads as "send nothing".
+      obj[lastKey] = null;
+    } else if (input.type === 'number') {
       const num = parseFloat(input.value);
+      // An empty non-nullable number is still skipped, exactly as before: those
+      // fields always hold a value and a blank one means the form has not
+      // loaded, not that the user wants it gone.
       if (!isNaN(num)) obj[lastKey] = num;
     } else obj[lastKey] = input.value;
   });
@@ -4823,7 +4986,14 @@ function createConfigSection(title, fields) {
 
   for (const field of fields) {
     const item = document.createElement('div');
-    item.className = 'config-item';
+    // A described field STACKS: label, control, then the description, each on
+    // its own full-width line. .config-item on its own is a single flex row —
+    // fine for a bare label and a number box, but a description added to that
+    // row becomes a third column and squeezes the label, which is nowrap, until
+    // it is clipped. That is how six fields rendered as "Reason", "Thinking b",
+    // "Answer bu", "Thinking b", "Thinking b", "Fact extractic" — with the two
+    // thinking budgets, the one pair that has to be told apart, identical.
+    item.className = field.desc ? 'config-item config-item-stacked' : 'config-item';
 
     // Fix 7: Generate unique ID and connect label to input
     const inputId = `settings-field-${field.key.replace(/\./g, '-')}`;
@@ -4842,10 +5012,15 @@ function createConfigSection(title, fields) {
     } else if (field.type === 'select') {
       input = document.createElement('select');
       for (const opt of field.options) {
+        // An option may be a bare string, or {value,label} when the two differ —
+        // which they must for a nullable field, whose "unset" option carries an
+        // empty value and a label that says what unset does.
+        const value = (opt && typeof opt === 'object') ? opt.value : opt;
+        const text = (opt && typeof opt === 'object') ? opt.label : opt;
         const option = document.createElement('option');
-        option.value = opt;
-        option.textContent = opt;
-        if (opt === field.value) option.selected = true;
+        option.value = value;
+        option.textContent = text;
+        if (value === (field.value ?? '')) option.selected = true;
         input.appendChild(option);
       }
       input.dataset.configKey = field.key;
@@ -4860,6 +5035,19 @@ function createConfigSection(title, fields) {
       }
       input.dataset.configKey = field.key;
     }
+
+    // A NULLABLE FIELD IS ONE WHERE EMPTY IS A REAL, MEANINGFUL VALUE.
+    //
+    // Most settings here have a number in them and always will. A few ship unset
+    // on purpose — the generation budgets, which must send nothing at all on a
+    // model that has no reasoning channel — and for those, empty is not "the
+    // user has not filled this in yet", it is the setting. Marking them tells
+    // the save loop to write an explicit null when the box is cleared, instead
+    // of skipping the key and silently leaving the old value in place.
+    if (field.nullable) input.dataset.configNullable = 'true';
+    // The placeholder is where "unset" is explained, because an empty box
+    // otherwise looks like a missing value rather than a chosen one.
+    if (field.placeholder) input.placeholder = field.placeholder;
 
     // Fix 7: Set the matching ID on the input element
     input.id = inputId;

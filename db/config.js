@@ -43,6 +43,121 @@ const DEFAULTS = {
     heartbeat: { provider: 'ollama', instance: 'Local', model: 'qwen3:14b' },
     embedding: { provider: 'ollama', instance: 'Local', model: 'nomic-embed-text' }
   },
+  // Generation budgets for the chat path.
+  //
+  // A reasoning model spends its output allowance in TWO places — the thinking
+  // it does before answering, and the answer itself — and the OpenAI wire format
+  // has a single field for the total. Sizing only the total is what produced the
+  // 2026-08-15 empty reply: the model thought for 8,000 characters, decided
+  // "let me run the tool", and emitted end-of-turn having written no answer at
+  // all. finish_reason was `stop`, not `length`, so nothing looked wrong.
+  //
+  // So the two budgets are declared separately and the wire total is derived:
+  //   max_tokens            = thinkingTokens + responseTokens
+  //   thinking_token_budget = thinkingTokens
+  //
+  // thinking_token_budget is engine-enforced: when thinking runs past it the
+  // engine closes the reasoning channel and makes the model answer, which is the
+  // thing that actually guarantees an answer comes back. Measured on vLLM
+  // 0.27.1: budget 64 → 288 chars of thinking and a 2,637-char answer; budget
+  // 256 → 1,164 and 1,478. It is a vLLM extension, so it is only sent to the
+  // local OpenAI-compatible engines (see server.js) — hosted providers get
+  // max_tokens and reasoningEffort only.
+  //
+  // reasoningEffort is the model's own dial. Qwen3's chat template defaults it
+  // to 'xhigh' when nothing is passed, which is the most expensive setting it
+  // has; 'medium' is the default here deliberately. Accepted by this engine:
+  // none, minimal, low, medium, high, xhigh, max — but a model's TEMPLATE may
+  // accept fewer (Qwen3's raises on anything but xhigh/medium/low), so a wrong
+  // value fails as a 400 rather than silently.
+  //
+  // EVERY FIELD DEFAULTS TO null, AND null MEANS "SEND NOTHING".
+  //
+  // These defaults ship to every box, and one of them (Sparky/Aurelius) runs a
+  // model with no reasoning channel at all. A shared default is only safe if
+  // pulling it changes nothing, and a value here would not have been:
+  //
+  //   - max_tokens is the dangerous one. SNH has never sent it on the
+  //     vllm/llamacpp path, so the engine allows max_model_len minus the prompt
+  //     — effectively uncapped. Defaulting it to 4096 would hand every box a new
+  //     output ceiling, and a long answer would stop MID-SENTENCE with
+  //     finish_reason `length`, which nothing in the streaming path surfaces.
+  //     Measured on this engine: max_tokens 300 → 527 chars, cut at "## Eastern".
+  //   - thinking_token_budget is a vLLM extension. Its behaviour on llama.cpp,
+  //     and on a vLLM served without a --reasoning-parser, is UNVERIFIED here.
+  //   - reasoning_effort reaches the chat template. Qwen3's reads it; a template
+  //     that does not reference it should ignore it, but that is reasoning about
+  //     Jinja rather than a measurement, and it was not measured against Gemma.
+  //
+  // So the shipped default reproduces the request SNH sent before this block
+  // existed, byte for byte, and a box opts in through its own data/config.json
+  // (gitignored, so it stays local). aiserver sets all three; see that file.
+  //
+  // Turning it on, on a reasoning model:
+  //   reasoningEffort: 'medium', thinkingTokens: 2048, responseTokens: 2048
+  //
+  // Then the wire carries max_tokens = thinkingTokens + responseTokens = 4096
+  // and thinking_token_budget = 2048. Sizing the total ALONE is what produced
+  // the 2026-08-15 empty reply: the model thought for 8,000 characters, decided
+  // "let me run the tool", and ended its turn having written no answer, with
+  // finish_reason `stop` — so nothing looked wrong. thinking_token_budget is the
+  // half that fixes it, because it is engine-enforced: when thinking runs past
+  // it the engine closes the reasoning channel and makes the model answer.
+  // Measured on vLLM 0.27.1: budget 64 → 288 chars of thinking and a 2,637-char
+  // answer; budget 256 → 1,164 and 1,478.
+  //
+  // reasoningEffort is the model's own dial, and leaving it null is not neutral
+  // on a model whose template has an opinion: Qwen3's defaults it to 'xhigh',
+  // the most expensive setting it has. Accepted by vLLM: none, minimal, low,
+  // medium, high, xhigh, max — but a model's TEMPLATE may accept fewer (Qwen3's
+  // raises on anything but xhigh/medium/low), so a wrong value is a 400, not a
+  // silent misconfiguration.
+  // The BACKGROUND half of the same problem, and it is worse there than in chat.
+  //
+  // Every callLLM site sizes maxTokens for the ANSWER — 8 for a claim-type tag,
+  // 100 for a gap question, 120 for a salience score — because they were written
+  // for a model that does not think. On a reasoning model that budget covers the
+  // thinking too, and the thinking goes first. Measured on the real prompts:
+  //
+  //   scoreSalience   (answer budget 120), no thinking budget:  0/3 usable, finish=length, content ""
+  //   detectGapQuestion (answer budget 100), no thinking budget: 0/3 usable, finish=length, content ""
+  //
+  // So salience scoring and gap detection were failing on EVERY run, falling back
+  // to salience 5 with an empty rationale. The floor is low — 128 was already 3/3
+  // on both with a real rationale — and 256 is set as twice the floor, which buys
+  // roughly 1,000–1,200 characters of reasoning:
+  //
+  //   budget 128 -> 3/3, "9  This is a defining identity fact — being the creator..."
+  //   budget 256 -> 3/3, "9  Being the creator of a named project (SNH) is durable..."
+  //
+  // backgroundThinkingTokens is added ON TOP of each caller's maxTokens rather
+  // than carved out of it, so every existing call site keeps the answer budget it
+  // asked for and none of them need editing.
+  //
+  // Extraction is sized separately because it is a much larger job and the
+  // failure there was the 30s timeout, not an empty string — its call sends no
+  // max_tokens at all, so thinking simply ran long. Measured over the three
+  // longest exchanges of a real conversation, worst case of three:
+  //
+  //   no budget:  30.8s  (EXCEEDS the 30s timeout — this is the live failure)
+  //   budget 256:  8.3s  but one exchange returned unparseable JSON
+  //   budget 512: 13.2s
+  //   budget 768: 19.6s  and reproduced the uncapped result exactly (4 facts, 1 event)
+  //
+  // 768 keeps the quality of unbounded thinking at roughly two thirds of the
+  // wall-clock. extractionTimeoutMs is then 45s: 2.3x the measured worst, because
+  // these numbers came off an idle GPU and the real one is shared with live chat.
+  //
+  // null for all three, for the same reason as above — a box with a non-reasoning
+  // model must send exactly what it sends today.
+  generation: {
+    reasoningEffort: null,
+    thinkingTokens: null,
+    responseTokens: null,
+    backgroundThinkingTokens: null,
+    extractionThinkingTokens: null,
+    extractionTimeoutMs: null
+  },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
   // polling UI plus chunked TTS exhausts in a couple of minutes — that is what

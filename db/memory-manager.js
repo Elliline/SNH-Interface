@@ -18,6 +18,7 @@ const path = require('path');
 const { randomUUID, createHash } = require('crypto');
 const { getConfig, getProviderInstance } = require('./config');
 const { getCurrentDateTimeString, getLocalDateStamp } = require('./datetime');
+const reasoningChannel = require('./reasoning-channel');
 
 const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
 const memoryClusters = require('./memory-clusters');
@@ -334,10 +335,28 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   const timeoutMs = Math.max(60000, Math.ceil(maxTokens / 45 * 1000 * 2));
 
   // Build provider call based on config
+  // THE CALLER'S maxTokens IS THE ANSWER BUDGET, AND ON A REASONING MODEL THAT
+  // IS NOT THE WHOLE BILL.
+  //
+  // Every call site here sizes for the reply — 8 for a claim-type tag, 100 for a
+  // gap question, 120 for a salience score. A reasoning model spends that budget
+  // on thinking first and never reaches the answer, which is why salience and gap
+  // detection returned "" on every run. The thinking allowance is therefore ADDED
+  // to what the caller asked for rather than taken out of it: no call site
+  // changes meaning, and none of the twenty of them need editing.
+  //
+  // null (the shipped default) sends neither field, so a non-reasoning box gets
+  // byte-identical requests. vLLM extension, so OpenAI-style local engines only.
+  const gen = config.generation || {};
+  const bgThinking = Number.isFinite(gen.backgroundThinkingTokens) ? gen.backgroundThinkingTokens : null;
+  const wireMaxTokens = bgThinking > 0 ? maxTokens + bgThinking : maxTokens;
+
   let url, body, extract, extractFinishReason;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
     url = `${host}/v1/chat/completions`;
-    body = { messages, stream: false, max_tokens: maxTokens };
+    body = { messages, stream: false, max_tokens: wireMaxTokens };
+    if (bgThinking > 0) body.thinking_token_budget = bgThinking;
+    if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
     extract = (data) => data.choices?.[0]?.message?.content || '';
     extractFinishReason = (data) => data.choices?.[0]?.finish_reason || '';
   } else {
@@ -387,17 +406,32 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
       const data = await response.json();
       const content = provider.extract(data);
+      // The thinking channel, read through the one shared reader. It is never
+      // folded into content — it is returned so a caller can show it, and named
+      // in the error below so a model that thought instead of answering says so.
+      const reasoning = reasoningChannel.reasoningFromResponse(data);
       const finishReason = provider.extractFinishReason(data);
       const truncated = finishReason === 'length';
 
       if (truncated) {
-        console.warn(`[Heartbeat] WARNING: ${provider.name} finish_reason: "length" — response truncated at max_tokens (${maxTokens}). Response: ${content.length} chars`);
+        console.warn(`[Heartbeat] WARNING: ${provider.name} finish_reason: "length" — response truncated at max_tokens (${wireMaxTokens}). Response: ${content.length} chars`);
       }
 
       if (content) {
-        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars, finish_reason: ${finishReason || 'n/a'})`);
+        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars${reasoning ? `, ${reasoning.length} chars reasoning` : ''}, finish_reason: ${finishReason || 'n/a'})`);
         closeCircuit(); // a real response means the engine is alive
-        return { content, provider: provider.name, truncated };
+        return { content, reasoning, provider: provider.name, truncated };
+      }
+      // ALL THINKING, NO ANSWER. Distinguished from a genuinely empty reply,
+      // because the two need opposite fixes and used to be the same message:
+      // this one is a budget that the reasoning consumed before the answer
+      // started, and it is fixed in config, not by retrying.
+      if (reasoning) {
+        throw new Error(
+          `Model spent the whole budget reasoning and produced no answer ` +
+          `(${reasoning.length} chars of reasoning, max_tokens ${wireMaxTokens}, finish_reason ${finishReason || 'n/a'}). ` +
+          `Raise memory.generation.backgroundThinkingTokens.`
+        );
       }
       throw new Error('Empty response');
     } catch (err) {

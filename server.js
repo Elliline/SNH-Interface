@@ -54,6 +54,10 @@ app.set('trust proxy', 'loopback');
 
 // Configuration from environment
 const PORT = process.env.PORT || 3000;
+// Bind address. Defaults to loopback so an unconfigured instance is never
+// exposed on the network by accident; LAN binding is opt-in by setting HOST
+// to a specific address (this box uses 192.168.4.179 via .env).
+const HOST = process.env.HOST || '127.0.0.1';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
@@ -96,6 +100,97 @@ function formatToolResult(fnName, result, sink) {
     return `FETCHED PAGE [S${n}] — ${result.url}\n${result.content || ''}`;
   }
   return typeof result === 'string' ? result : JSON.stringify(result);
+}
+
+/**
+ * Compact role sequence of a messages array, for logging: "0:system 1:system 2:user".
+ * The order of roles is the thing that breaks against a strict chat template, and
+ * it was not visible anywhere in the logs when it did.
+ */
+function roleSequence(messages) {
+  return (messages || []).map((m, i) => `${i}:${m && m.role}`).join(' ');
+}
+
+/**
+ * Canonical outbound shape for a chat-completions API: AT MOST ONE system
+ * message, and it leads the array; every other message keeps conversation order.
+ *
+ * SNH builds its prompt as many separate system messages — identity, capability
+ * manifest, memory, date/time, unseen notices, and a tail of per-turn guidance
+ * blocks that are pushed AFTER the conversation on purpose. That is a fine
+ * internal representation and a bad wire format: a chat template is free to
+ * accept only one, and Qwen3's does exactly that. Its loop raises
+ * 'System message must be at the beginning.' for any system message where
+ * `not loop.first` — so the SECOND system message trips it even though every
+ * system message is still, in plain English, at the beginning. Gemma's template
+ * merged them silently, which is why this survived until the model changed.
+ *
+ * This is not a Qwen workaround. One leading system message is the shape every
+ * OpenAI-compatible provider accepts, so it is what we send to all of them, and
+ * the next template's rules cannot reach it.
+ *
+ * Concatenation order is the array's own order, which the assembly above has
+ * already arranged stable → volatile → trailing guidance, so the cacheable
+ * prefix that ordering exists to protect is preserved inside the folded message.
+ */
+function foldSystemMessages(messages) {
+  const systemParts = [];
+  const rest = [];
+  for (const m of messages || []) {
+    if (!m) continue;
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content : String(m.content ?? '');
+      if (text.trim()) systemParts.push(text.trim());
+    } else {
+      rest.push(m);
+    }
+  }
+  if (!systemParts.length) return rest;
+  return [{ role: 'system', content: systemParts.join('\n\n') }, ...rest];
+}
+
+// The reasoning channel, shared with the background paths (db/memory-manager.js
+// reads the same function). Reasoning is deliberately NOT answer text: it never
+// joins the reply, is never embedded, and is never stored as what SNH said.
+const { extractReasoning } = require('./db/reasoning-channel');
+
+/**
+ * Generation budgets for one provider request.
+ *
+ * `thinking_token_budget` is a vLLM extension and is only included for the local
+ * OpenAI-compatible engines; sending an unknown field to a hosted provider is a
+ * 400. `reasoning_effort` is understood by both vLLM and OpenAI, and is omitted
+ * entirely when configured null so a non-reasoning model is left alone.
+ */
+function generationParams(providerType) {
+  const gen = getConfig().generation || {};
+  const thinking = Number.isFinite(gen.thinkingTokens) ? gen.thinkingTokens : null;
+  const responseT = Number.isFinite(gen.responseTokens) ? gen.responseTokens : null;
+  const body = {};
+
+  // Unset means UNSENT, not a fallback number. An engine given no max_tokens
+  // allows the rest of its window; an engine given 4096 stops at 4096 and cuts
+  // the sentence in half. Defaulting here would apply that ceiling to every box
+  // that never asked for one.
+  if (thinking !== null || responseT !== null) {
+    body.max_tokens = (thinking || 0) + (responseT || 0);
+  }
+  if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
+  if (thinking !== null && thinking > 0 && ['vllm', 'llamacpp'].includes(providerType)) {
+    body.thinking_token_budget = thinking;
+  }
+  return body;
+}
+
+/**
+ * Fold + log, immediately before a provider request. Logs both sequences so the
+ * shape actually sent is visible, not inferred.
+ */
+function prepareOutboundMessages(messages, label) {
+  const folded = foldSystemMessages(messages);
+  console.log(`[Outbound ${label}] roles in : ${roleSequence(messages)}`);
+  console.log(`[Outbound ${label}] roles out: ${roleSequence(folded)}`);
+  return folded;
 }
 
 // Additional allowed Ollama hosts (comma-separated in .env)
@@ -2311,19 +2406,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const host = instanceName ? providerHost : getOllamaHost({ ollamaHost });
       let ollamaMessages = [...enhancedMessages];
 
-      // Ollama tool calling is strict about message format — consolidate
-      // all system messages into a single one at position 0 so the memory
-      // context doesn't create extra messages that break the tool schema
-      if (needsTools) {
-        const systemMsgs = ollamaMessages.filter(m => m.role === 'system');
-        const nonSystemMsgs = ollamaMessages.filter(m => m.role !== 'system');
-        if (systemMsgs.length > 0) {
-          ollamaMessages = [
-            { role: 'system', content: systemMsgs.map(m => m.content).join('\n\n') },
-            ...nonSystemMsgs
-          ];
-        }
-      }
+      // Consolidation into a single leading system message used to live here,
+      // gated on needsTools. It is now foldSystemMessages, applied at every
+      // dispatch below for two reasons: the tool-free path needs it just as
+      // much (the model behind Ollama has a chat template too), and folding
+      // once up front does not hold — the tool loop appends the "tool calls
+      // are complete" system nudge afterwards and would put it last again.
 
       // MCP tool calling loop for Ollama
       console.log(`MCP [ollama]: toolsEnabled=${toolsEnabled}, hasTools=${mcpClient.hasTools()}`);
@@ -2370,7 +2458,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model,
-              messages: ollamaMessages,
+              messages: prepareOutboundMessages(ollamaMessages, `ollama tool-round ${round + 1}`),
               tools,
               stream: false
             }),
@@ -2467,7 +2555,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
-          messages: ollamaMessages,
+          messages: prepareOutboundMessages(ollamaMessages, 'ollama final'),
           stream: true
         }),
         signal: streamAbort.signal
@@ -2513,7 +2601,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'grok')
         }),
         signal: streamAbort.signal
       });
@@ -2531,7 +2619,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'openai')
         }),
         signal: streamAbort.signal
       });
@@ -2545,7 +2633,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         body: JSON.stringify({
           model,
           stream: true,
-          messages: enhancedMessages
+          messages: prepareOutboundMessages(enhancedMessages, 'squatchserve')
         }),
         signal: streamAbort.signal
       });
@@ -2600,8 +2688,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             body: JSON.stringify({
               model,
               stream: false,
-              messages: llamacppMessages,
-              tools
+              // Folded per round, not once up front: the loop keeps appending to
+              // llamacppMessages (assistant tool_calls, tool results, and the
+              // post-tool nudge), so the working history stays as built and only
+              // the wire format is canonicalised.
+              messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} tool-round ${round + 1}`),
+              tools,
+              ...generationParams(providerType)
             }),
             signal: AbortSignal.timeout(120000) // 2 minute timeout per tool round
           });
@@ -2722,7 +2815,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       const finalBody = {
         model,
         stream: true,
-        messages: llamacppMessages
+        messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} final`),
+        ...generationParams(providerType)
       };
       if (toolsUsed) {
         finalBody.tools = mcpClient.getToolsForOpenAI();
@@ -2744,7 +2838,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       let errBody = '';
       try { errBody = await response.text(); } catch (e) {}
       console.error(`Provider ${providerType} returned ${response.status}:`, errBody.substring(0, 500));
-      throw new Error(`Provider returned ${response.status}: ${errBody.substring(0, 200)}`);
+      const upstreamErr = new Error(`Provider returned ${response.status}: ${errBody.substring(0, 200)}`);
+      // Marked rather than string-matched in the handler: the status this turns
+      // into is a decision about WHERE the failure was, and that is known here
+      // and nowhere else.
+      upstreamErr.upstream = true;
+      throw upstreamErr;
     }
 
     // Set up streaming response
@@ -2785,6 +2884,10 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
     // Collect full response for saving
     let fullResponse = '';
+    // The thinking channel, kept strictly apart from the answer. It is measured
+    // and logged, forwarded to the browser to show or hide, and never saved as
+    // the assistant's message — what SNH said is the answer, not the working out.
+    let fullReasoning = '';
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
@@ -2890,6 +2993,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
             try {
               const data = JSON.parse(jsonStr);
+
+              // Thinking arrives on its own field, interleaved with nothing else
+              // — during the reasoning phase there is no `content` at all. This
+              // is why an all-thinking reply used to read as a blank message.
+              const reasoned = extractReasoning(data.choices?.[0]?.delta)
+                || extractReasoning(data.choices?.[0]?.message);
+              if (reasoned) fullReasoning += reasoned;
+
               let content = null;
 
               if (providerType === 'claude' && data.delta?.text) {
@@ -2939,6 +3050,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         fullResponse = stripToolArtifacts(fullResponse).text;
       }
 
+      // THE MODEL THOUGHT AND NEVER ANSWERED.
+      //
+      // Same family as the artifact case above, and it cost the same thing: a
+      // reply that is entirely reasoning leaves `fullResponse` empty, the save
+      // below is guarded on truthiness, so nothing was stored and the browser
+      // rendered a blank turn. Measured 2026-08-15: 8,062 characters of thinking,
+      // zero of answer, finish_reason `stop`. Nothing in the logs said so.
+      //
+      // thinking_token_budget makes this rare rather than impossible, so the
+      // honest sentence stays. An empty message reads as answered.
+      if (!fullResponse.trim() && fullReasoning.trim()) {
+        const msg = 'I thought about that but never actually wrote an answer — my reasoning ran to the end of its budget without producing a reply. Ask me again and I should get there.';
+        console.warn(`[Chat] reply was ${fullReasoning.length} chars of reasoning and no answer — sending the honest note instead`);
+        fullResponse = msg;
+        res.write(contentType === 'text/event-stream'
+          ? `data: ${JSON.stringify({ choices: [{ delta: { content: msg } }] })}\n\n`
+          : `${JSON.stringify({ message: { content: msg } })}\n`);
+      }
+
+      if (fullReasoning) {
+        console.log(`[Chat] reasoning ${fullReasoning.length} chars / answer ${fullResponse.length} chars`);
+      }
+
       res.end();
     } finally {
       if (stallTimer) clearTimeout(stallTimer);
@@ -2981,7 +3115,23 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   } catch (error) {
     console.error('Memory chat error:', error.message);
     if (!res.headersSent) {
-      res.status(503).json({ error: error.message || 'Chat service unavailable' });
+      // 502, not 503. The whole handler used to answer 503 for anything that
+      // threw, and 503 says "this service is temporarily unavailable, retry" —
+      // which is a claim about SNH, and a wrong one when the engine has rejected
+      // the request body. On 2026-08-15 that read as an outage separate from the
+      // provider's 400 it was actually carrying, and cost a round of diagnosis.
+      //
+      // Upstream failure (engine returned an error, or could not be reached) is
+      // 502 Bad Gateway. Anything else that reaches here is our own bug: 500.
+      // The body shape is unchanged — the frontend branches on response.ok and
+      // renders `error`, never on the number.
+      // A fetch that never got a response — engine down, refused, DNS — is
+      // upstream too, and arrives here as a bare TypeError with the reason on
+      // `cause`, carrying no flag of its own.
+      const networkFailure = !!error.cause?.code
+        || (error.name === 'TypeError' && /fetch failed|network|socket/i.test(error.message || ''));
+      res.status(error.upstream || networkFailure ? 502 : 500)
+        .json({ error: error.message || 'Chat service unavailable' });
     } else if (!res.writableEnded) {
       // Stream already started (e.g. the upstream request was aborted mid-stream
       // by the stall watchdog or a client disconnect) — just close it out.
@@ -3010,8 +3160,8 @@ db.initVectorStore()
   .then(() => console.log('LanceDB vector store initialized'))
   .catch(error => console.error('Failed to initialize LanceDB:', error.message));
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
   console.log('Security features enabled:');
   console.log('  - Rate limiting: Active');
   console.log('  - Content Security Policy: Active');
