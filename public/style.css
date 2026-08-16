@@ -2454,6 +2454,7 @@ a.msg-source:hover {
   margin-bottom: 8px;
 }
 
+
 .config-item label {
   font-size: 0.82rem;
   color: var(--text-secondary);
@@ -2503,6 +2504,44 @@ a.msg-source:hover {
   outline: none;
   border-color: var(--primary-color);
 }
+
+/* A described field stacks instead of sitting in one row.
+   .config-item is a flex row built for "label ....... [input]". Adding a
+   description to that row makes it a third column, and because the label is
+   white-space: nowrap with flex-shrink: 1 it gets squeezed to a few characters
+   rather than wrapping — which is what truncated the generation budget labels
+   to "Thinking b" twice over. Stacked, every part gets the full panel width. */
+.config-item-stacked {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+/* The label may now use as many lines as it needs. */
+.config-item-stacked label {
+  white-space: normal;
+  flex-shrink: 0;
+  font-weight: 500;
+  color: var(--text-color);
+}
+
+/* The control is full width here rather than capped at the 180px that suits a
+   right-aligned number box in a row. */
+.config-item-stacked input[type="text"],
+.config-item-stacked input[type="number"],
+.config-item-stacked select {
+  max-width: 100%;
+  width: 100%;
+  flex: none;
+}
+
+.config-item-stacked .config-item-desc {
+  margin-top: 0;
+  max-width: 60ch;
+}
+
 
 .config-save-btn {
   width: 100%;

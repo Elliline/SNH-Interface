@@ -4986,7 +4986,14 @@ function createConfigSection(title, fields) {
 
   for (const field of fields) {
     const item = document.createElement('div');
-    item.className = 'config-item';
+    // A described field STACKS: label, control, then the description, each on
+    // its own full-width line. .config-item on its own is a single flex row —
+    // fine for a bare label and a number box, but a description added to that
+    // row becomes a third column and squeezes the label, which is nowrap, until
+    // it is clipped. That is how six fields rendered as "Reason", "Thinking b",
+    // "Answer bu", "Thinking b", "Thinking b", "Fact extractic" — with the two
+    // thinking budgets, the one pair that has to be told apart, identical.
+    item.className = field.desc ? 'config-item config-item-stacked' : 'config-item';
 
     // Fix 7: Generate unique ID and connect label to input
     const inputId = `settings-field-${field.key.replace(/\./g, '-')}`;
