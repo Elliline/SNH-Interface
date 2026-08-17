@@ -316,6 +316,15 @@ const DEFAULTS = {
     maxUnpromptedPerDay: 1,     // hard cap on SNH-initiated conversations per day
     quietHours: { start: 22, end: 8 }, // no unprompted messages 22:00–08:00 Pacific
     questionAgeDays: 3,         // a pending gap question this old becomes an initiative
+    // How far back the daily-log follow-up reader looks, in calendar days
+    // including today. Log entries go stale as conversational material —
+    // "you mentioned yesterday" lands, "you mentioned three weeks ago" is odd —
+    // and the line between those is days, not hours. 3 survives a day the user
+    // does not talk to SNH, and a weekend; 7 would put the back half of the
+    // window past the point where circling back reads as attentive. It also sits
+    // inside staleDays below, so a follow-up drawn from the oldest entry in the
+    // window cannot outlive the window that justified it.
+    logFollowupDays: 3,
     staleDays: 7,               // pending initiatives older than this expire
     maxPending: 10,             // cap on the pending pool so it never nags
     dedupThreshold: 0.85        // skip a new initiative this cosine-similar to a pending one of the same type

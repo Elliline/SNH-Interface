@@ -649,6 +649,38 @@ function initDatabase() {
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_followup_traces_created ON followup_traces(created_at)`);
 
+    // Daily-log follow-up traces. The sibling of followup_traces, for the source
+    // that reads the day's LOG rather than the conversation transcript.
+    //
+    // A separate table rather than a `source` column on followup_traces because
+    // the two describe different things: that one records conversations and
+    // message counts, this one records log entries and the window they were
+    // drawn from. Folding them together would leave half the columns null on
+    // every row and make neither readable.
+    //
+    // EVERY PASS WRITES A ROW, INCLUDING THE ONES THAT RAISE NOTHING. Choosing
+    // not to ask is the common outcome and it is a decision, not an absence —
+    // without a row, "it read the log and judged nothing worth raising" and "it
+    // never ran" are the same silence, and that is not a thing anyone should
+    // have to debug. `skipped` and `reasoning` are how they are told apart.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS log_followup_traces (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        window_days INTEGER DEFAULT 0,      -- staleness window used for this pass
+        files_read TEXT,                    -- JSON [string] daily files actually present
+        entries_considered INTEGER DEFAULT 0, -- event entries in the window
+        entries_json TEXT,                  -- JSON [{id,date,time,text}] what it looked at
+        candidates_json TEXT,               -- JSON [string] follow-ups weighed
+        generated TEXT,                     -- the follow-up raised, or NULL
+        source_entry_id TEXT,               -- the log entry it followed up on, if any
+        skipped INTEGER DEFAULT 1,          -- 1 = raised nothing this pass
+        reasoning TEXT,                     -- why it raised, or why it declined
+        initiative_id TEXT                  -- the queued initiative id, if any
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_log_followup_traces_created ON log_followup_traces(created_at)`);
+
     // Heartbeat pass stats: one row per maintenance/rebuild cycle so the Thinking
     // view can show what each background pass actually did (clusters audited/split,
     // links touched, duration, anomalies) alongside the reflection reasoning.

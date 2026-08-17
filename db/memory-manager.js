@@ -2063,9 +2063,23 @@ async function runMaintenance() {
       initiative = await runStep('initiativeLayer', 'quiet hours + max 1 unprompted/day', async () => {
         await initiativeEngine.noticeFromQuestions();
         await initiativeEngine.noticeFromAudit(auditResults);
+        // Reading the day's log back. Runs before prioritize() so anything it
+        // raises is scored in the same cycle rather than sitting unranked until
+        // the next one. It raises nothing on most passes, by design, and records
+        // a trace either way.
+        const logFollowup = await initiativeEngine.generateLogFollowup();
+        // Same one-line shape as the conversation follow-up above it, so the two
+        // sources read alike in the log — and so a pass that declined is visible
+        // as a decision rather than as an absence.
+        factExtractor.appendToDailyLog(
+          logFollowup && logFollowup.generated
+            ? `Log follow-up: read ${logFollowup.entries?.length || 0} recent entry(s) → asking "${logFollowup.generated}"`
+            : `Log follow-up: read ${logFollowup?.entries?.length || 0} recent entry(s) → nothing raised (${logFollowup?.reasoning || 'nothing cleared the bar'})`,
+          path.join(MEMORY_DIR, 'daily')
+        );
         const prioritized = await initiativeEngine.prioritize();
         const unprompted = await initiativeEngine.deliverUnprompted();
-        return { prioritized, unprompted };
+        return { prioritized, unprompted, logFollowup };
       });
     } catch (initErr) {
       console.error('[Heartbeat] Initiative layer error:', initErr.message);

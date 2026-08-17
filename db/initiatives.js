@@ -456,6 +456,77 @@ function listFollowupTraces({ limit = 20 } = {}) {
   }
 }
 
+/**
+ * Persist a daily-log follow-up trace. Sibling of recordFollowupTrace, for the
+ * source that reads the day's log instead of the conversation transcript.
+ *
+ * CALLED ON EVERY PASS, INCLUDING THE ONES THAT RAISE NOTHING. Declining is the
+ * expected outcome and it is a judgement, not an absence — with no row, "read
+ * the log and decided nothing was worth raising" is indistinguishable from
+ * "never ran", and those need opposite fixes.
+ * @param {Object} trace
+ * @returns {string|null} the trace id
+ */
+function recordLogFollowupTrace(trace = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return null;
+    const id = randomUUID();
+    const entries = Array.isArray(trace.entries) ? trace.entries : [];
+    db.prepare(`
+      INSERT INTO log_followup_traces
+        (id, created_at, window_days, files_read, entries_considered, entries_json,
+         candidates_json, generated, source_entry_id, skipped, reasoning, initiative_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      trace.at || new Date().toISOString(),
+      trace.windowDays || 0,
+      JSON.stringify(trace.filesRead || []),
+      entries.length,
+      JSON.stringify(entries.map(e => ({ id: e.id, date: e.date, time: e.time, text: e.text }))),
+      JSON.stringify(trace.candidates || []),
+      trace.generated || null,
+      trace.sourceEntryId || null,
+      trace.skipped ? 1 : 0,
+      trace.reasoning || '',
+      trace.initiativeId || null
+    );
+    return id;
+  } catch (error) {
+    console.error('[Initiatives] recordLogFollowupTrace error:', error.message);
+    return null;
+  }
+}
+
+/** Recent daily-log follow-up traces (newest first), rehydrated from JSON. */
+function listLogFollowupTraces({ limit = 20 } = {}) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    const rows = db.prepare(
+      'SELECT * FROM log_followup_traces ORDER BY created_at DESC LIMIT ?'
+    ).all(limit);
+    return rows.map(r => ({
+      id: r.id,
+      at: r.created_at,
+      windowDays: r.window_days,
+      filesRead: safeParse(r.files_read, []),
+      entriesConsidered: r.entries_considered,
+      entries: safeParse(r.entries_json, []),
+      candidates: safeParse(r.candidates_json, []),
+      generated: r.generated,
+      sourceEntryId: r.source_entry_id,
+      skipped: !!r.skipped,
+      reasoning: r.reasoning,
+      initiativeId: r.initiative_id
+    }));
+  } catch (error) {
+    console.error('[Initiatives] listLogFollowupTraces error:', error.message);
+    return [];
+  }
+}
+
 module.exports = {
   VALID_TYPES,
   RECORD_TYPES,
@@ -474,5 +545,7 @@ module.exports = {
   updatePriority,
   countUnpromptedDeliveredToday,
   recordFollowupTrace,
-  listFollowupTraces
+  listFollowupTraces,
+  recordLogFollowupTrace,
+  listLogFollowupTraces
 };

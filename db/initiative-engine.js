@@ -31,6 +31,7 @@ function initiativeConfig() {
     maxUnpromptedPerDay: 1,
     quietHours: { start: 22, end: 8 },
     questionAgeDays: 3,
+    logFollowupDays: 3,
     staleDays: 7,
     maxPending: 10
   }, cfg.initiative || {});
@@ -182,7 +183,10 @@ async function noticeReflectionInsight(text, priority = 6) {
  * @param {string} raw
  */
 function parseFollowupResponse(raw) {
-  const out = { candidates: [], followup: null, reasoning: '' };
+  // sourceEntry is only meaningful to the daily-log source, which asks the model
+  // to point at one numbered entry. The conversation source never sets it and
+  // ignores it — one parser, because two would drift.
+  const out = { candidates: [], followup: null, reasoning: '', sourceEntry: null };
   try {
     const text = (raw || '').replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
     const objMatch = text.match(/\{[\s\S]*\}/);
@@ -196,6 +200,10 @@ function parseFollowupResponse(raw) {
         .slice(0, 5);
     }
     if (typeof parsed.reasoning === 'string') out.reasoning = parsed.reasoning.trim();
+    if (parsed.sourceEntry !== undefined && parsed.sourceEntry !== null) {
+      const n = Number(parsed.sourceEntry);
+      if (Number.isInteger(n)) out.sourceEntry = n;
+    }
     const f = parsed.followup;
     if (typeof f === 'string') {
       const clean = f.trim();
@@ -324,6 +332,216 @@ Return ONLY a JSON object, nothing else:
   }
 
   initiatives.recordFollowupTrace(trace);
+  return trace;
+}
+
+/**
+ * Daily-log follow-up source — "you mentioned yesterday that…".
+ *
+ * Events have always routed to the day's log correctly and nothing ever read
+ * them back, so everything SNH knew about what HAPPENED was write-only. This is
+ * the read side: it looks at recent log entries and decides whether one of them
+ * is worth returning to.
+ *
+ * ─── IT IS ALLOWED TO SAY NO, AND SAYING NO IS RECORDED ────────────────────
+ *
+ * This is a judgement every pass, not a rule that fires on every entry. Most
+ * days a person logs "User let the dogs out" and there is nothing to follow up
+ * on; occasionally they log "user found Aurelius' philosophical discussions can
+ * get too deep for them sometimes", which is exactly the kind of thing a person
+ * would come back to. The model decides which it is, and the expected answer is
+ * usually no.
+ *
+ * Every pass writes a row to log_followup_traces whether or not it raises
+ * anything, because declining and never running look identical from outside and
+ * they need opposite fixes. The row carries what was read, what was weighed and
+ * why it went the way it did.
+ *
+ * ─── THE WINDOW ────────────────────────────────────────────────────────────
+ *
+ * `initiative.logFollowupDays`, default 3 (today plus the two before it).
+ *
+ * Log entries go stale as conversational material: "you mentioned yesterday"
+ * lands, "you mentioned three weeks ago" is strange, and the gap between those
+ * is days rather than hours. 3 was chosen over 1–2 because it survives a day
+ * the user does not talk to SNH at all and a weekend, and over 7 because the
+ * back half of a week-long window is already past the point where returning to
+ * something reads as attentive rather than odd. It also matches the grain
+ * already in this file — `questionAgeDays` is 3 — and sits inside `staleDays`
+ * (7), so a follow-up raised from the oldest entry in the window cannot outlive
+ * the window that justified it before the stale sweep expires it.
+ *
+ * ─── NOT A PARALLEL NOTIFICATION PATH ──────────────────────────────────────
+ *
+ * It queues a normal `followup` initiative through initiatives.addInitiative, so
+ * it inherits semantic dedup, the prioritiser's re-scoring, the stale sweep, the
+ * pool cap, quiet hours and both delivery channels. Nothing here talks to the
+ * user directly.
+ *
+ * @param {Object} [opts]
+ * @param {number} [opts.days] - override the window (tests)
+ * @param {string} [opts.dailyDir] - override the log directory (tests)
+ * @returns {Promise<Object>} the trace
+ */
+async function generateLogFollowup({ days = null, dailyDir = null } = {}) {
+  const cfg = initiativeConfig();
+  const windowDays = Math.max(1, days || cfg.logFollowupDays || 3);
+  const dailyLogReader = require('./daily-log-reader');
+
+  const trace = {
+    at: new Date().toISOString(),
+    windowDays,
+    filesRead: [],
+    entries: [],
+    candidates: [],
+    generated: null,
+    sourceEntryId: null,
+    skipped: true,
+    reasoning: '',
+    initiativeId: null
+  };
+
+  try {
+    const { events, filesRead } = dailyLogReader.readRecentEvents({
+      days: windowDays,
+      dailyDir: dailyDir || DAILY_DIR
+    });
+    trace.filesRead = filesRead;
+
+    if (!events.length) {
+      trace.reasoning = `no event entries in the last ${windowDays} day(s)`;
+      initiatives.recordLogFollowupTrace(trace);
+      console.log(`[Initiatives] Log follow-up: ${trace.reasoning}`);
+      return trace;
+    }
+
+    // Entries already followed up on, ever. addInitiative dedupes by source
+    // against pending AND delivered, but doing it here too means the model is
+    // never shown an entry it cannot act on — otherwise it can spend its one
+    // choice on something that will be silently folded, which reads as a raise
+    // in the trace and produces nothing.
+    const sqlite = getSqliteDb();
+    let usedRefs = new Set();
+    if (sqlite) {
+      try {
+        const rows = sqlite.prepare(
+          "SELECT source_ref FROM initiatives WHERE source_kind = 'daily-log' AND source_ref IS NOT NULL"
+        ).all();
+        usedRefs = new Set(rows.map(r => r.source_ref));
+      } catch (e) {
+        console.error('[Initiatives] log follow-up: could not read prior sources:', e.message);
+      }
+    }
+    const fresh = events.filter(e => !usedRefs.has(e.id));
+    trace.entries = fresh;
+
+    if (!fresh.length) {
+      trace.reasoning = `all ${events.length} entry(s) in the window have already been followed up on`;
+      initiatives.recordLogFollowupTrace(trace);
+      console.log(`[Initiatives] Log follow-up: ${trace.reasoning}`);
+      return trace;
+    }
+
+    // One pending log follow-up at a time. The pool cap and the prioritiser
+    // already stop this becoming a nag queue, but they do it by expiring things
+    // AFTER they are queued; refusing here means the queue never fills with
+    // variations on "about that thing you mentioned" in the first place.
+    if (sqlite) {
+      try {
+        const pending = sqlite.prepare(
+          "SELECT id FROM initiatives WHERE status = 'pending' AND source_kind = 'daily-log'"
+        ).get();
+        if (pending) {
+          trace.reasoning = `a daily-log follow-up is already waiting to be delivered (${pending.id.slice(0, 8)}) — not stacking another`;
+          initiatives.recordLogFollowupTrace(trace);
+          console.log(`[Initiatives] Log follow-up: ${trace.reasoning}`);
+          return trace;
+        }
+      } catch (e) {
+        console.error('[Initiatives] log follow-up: pending check failed:', e.message);
+      }
+    }
+
+    const { callLLM } = require('./memory-manager');
+
+    // Numbered so the model can point at one precisely. Newest first, which is
+    // also most-likely-relevant first, and capped so a very chatty few days
+    // cannot blow the prompt.
+    const MAX_SHOWN = 40;
+    const shown = fresh.slice(0, MAX_SHOWN);
+    const list = shown
+      .map((e, i) => `[${i + 1}] (${e.date} ${e.time}) ${e.text}`)
+      .join('\n');
+
+    const sys = `You are SNH, reading back the log of things that have happened recently — the day's log, not a conversation transcript. Each line is something that was noted at the time.
+
+Decide whether ONE of them is worth following up on with your user: the "you mentioned the other day that…" impulse. Good reasons to follow up:
+  - something unresolved that a person would naturally circle back to,
+  - something that sounded difficult, or that they seemed to feel something about,
+  - something they said they intended to do, where asking how it went is natural,
+  - feedback about you, or about how the two of you talk, that deserves a response.
+
+Do NOT follow up on:
+  - routine daily activity with nothing open in it ("got up", "let the dogs out"),
+  - operational or debugging chatter about the system itself,
+  - anything you would only be raising to appear attentive,
+  - anything that would make the user feel watched or catalogued rather than known.
+
+Quality bar: high. RAISING NOTHING IS THE NORMAL, EXPECTED OUTCOME — most passes should raise nothing, and choosing not to speak is a real answer, not a failure. Only raise something if a thoughtful person who had been there would genuinely bring it up.
+
+At most ONE. Write it as a short, warm, natural first-person message to the user (address them as "you", never by name). One or two sentences. Do not quote the log entry back at them verbatim or mention that you keep a log.
+
+Return ONLY a JSON object, nothing else:
+{
+  "candidates": [up to 3 short strings naming entries you weighed],
+  "sourceEntry": the [number] of the entry you are following up on, or null,
+  "followup": "the ONE message to send — or null if nothing clears the bar",
+  "reasoning": "one sentence: why this one, or why nothing cleared the bar"
+}`;
+
+    const user = `RECENT LOG ENTRIES (last ${windowDays} day(s), newest first):\n${list}\n\nDecide.`;
+
+    const { content } = await agentPool.schedule(
+      () => callLLM(sys, user, { maxTokens: 400 }),
+      'daily-log-followup'
+    );
+
+    const parsed = parseFollowupResponse(content);
+    trace.candidates = parsed.candidates;
+    trace.reasoning = parsed.reasoning || (parsed.followup ? 'raised a follow-up' : 'nothing cleared the bar');
+
+    // Which entry it chose. An out-of-range or missing index does not void a
+    // good follow-up — it just means this one dedupes by timestamp rather than
+    // by entry, which is the safe direction to fail.
+    let sourceEntry = null;
+    const idx = Number(parsed.sourceEntry);
+    if (Number.isInteger(idx) && idx >= 1 && idx <= shown.length) sourceEntry = shown[idx - 1];
+
+    if (parsed.followup && parsed.followup.length >= 8) {
+      trace.generated = parsed.followup;
+      trace.skipped = false;
+      trace.sourceEntryId = sourceEntry ? sourceEntry.id : null;
+      const priority = Math.min(10, Math.max(cfg.followupThreshold, 5) + 1);
+      const id = await initiatives.addInitiative({
+        type: 'followup',
+        content: parsed.followup,
+        sourceKind: 'daily-log',
+        sourceRef: sourceEntry ? sourceEntry.id : `daily-log:pass:${trace.at}`,
+        priority
+      });
+      trace.initiativeId = id;
+      console.log(`[Initiatives] Log follow-up raised (priority ${priority}) from ${sourceEntry ? sourceEntry.id : 'the window'}: "${parsed.followup.slice(0, 80)}"`);
+    } else {
+      console.log(`[Initiatives] Log follow-up: raised nothing — ${trace.reasoning}`);
+    }
+  } catch (err) {
+    // An error is not a decline. It is recorded as its own reason so a pass that
+    // fell over is never read as a pass that considered and declined.
+    trace.reasoning = `error: ${err.message}`;
+    console.error('[Initiatives] generateLogFollowup error:', err.message);
+  }
+
+  initiatives.recordLogFollowupTrace(trace);
   return trace;
 }
 
@@ -592,6 +810,7 @@ module.exports = {
   raiseMemoryDrift,
   noticeReflectionInsight,
   generateConversationFollowup,
+  generateLogFollowup,
   prioritize,
   prioritizerSystemPrompt,
   deliverUnprompted,
