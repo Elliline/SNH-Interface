@@ -67,6 +67,52 @@ function cfg() {
 function factExtractor() { return require('./fact-extractor'); }
 function memoryClusters() { return require('./memory-clusters'); }
 function ledger() { return require('./corrections-ledger'); }
+function agentPool() { return require('./agent-pool'); }
+
+/**
+ * Every model judgement this module makes goes through the agent pool, and MOST
+ * of them go through it one at a time.
+ *
+ * The point of routing a judgement the pass immediately awaits is not
+ * parallelism — it is the CHAT THROTTLE. The corrector is the only background
+ * step with write hands, and until now it was the one that ran at full speed
+ * while someone was typing: the thing editing the memory competed with the
+ * conversation for the same engine. `schedule()` puts each call behind the
+ * pool's gate, so a corrector judgement waits while chat is in flight exactly
+ * like every other background judgement already did. Awaiting each one keeps the
+ * pass strictly serial and in the same order it has always run.
+ *
+ * It also closes the asymmetry: judgeContradiction was pooled when intake called
+ * it (fact-extractor's contradiction-judge batch) and unpooled when the
+ * corrector called it — one function, two dispatch regimes, depending only on
+ * who was asking.
+ *
+ * WRAP AT THE CALL SITE, NEVER INSIDE THE judge* FUNCTIONS. Intake already calls
+ * judgeContradiction from inside a pooled batch; if the function pooled itself,
+ * that inner schedule() would wait for a slot the outer task is still holding.
+ * With concurrency 3 and three outer tasks in flight, every slot is occupied by
+ * a task waiting for a slot — a deadlock, arrived at by trying to be tidy.
+ */
+function viaPool(label, fn) {
+  return agentPool().schedule(fn, label);
+}
+
+/**
+ * Judge a list of INDEPENDENT candidates concurrently, in bounded chunks.
+ *
+ * Only for judgements that are a pure function of one row's own content, where
+ * no candidate's verdict can depend on another's — see the call sites, which
+ * name why they qualify. Chunked rather than fanned out whole so that
+ * speculation is bounded: the apply loop may stop early (a per-phase cap, the
+ * write budget, the wall clock), and everything judged past that point is
+ * discarded. Discarding costs model calls; it can never cost a write, because
+ * nothing in these phases is recorded until the serial apply loop reaches it.
+ */
+function judgeChunkSize() {
+  const c = getConfig();
+  const n = c.agentPool && Number.isInteger(c.agentPool.concurrency) ? c.agentPool.concurrency : 3;
+  return Math.max(1, n);
+}
 
 // ---------------------------------------------------------------------------
 // Pass state on disk — WHEN a pass last ran, not what it did
@@ -499,11 +545,22 @@ async function mergeNearDuplicates(pass, { subject = null } = {}) {
       let why = identical ? 'identical wording' : null;
       let subsumedBy = null;     // the row that contains the other, when that is how they relate
       if (!identical) {
-        const verdict = await factExtractor().judgeSameAssertion(other.content, row.content);
+        // POOLED BUT SERIAL, and it stays that way. Which pairs get judged at
+        // all depends on `gone`, which this loop mutates as it merges: a row
+        // folded away here is skipped as a candidate below, and a row that loses
+        // to its own candidate ends its iteration entirely. Judging ahead would
+        // therefore ask about pairs the serial walk would never have reached,
+        // and this phase MEMOISES its verdicts into corrector_pair_checks — so
+        // the speculative answers would be written down and silently change
+        // which pairs a future pass skips. Wrong in a way that would look like a
+        // model failure months later, which is exactly the trade not worth making.
+        const verdict = await viaPool('corrector-same-assertion',
+          () => factExtractor().judgeSameAssertion(other.content, row.content));
         same = verdict.same;
         why = verdict.reasoning;
         if (!same) {
-          const sub = await factExtractor().judgeSubsumption(row.content, other.content);
+          const sub = await viaPool('corrector-subsumption',
+            () => factExtractor().judgeSubsumption(row.content, other.content));
           if (sub.relation === 'a-contains-b') { subsumedBy = row; why = sub.reasoning; }
           else if (sub.relation === 'b-contains-a') { subsumedBy = other; why = sub.reasoning; }
         }
@@ -547,7 +604,8 @@ async function mergeNearDuplicates(pass, { subject = null } = {}) {
           [survivor, loser] = new Date(row.created_at) <= new Date(other.created_at) ? [row, other] : [other, row];
         }
       } else {
-        const pick = await factExtractor().judgeWhichSurvives(row.content, other.content);
+        const pick = await viaPool('corrector-which-survives',
+          () => factExtractor().judgeWhichSurvives(row.content, other.content));
         if (pick === 'a') [survivor, loser] = [row, other];
         else if (pick === 'b') [survivor, loser] = [other, row];
         else {
@@ -610,11 +668,21 @@ async function expireDatedEvents(pass, { subject = null } = {}) {
     ORDER BY datetime(created_at) ASC
   `).all(...(subject ? [subject] : []));
 
-  let expired = 0;
+  // THIS PHASE'S JUDGEMENT IS INDEPENDENT PER ROW, WHICH IS WHY IT CAN FAN OUT.
+  //
+  // judgeStripTheTimestamp is asked one question — "strip the time reference out
+  // of this sentence; is anything durable left?" — about ONE row's own content.
+  // No candidate's answer can depend on another's, nothing here consults a
+  // neighbour, and unlike the merge and contradiction phases there is no pair
+  // and no evolving `gone`/`resolved` set to invalidate a verdict computed
+  // early. So the judging fans out and the ACTING stays exactly as serial and
+  // as ordered as it was.
+  //
+  // The cheap filters run first, on their own, because they are deterministic
+  // and free: it would be silly to spend a model call to discover a row has no
+  // date marker in it.
+  const candidates = [];
   for (const row of rows) {
-    if (expired >= maxExpiries) break;
-    if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); break; }
-
     // The marker is a CANDIDATE FILTER, not the decision. See
     // factExtractor.judgeStripTheTimestamp for why: on the marker alone this
     // proposed retiring "User's partner passed away on January 24th, 2025" and
@@ -635,8 +703,35 @@ async function expireDatedEvents(pass, { subject = null } = {}) {
     // updated_at, so a reworded fact is asked again.
     if (!pass.dryRun && alreadyScanned(db, 'exp', row)) continue;
 
-    const stripTest = await factExtractor().judgeStripTheTimestamp(row.content);
-    if (!stripTest.isEvent) { if (!pass.dryRun) markScanned(db, 'exp', row); continue; }
+    candidates.push({ row, marker });
+  }
+
+  let expired = 0;
+  const chunk = judgeChunkSize();
+  for (let start = 0; start < candidates.length; start += chunk) {
+    if (expired >= maxExpiries) break;
+    if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); break; }
+
+    const slice = candidates.slice(start, start + chunk);
+    const verdicts = await agentPool().runBatch(
+      slice.map(({ row }) => () => factExtractor().judgeStripTheTimestamp(row.content)),
+      'corrector-expire-judge'
+    );
+
+    for (let k = 0; k < slice.length; k++) {
+      if (expired >= maxExpiries) break;
+      if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); break; }
+
+      const { row, marker } = slice[k];
+      const settled = verdicts[k];
+      // A judge that threw aborts the pass, exactly as it did when this call was
+      // inline — but only once the loop actually REACHES that row. runBatch
+      // isolates the rejection so one bad row cannot kill rows judged beside it
+      // speculatively; rethrowing here reproduces the old control flow at the
+      // point the old code would have made the call, and no earlier.
+      if (settled.status !== 'fulfilled') throw settled.reason;
+      const stripTest = settled.value;
+      if (!stripTest.isEvent) { if (!pass.dryRun) markScanned(db, 'exp', row); continue; }
 
     // Move before removing. Under the date it was learned, so the day's log reads
     // as a record of when it happened rather than of when it was tidied up.
@@ -664,7 +759,8 @@ async function expireDatedEvents(pass, { subject = null } = {}) {
         evidence: { marker: marker.marker, marker_kind: marker.kind, learned: row.created_at, judge: trim(stripTest.reasoning, 200) }
       }
     });
-    expired++;
+      expired++;
+    }
   }
   return { expired };
 }
@@ -798,20 +894,37 @@ async function repairCompounds(pass, { subject = null } = {}) {
     ORDER BY datetime(created_at) ASC
   `).all(...(subject ? [subject] : []));
 
-  let split = 0;
-  let pending = 0;      // compounds this pass did not get to
+  // INDEPENDENT PER ROW, like the expiry phase. splitCompoundFact is asked to
+  // break ONE sentence into its clauses; no other row participates in that
+  // answer. What follows the split — the identity guard, assignToCluster, the
+  // write — is NOT independent (assignment can create a cluster that the next
+  // row's atoms then join), so all of that stays serial and in order. Only the
+  // splitting fans out.
+  //
+  // THE CHEAP FILTER IS ONLY looksCompound, AND THE CHECK ORDER BELOW IS LOAD-
+  // BEARING. `pending` is not bookkeeping: runPass refuses to resolve any
+  // contradiction while a compound is still whole, because a whole compound that
+  // loses a contradiction takes undisputed clauses down with it. In the serial
+  // original the cap and budget checks come BEFORE the self-fact gate, so a
+  // self-fact compound met after the cap is hit still counts as pending. Moving
+  // that gate up into the filter would quietly stop counting those, and the
+  // semantic tier would run in a pass where it should have been held back. So
+  // the gate stays exactly where it was; it only decides whether we bother
+  // asking the model, never whether the row is counted.
+  const candidates = [];
   for (const row of rows) {
     if (!rules.looksCompound(row.content).compound) continue;
-    if (split >= maxSplits) { pending++; continue; }
-    if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); pending++; continue; }
+    candidates.push({
+      row,
+      selfHeld: (row.subject || 'user') === 'self' && cfg().selfFactSemantic !== true
+    });
+  }
 
-    // Same scope gate as the near-duplicate merge. Splitting "I value
-    // transparency and precision" into two self-facts is mechanically safe for
-    // the RECORD but changes the granularity of his self-view, and it would
-    // reshape the very corpus the joint curation session is meant to review —
-    // ten compounds became nineteen atoms in the dry run. Held back with the
-    // rest of the self-fact work.
-    if ((row.subject || 'user') === 'self' && cfg().selfFactSemantic !== true) continue;
+  let split = 0;
+  let pending = 0;      // compounds this pass did not get to
+  const chunk = judgeChunkSize();
+  for (let start = 0; start < candidates.length; start += chunk) {
+    const slice = candidates.slice(start, start + chunk);
 
     // Strip the archiver's "User (Ellie)" annotation BEFORE splitting. It is a
     // note about who "User" refers to, not a claim the sentence makes — but the
@@ -821,87 +934,121 @@ async function repairCompounds(pass, { subject = null } = {}) {
     // compound can lose a contradiction over one of its clauses. That is the
     // chain that retired "User (Ellie) has blue eyes and her favorite color is
     // green" for "User's favorite color is blue".
-    const annotated = rules.stripSubjectAnnotation(row.content);
-    if (annotated.stripped) {
-      console.log(`[Corrector] dropped the subject annotation "(${annotated.stripped})" before splitting — it names the subject, it does not assert anything`);
+    for (const item of slice) {
+      item.annotated = rules.stripSubjectAnnotation(item.row.content);
     }
 
-    const atoms = await factExtractor().splitCompoundFact(annotated.text, row.subject || 'user');
-    if (!atoms || atoms.length < 2) continue;
-
-    // THE CORRECTOR NEVER MANUFACTURES AN IDENTITY ASSERTION.
-    //
-    // "User (Ellie) is developing a system where cron jobs can be proposed…"
-    // splits into the substance plus, from the parenthetical alone, "User's name
-    // is Ellie." — a brand-new name fact, written with no self-introduction
-    // anywhere near it. That is precisely what the identity anchor refuses at
-    // intake (the F1 rule), walked around by a phase that was never asked the
-    // question, and it produced the thing F1's second half forbids: two active
-    // name facts. Observed live, twice, on 2026-08-05.
-    //
-    // ABANDON, do not filter. Dropping the offending atom and splitting the rest
-    // would supersede the original, and with it whatever that atom said — and
-    // the identity classes include relationships, so the atom thrown away could
-    // be "User's partner passed away on January 24th, 2025". Leaving the
-    // compound whole loses nothing; it is the state the corpus is already in.
-    const identityAtoms = atoms.filter(a => !!rules.identityClassOf(a));
-    if (identityAtoms.length) {
-      console.log(`[Corrector] abandoning split of "${trim(row.content, 60)}" — an atom would assert an identity slot: ${identityAtoms.map(a => `"${trim(a, 60)}"`).join(', ')}`);
-      continue;
+    // Held-back self-facts are still walked below (they must reach the cap check
+    // to be counted) but there is nothing to ask about them.
+    const askable = slice.filter(it => !it.selfHeld);
+    const settledFor = new Map();
+    if (askable.length) {
+      const results = await agentPool().runBatch(
+        askable.map(it => () => factExtractor().splitCompoundFact(it.annotated.text, it.row.subject || 'user')),
+        'corrector-compound-split'
+      );
+      askable.forEach((it, i) => settledFor.set(it, results[i]));
     }
 
-    if (pass.dryRun) {
-      pass.plan.push({
-        tier: 'mechanical', action: 'split', subject: row.subject || 'user',
-        targetId: row.id, targetText: row.content,
-        atoms, reason: `Says more than one thing; would become ${atoms.length} separate facts.`,
-        dryRun: true, applied: false
+    for (const item of slice) {
+      const { row, annotated, selfHeld } = item;
+      if (split >= maxSplits) { pending++; continue; }
+      if (!pass.dryRun && budgetSpent(pass)) { pass.stopped = budgetSpent(pass); pending++; continue; }
+
+      // Same scope gate as the near-duplicate merge. Splitting "I value
+      // transparency and precision" into two self-facts is mechanically safe for
+      // the RECORD but changes the granularity of his self-view, and it would
+      // reshape the very corpus the joint curation session is meant to review —
+      // ten compounds became nineteen atoms in the dry run. Held back with the
+      // rest of the self-fact work.
+      if (selfHeld) continue;
+
+      if (annotated.stripped) {
+        console.log(`[Corrector] dropped the subject annotation "(${annotated.stripped})" before splitting — it names the subject, it does not assert anything`);
+      }
+
+      // Rethrown at the point the serial original would have made the call, so a
+      // splitter failure aborts the pass exactly as it used to — never earlier,
+      // and never for a row this pass would not have reached.
+      const settled = settledFor.get(item);
+      if (settled && settled.status !== 'fulfilled') throw settled.reason;
+      const atoms = settled ? settled.value : null;
+      if (!atoms || atoms.length < 2) continue;
+
+      // THE CORRECTOR NEVER MANUFACTURES AN IDENTITY ASSERTION.
+      //
+      // "User (Ellie) is developing a system where cron jobs can be proposed…"
+      // splits into the substance plus, from the parenthetical alone, "User's name
+      // is Ellie." — a brand-new name fact, written with no self-introduction
+      // anywhere near it. That is precisely what the identity anchor refuses at
+      // intake (the F1 rule), walked around by a phase that was never asked the
+      // question, and it produced the thing F1's second half forbids: two active
+      // name facts. Observed live, twice, on 2026-08-05.
+      //
+      // ABANDON, do not filter. Dropping the offending atom and splitting the rest
+      // would supersede the original, and with it whatever that atom said — and
+      // the identity classes include relationships, so the atom thrown away could
+      // be "User's partner passed away on January 24th, 2025". Leaving the
+      // compound whole loses nothing; it is the state the corpus is already in.
+      const identityAtoms = atoms.filter(a => !!rules.identityClassOf(a));
+      if (identityAtoms.length) {
+        console.log(`[Corrector] abandoning split of "${trim(row.content, 60)}" — an atom would assert an identity slot: ${identityAtoms.map(a => `"${trim(a, 60)}"`).join(', ')}`);
+        continue;
+      }
+
+      if (pass.dryRun) {
+        pass.plan.push({
+          tier: 'mechanical', action: 'split', subject: row.subject || 'user',
+          targetId: row.id, targetText: row.content,
+          atoms, reason: `Says more than one thing; would become ${atoms.length} separate facts.`,
+          dryRun: true, applied: false
+        });
+        split++;
+        continue;
+      }
+
+      // Write the atoms first. If this fails we have added nothing and removed
+      // nothing, which is the only safe way round.
+      const config = getConfig();
+      const { getProviderInstance } = require('./config');
+      const prov = config.models.extraction.provider;
+      const model = config.models.extraction.model;
+      const inst = getProviderInstance(prov, config.models.extraction.instance);
+      const host = inst ? inst.host : 'http://localhost:11434';
+
+      const created = [];
+      for (const atom of atoms) {
+        const res = await memoryClusters().assignToCluster(
+          atom, prov, model, '', host, 'corrector-split', row.salience ?? 5,
+          row.subject || 'user', row.claim_type || null,
+          {
+            conversationId: row.conversation_id,
+            messageId: row.message_id,
+            verbatimSourceText: row.verbatim_source_text,
+            inputModality: row.input_modality || 'unknown',
+            salienceRationale: `Split out of a compound fact by the corrector: "${trim(row.content, 100)}"`
+          }
+        );
+        if (res && res.memberId) created.push({ id: res.memberId, text: atom, cluster: res.clusterName });
+      }
+      if (created.length < 2) {
+        console.warn(`[Corrector] compound split produced <2 stored atoms, leaving original alone: ${row.id.slice(0, 8)}`);
+        continue;
+      }
+
+      await act(pass, {
+        tool: 'memory_supersede_fact',
+        args: { old_id: row.id, new_id: created[0].id },
+        entry: {
+          tier: 'mechanical', action: 'split', subject: row.subject || 'user',
+          targetId: row.id, targetText: row.content,
+          survivorId: created[0].id, survivorText: created.map(a => a.text).join(' | '),
+          reason: `This said more than one thing at once, so it was split into ${created.length} separate facts, each filed where it belongs: ${created.map(a => `"${a.text}" → ${a.cluster}`).join('; ')}.`,
+          evidence: { atoms: created.map(a => ({ id: a.id, text: a.text, cluster: a.cluster })) }
+        }
       });
       split++;
-      continue;
     }
-
-    // Write the atoms first. If this fails we have added nothing and removed
-    // nothing, which is the only safe way round.
-    const config = getConfig();
-    const { getProviderInstance } = require('./config');
-    const prov = config.models.extraction.provider;
-    const model = config.models.extraction.model;
-    const inst = getProviderInstance(prov, config.models.extraction.instance);
-    const host = inst ? inst.host : 'http://localhost:11434';
-
-    const created = [];
-    for (const atom of atoms) {
-      const res = await memoryClusters().assignToCluster(
-        atom, prov, model, '', host, 'corrector-split', row.salience ?? 5,
-        row.subject || 'user', row.claim_type || null,
-        {
-          conversationId: row.conversation_id,
-          messageId: row.message_id,
-          verbatimSourceText: row.verbatim_source_text,
-          inputModality: row.input_modality || 'unknown',
-          salienceRationale: `Split out of a compound fact by the corrector: "${trim(row.content, 100)}"`
-        }
-      );
-      if (res && res.memberId) created.push({ id: res.memberId, text: atom, cluster: res.clusterName });
-    }
-    if (created.length < 2) {
-      console.warn(`[Corrector] compound split produced <2 stored atoms, leaving original alone: ${row.id.slice(0, 8)}`);
-      continue;
-    }
-
-    await act(pass, {
-      tool: 'memory_supersede_fact',
-      args: { old_id: row.id, new_id: created[0].id },
-      entry: {
-        tier: 'mechanical', action: 'split', subject: row.subject || 'user',
-        targetId: row.id, targetText: row.content,
-        survivorId: created[0].id, survivorText: created.map(a => a.text).join(' | '),
-        reason: `This said more than one thing at once, so it was split into ${created.length} separate facts, each filed where it belongs: ${created.map(a => `"${a.text}" → ${a.cluster}`).join('; ')}.`,
-        evidence: { atoms: created.map(a => ({ id: a.id, text: a.text, cluster: a.cluster })) }
-      }
-    });
-    split++;
   }
   return { split, pending };
 }
@@ -991,7 +1138,21 @@ async function resolveContradictions(pass, { subject = 'user' } = {}) {
         continue;
       }
 
-      const { verdict } = await factExtractor().judgeContradiction(row.content, other.content);
+      // POOLED BUT SERIAL, for the same reason as the merge phase and one more.
+      // The pair set here is shaped by `resolved` and `judged` as the loop runs,
+      // and the verdicts are memoised into corrector_pair_checks, so judging
+      // ahead would write down answers about pairs this pass would never have
+      // asked. On top of that, a supersession applied earlier in the loop retires
+      // a row, and a retired row must not go on to win or lose a later pair —
+      // the enumeration has to see the corpus as it stands, not as it stood
+      // before the pass began.
+      //
+      // This is also the call that was pooled on one path and not the other:
+      // intake judges contradictions inside fact-extractor's contradiction-judge
+      // batch, and the corrector judged them bare. Same function, same question,
+      // now the same gate.
+      const { verdict } = await viaPool('corrector-contradiction',
+        () => factExtractor().judgeContradiction(row.content, other.content));
       if (!pass.dryRun) {
         try { markStmt.run(key, new Date().toISOString(), verdict, row.id, other.id); } catch { /* non-fatal */ }
       }
@@ -1119,6 +1280,13 @@ async function runPass(opts = {}) {
     unresolved: 0, selfCorrections: 0, refusedLocked: 0, stopped: null, plan: []
   };
 
+  // Group this pass's judgements so the ops ledger reports what the corrector
+  // actually spent on the engine — task count, wall time, peak concurrency — the
+  // same way the cluster audit and the self-coherence audit already do. Before
+  // this, the corrector was the one model-using background step invisible to
+  // that accounting, because none of its calls went through the pool at all.
+  agentPool().startPass('corrector');
+
   try {
     // --- mechanical: both subjects. These repair the record, not a view. ---
     const m = await mergeNearDuplicates(pass, {});
@@ -1174,6 +1342,10 @@ async function runPass(opts = {}) {
   } catch (err) {
     console.error('[Corrector] pass error:', err.message);
     result.error = err.message;
+  } finally {
+    // In a finally so an aborted pass still closes its pass — an unbalanced
+    // startPass would attribute the next pass's tasks to this one.
+    try { agentPool().endPass(); } catch { /* telemetry must never fail a pass */ }
   }
 
   result.unresolved = pass.unresolved.length;
