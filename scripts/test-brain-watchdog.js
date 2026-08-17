@@ -7,6 +7,7 @@
 
 // ---- Install mocks BEFORE requiring the module under test -------------------
 // The module destructures execFile + getConfig at load, so patch first.
+const path = require('path');
 const cp = require('child_process');
 const dockerCalls = [];
 let dockerShouldFail = false;
@@ -122,6 +123,45 @@ function opsMatch(re) { return opsLines.some(l => re.test(l)); }
   await failProbe(); advance(5); await failProbe(); advance(5); await failProbe(); advance(5); await failProbe();
   check(dockerCalls.length === 0, 'disabled watchdog never restarts');
   watchdogCfg = { ...watchdogCfg, enabled: true };
+
+  // ===== Scenario E: disposable instance (SNH_DATA_DIR) ====================
+  // The gate is read from the environment at module load, so it cannot be
+  // toggled in-process the way watchdogCfg can — it is exercised in a child
+  // with SNH_DATA_DIR set, running the same mocks. This is the case that cost a
+  // day on 2026-08-16: a throwaway instance inheriting the live config's
+  // watchdog and restarting the shared container.
+  console.log('\n── Scenario E: SNH_DATA_DIR disables the watchdog ──');
+  const child = `
+    const cp = require('child_process');
+    const calls = [];
+    cp.execFile = (cmd, args, opts, cb) => { calls.push(args); setImmediate(() => cb(null, '', '')); };
+    const config = require('${path.join(__dirname, '../db/config')}');
+    config.getConfig = () => ({ watchdog: { enabled: true, container: 'test-brain', failureThreshold: 3, cooldownMinutes: 5, maxRestartsPerHour: 2 } });
+    const fe = require('${path.join(__dirname, '../db/fact-extractor')}');
+    const ops = []; fe.appendToOpsLog = (m) => ops.push(m);
+    const wd = require('${path.join(__dirname, '../db/brain-watchdog')}');
+    (async () => {
+      for (let i = 0; i < 6; i++) await wd.onProbeResult({ ok: false, ms: 8000, error: 'timeout' });
+      console.log(JSON.stringify({ restarts: calls.length, spoke: ops.some(o => /DISABLED for this process/.test(o)) }));
+    })();
+  `;
+  let childOut = '';
+  try {
+    childOut = require('child_process').execFileSync(process.execPath, ['-e', child], {
+      encoding: 'utf8',
+      env: { ...process.env, SNH_DATA_DIR: '/tmp/throwaway-watchdog-test' },
+      timeout: 30000
+    });
+  } catch (e) {
+    childOut = `child failed: ${e.message}`;
+  }
+  const childResult = (() => {
+    const m = childOut.match(/\{[\s\S]*\}/);
+    try { return m ? JSON.parse(m[0]) : null; } catch { return null; }
+  })();
+  check(childResult !== null, `child produced a result (${childOut.trim().slice(0, 120)})`);
+  check(childResult && childResult.restarts === 0, 'disposable instance never restarts the shared container');
+  check(childResult && childResult.spoke === true, 'the refusal is SPOKEN to the ops log, not silent');
 
   Date.now = realNow;
   console.log(`\n${failures === 0 ? '✅ ALL PASSED' : `❌ ${failures} CHECK(S) FAILED`}`);

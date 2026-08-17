@@ -62,11 +62,45 @@ function pruneWindow(now) {
   restartTimes = restartTimes.filter(t => now - t < HOUR_MS);
 }
 
+// A DISPOSABLE INSTANCE DOES NOT GET TO RESTART SHARED INFRASTRUCTURE.
+//
+// SNH_DATA_DIR redirects SQLite and LanceDB so a throwaway process cannot touch
+// the live corpus (see "The replay redirects a PROCESS, not a call"). It
+// deliberately does NOT redirect data/config.json, which is the right call for
+// the data — a throwaway wants the real configuration against a disposable
+// store — and exactly the wrong thing here: the throwaway inherits the real
+// `watchdog` block, container name and all, pointed at the shared engine.
+//
+// On 2026-08-16 two orphaned verification instances did precisely that. They had
+// been given a capture proxy as their engine host; the proxy was shut down when
+// the capture finished; their liveness probes then failed forever, hit the
+// threshold, and ran `docker restart sparky-brain` against the LIVE engine five
+// times across a day. Each restart cost ~3.5 minutes of model load during which
+// the real assistant answered "fetch failed" — including on a message the user
+// actually sent. None of it appeared in the live instance's logs or ops ledger,
+// because the watchdog entries belonged to the throwaways, so the outages looked
+// unattributable for a full day.
+//
+// The redirect is therefore the signal. A process pointed at a disposable store
+// is by definition not the instance responsible for the shared container, so it
+// observes and reports but never acts. There is no override: an instance that
+// genuinely owns its engine is the one running against the live data directory.
+const DISPOSABLE_INSTANCE = !!process.env.SNH_DATA_DIR;
+let disposableNoticeLogged = false;
+
 /** Read + normalize the watchdog config each probe so knobs take effect live. */
 function cfg() {
   const w = (getConfig().watchdog) || {};
+  // Spoken, not silent — a guard that disables a self-healing action without
+  // saying so is the same defect class as a refused write that reports success.
+  if (DISPOSABLE_INSTANCE && w.enabled !== false && !disposableNoticeLogged) {
+    disposableNoticeLogged = true;
+    const msg = `Brain watchdog DISABLED for this process: SNH_DATA_DIR is set (${process.env.SNH_DATA_DIR}), so this is a disposable instance and must not restart the shared container "${w.container || 'sparky-brain'}". Liveness is still probed and reported.`;
+    console.warn(`[Watchdog] ${msg}`);
+    opsLog(msg);
+  }
   return {
-    enabled: w.enabled !== false,
+    enabled: w.enabled !== false && !DISPOSABLE_INSTANCE,
     container: w.container || 'sparky-brain',
     failureThreshold: Math.max(1, w.failureThreshold || 3),
     cooldownMs: Math.max(0, (w.cooldownMinutes ?? 5) * 60 * 1000),
