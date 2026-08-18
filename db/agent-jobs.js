@@ -149,6 +149,36 @@ function startsLastHour() {
 }
 
 /**
+ * Every call to start a job leaves a row in tool_call_log — started, refused or
+ * errored.
+ *
+ * Added 2026-08-18, after an hour was spent establishing whether the tool had
+ * been called at all. It had not (the turn never reached the tool loop), but
+ * nothing in the data could say so: this tool logged nothing, ever, so "no entry"
+ * meant "never called" and "called and refused" identically. create_cron_job has
+ * logged its calls since the day it shipped; this is the same courtesy.
+ */
+function logToolCall({ outcome, detail, refId = null, conversationId = null, args = null }) {
+  const db = getSqliteDb();
+  if (!db) return;
+  try {
+    db.prepare(`
+      INSERT INTO tool_call_log (id, created_at, tool, args_json, outcome, detail, ref_id, conversation_id)
+      VALUES (?, ?, 'start_background_job', ?, ?, ?, ?, ?)
+    `).run(randomUUID(), new Date().toISOString(), args ? JSON.stringify(args) : null,
+      outcome, String(detail || '').slice(0, 300), refId, conversationId);
+  } catch (err) {
+    console.error('[AgentJobs] logToolCall failed:', err.message);
+  }
+}
+
+/** A refusal, logged and returned in one move so neither can be forgotten. */
+function refuse(outcome, error, { conversationId = null } = {}) {
+  logToolCall({ outcome, detail: error, conversationId });
+  return { ok: false, error };
+}
+
+/**
  * Put a job on the queue and start it.
  *
  * Returns synchronously-decided state: by the time this resolves the row exists
@@ -166,21 +196,21 @@ function enqueue({ title, task, why = null, conversationId = null, messageId = n
   if (!db) return { ok: false, error: 'The job queue is unavailable (no database handle).' };
 
   const c = cfg();
-  if (!c.enabled) return { ok: false, error: 'Background jobs are switched off in configuration, so nothing was started.' };
+  if (!c.enabled) return refuse('error', 'Background jobs are switched off in configuration, so nothing was started.', { conversationId });
 
   const t = String(title || '').trim();
   const k = String(task || '').trim();
-  if (!t) return { ok: false, error: 'A job needs a short title — nothing was started.' };
-  if (!k) return { ok: false, error: 'A job needs a task describing what to do — nothing was started.' };
-  if (k.length > 4000) return { ok: false, error: 'That task is too long to hand off (4000 characters max) — nothing was started.' };
+  if (!t) return refuse('error', 'A job needs a short title — nothing was started.', { conversationId });
+  if (!k) return refuse('error', 'A job needs a task describing what to do — nothing was started.', { conversationId });
+  if (k.length > 4000) return refuse('error', 'That task is too long to hand off (4000 characters max) — nothing was started.', { conversationId });
 
   const active = activeCount();
   if (active >= c.maxQueued) {
-    return { ok: false, error: `There are already ${active} jobs queued or running, which is the limit (${c.maxQueued}). Nothing was started — say so, and offer to do this once some of them finish.` };
+    return refuse('refused-cap', `There are already ${active} jobs queued or running, which is the limit (${c.maxQueued}). Nothing was started — say so, and offer to do this once some of them finish.`, { conversationId });
   }
   const recent = startsLastHour();
   if (recent >= c.maxStartsPerHour) {
-    return { ok: false, error: `You have already started ${recent} background jobs in the last hour, which is the limit (${c.maxStartsPerHour}). Nothing was started — say so plainly rather than implying it is running.` };
+    return refuse('refused-cap', `You have already started ${recent} background jobs in the last hour, which is the limit (${c.maxStartsPerHour}). Nothing was started — say so plainly rather than implying it is running.`, { conversationId });
   }
 
   const id = randomUUID();
@@ -192,6 +222,7 @@ function enqueue({ title, task, why = null, conversationId = null, messageId = n
 
   console.log(`[AgentJobs] queued ${id.slice(0, 8)} (${source}): "${t}"`);
   opsLog(`Background job queued: "${t}" (${id.slice(0, 8)}, ${source}).`);
+  logToolCall({ outcome: 'started', detail: `queued "${t}"`, refId: id, conversationId, args: { title: t } });
 
   launch(id);
   return { ok: true, id };
@@ -486,6 +517,23 @@ function startup() {
 // Reading — the panel, and the entity's turn-start handoff
 // ---------------------------------------------------------------------------
 
+/**
+ * Jobs this conversation created since `sinceIso` — the phantom-dispatch check.
+ *
+ * Scoped to BOTH the conversation and the turn window on purpose: a job started
+ * ten minutes ago in another conversation must not vouch for a claim made in
+ * this one.
+ *
+ * @returns {Array<{id: string, title: string, status: string}>}
+ */
+function jobsStartedInTurn(conversationId, sinceIso) {
+  const db = getSqliteDb();
+  if (!db || !conversationId || !sinceIso) return [];
+  return db.prepare(
+    'SELECT id, title, status FROM agent_jobs WHERE conversation_id = ? AND datetime(created_at) >= datetime(?)'
+  ).all(conversationId, sinceIso);
+}
+
 /** Cancel a job. Queued only, and the refusal says why. */
 function cancel(id) {
   const job = getJob(id);
@@ -649,6 +697,68 @@ function pendingAnnouncements({ limit = 3 } = {}) {
     .slice(0, lim);
 }
 
+/**
+ * What is running or waiting RIGHT NOW — the live view he otherwise does not have.
+ *
+ * WHY THIS EXISTS. On 2026-08-18 Ellie asked "Are you still working on this?"
+ * and got a detailed progress report: one job "slowed by a search connection
+ * issue I am working through", another "scanning a large volume of memory and
+ * logs". Both invented. Every job he had was already finished, and one of them
+ * had never existed at all. He had no way to see the queue — the only chat-side
+ * view is the announcement block, which by construction shows FINISHED work —
+ * and nothing told him he could not see it, so he produced the plausible thing.
+ *
+ * This is the same failure as the capability manifest: not lying, exactly, but
+ * having no ground truth and filling the gap. The fix is the same shape — give
+ * him the true state, and say plainly what its absence means.
+ *
+ * A LINE, NOT A TOOL. A tool only helps on a turn that reaches the tool loop,
+ * and "Are you still working on this?" trips no classifier; under the old gate
+ * that turn was DIRECT, and a status tool would have been exactly as absent as
+ * the handoff tool was. This renders into the per-turn context instead, so it is
+ * there whether or not he thinks to ask for it.
+ *
+ * ZERO TOKENS WHEN NOTHING IS ACTIVE — returns null, and the absence is itself
+ * the signal the standing instruction refers to.
+ *
+ * @returns {{text: string, running: number, queued: number}|null}
+ */
+function renderActiveJobsBlock() {
+  const db = getSqliteDb();
+  if (!db) return null;
+  const rows = db.prepare(
+    "SELECT id, title, status, created_at, started_at FROM agent_jobs WHERE status IN ('queued','running') ORDER BY datetime(created_at) ASC"
+  ).all();
+  if (!rows.length) return null;
+
+  const now = Date.now();
+  const elapsed = (iso) => {
+    if (!iso) return '';
+    const ms = now - new Date(iso).getTime();
+    if (ms < 0) return 'just now';
+    const m = Math.floor(ms / 60000);
+    return m < 1 ? `${Math.max(1, Math.round(ms / 1000))}s so far` : `${m} min so far`;
+  };
+
+  const running = rows.filter(r => r.status === 'running');
+  const queued = rows.filter(r => r.status === 'queued');
+  const lines = rows.map(r => r.status === 'running'
+    ? `- RUNNING: "${r.title}" (${elapsed(r.started_at)})`
+    : `- WAITING TO START: "${r.title}"`);
+
+  const text =
+    '=== Your Background Jobs, Right Now ===\n' +
+    `${running.length} running, ${queued.length} waiting to start.\n` +
+    lines.join('\n') + '\n' +
+    'This is the whole picture and it is live as of this message. You can see THAT they are ' +
+    'running and for how long; you cannot see how far along one is, what it has found so far, or ' +
+    'why it is taking the time it is. Do not describe progress you cannot see. When one finishes ' +
+    'you are told what it found at the top of a reply — until then the honest answer about its ' +
+    'contents is that you do not know yet.';
+
+  return { text, running: running.length, queued: queued.length };
+}
+
 /** Stamp announcements as delivered. Called only once the block is really in the request. */
 function markAnnounced(items = []) {
   const db = getSqliteDb();
@@ -731,6 +841,8 @@ module.exports = {
   markRunSeen,
   pendingAnnouncements,
   markAnnounced,
+  renderActiveJobsBlock,
+  jobsStartedInTurn,
   renderAnnouncementBlock,
   activeCount,
   startsLastHour,

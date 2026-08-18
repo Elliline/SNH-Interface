@@ -3173,3 +3173,35 @@ a.msg-source:hover {
   color: var(--text-color);
 }
 .job-seen:disabled, .job-cancel:disabled { opacity: 0.5; cursor: default; }
+
+
+/* Running count — a SECOND number, and deliberately not the badge's.
+   The badge (top-right, accent) counts unread RESULTS: something to read. This
+   one (bottom-left, secondary) counts jobs still working: nothing to do yet.
+   Same corner or same colour would make "3" ambiguous, which is the one thing
+   this must not be. */
+.jobs-running-count {
+  position: absolute;
+  bottom: -4px;
+  left: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--surface-color);
+  border: 1px solid var(--secondary-color);
+  color: var(--secondary-color);
+  font-size: 0.62rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+.jobs-activity {
+  padding: 8px 14px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--secondary-color);
+  border-bottom: 1px solid var(--border-color);
+}
+.job-elapsed { font-size: 0.66rem; color: var(--secondary-color); margin-left: 6px; }

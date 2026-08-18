@@ -39,7 +39,7 @@
           🔔<span id="initiativeBadge" class="initiative-badge" style="display: none;">0</span>
         </button>
         <button id="jobsBtn" class="jobs-btn" title="Background jobs — results, not messages">
-          🤖<span id="jobsBadge" class="jobs-badge" style="display: none;">0</span>
+          🤖<span id="jobsBadge" class="jobs-badge" style="display: none;">0</span><span id="jobsRunning" class="jobs-running-count" style="display: none;">0</span>
         </button>
         <button id="memoryBtn" class="memory-panel-btn" title="Memory">&#x1F9E0;</button>
         <button id="newChatBtn" class="new-chat-btn">New Chat</button>
@@ -189,6 +189,7 @@
       Work SNH ran in the background — jobs it started during a conversation, and its scheduled jobs.
       These are results, not messages: nothing here will start a conversation with you.
     </div>
+    <div id="jobsActivity" class="jobs-activity" style="display: none;"></div>
     <div id="jobsList" class="initiative-list">
       <div class="memory-loading">Loading…</div>
     </div>

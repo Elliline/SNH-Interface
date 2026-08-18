@@ -613,72 +613,161 @@ function classifyJobsIntent(text) {
  * handed off rather than half-answered.
  */
 /**
- * SHE HAS SAID SHE IS NOT WAITING — the clearest handoff signal there is, kept
- * as its own list because it also OVERRIDES the immediacy negatives below.
+ * HANDOFF SIGNALS — built from HER messages, not from mine.
  *
- * "…as inference backends as of right now" cancelled a research request on
- * 2026-08-18: "right now" is in the immediacy list, meant to catch "answer right
- * now", and it fired on a phrase that meant "current information". A message
- * that grants time and asks for current facts is not asking to be rushed, and
- * the grant is the more specific signal of the two.
+ * The first version of this list was assembled from my own test prompts and
+ * then, inevitably, matched them. Measured against 590 real user messages on
+ * 2026-08-18: "take your time" appeared twice and BOTH were mine, typed that
+ * same afternoon; "take as long as you need" once, mine; "I'll keep chatting"
+ * once, mine; "while I'm out" never. The one time she used background-work
+ * language herself she was describing the feature she wanted built, not asking
+ * for work: "down the road i want you to be able to be given a task and you run
+ * it in the background with an agent" (2026-07-23).
+ *
+ * So these lists come from how she actually writes, including how she actually
+ * types. Four tiers, highest first — see classifyHandoffSignal.
  */
-const TIME_GRANT_PATTERNS = [
-  /\b(take your time|take as long as you need|take all the time you need)\b/,
-  /\bno (rush|hurry)\b/,
-  /\bdon'?t (rush|hurry)\b/,
-  /\b(whenever|when) you (get a chance|can|have time|have a moment|get to it|are done|finish)\b/,
-  /\bi'?(ll| will) (keep|carry on) (chatting|talking)\b/,
-  /\bwhile you (work|dig|research|look)\b/,
-  /\bwhile i('?m| am) (out|away|asleep|gone|at work|not (here|around))\b/,
-  /\b(come back to me|get back to me|let me know when|report back|tell me when you'?re done)\b/,
-  /\bin the background\b/,
+
+/**
+ * TIER 1 — SHE NAMES THE MECHANISM. Dispatch, no judgement call.
+ *
+ * `and` is not a typo to be tolerated grudgingly; it is her spelling, and the
+ * only real instance of this tier in the whole corpus is "Use and agent and
+ * write me a write up on Paradox Interactive" (2026-08-18). A pattern requiring
+ * "an agent" would have missed the one message that ever used this tier. She
+ * also writes "witch" for which, "aproved", "scedual", "acurate" — matching her
+ * typing is the job, not correcting it.
+ */
+const HANDOFF_MECHANISM = [
+  /\b(use|send|have|get|give|spin ?up|spool ?up|fire ?up|kick off|start)\b[^.!?]{0,20}\b(an?|and|the|another|one)\s+agents?\b/,
+  /\b(an?|and)\s+agent\s+(can|could|should|to)\b/,
+  /\bagent work\b/,
+  /\bhave (the|an?|and) agents? (do|handle|take|run|write|research)\b/,
+  /\b(start|queue|kick off) (a|an|the)?\s*(background )?job\b/,
   /\bbackground job\b/,
 ];
 
 /**
- * A request to go and DO something, as opposed to a question to answer.
+ * TIER 2 — SHE ASKS FOR SOMETHING BUILT. Behind a config flag; see
+ * tools.agentJobs.dispatchBuildRequests and the note there.
+ *
+ * Her real phrasings: "write me a write up", "I need a game built and working",
+ * "can you make games". Thin in the corpus for a plain reason — she has been
+ * told he cannot build yet ("well you are not a programer so how are you going
+ * to build stuff?").
  */
-const HANDOFF_WORK_PATTERNS = [
-  /\b(dig|digging) (into|through)\b/,
-  /\b(look|go look|have a look|go through|comb|trawl|sift) (in)?to\b.{0,40}\b(and|then)?\s*(report|tell me|let me know|come back)\b/,
-  /\b(go|go and|please)\s+(look|research|investigate|check|review|read|analy[sz]e|work)\b/,
-  /\b(research|investigate|audit|survey|inventory|catalogue|catalog)\b.{0,40}\b(for me|and (tell|let|report|come back))\b/,
-  /\bwork (on|through) (it|this|that)\b.{0,20}\b(background|while|later|whenever)\b/,
-  /\b(start|kick off|get started on|begin) (a|an|the)?\s*(job|task|search|review|audit|dig|investigation)\b/,
-  /\b(overnight|later today|by (tonight|tomorrow|morning))\b.{0,30}\b(look|check|find|work|research|review)\b/,
+const HANDOFF_BUILD = [
+  /\b(write|make|build|create|draft|put together)\b[^.!?]{0,15}\b(me\s+)?(a|an|the)?\s*(write[- ]?up|writeup|report|script|app|application|tool|program|game|page|site|website|dashboard|spreadsheet|document)\b/,
+  /\bi need (a|an|the)?\s*\w+\s+(built|made|written|created)\b/,
 ];
 
 /**
- * She wants it NOW. Cancels a work request — but NOT a time grant, because a
- * message that says both ("current info as of right now… take as long as you
- * need") has told you plainly which it means.
+ * TIER 3 — THE SHAPE OF THE WORK. More than a couple of lookups, several
+ * sources, more than one subject, or a writeup.
+ *
+ * Drawn from how she actually asks for research:
+ *   "Can you search the web for reviews and discussions of that book and tell me
+ *    what others have said about it — criticisms as well as praise?"
+ *   "Can you look up what new stuff has been happening in the AI world over the
+ *    last week?"
+ *   "Any ways look again for the latest AI news with in the last 7 days."
+ *   "Can you please verify these news items are actually news from the last 7
+ *    days please. also if you find some that are not let me know witch ones and
+ *    find what really is going on in the ai world"
+ *   "I dont know, why dont you look online and see if any one else knows."
+ *
+ * The recurring shape is a LOOKING VERB plus either a SCOPE marker or a SECOND
+ * CLAUSE. "Can you" on its own is worthless as a signal — thirteen occurrences,
+ * split between "can you look up X" and "can you explain this more" / "can you
+ * see why im getting brain dead" — so it never counts without a verb behind it.
  */
-const IMMEDIACY_NEGATIVES = [
-  /\b(quick|quickly|real quick|off the top of your head|just tell me|in a sentence|briefly)\b/,
-  /\bright now\b/,
+const LOOKING_VERB = /\b(look up|look online|look into|look again|search the web|search online|find out|go find|research|dig into|compare|verify|catalogue|catalog|categorize|catagorize)\b/;
+const SCOPE_MARKER = /\b(over the (last|past)|last \d+ days?|past \d+ days?|latest|current|everything|all of|what you can find|anything you know|any thing you know|each (one|client|item)|as of (right )?now)\b/;
+const SECOND_CLAUSE = /\b(also|as well as|and tell me|and let me know|and find|criticisms|plus)\b/;
+const COMPARISON = /\b(compare|comparing|comparison|versus|vs\.?)\b|\bwrite[- ]?up\b|\bwriteup\b|\breport on\b/;
+
+/**
+ * TIER 4 — SHE GRANTED TIME. A WEAK signal, and flagged here as what it is.
+ *
+ * ⚠ UNATTESTED IN HER HISTORY. Not one of the 590 messages grants time in these
+ * words; every apparent instance traced back to my own test prompts. It is kept
+ * so the signal exists if she ever does use it, and it is deliberately NOT
+ * sufficient on its own — a single-fact lookup with "take your time" on the end
+ * is still a single-fact lookup. It only lifts something that already has work
+ * shape.
+ */
+const HANDOFF_TIME_GRANTED = [
+  /\b(take your time|take as long as you need|take all the time you need)\b/,
+  /\bno (rush|hurry)\b/,
+  /\b(whenever|when) you (get a chance|can|have time|have a moment|get to it)\b/,
+  /\bin the background\b/,
 ];
 
 /**
- * She wants it dropped. Cancels everything, grant included: "take your time —
- * actually, never mind" is not a handoff.
+ * NEGATIVES — from her actual brevity and answer asks, not invented.
+ *
+ *   "In one sentence: what do you know about my projects?"
+ *   "Ok can you break this down barnie style, Your big words get me confused"
+ *   "can you explain this more?"
+ *   "A few questions: … (Don't search…)"
+ *   "Check again, what all can you do?"
  */
 const HANDOFF_NEGATIVES = [
-  /\bdon'?t (bother|worry about it)\b/,
+  /\bin one sentence\b/,
+  /\b(explain|break) (this|it) (more|down)\b/,
+  /\bdon'?t (search|look it up|bother|worry about it)\b/,
+  /\bwhat (all )?can you do\b/,
   /\bnever ?mind\b/,
   /\bforget (it|about it|that)\b/,
+  /\b(quick|quickly|real quick|off the top of your head|just tell me|briefly)\b/,
 ];
 
-function classifyHandoffIntent(text) {
+/**
+ * Which tier fired, and why — so the guidance block can say the true thing
+ * rather than a generic one.
+ *
+ * @param {string} text
+ * @returns {{dispatch: boolean, tier: number|null, reason: string|null}}
+ */
+function classifyHandoffSignal(text, { allowBuild = false } = {}) {
   const t = String(text || '').toLowerCase();
-  if (HANDOFF_NEGATIVES.some(r => r.test(t))) return false;   // dropped entirely
-  const granted = TIME_GRANT_PATTERNS.some(r => r.test(t));
-  if (granted) return true;                                   // a grant outranks "right now"
-  if (IMMEDIACY_NEGATIVES.some(r => r.test(t))) return false;
-  return HANDOFF_WORK_PATTERNS.some(r => r.test(t));
+  const none = { dispatch: false, tier: null, reason: null };
+  if (!t) return none;
+
+  // Tier 1 outranks the negatives: "use an agent, quick" is still "use an agent".
+  if (HANDOFF_MECHANISM.some(r => r.test(t))) {
+    return { dispatch: true, tier: 1, reason: 'she asked for an agent by name' };
+  }
+  if (HANDOFF_NEGATIVES.some(r => r.test(t))) return none;
+
+  if (allowBuild && HANDOFF_BUILD.some(r => r.test(t))) {
+    return { dispatch: true, tier: 2, reason: 'she asked for something to be produced, not explained' };
+  }
+
+  const looking = LOOKING_VERB.test(t);
+  const shaped = looking && (SCOPE_MARKER.test(t) || SECOND_CLAUSE.test(t));
+  if (shaped || COMPARISON.test(t)) {
+    return { dispatch: true, tier: 3, reason: 'it needs more than a lookup — several sources or several parts' };
+  }
+
+  // Tier 4 never carries a turn alone. It lifts a looking verb that did not
+  // otherwise reach tier 3; it does nothing for a bare question.
+  if (looking && HANDOFF_TIME_GRANTED.some(r => r.test(t))) {
+    return { dispatch: true, tier: 4, reason: 'she said she is not waiting on it' };
+  }
+  return none;
+}
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when the message asks for work that may outlive the turn
+ */
+function classifyHandoffIntent(text, opts) {
+  return classifyHandoffSignal(text, opts).dispatch;
 }
 
 module.exports = {
   classifyToolNeed, isTimeSensitive, classifySchedulingIntent,
   classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent,
-  classifyJobsIntent, classifyHandoffIntent
+  classifyJobsIntent, classifyHandoffIntent, classifyHandoffSignal
 };

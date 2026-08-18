@@ -371,6 +371,36 @@ Four more things that are load-bearing if you touch this:
   corrector's three writes, and `start_background_job` itself are all absent —
   the last one structurally, since it is registered chat-side and is not in
   `MCPClient.BACKGROUND_TOOLS`. Widening that list is a decision, not a knob.
+- **No pre-generation tool gate.** Tools are attached to EVERY chat turn; the
+  model decides. The classifiers still run and still drive guidance blocks, but
+  they are a safety net, not the mechanism. They gated generation until
+  2026-08-18, when Ellie typed "Use an agent and write up any thing you know
+  about my clients", every classifier returned false, the turn routed DIRECT with
+  an empty tools array, and the model wrote three paragraphs about the job it had
+  started. No job existed; none could have. The two dispatches that worked that
+  day worked because their messages happened to mention a company and a year,
+  tripping the SEARCH classifier and dragging the registry along — working by
+  coincidence of shape. Cost measured: **3,432 tokens of tool schemas per turn**
+  (11 tools), in the `tools` field, so outside the 6,000-token message ceiling.
+- **The triggers are built from HER messages, not ours.** Measured over 590 real
+  user messages: "take your time" appeared twice and both were Claude's own test
+  prompts typed that afternoon; "while I'm out" never. Tier 1 (she names the
+  mechanism) matches her actual typing including `use and agent`, which is the
+  only real instance in the corpus. Tier 2 (build asks) is behind
+  `tools.agentJobs.dispatchBuildRequests`, off until code execution ships. Tier 4
+  (time granted) is flagged in code as unattested and never dispatches alone.
+- **A claimed dispatch is checked against the queue, in the turn.** If a reply
+  asserts a started job and no `agent_jobs` row was created in that conversation
+  in that turn, it is logged as PHANTOM DISPATCH and a correction is appended to
+  the reply she is reading. Same doctrine as the ledger funnel: not "the model
+  should not claim this" but "a false claim does not reach her unmarked".
+- **He can see running jobs only when the block is there.** `renderActiveJobsBlock`
+  injects live queue state per turn (null, and zero tokens, when nothing is
+  active), paired with a standing rule in the epistemic block: absent block means
+  nothing is running and he must say so; present block means he knows THAT a job
+  runs and for how long, never how far along. Asked "are you still working on
+  this?" with no such view, he had produced a detailed progress report on two
+  jobs — one already finished, one that never existed.
 - **The description says WHEN, and a guidance block says "now".** Shipped, the
   tool described mechanics and prohibitions only: every reason to delegate was
   self-assessed, while the reason not to was concrete and always satisfiable —

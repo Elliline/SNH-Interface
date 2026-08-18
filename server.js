@@ -31,7 +31,7 @@ const agentJobs = require('./db/agent-jobs');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent, classifyHandoffIntent } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent, classifyHandoffIntent, classifyHandoffSignal } = require('./db/tool-routing');
 const { createToolArtifactFilter, stripToolArtifacts, CANNOT_CHECK } = require('./db/tool-artifacts');
 
 // MCP tool calling
@@ -1613,6 +1613,9 @@ function isMindQuery(messageText) {
  */
 app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   let chatMarked = false;
+  // When this turn began — the window the phantom-dispatch guard compares
+  // against, so a job started in an earlier turn cannot vouch for this one.
+  const turnStartedAt = new Date().toISOString();
   try {
     const { model, messages, ollamaHost, conversation_id, provider, apiKey, searxngHost, ttsEnabled, superSearch, inputModality } = req.body;
 
@@ -1707,12 +1710,47 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // turn can be handed off without its own classifier firing. Whether a thing
     // is worth handing off is his judgement, in the tool description — a regex
     // cannot tell a two-second lookup from a twenty-minute sweep.
-    const needsHandoff = agentJobsToolEnabled && mcpClient.hasTool('start_background_job')
-      && classifyHandoffIntent(userMessage.content);
-    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections || needsJobsRead || needsHandoff;
-    console.log('Tool routing:', needsTools
-      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections', needsJobsRead && 'jobs-read', needsHandoff && 'handoff'].filter(Boolean).join(' + ')})`
-      : 'DIRECT (conversational, skipping tool loop)');
+    const handoffSignal = agentJobsToolEnabled && mcpClient.hasTool('start_background_job')
+      ? classifyHandoffSignal(userMessage.content, {
+        allowBuild: !!(appConfig.tools && appConfig.tools.agentJobs && appConfig.tools.agentJobs.dispatchBuildRequests)
+      })
+      : { dispatch: false, tier: null, reason: null };
+    const needsHandoff = handoffSignal.dispatch;
+
+    // === THE PRE-GENERATION TOOL GATE IS GONE (2026-08-18) ===
+    //
+    // Tools are attached to every turn now, and the model decides. The classifiers
+    // above still run — they are what the guidance nudges key off, and they are a
+    // useful record of what the turn looked like — but they no longer decide
+    // whether he is ALLOWED to reach for anything.
+    //
+    // WHY. On 2026-08-18 Ellie typed "Use an agent and write up any thing you
+    // know about my clients." Every classifier returned false, the turn routed
+    // DIRECT, and the model was handed an empty tools array — so it wrote a
+    // detailed paragraph about the background job it had started, the categories
+    // the report would use, and the fields within each. No job existed. It could
+    // not have existed: nothing was callable.
+    //
+    // That is the shape of the whole class. A gate in front of generation has to
+    // predict, from a regex, what the model will need before the model has read
+    // the message — and every miss is invisible, because a tool that was never
+    // offered leaves no trace of not being offered. The two dispatches that DID
+    // work that day worked because the messages happened to mention a company
+    // and a year, which tripped the SEARCH classifier and dragged the whole
+    // registry along behind it. Working by coincidence of shape is not working.
+    //
+    // What the classifiers become is a SAFETY NET rather than the mechanism: they
+    // add guidance ("she is not waiting", "she asked for an agent by name") on
+    // top of a tool set the model already has. Right order.
+    const classifierWouldHaveGated = needsSearchTools || needsActionTools || needsMemoryWrite
+      || needsMemoryRead || needsMemoryCorrections || needsJobsRead || needsHandoff;
+    const needsTools = mcpClient.hasTools();
+    const firedList = [needsSearchTools && 'search/fetch', needsActionTools && 'scheduling',
+      needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read',
+      needsMemoryCorrections && 'memory-corrections', needsJobsRead && 'jobs-read',
+      needsHandoff && `handoff:t${handoffSignal.tier}`].filter(Boolean);
+    console.log(`Tool routing: ALL TOOLS ATTACHED (classifiers fired: ${firedList.length ? firedList.join(' + ') : 'none'}` +
+      `${!classifierWouldHaveGated ? ' — this turn would have been DIRECT under the old gate' : ''})`);
 
     // Should-I-search honesty guard: if the question is about current/changeable
     // facts (weather, prices, news, "right now"/"latest") but search will NOT run
@@ -1720,7 +1758,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // model must NOT answer confidently from memory (7/23: it fabricated a weather
     // high). We inject an instruction to offer to look it up instead. When search
     // WILL run (needsTools), the tool loop handles it and no nudge is needed.
-    const timeSensitiveUnsearched = isTimeSensitive(userMessage.content) && !needsTools;
+    // With the gate gone, "will search run" is no longer knowable up front — the
+    // model decides. So this guard now fires on what IS knowable: whether search
+    // is available at all. If the stack is off or unregistered, a question about
+    // current facts still needs the honesty nudge; if it is available, the tool
+    // loop is there and the model can use it.
+    const searchAvailable = toolsEnabled && mcpClient.hasTool('web_search');
+    const timeSensitiveUnsearched = isTimeSensitive(userMessage.content) && !searchAvailable;
 
     // Save user message to database
     // Modality rides from the client: 'stt' when the text came from a whisper
@@ -1936,20 +1980,48 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // only "I'll come back to you" is the other failure, and it happened live
     // too.
     if (needsHandoff && mcpClient.hasTool('start_background_job')) {
+      // The nudge says WHICH signal fired, because the four tiers are different
+      // arguments. Tier 1 is not a suggestion — she named the mechanism.
+      const head = handoffSignal.tier === 1
+        ? '=== She Asked For An Agent, By Name ===\n' +
+          'She has asked you to use an agent for this. That is not a judgement call: call ' +
+          'start_background_job and hand the work to it.\n'
+        : `=== This Looks Like Agent Work ===\nWhy: ${handoffSignal.reason}.\n` +
+          'If answering it properly needs real digging — more than a couple of searches, or several ' +
+          'sources compared — hand that part to a background agent with start_background_job. It can ' +
+          'run a dozen searches and read whole pages, where you get two or three searches and snippets.\n';
       memoryParts.push({
         kind: 'guidance',
-        label: 'she is not waiting',
-        text:
-          '=== She Has Said She Is Not Waiting For This ===\n' +
-          'Her message grants you time — she is not sitting waiting on this reply. If answering it ' +
-          'properly needs real digging (more than a couple of searches, or several sources compared), ' +
-          'hand that part to a background agent with start_background_job: it can run a dozen searches ' +
-          'and read whole pages, where you get two or three searches and snippets.\n' +
+        label: `handoff signal (tier ${handoffSignal.tier})`,
+        text: head +
           'Then answer her anyway in this same turn with what you already know. Starting a job is not ' +
           'a reason to say nothing — a reply that only promises to come back later leaves her with ' +
           'nothing, and she asked you.'
       });
-      console.log(`[Handoff] She granted time — nudging toward start_background_job (convo ${convoId})`);
+      console.log(`[Handoff] tier ${handoffSignal.tier} (${handoffSignal.reason}) — nudging toward start_background_job (convo ${convoId})`);
+    }
+
+    // === What is running right now ===
+    //
+    // The live half of the jobs picture. The announcement block below covers
+    // FINISHED work; this covers work in flight, and it exists because their
+    // absence was being filled with invention: asked "are you still working on
+    // this?", he described one job as slowed by a connection issue he was
+    // "working through" and another as scanning a large volume of memory. Every
+    // job he had was finished, and one had never existed.
+    //
+    // Costs nothing on a normal turn — renderActiveJobsBlock returns null when
+    // the queue is empty, and that absence is what the standing instruction
+    // below keys off.
+    let activeJobsBlock = null;
+    try {
+      activeJobsBlock = agentJobs.renderActiveJobsBlock();
+      if (activeJobsBlock) {
+        memoryParts.push({ kind: 'guidance', label: 'jobs running now', text: activeJobsBlock.text });
+        console.log(`[AgentJobs] ${activeJobsBlock.running} running / ${activeJobsBlock.queued} queued — live status injected (convo ${convoId})`);
+      }
+    } catch (activeErr) {
+      console.error('[AgentJobs] Active-jobs render error:', activeErr.message);
     }
 
     // === Background work that finished since he last spoke ===
@@ -3176,6 +3248,54 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         // markup — a later turn reading this conversation back would see it.
         console.warn(`[Chat] stripped ${artifactFilter.stripped()} tool-call artifact(s) from the reply`);
         fullResponse = stripToolArtifacts(fullResponse).text;
+      }
+
+      // === PHANTOM DISPATCH: HE SAID HE STARTED A JOB, AND HE DID NOT ===
+      //
+      // The third member of a family this codebase keeps meeting. Cron proposals
+      // claimed but never created. `write_memory` saying "I've updated my memory"
+      // with no tool call. And on 2026-08-18: "I have started a background job to
+      // organize and categorize everything I know about your clients", followed
+      // by three paragraphs of what the report would contain. No job existed —
+      // the turn had routed DIRECT and there was no tool to call. An hour later
+      // she asked where it was.
+      //
+      // The narrow fix for that turn was the trigger list. This is the guard for
+      // the CLASS, and it goes where the invariant cannot be forgotten: after the
+      // reply is written, compare what it CLAIMS against what the queue actually
+      // holds. Same doctrine as the ledger funnel — not "the model should not
+      // claim this", but "a claim that is not true does not reach her unmarked".
+      //
+      // Deliberately narrow: only the assertion of a STARTED job, only in the
+      // first person, only when this conversation created no row in this turn. A
+      // false positive here would append a correction to a true statement, which
+      // is its own kind of lie, so the patterns are the ones he actually writes.
+      try {
+        const claimsDispatch = /\b(i(?:'ve| have)? (?:just )?(?:started|kicked off|queued|launched|dispatched|handed (?:this|that|it) (?:off|over))|i(?:'m| am) (?:now )?running (?:this|that|it) in the background|(?:i(?:'ve| have)? )?(?:handed|passed) (?:this|that|it) (?:off )?to (?:a|an|the|my) (?:background )?agent|background job (?:has been|is) (?:started|running)|the agent is (?:now )?(?:working|running))\b/i.test(fullResponse);
+        if (claimsDispatch) {
+          const created = agentJobs.jobsStartedInTurn(convoId, turnStartedAt);
+          if (created.length === 0) {
+            const line = `PHANTOM DISPATCH: the reply claims a background job was started, and no agent_jobs row was created in this turn (convo ${convoId}).`;
+            console.error(`[AgentJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line + ` Reply began: "${fullResponse.slice(0, 160).replace(/\s+/g, ' ')}"`, db.getOpsDir()); } catch { /* console is the floor */ }
+
+            // The correction is APPENDED TO THE TURN, not swallowed into a log,
+            // because she is the one who was told the false thing and she is
+            // reading this reply, not the ops ledger.
+            const correction = '\n\n---\n\n**Correction — no job was actually started.** I said above that I had ' +
+              'handed this to a background agent; that did not happen. Nothing is running, and nothing will ' +
+              'appear in the jobs panel for it. Ask me again and I will either start one properly or tell you ' +
+              'plainly that I cannot.';
+            fullResponse += correction;
+            res.write(contentType === 'text/event-stream'
+              ? `data: ${JSON.stringify({ choices: [{ delta: { content: correction } }] })}\n\n`
+              : `${JSON.stringify({ message: { content: correction } })}\n`);
+          } else {
+            console.log(`[AgentJobs] dispatch claim checks out — ${created.length} job(s) created in this turn`);
+          }
+        }
+      } catch (phantomErr) {
+        console.error('[AgentJobs] phantom-dispatch check failed:', phantomErr.message);
       }
 
       // THE MODEL THOUGHT AND NEVER ANSWERED.

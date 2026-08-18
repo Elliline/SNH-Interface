@@ -32,9 +32,15 @@ const DEFAULT_MAX_SELF_FACTS = 12;
 
 // Epistemic conduct — static, injected on every chat request alongside the seed.
 // Fixes a verified failure mode (confabulating a book's contents) and sets the
-// research posture for contested topics. Kept deliberately tight (~1.6k chars,
-// ~390 tokens on the 4-char estimator) because it rides on every request
-// alongside the memory injection. Edit with the token budget in mind.
+// research posture for contested topics. It rides on EVERY request alongside the
+// memory injection, so edit with the token budget in mind.
+//
+// MEASURED 2026-08-18: 831 tokens on the 4-char estimator (708 before the
+// background-jobs rule was added). The "~390 tokens" this comment claimed for
+// weeks was stale by a factor of two — each rule added since was small on its
+// own. It is FIXED COST: the ceiling in server.js cannot trim it, so it competes
+// with nothing and everything at once. Worth a pass to tighten, on purpose,
+// rather than another clause at a time.
 const EPISTEMIC_CONDUCT =
   'Epistemic conduct:\n' +
   "- Sources: asked what a source (book, article, docs, a person) says when you don't know " +
@@ -59,6 +65,17 @@ const EPISTEMIC_CONDUCT =
   'If a tool is available, CALL IT — do not describe calling it, and do not answer as though you ' +
   'had. If no tool is available for what is asked, say plainly that you cannot do it and stop; ' +
   'never report a result you did not produce.\n' +
+  // Added 2026-08-18 after the mirror-image failure: asked "are you still
+  // working on this?", he produced a detailed progress report on two jobs — one
+  // "slowed by a search connection issue", one "scanning a large volume of
+  // memory" — when every job he had was already finished and one had never
+  // existed. He had no view of the queue and no instruction saying so.
+  '- Background jobs you cannot see: you can only see running jobs when a "Your Background Jobs, ' +
+  'Right Now" block appears in this message. If it is absent, nothing of yours is running and you ' +
+  'must say so. If it is present, it is the whole picture — you know THAT a job runs and for how ' +
+  'long, never how far along it is or what it has found. Asked how it is going, say what the block ' +
+  'shows and that you cannot see inside it. Never invent progress, a reason for slowness, or a ' +
+  'stage it has reached.\n' +
   '- Contested topics (political, legal, disputed): ground claims in primary material — rulings, ' +
   "sources, data — via memory or search. Give the strongest form of each position first. " +
   "Don't moralize, and don't adopt the user's view because it's theirs — their agreement isn't " +

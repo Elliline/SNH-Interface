@@ -3215,6 +3215,7 @@ setInterval(refreshInitiativeBadge, 60000);
 // attention — quietly, as a count.
 const jobsBtn = document.getElementById('jobsBtn');
 const jobsBadge = document.getElementById('jobsBadge');
+const jobsRunning = document.getElementById('jobsRunning');
 const jobsPanel = document.getElementById('jobsPanel');
 const jobsPanelOverlay = document.getElementById('jobsPanelOverlay');
 const jobsPanelClose = document.getElementById('jobsPanelClose');
@@ -3255,10 +3256,22 @@ async function refreshJobsBadge() {
     } else {
       jobsBadge.style.display = 'none';
     }
+    // The running count is its OWN number in its own corner — see the note on
+    // .jobs-running-count. One badge carrying both would make "3" ambiguous
+    // between "three results to read" and "three still working".
+    if (jobsRunning) {
+      if (active > 0) { jobsRunning.textContent = active; jobsRunning.style.display = 'inline-flex'; }
+      else jobsRunning.style.display = 'none';
+    }
     jobsBtn?.classList.toggle('jobs-running', active > 0);
     jobsBtn?.setAttribute('title', active > 0
       ? `Background jobs — ${active} running, ${unseen} unread`
       : (unseen > 0 ? `Background jobs — ${unseen} unread` : 'Background jobs — results, not messages'));
+
+    // Poll faster while anything is actually working: a job that finishes in
+    // twenty seconds is otherwise invisible for a minute, which reads as nothing
+    // having happened.
+    applyJobsPollRate(active > 0);
   } catch (e) { /* silent */ }
 }
 
@@ -3271,6 +3284,16 @@ function openJobsPanel() {
 function closeJobsPanel() {
   jobsPanel?.classList.remove('open');
   jobsPanelOverlay?.classList.remove('active');
+}
+
+/** How long something has been going, for a job that has not finished. */
+function formatElapsed(startedIso) {
+  const started = new Date(startedIso.includes('T') ? startedIso : startedIso.replace(' ', 'T') + 'Z');
+  if (isNaN(started.getTime())) return '';
+  const secs = Math.max(0, Math.round((Date.now() - started.getTime()) / 1000));
+  if (secs < 90) return `${secs}s so far`;
+  const mins = Math.floor(secs / 60);
+  return mins < 60 ? `${mins} min so far` : `${Math.floor(mins / 60)}h ${mins % 60}m so far`;
 }
 
 /** Plain sentence for how long a run took. */
@@ -3302,11 +3325,32 @@ async function loadJobsList() {
     const res = await fetch('/api/jobs?limit=60');
     const data = await res.json();
     const items = data.jobs || [];
+
+    // "N running · N queued", always present while anything is active. The panel
+    // is where she looks when she has handed out work and wants to know how much
+    // is still going.
+    const activity = document.getElementById('jobsActivity');
+    if (activity) {
+      const running = items.filter(j => j.status === 'running').length;
+      const queued = items.filter(j => j.status === 'queued').length;
+      if (running || queued) {
+        activity.textContent = `${running} running · ${queued} queued`;
+        activity.style.display = 'block';
+      } else {
+        activity.style.display = 'none';
+      }
+    }
+
     if (items.length === 0) {
       container.innerHTML = '<div class="memory-empty">No background jobs yet.</div>';
       refreshJobsBadge();
       return;
     }
+
+    // Work in flight sorts to the top — it is the part she is waiting on. The
+    // rest stays newest-first underneath.
+    const rank = (j) => (j.status === 'running' ? 0 : j.status === 'queued' ? 1 : 2);
+    items.sort((a, b) => rank(a) - rank(b) || (new Date(b.created_at || 0) - new Date(a.created_at || 0)));
 
     container.innerHTML = items.map(it => {
       const unread = !it.seen_at && ['ok', 'failed', 'interrupted', 'cancelled'].includes(it.status);
@@ -3315,6 +3359,10 @@ async function loadJobsList() {
       const body = it.status === 'ok'
         ? escapeHtml(it.result_text || '')
         : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`;
+      // Elapsed, for the ones still going — "running" with no clock on it tells
+      // her nothing about whether to keep waiting.
+      const elapsed = (it.status === 'running' && it.started_at)
+        ? `<span class="job-elapsed">${escapeHtml(formatElapsed(it.started_at))}</span>` : '';
       const meta = [
         it.finished_at ? `finished ${escapeHtml(formatInitiativeTime(it.finished_at))}` : '',
         it.duration_ms ? escapeHtml(formatJobDuration(it.duration_ms)) : '',
@@ -3332,7 +3380,7 @@ async function loadJobsList() {
           <span class="job-kind">${escapeHtml(kindLabel)}</span>
           <span class="initiative-time" title="${escapeHtml(it.created_at || '')}">${escapeHtml(formatInitiativeTime(it.created_at))}</span>
         </div>
-        <div class="job-title">${escapeHtml(it.title || '')}</div>
+        <div class="job-title">${escapeHtml(it.title || '')}${elapsed}</div>
         ${it.status === 'queued' || it.status === 'running'
           ? `<div class="initiative-note">${escapeHtml(note)} The result will appear here — it will not message you.</div>`
           : `<div class="initiative-content">${body}</div>`}
@@ -3380,11 +3428,22 @@ async function loadJobsList() {
   }
 }
 
-// The robot panel polls the way the bell does. While it is open the list itself
-// refreshes too, so a job finishing is visible without reopening it.
+// The robot panel polls the way the bell does — 60s at rest, 15s while anything
+// is actually running, because a job that finishes in twenty seconds would
+// otherwise sit invisible for a minute and read as nothing having happened.
+let jobsPollTimer = null;
+let jobsPollFast = null;
+function applyJobsPollRate(fast) {
+  if (jobsPollFast === fast && jobsPollTimer) return;   // already at this rate
+  jobsPollFast = fast;
+  if (jobsPollTimer) clearInterval(jobsPollTimer);
+  jobsPollTimer = setInterval(() => {
+    refreshJobsBadge();
+    if (jobsPanel?.classList.contains('open')) loadJobsList();
+  }, fast ? 15000 : 60000);
+}
 refreshJobsBadge();
-setInterval(refreshJobsBadge, 60000);
-setInterval(() => { if (jobsPanel?.classList.contains('open')) loadJobsList(); }, 20000);
+applyJobsPollRate(false);
 
 function openMemoryPanel() {
   memoryPanel?.classList.add('open');

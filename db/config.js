@@ -673,7 +673,15 @@ const DEFAULTS = {
     // agentJobs.maxStartsPerHour rather than here, because the queue enforces it
     // and one counter is better than two that can disagree.
     agentJobs: {
-      enabled: true
+      enabled: true,
+      // TIER 2 of the handoff triggers: "write me a script", "I need a game
+      // built". OFF until sandboxed code execution ships, and the reason is not
+      // caution — it is that dispatching one today produces script text from an
+      // agent that cannot run it either, which is not better than answering
+      // inline and costs a round trip. Turn this on the day a job can execute
+      // what it writes. The patterns are built and tested (HANDOFF_BUILD in
+      // db/tool-routing.js) so that day is a flag flip, not a rewrite.
+      dispatchBuildRequests: false
     }
   },
   voice: {
