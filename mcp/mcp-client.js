@@ -209,7 +209,9 @@ class MCPClient {
    * Execute a tool call by name
    * @param {string} toolName - The tool function name
    * @param {Object} args - The parsed arguments for the tool
-   * @param {Object} context - Optional context (e.g., { searxngHost } for endpoint override)
+   * @param {Object} context - Optional context. `searxngHost` overrides the
+   *   configured SearXNG instance for web_search; anything else is passed to the
+   *   tool as its context object.
    * @returns {Object} Tool execution result
    */
   async executeTool(toolName, args, context = {}) {
@@ -219,9 +221,29 @@ class MCPClient {
     }
 
     try {
-      // Pass endpoint override for tools that support it
-      if (toolName === 'web_search' && context.searxngHost) {
-        return await tool.execute(args, context.searxngHost);
+      // web_search IS THE ODD ONE: its execute() is (args, endpointOverride) —
+      // a positional STRING — while every other tool takes (args, context).
+      //
+      // That difference broke the agent worker on 2026-08-18. The old line here
+      // was `if (toolName === 'web_search' && context.searxngHost)`, so the
+      // chat path — which passes { searxngHost } — worked, and every path that
+      // does not — the background tool loop passes { caller } — fell through to
+      // the generic call and handed the CONTEXT OBJECT to a parameter used as a
+      // URL base. The real error, verbatim:
+      //
+      //   Search failed: Failed to parse URL from [object Object]/search?q=…
+      //
+      // Seven of those inside one job in 11 seconds, and the model reported it
+      // to Ellie as "an issue with the search tool", which is all it could see.
+      //
+      // The endpoint is now RESOLVED HERE, from the same getSearxngConfig() the
+      // chat path reads, so a caller that says nothing gets the configured
+      // instance instead of a broken URL. An explicit override is still
+      // honoured, and only if it is actually a string — the shape that caused
+      // this cannot be passed through again.
+      if (toolName === 'web_search') {
+        const override = typeof context.searxngHost === 'string' ? context.searxngHost : null;
+        return await tool.execute(args, override || getSearxngConfig().url);
       }
       // Everything else gets the context object as its second argument. Action
       // tools need it (create_cron_job records which conversation proposed the

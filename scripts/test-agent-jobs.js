@@ -310,8 +310,52 @@ async function settle(id, ms = 3000) {
     !!job(queuedSurvivor));
 
   // =========================================================================
-  console.log('\n── A job cannot start a job ──');
+  console.log('\n── The worker reaches the SAME search instance the chat path does ──');
+  // 2026-08-18: it did not. web_search's execute() is (args, endpointOverride) —
+  // a positional STRING — while every other tool takes (args, context), and
+  // executeTool only passed the string when the caller supplied `searxngHost`.
+  // The chat path does; the background tool loop passes { caller }, so the whole
+  // CONTEXT OBJECT arrived where a URL base was expected:
+  //
+  //   Search failed: Failed to parse URL from [object Object]/search?q=…
+  //
+  // Seven of those inside one job in 11 seconds, reported to Ellie as "an issue
+  // with the search tool" because that is all the model could see. Asserted on
+  // ENDPOINT RESOLUTION rather than on a live search, so the check still means
+  // something when the upstream engines are rate-limited.
   const MCPClient = require(path.join(ROOT, 'mcp/mcp-client'));
+  const client = MCPClient.shared();
+  const searchTool = client.tools.get('web_search');
+  if (!searchTool) {
+    check('web_search is registered (SearXNG enabled in config)', false, 'not registered — cannot check the worker path');
+  } else {
+    const realExecute = searchTool.execute.bind(searchTool);
+    let sawEndpoint = null;
+    searchTool.execute = async (args, endpoint) => { sawEndpoint = endpoint; return { results: [] }; };
+    const { getSearxngConfig } = require(path.join(ROOT, 'db/config'));
+    const configured = getSearxngConfig().url;
+
+    await client.executeTool('web_search', { query: 'x' }, { caller: 'heartbeat:agent-job:test' });
+    check('a worker-context search gets the configured URL, not the context object',
+      sawEndpoint === configured, JSON.stringify(sawEndpoint));
+
+    await client.executeTool('web_search', { query: 'x' }, {});
+    check('…and so does a call with no context at all', sawEndpoint === configured, JSON.stringify(sawEndpoint));
+
+    await client.executeTool('web_search', { query: 'x' }, { searxngHost: 'http://example.test:9999' });
+    check('an explicit string override is still honoured', sawEndpoint === 'http://example.test:9999', JSON.stringify(sawEndpoint));
+
+    await client.executeTool('web_search', { query: 'x' }, { searxngHost: { not: 'a string' } });
+    check('a non-string override is refused and the configured URL used instead',
+      sawEndpoint === configured, JSON.stringify(sawEndpoint));
+
+    check('nothing here introduced a second SearXNG endpoint',
+      configured === (require(path.join(ROOT, 'db/config')).getSearxngConfig().url), configured);
+    searchTool.execute = realExecute;
+  }
+
+  // =========================================================================
+  console.log('\n── A job cannot start a job ──');
   check('start_background_job is not among the tools a background step may hold',
     !MCPClient.BACKGROUND_TOOLS.includes('start_background_job'));
   check('and it is not in the job allowlist either',
