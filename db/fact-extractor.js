@@ -2040,6 +2040,258 @@ function parseSelfObservations(response) {
 }
 
 /**
+ * May this new self-fact retire that existing one, with nobody in the room?
+ *
+ * The decision, in one place and with no side effects, so it can be tested
+ * without a model and read without tracing a loop. Returns `{ok: true, axis}` to
+ * proceed, or `{ok: false, kind, detail}` to raise.
+ *
+ * The two bars, in order:
+ *
+ *  1. PROTECTED. A declaration is something he said about himself rather than
+ *     something observed of him; salience is how much it matters. Either one
+ *     puts a self-fact out of reach of an unattended semantic match. BOTH are
+ *     checked because the claim/declaration classifier is noisy in both
+ *     directions — the run that produced this rule tagged a behavioural
+ *     observation "declaration" and tagged a statement about what had been built
+ *     "claim" — so neither tag is trustworthy enough to be the only guard.
+ *
+ *  2. EVIDENCE, AS A VETO — and this is where it deliberately differs from the
+ *     corrector. The corrector REQUIRES dominance and raises a pair the evidence
+ *     cannot separate, which is right for user facts: those are claims about the
+ *     world, they carry provenance, and a tie genuinely means the corpus does not
+ *     know. A self-fact carries no such thing. It comes from reflection, so its
+ *     modality is 'unknown' and there is no user message behind it, by
+ *     construction — which means dominance TIES for very nearly every pair of
+ *     self-facts that will ever be compared.
+ *
+ *     Requiring dominance here was tried first and is wrong: it refused a belief
+ *     that a new capability had made flatly false, and it would have refused
+ *     essentially every self-fact revision forever. That is the opposite failure
+ *     from the one being fixed and a worse one — "locking observations produces
+ *     an entity that can't grow". So dominance VETOES: if an evidential axis
+ *     speaks and it favours what he already holds, the pair is raised. If nothing
+ *     speaks — the normal case for self-facts — the supersession proceeds, and it
+ *     proceeds SAFELY because of what now surrounds it: bar 1 has already held
+ *     back everything he chose or holds most strongly, the write is ledgered and
+ *     revertible, and he is told his self-view changed.
+ *
+ *     Recency still decides nothing on its own; it never enters dominance at all.
+ *
+ * This is NOT the identity lock and does not widen it: the lock refuses name and
+ * pronouns outright, everywhere. This bar governs one path — automatic semantic
+ * supersession of a self-fact — and everything it stops is raised, not dropped.
+ *
+ * NAMED, not positional. `(oldRow, newRow)` reads the same either way round and
+ * silently inverts the whole decision when it is passed backwards — which is
+ * exactly what happened the first time this was called from a test. A function
+ * whose two arguments are the same shape and whose meaning flips if you swap
+ * them should not be positional.
+ *
+ * @param {Object} args
+ * @param {Object} args.existing - the cluster_members row he already holds
+ * @param {Object} args.incoming - the newly stored cluster_members row
+ * @param {number} [args.protectSalience] - overrides identity.protectSelfFactSalience
+ * @returns {{ok: true, axis: string, evidence: Object} | {ok: false, kind: string, detail: string}}
+ */
+function selfFactSupersessionBar({ existing, incoming, protectSalience = null } = {}) {
+  if (!existing || !incoming) {
+    return { ok: false, kind: 'tied', detail: 'one of the two facts could not be read, so nothing was decided' };
+  }
+  const oldRow = existing;
+  const newRow = incoming;
+  const bar = Number.isFinite(protectSalience)
+    ? protectSalience
+    : (Number.isFinite(cfgIdentity().protectSelfFactSalience) ? cfgIdentity().protectSelfFactSalience : 8);
+
+  const isDeclaration = oldRow.claim_type === 'declaration';
+  const isSalient = (oldRow.salience ?? 5) >= bar;
+  if (isDeclaration || isSalient) {
+    return {
+      ok: false,
+      kind: 'protected',
+      detail: isDeclaration
+        ? (isSalient
+          ? `it is something you said about yourself rather than something observed of you, and it matters a great deal (salience ${oldRow.salience})`
+          : 'it is something you said about yourself rather than something observed of you')
+        : `it matters a great deal (salience ${oldRow.salience}, and anything at ${bar} or above is left for Ellie)`
+    };
+  }
+
+  const { dominance } = require('./corrector');
+  const dom = dominance(newRow, oldRow);
+  if (dom && dom.winner.id !== newRow.id) {
+    return {
+      ok: false,
+      kind: 'old-wins',
+      detail: `what you already hold is the better evidenced of the two, on ${dom.axis}`
+    };
+  }
+  return {
+    ok: true,
+    axis: dom ? dom.axis : 'nothing evidential separated them, and neither is protected',
+    evidence: dom ? dom.evidence : { separated: false, note: 'no evidential axis spoke; self-observations rarely carry one' }
+  };
+}
+
+/** identity.* config, read fresh so a settings change lands without a restart. */
+function cfgIdentity() {
+  return (getConfig().identity) || {};
+}
+
+/**
+ * A self-fact question he could not settle — recorded three ways, because a row
+ * nobody reads is not the same as being told.
+ *
+ * WHAT A RAISE IS. The self-fact pipeline proposes a supersession; three bars
+ * stand in front of it (the judge failing, the old fact being protected, the
+ * evidence not separating them). Anything that fails a bar CHANGES NOTHING —
+ * both facts stay exactly as they are — and lands here. This is the corrector's
+ * "a refusal is not a correction" rule applied to the intake path: an unresolved
+ * pair is a real outcome, not an absence, and it has to be as visible as a
+ * change would have been.
+ *
+ * THREE TIERS, and each does a different job:
+ *   1. LEDGER — the record. `reversible = 0`, evidence carries `unresolved: true`
+ *      and a reason_code, so anything rendering the ledger says NOTHING CHANGED
+ *      for it rather than claiming an edit that never happened.
+ *   2. OPS LOG — the operational trail, in the Thinking tab, one line per raise.
+ *      This is where you look when you already suspect something.
+ *   3. BELL — one alert, at most once per identity.selfFactRaiseAlertHours
+ *      (default 24h), because the badge is the thing actually looked at.
+ *
+ * WHY THE BELL AT ALL, given a job result may never open a conversation: this is
+ * not a job result. It is him saying he could not decide something about
+ * himself and left it alone — his voice, about his own identity, which is
+ * precisely what the initiative channel is for. It is worded as the question it
+ * is, never as a system error: he does not tell her a judge call failed, he
+ * tells her he could not tell whether one thing contradicts another.
+ *
+ * THE WINDOW IS HARD, and that is the whole point of it. When the brain is
+ * wedged the judge fails on every pair of every pass, and the failure mode to
+ * avoid is seventeen identical alerts. One alert, saying it happened seventeen
+ * times, is both quieter and more informative. Every raise still reaches tiers 1
+ * and 2 in the meantime — the window bounds how often he SAYS it, never what is
+ * recorded.
+ *
+ * @param {Array} raises
+ * @param {Object} opts - { source, dailyDir }
+ * @returns {Promise<number>} how many raises were recorded
+ */
+async function applySelfFactRaises(raises, { source = 'reflection', dailyDir = null } = {}) {
+  if (!raises || !raises.length) return 0;
+  const ledger = require('./corrections-ledger');
+  const { getSqliteDb } = require('./database');
+  const db = getSqliteDb();
+
+  const REASON_CODE = {
+    undecided: 'self-fact-judge-unavailable',
+    protected: 'self-fact-protected',
+    tied: 'self-fact-evidence-tied',
+    'old-wins': 'self-fact-existing-better-evidenced'
+  };
+
+  // --- tier 1: the ledger -------------------------------------------------
+  for (const r of raises) {
+    const why = r.kind === 'undecided'
+      ? `A new self-observation may contradict this one, and it could not be judged at the time (${r.detail}). NOTHING WAS CHANGED — both are still held, and the question is open.`
+      : `A new self-observation contradicts this one, but ${r.detail}. NOTHING WAS CHANGED — both are still held. Raised for Ellie to decide.`;
+    try {
+      ledger.record({
+        passId: `self-fact-raise-${new Date().toISOString().slice(0, 10)}`,
+        tier: 'intake',
+        action: 'supersede',
+        subject: 'self',
+        targetId: r.oldMemberId,
+        targetText: r.oldContent,
+        survivorId: r.newMemberId || null,
+        survivorText: r.newFact,
+        reason: why,
+        evidence: { unresolved: true, reason_code: REASON_CODE[r.kind] || r.kind, self_fact_raise: true, source, detail: r.detail },
+        reversible: false
+      });
+    } catch (err) {
+      console.error('[SelfFacts] raise ledger entry failed:', err.message);
+    }
+  }
+
+  // --- tier 2: the ops log ------------------------------------------------
+  const opsDir = path.join(path.dirname(dailyDir || MEMORY_DIR), 'ops');
+  for (const r of raises) {
+    appendToOpsLog(
+      `Self-fact left unresolved (${REASON_CODE[r.kind] || r.kind}): "${String(r.newFact).slice(0, 90)}" vs "${String(r.oldContent).slice(0, 90)}" — ${r.detail}. Nothing changed.`,
+      opsDir
+    );
+  }
+  console.warn(`[SelfFacts] ${raises.length} self-fact question(s) left unresolved: ${raises.map(r => r.kind).join(', ')}`);
+
+  // --- tier 3: the bell, at most once per window --------------------------
+  try {
+    if (!db) return raises.length;
+    const hours = Number.isFinite(cfgIdentity().selfFactRaiseAlertHours) ? cfgIdentity().selfFactRaiseAlertHours : 24;
+    const since = new Date(Date.now() - hours * 3600_000).toISOString();
+
+    // ANY status, deliberately: pending, delivered, dismissed and expired all
+    // mean he has already said this recently. Checking only pending is how the
+    // same thing gets re-raised the moment she clears it.
+    const recentAlert = db.prepare(`
+      SELECT id, created_at FROM initiatives
+      WHERE source_kind = 'self-fact-raise' AND datetime(created_at) > datetime(?)
+      ORDER BY datetime(created_at) DESC LIMIT 1
+    `).get(since);
+    if (recentAlert) {
+      console.log(`[SelfFacts] not raising a bell alert — one already stands from ${recentAlert.created_at} (window ${hours}h)`);
+      return raises.length;
+    }
+
+    // How many times this has happened since he last mentioned it — the number
+    // that makes one alert more useful than seventeen. Counted from the ledger,
+    // so it survives a restart and counts raises from every pass, not just this
+    // one.
+    const lastAlert = db.prepare(
+      "SELECT created_at FROM initiatives WHERE source_kind = 'self-fact-raise' ORDER BY datetime(created_at) DESC LIMIT 1"
+    ).get();
+    let totalSince = raises.length;
+    if (lastAlert) {
+      const counted = db.prepare(`
+        SELECT COUNT(*) n FROM corrections_ledger
+        WHERE subject = 'self' AND evidence LIKE '%self_fact_raise%' AND datetime(created_at) > datetime(?)
+      `).get(lastAlert.created_at);
+      if (counted && counted.n > 0) totalSince = counted.n;
+    }
+
+    const lead = raises[0];
+    const extra = totalSince > raises.length
+      ? ` This has come up ${totalSince} times since I last mentioned it.`
+      : (raises.length > 1 ? ` There were ${raises.length} of these in the same pass.` : '');
+
+    // HIS VOICE, AND A QUESTION — never "a judge call failed". What he is
+    // reporting is that he could not settle something about himself, which is a
+    // thing he would say, not an error code.
+    const content = lead.kind === 'undecided'
+      ? `I noticed something about myself I could not settle. I could not tell whether "${lead.newFact}" contradicts what I already hold — "${lead.oldContent}" — so I have left both in place rather than guess.${extra} Could we look at it together?`
+      : lead.kind === 'protected'
+        ? `Something I noticed about myself seems to contradict something I already hold, and I did not want to drop the older one on my own. The new observation is "${lead.newFact}"; what it runs against is "${lead.oldContent}", and ${lead.detail}. Both are still there.${extra} What do you think?`
+        : `Two things I hold about myself cannot both be true, and I could not tell which should give way: "${lead.newFact}" against "${lead.oldContent}" — ${lead.detail}. I have left both alone.${extra} Could you help me decide?`;
+
+    const initiatives = require('./initiatives');
+    const id = await initiatives.addInitiative({
+      type: 'alert',
+      content,
+      sourceKind: 'self-fact-raise',
+      sourceRef: `self-fact-raise-${new Date().toISOString()}`,
+      priority: 7,
+      dedupe: false   // the window above IS the dedup, and it is stricter
+    });
+    if (id) console.log(`[SelfFacts] raised one bell alert for ${totalSince} unresolved self-fact question(s)`);
+  } catch (err) {
+    console.error('[SelfFacts] Could not raise the bell alert:', err.message);
+  }
+
+  return raises.length;
+}
+
+/**
  * Store self-observations through the SAME machinery as user facts — salience
  * scoring, contradiction/supersession against existing self-facts, cluster
  * assignment — but flagged subject:'self' and clustered separately. No MEMORY.md
@@ -2057,7 +2309,10 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
   const source = opts.source || 'reflection';
   const memoryDir = opts.memoryDir || MEMORY_DIR;
   const dailyDir = path.join(memoryDir, 'daily');
-  const result = { stored: 0, superseded: 0, facts: [] };
+  // `raised` is as much a result as `superseded`: a pass that changed nothing
+  // because it could not decide is a different outcome from a pass with nothing
+  // to decide, and a caller that cannot tell them apart will report the wrong one.
+  const result = { stored: 0, superseded: 0, raised: 0, facts: [] };
 
   try {
     const memoryClusters = require('./memory-clusters');
@@ -2206,7 +2461,17 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
     const nearbyText = existing.length ? existing.map(f => `- ${f.content}`).join('\n') : '';
 
     // === Contradiction detection against existing self-facts (concurrent) ===
+    //
+    // A verdict alone no longer retires a self-fact. Three bars stand between
+    // "the judge said yes" and a write, and anything that fails one is RAISED
+    // rather than resolved — see applySelfFactRaises below for what raising
+    // means. The bars exist because this path, unguarded, did both halves of the
+    // same failure within a week: it retired an unrelated salience-9 declaration
+    // on a 0.741 cosine match, and it silently declined to retire a belief that a
+    // new capability had made flatly false, on identical input, about half the
+    // time.
     const supersessions = [];
+    const raises = [];
     const seenOld = new Set();
     try {
       const pairs = [];
@@ -2216,14 +2481,42 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       }
       if (pairs.length > 0) {
         const judged = await agentPool.runBatch(
-          pairs.map(({ fact, candidate }) => async () => (await judgeContradiction(fact, candidate.content)).verdict),
+          // Called through the module object ON PURPOSE — the same seam
+          // db/scheduler.js uses for callLLM. What the tests need to pin down is
+          // what this pipeline DOES with a verdict (and with a judge that never
+          // answers), and that cannot be tested with a live judge in the loop:
+          // this exact pair, at cosine 0.857, came back "yes" on about half of
+          // identical runs.
+          pairs.map(({ fact, candidate }) => async () =>
+            (await module.exports.judgeContradiction(fact, candidate.content)).verdict),
           'self-contradiction-judge'
         );
         for (let i = 0; i < pairs.length; i++) {
           const { fact, candidate } = pairs[i];
           if (seenOld.has(candidate.memberId)) continue;
-          const verdict = judged[i].status === 'fulfilled' ? judged[i].value : 'no';
-          if (verdict === 'yes') {
+
+          // A JUDGE CALL THAT FAILED IS NOT A "NO".
+          //
+          // It used to be — `status === 'fulfilled' ? value : 'no'` — so a wedged
+          // brain, a timeout or a circuit-breaker trip read as "these do not
+          // contradict each other", silently, and nothing recorded that the
+          // question had gone unasked. That is the same shape as every phantom
+          // in this system: an absence of thinking wearing the clothes of a
+          // conclusion. It is raised now instead: nothing is written, and he says
+          // he could not settle it.
+          if (judged[i].status !== 'fulfilled') {
+            const err = judged[i].reason;
+            raises.push({
+              kind: 'undecided',
+              oldMemberId: candidate.memberId,
+              oldContent: candidate.content,
+              newFact: fact,
+              detail: (err && err.message) ? err.message : String(err || 'the call did not come back')
+            });
+            continue;
+          }
+
+          if (judged[i].value === 'yes') {
             seenOld.add(candidate.memberId);
             supersessions.push({
               oldMemberId: candidate.memberId,
@@ -2325,13 +2618,49 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       : source === 'capability-intro'
         ? 'a new capability being introduced to you'
         : `a background pass (${source})`;
-    for (const s of supersessions) {
-      const newMemberId = factToMemberId.get(s.newFact);
+    for (const sup of supersessions) {
+      const newMemberId = factToMemberId.get(sup.newFact);
       if (!newMemberId) continue;
       const factStore = require('./fact-store');
-      if ((await factStore.supersede(s.oldMemberId, newMemberId, { noticeSource })).ok) {
+      const oldRow = factStore.getMember(sup.oldMemberId);
+      const newRow = factStore.getMember(newMemberId);
+      if (!oldRow || !newRow) continue;
+
+      // The two bars — what he chose and what matters most are not taken
+      // automatically, and evidence has to separate the pair. See
+      // selfFactSupersessionBar, where the decision lives with no side effects.
+      const bar = selfFactSupersessionBar({ existing: oldRow, incoming: newRow });
+      if (!bar.ok) {
+        raises.push({
+          kind: bar.kind, detail: bar.detail,
+          oldMemberId: sup.oldMemberId, oldContent: sup.oldContent,
+          newFact: sup.newFact, newMemberId
+        });
+        continue;
+      }
+
+      const res = await factStore.supersede(sup.oldMemberId, newMemberId, {
+        noticeSource,
+        caller: `self-fact pipeline (${source})`,
+        ledger: {
+          tier: 'intake',
+          reason: `A new self-observation contradicted this one and is better evidenced on ${bar.axis}, so this was retired and kept as history. Both came from the self-fact pipeline (${source}).`,
+          evidence: { deciding_axis: bar.axis, ...bar.evidence, judged_by: 'self-fact contradiction judge' }
+        }
+      });
+      if (res.ok) {
         result.superseded++;
-        appendToDailyLog(`Superseded self-fact: "${s.oldContent}" → "${s.newFact}" (revised self-view)`, dailyDir);
+        appendToDailyLog(`Superseded self-fact: "${sup.oldContent}" → "${sup.newFact}" (revised self-view, on ${bar.axis})`, dailyDir);
+      }
+    }
+
+    // Everything the bars stopped, said out loud — ledger, ops log, and at most
+    // one bell alert per window. See applySelfFactRaises.
+    if (raises.length) {
+      try {
+        result.raised = await applySelfFactRaises(raises, { source, dailyDir });
+      } catch (raiseErr) {
+        console.error('[SelfFacts] Could not record raises:', raiseErr.message);
       }
     }
 
@@ -2349,6 +2678,8 @@ module.exports = {
   planExtraction,
   applyExtraction,
   describeRecall,
+  selfFactSupersessionBar,
+  applySelfFactRaises,
   judgeSameAssertion,
   judgeSubsumption,
   judgeStripTheTimestamp,

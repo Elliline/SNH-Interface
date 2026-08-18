@@ -336,6 +336,20 @@ const DEFAULTS = {
     // (or to another in the same batch). Tuned from real data: genuine reworded
     // duplicates sit ~0.89–0.97, while distinct-but-related traits stay ≤0.85.
     selfFactDedupThreshold: 0.88,
+    // A self-fact this salient is never retired by an automatic semantic match —
+    // it is raised for Ellie instead. 8, because the failure that produced this
+    // rule retired a salience-9 DECLARATION on a 0.741 cosine match, and the
+    // claim/declaration classifier is too noisy to be the only guard: the same
+    // run tagged a behavioural observation "declaration" and a statement about
+    // what had been built "claim". Salience is the second, independent bar.
+    protectSelfFactSalience: 8,
+    // How long one "I couldn't settle this about myself" bell alert stands for.
+    // A hard window, not a per-pass thing: if the brain is wedged the judge fails
+    // on every pair of every pass, and the point is ONE alert saying it happened
+    // seventeen times — not seventeen alerts. Raises keep being recorded in the
+    // ledger and the ops log throughout; this only bounds how often he says it
+    // out loud.
+    selfFactRaiseAlertHours: 24,
     // Identity lock: the narrow set of self-facts SNH CHOSE rather than observed,
     // which no automatic path may change (db/identity-lock.js). Kept to name and
     // pronouns on purpose — nearly everything else in its identity is observed,

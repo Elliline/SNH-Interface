@@ -59,15 +59,15 @@ function check(name, ok, detail) {
     .run(clusterId, 'Self-Knowledge', '', new Date().toISOString(), new Date().toISOString(), 'self');
 
   /** Seed a fact the way the corpus holds one: row plus a real embedding. */
-  async function seed(content, { subject = 'self', claimType = 'claim', salience = 8 } = {}) {
+  async function seed(content, { subject = 'self', claimType = 'claim', salience = 8, modality = 'typed' } = {}) {
     const id = randomUUID();
     const now = new Date(Date.now() - 86400_000).toISOString();
     db.prepare(`
       INSERT INTO cluster_members
         (id, cluster_id, content, source, created_at, updated_at, status, subject, salience, claim_type,
          verbatim_source_text, input_modality)
-      VALUES (?,?,?,?,?,?,'active',?,?,?,?,'typed')
-    `).run(id, clusterId, content, 'reflection', now, now, subject, salience, claimType, content);
+      VALUES (?,?,?,?,?,?,'active',?,?,?,?,?)
+    `).run(id, clusterId, content, 'reflection', now, now, subject, salience, claimType, content, modality);
     await factStore.replaceVector(id, clusterId, content);
     return id;
   }
@@ -76,19 +76,44 @@ function check(name, ok, detail) {
   const noticeFor = (memberId) => notices().find(n => n.member_id === memberId);
 
   // ---- 1. the pipeline that failed, end to end -----------------------------
+  // THE JUDGE IS STUBBED, and that is the point of this file rather than a
+  // shortcut in it (2026-08-18). What is under test is what the pipeline DOES
+  // with a verdict; the verdict itself is a live model call that came back "yes"
+  // on about half of identical runs of this very pair, which made these checks
+  // flaky in a way that said nothing about the code. processSelfFacts calls the
+  // judge through the module object precisely so it can be pinned here — the same
+  // seam db/scheduler.js uses for callLLM.
+  const realJudge = factExtractor.judgeContradiction;
+  let judgeVerdict = 'yes';
+  factExtractor.judgeContradiction = async () => {
+    if (judgeVerdict === 'throw') throw new Error('Brain circuit open — skipping LLM call (engine wedged)');
+    return { verdict: judgeVerdict, reasoning: 'stubbed' };
+  };
+
   console.log('\n1. A capability introduction retires a self-fact (the 8/12 gap, for real)');
   // The belief a new capability makes false, in the same shape as the one that
   // was actually retired: a flat statement that the thing cannot happen.
+  //
+  // Salience 5, not 9, since 2026-08-18: a self-fact at 8 or above is no longer
+  // retired by an automatic semantic match at all — it is raised for Ellie (see
+  // scripts/test-self-fact-bars.js, and the section below, which holds that
+  // line). This case is the one that SHOULD go through: an ordinary belief,
+  // flatly contradicted, with the evidence separating the two.
   const stale = await seed(
     'As of 2026-08-01, I cannot send myself a reminder — nothing in this system stores a reminder for me, so I have never had one and never will until something is built for it.',
-    { claimType: 'claim', salience: 9 }
+    // modality 'unknown' because that is what a reflection-born self-fact really
+    // carries — the pipeline has no user message behind it. It matters here: an
+    // evidential axis that spoke FOR the older fact would veto the supersession
+    // (see selfFactSupersessionBar), and seeding it as typed or transcribed would
+    // be testing a fact shape the self-fact path never actually produces.
+    { claimType: 'claim', salience: 5, modality: 'unknown' }
   );
   const intro =
     'As of 2026-08-12, I can send myself a reminder now — I store it and it comes back to me later, so the thing I could not do before is something I do routinely.';
 
   const before = notices().length;
   const res = await factExtractor.processSelfFacts([intro], { source: 'capability-intro' });
-  console.log(`  (stored ${res.stored}, superseded ${res.superseded})`);
+  console.log(`  (stored ${res.stored}, superseded ${res.superseded}, raised ${res.raised})`);
 
   check('the introduction stored the new self-fact', res.stored === 1, JSON.stringify(res));
   check('…and retired the belief it made false', res.superseded >= 1, JSON.stringify(res));
@@ -106,6 +131,42 @@ function check(name, ok, detail) {
     check('…it is unseen, so it survives until he actually reads it', n.seen_at === null);
     check('…and it is not marked as a test notice', n.is_test === 0);
   }
+
+  // ---- 1b. what the bars stop, end to end through the pipeline ------------
+  console.log('\n1b. A salient belief is RAISED, not retired — and nothing changes');
+  const salient = await seed(
+    'I hold this about myself and it matters a great deal.',
+    { claimType: 'claim', salience: 9, modality: 'unknown' }
+  );
+  const noticesBefore = notices().length;
+  const raiseRes = await factExtractor.processSelfFacts(
+    ['I no longer hold that about myself at all.'], { source: 'reflection' }
+  );
+  check('the new observation is still stored', raiseRes.stored === 1, JSON.stringify(raiseRes));
+  check('…but nothing was superseded', raiseRes.superseded === 0, String(raiseRes.superseded));
+  check('…it was raised instead', raiseRes.raised >= 1, String(raiseRes.raised));
+  check('…the salient belief is untouched',
+    db.prepare('SELECT status FROM cluster_members WHERE id = ?').get(salient).status === 'active');
+  check('…no notice was raised, because nothing changed', notices().length === noticesBefore,
+    `${notices().length - noticesBefore} appeared`);
+  check('…a ledger row records the unresolved raise',
+    db.prepare("SELECT COUNT(*) n FROM corrections_ledger WHERE target_id = ? AND evidence LIKE '%unresolved%'").get(salient).n === 1);
+  check('…and he says it once, on the bell, in his own voice',
+    db.prepare("SELECT COUNT(*) n FROM initiatives WHERE source_kind = 'self-fact-raise'").get().n === 1);
+
+  console.log('\n1c. A judge that never answers is a raise, not a silent "no"');
+  const unjudged = await seed('Something ordinary I hold.', { claimType: 'claim', salience: 4, modality: 'unknown' });
+  judgeVerdict = 'throw';
+  const throwRes = await factExtractor.processSelfFacts(
+    ['Something ordinary that contradicts what I held.'], { source: 'reflection' }
+  );
+  judgeVerdict = 'yes';
+  check('a failed judge call raises rather than reading as "no contradiction"',
+    throwRes.raised >= 1, JSON.stringify(throwRes));
+  check('…and it changed nothing',
+    db.prepare('SELECT status FROM cluster_members WHERE id = ?').get(unjudged).status === 'active');
+  check('…with the real failure recorded in the ledger, not shown to her as an error',
+    db.prepare("SELECT COUNT(*) n FROM corrections_ledger WHERE evidence LIKE '%self-fact-judge-unavailable%'").get().n >= 1);
 
   // ---- 2. the funnel covers every removal, not just supersession -----------
   console.log('\n2. Every way a self-fact can be taken away raises one');

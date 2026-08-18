@@ -126,6 +126,53 @@ Resist widening the category list. Almost everything else in his identity is
 observed rather than chosen, and locking observations produces an entity that
 can't grow.
 
+## ⚠️ A verdict is not enough to retire a self-fact
+
+`processSelfFacts` asks a judge whether a new self-observation contradicts one he
+already holds. On 2026-08-18 that verdict was the ONLY thing between the judge
+and a write, and it failed in both directions within a week: it retired an
+unrelated salience-9 **declaration** on a 0.741 cosine match, and on identical
+input at 0.857 it said "no" about half the time — while a judge call that FAILED
+outright was read as "no contradiction" and left no trace at all. No threshold
+separates 0.741 from 0.857, so the fix is structural, in
+`selfFactSupersessionBar` (pure, named arguments, exported for test):
+
+- **Bar 1 — protected.** A `declaration`, or salience ≥ `identity.protectSelfFactSalience`
+  (8), is never retired by an automatic semantic match. Both, because the
+  claim/declaration classifier is noisy in both directions — the same run tagged
+  a behavioural observation "declaration" and a statement about what had been
+  built "claim". This is NOT the identity lock and does not widen it: the lock
+  refuses name and pronouns everywhere; this governs one path, and what it stops
+  is raised, not dropped.
+- **Bar 2 — evidence VETOES, it is not required.** Deliberately unlike the
+  corrector, which requires `dominance()` and raises what it cannot separate.
+  That is right for user facts, which carry provenance. A self-fact does not: it
+  comes from reflection, so modality is `unknown` and there is no source message,
+  *by construction*, and dominance ties for nearly every self-fact pair. Requiring
+  it was tried first — it refused a belief a new capability had made flatly false,
+  and sustained it would freeze his self-view permanently, which is the worse
+  failure ("locking observations produces an entity that can't grow"). So: an
+  axis that speaks FOR what he already holds vetoes; silence proceeds.
+- **A failed judge call is a raise, not a "no".** `status === 'fulfilled' ? value : 'no'`
+  meant a wedged brain read as "these do not contradict each other", silently.
+- **A raise is recorded three ways** (`applySelfFactRaises`): a ledger row
+  (`reversible = 0`, `unresolved: true`, a reason_code — so the UI says *nothing
+  changed*), an ops-log line, and **at most one bell alert per
+  `identity.selfFactRaiseAlertHours` (24h)**. The window is hard and counts any
+  status — pending, delivered, dismissed, expired — because a wedged brain fails
+  on every pair of every pass and the failure to avoid is seventeen identical
+  alerts. One alert saying it happened seventeen times is quieter and more
+  useful. Tiers 1 and 2 record every raise throughout; the window only bounds how
+  often he SAYS it.
+- **The bell alert is a question in his voice, never a system error.** "I could
+  not tell whether X contradicts Y — I've left both in place." He never mentions
+  a judge, a call or a failure; the raw error lives in the ledger. It is on the
+  bell rather than the jobs panel because it is not a result — it is him saying
+  he could not decide something about himself, which is exactly what that channel
+  is for.
+- The judge is called through the module object so tests can pin it. Verify with
+  `node scripts/test-self-fact-bars.js` and `node scripts/test-self-fact-notices.js`.
+
 ## ⚠️ Intake: the model proposes, the rules decide
 
 Passive extraction (`db/fact-extractor.js`) asks the extraction model to split a
