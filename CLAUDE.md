@@ -272,6 +272,14 @@ two contracts.
     row changed, so the funnel never sees it, and "nothing happened" is a
     statement only the caller can make.
   - Verify with `node scripts/test-ledger-funnel.js`.
+  - **What was changed BEFORE the funnel is a report, never a re-decision.**
+    `scripts/report-unledgered-changes.js` (readonly connection, no writes in the
+    file) lists every inactive row with no ledger entry — 118 on 2026-08-18, 61
+    of them self-fact supersessions — and flags the ones today's bars would
+    refuse. Re-judging them automatically was considered and rejected: that is
+    the defect auditing itself, and the fresh mistakes would arrive ledgered,
+    which makes them look considered. Restoring is one row at a time, by a
+    person, with `scripts/restore-self-fact.js <id> --confirm`.
 
 ## ⚠️ The heartbeat has hands, and exactly one step uses them
 
