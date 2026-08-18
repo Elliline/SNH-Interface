@@ -254,6 +254,53 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+## ⚠️ Two channels, and a job result may never use the loud one
+
+`db/agent-jobs.js` is the async handoff: a chat turn calls
+`start_background_job`, gets a job id, and ends. The run happens on the agent
+pool, outside the request, and outlives it. The rule that shapes everything else
+in it:
+
+- **ROBOT** (`agent_jobs` + the jobs panel) = **results**. It NEVER opens a
+  conversation. Ellie reads it when she is ready.
+- **BELL** (`initiatives`) = things the entity wants to **say**. Unchanged; it
+  can still open one.
+
+A finding can LEAD TO a conversation — by him raising an ordinary initiative
+about it in an ordinary turn, subject to the normal judgement. Job completion is
+the most mechanical trigger there is, and a channel of its own would let it
+route around that judgement. The enforcement is an **absence**: nothing in
+`db/agent-jobs.js` requires `db/initiatives.js`, and `scripts/test-agent-jobs.js`
+asserts both the absence and that a completed job leaves the initiative table
+empty. Scheduled results moved here too (2026-08-18) — `scheduler.deliver()` is
+gone; the run row IS the delivery, because `job_runs.output_text` already holds
+the text and a second copy could only disagree with the first. The one thing the
+scheduler still raises on the bell is a job that **disabled itself**, which is
+not a result.
+
+Four more things that are load-bearing if you touch this:
+
+- **A job is an AGENT RUN, read-only, and cannot start a job.** `JOB_TOOLS` is
+  the scheduler's allowlist plus web search/fetch. `write_memory`, the
+  corrector's three writes, and `start_background_job` itself are all absent —
+  the last one structurally, since it is registered chat-side and is not in
+  `MCPClient.BACKGROUND_TOOLS`. Widening that list is a decision, not a knob.
+- **A restart kills a run, so the loss is made loud.** The row is written before
+  the work starts; `sweepInterrupted()` closes every `running` row as
+  `interrupted` WITH THE REASON, and re-queues it once if it is inside
+  `agentJobs.retryGraceMinutes`. The retry is only safe because jobs are
+  read-only — the day one can write, that is the first line to revisit.
+- **Announce, then stamp — never the other way round.** `renderAnnouncementBlock`
+  returns items and does NOT mark them; the chat route calls `markAnnounced`
+  only after the ceiling pass, and only if the block is really in the message
+  being sent. Same rule as correction notices: a job stamped by a block that was
+  then trimmed is a result he is never told about again. It fires on
+  `/api/chat/memory` only — the heartbeat is not told, because a finished job is
+  not a reason to start a conversation.
+- **The badge counts unread RESULTS, not work in progress.** Running jobs show as
+  a slow pulse on the button. A badge that counted starts would say something is
+  waiting on her when nothing is.
+
 ## ⚠️ The replay redirects a PROCESS, not a call
 
 `db/database.js` resolves its SQLite and LanceDB paths from `SNH_DATA_DIR` when

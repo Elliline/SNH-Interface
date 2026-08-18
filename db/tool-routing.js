@@ -590,8 +590,72 @@ function classifyJobsIntent(text) {
   return JOBS_PATTERNS.some(r => r.test(t));
 }
 
+/**
+ * HANDOFF INTENT — she is asking for work, not for an answer.
+ *
+ * The routing question this answers is only "may he be OFFERED
+ * start_background_job in this turn", never "should he use it". The judgement of
+ * whether a thing is worth handing off is his, in the tool description, and it
+ * has to be: the same sentence ("look into X") is a two-second lookup or a
+ * twenty-minute sweep depending entirely on what X is, which a regex cannot see.
+ *
+ * Matched in the MIDDLE of the range, deliberately, and the two neighbours show
+ * why. Memory-write is matched loosely because missing the ask is the failure it
+ * exists to fix; memory-read is matched narrowly because a false positive has
+ * him answering a casual remark with a database report. A false positive here is
+ * cheap — the tool is merely present and he ignores it — and a false negative is
+ * only a turn spent making her wait. So: an explicit request to go and do
+ * something, or an explicit grant of time, and nothing looser.
+ *
+ * The turn is ALSO given the tool whenever it is already in the tool loop for
+ * search or memory reading (server.js), which is where the interesting case
+ * lives: a research question that turns out to be bigger than a turn can be
+ * handed off rather than half-answered.
+ */
+const HANDOFF_PATTERNS = [
+  // Go and do it — an instruction to work, not to answer.
+  // "into/through" only: a bare "dig in!" is encouragement, not an instruction.
+  /\b(dig|digging) (into|through)\b/,
+  /\b(look|go look|have a look|go through|comb|trawl|sift) (in)?to\b.{0,40}\b(and|then)?\s*(report|tell me|let me know|come back)\b/,
+  /\b(go|go and|please)\s+(look|research|investigate|check|review|read|analy[sz]e|work)\b/,
+  /\b(research|investigate|audit|survey|inventory|catalogue|catalog)\b.{0,40}\b(for me|and (tell|let|report|come back))\b/,
+  /\bwork (on|through) (it|this|that)\b.{0,20}\b(background|while|later|whenever)\b/,
+  /\b(start|kick off|get started on|begin) (a|an|the)?\s*(job|task|search|review|audit|dig|investigation)\b/,
+  /\bin the background\b/,
+  /\bbackground job\b/,
+
+  // Explicit grant of time — the clearest handoff signal there is, because it
+  // says outright that she is not waiting for this reply.
+  /\b(take your time|no rush|no hurry|whenever you (get a chance|can|have time|get to it)|when you have (a )?(chance|time|a moment))\b/,
+  /\b(come back to me|get back to me|let me know when|tell me when you'?re done|report back)\b/,
+  /\bdon'?t (rush|hurry)\b/,
+  /\bwhile i('?m| am) (out|away|asleep|gone|at work|not (here|around))\b/,
+  /\b(overnight|later today|by (tonight|tomorrow|morning))\b.{0,30}\b(look|check|find|work|research|review)\b/,
+];
+
+/**
+ * Not a handoff. "Take your time" said about something else entirely, and the
+ * ordinary conversational uses of "look into" that are really "what do you
+ * think" — those are answered, not queued.
+ */
+const HANDOFF_NEGATIVES = [
+  /\b(quick|quickly|right now|real quick|off the top of your head|just tell me|in a sentence|briefly)\b/,
+  /\bdon'?t (bother|worry about it)\b/,
+  /\bnever ?mind\b/,
+];
+
+/**
+ * @param {string} text - the user's message
+ * @returns {boolean} true when she is asking for work that may outlive the turn
+ */
+function classifyHandoffIntent(text) {
+  const t = String(text || '').toLowerCase();
+  if (HANDOFF_NEGATIVES.some(r => r.test(t))) return false;
+  return HANDOFF_PATTERNS.some(r => r.test(t));
+}
+
 module.exports = {
   classifyToolNeed, isTimeSensitive, classifySchedulingIntent,
   classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent,
-  classifyJobsIntent
+  classifyJobsIntent, classifyHandoffIntent
 };

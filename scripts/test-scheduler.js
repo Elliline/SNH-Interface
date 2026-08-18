@@ -122,40 +122,44 @@ const minutesAgo = (n) => new Date(Date.now() - n * 60_000).toISOString();
   check('…on the same schedule (tomorrow at 09:00)',
     new Date(job(daily).next_run_at).getHours() === 9, new Date(job(daily).next_run_at).toLocaleString());
 
-  const bell = db.prepare("SELECT * FROM initiatives WHERE type = 'job-result'").all();
-  check('the output reached the bell panel', bell.length === 1, `${bell.length} item(s)`);
-  check('…marked as a job result with the job id attached',
-    bell[0] && /Scheduled job result/.test(bell[0].content) && bell[0].content.includes(daily.slice(0, 8)),
-    bell[0] && bell[0].content.slice(0, 120));
-  check('…pointing at the RUN, so a later run is not read as a duplicate of it',
-    bell[0] && bell[0].source_kind === 'scheduled-job' && bell[0].source_ref === r1[0].id);
-  check('the run row points back at the bell item, so "it ran" and "she was told" are separable',
-    r1[0].output_initiative_id === bell[0].id);
+  // 2026-08-18: the result goes to the JOBS panel, and the bell never hears about
+  // it. A scheduled result is a record of something that ran, not something the
+  // entity wants to say, and the bell is the channel that can open a
+  // conversation. The two are separated at the table now — see db/agent-jobs.js.
+  const agentJobs = require(path.join(ROOT, 'db/agent-jobs'));
+  const feed = agentJobs.feed({ limit: 50 });
+  const item = feed.find(f => f.kind === 'scheduled' && f.id === r1[0].id);
+  check('the output reached the jobs panel', !!item, `${feed.length} feed item(s)`);
+  check('…carrying the run\'s own text, not a second copy of it',
+    item && item.result_text === r1[0].output_text, item && item.result_text);
+  check('…identified as the scheduled job it came from',
+    item && item.title === 'Summarize background memory maintenance', item && item.title);
+  check('NOTHING was written to the bell — a result never gets a channel that can open a conversation',
+    db.prepare("SELECT COUNT(*) n FROM initiatives").get().n === 0);
+  check('and the run row does not claim a bell item', r1[0].output_initiative_id === null);
   check('the job description is what the model was asked to do',
     lastPrompt.userPrompt === 'Summarize background memory maintenance', lastPrompt.userPrompt);
   check('…and it was told to report only what the tools returned',
     /must come from a tool result/i.test(lastPrompt.systemPrompt));
 
-  console.log('\n3. A second run is a second bell item, never folded into the first');
+  console.log('\n3. A second run is a second panel item, never folded into the first');
   db.prepare('UPDATE cron_jobs SET next_run_at = ? WHERE id = ?').run(minutesAgo(1), daily);
   await scheduler.tick();
-  const bell2 = db.prepare("SELECT * FROM initiatives WHERE type = 'job-result'").all();
-  check('two runs, two notifications', bell2.length === 2, `${bell2.length} item(s)`);
-  check('…even though the text is identical',
-    bell2[0].content.split('\n\n')[1] === bell2[1].content.split('\n\n')[1]);
+  const feed2 = agentJobs.feed({ limit: 50 }).filter(f => f.kind === 'scheduled');
+  check('two runs, two panel items', feed2.length === 2, `${feed2.length} item(s)`);
+  check('…even though the text is identical', feed2[0].result_text === feed2[1].result_text);
+  // The dedup that would have folded them lives in the initiative table, which
+  // these no longer enter. Nothing else can fold two runs together: the feed is
+  // rendered from job_runs, and every run is its own row.
 
-  console.log('\n4. The prioritizer leaves records alone');
-  // Age both job results past the stale window and cap the pool at nothing:
-  // neither pass may touch them.
-  db.prepare("UPDATE initiatives SET created_at = ? WHERE type = 'job-result'")
-    .run(new Date(Date.now() - 90 * 86400_000).toISOString());
+  console.log('\n4. The bell queue is not involved at all any more');
   const initiatives = require(path.join(ROOT, 'db/initiatives'));
-  check('a job result is not offered to the pool machinery',
-    initiatives.listPending({ limit: 100 }).every(i => i.type !== 'job-result'));
-  check('…but the panel, which asks for records, sees it',
-    initiatives.listPending({ limit: 100, includeRecords: true }).filter(i => i.type === 'job-result').length === 2);
-  check('…and it is not chosen for an unprompted conversation',
-    !initiatives.getTopPending(0) || initiatives.getTopPending(0).type !== 'job-result');
+  check('two successful runs left the bell empty',
+    db.prepare("SELECT COUNT(*) n FROM initiatives").get().n === 0);
+  check('so there is nothing for the pool machinery to be exempted from',
+    initiatives.listPending({ limit: 100, includeRecords: true }).length === 0);
+  check('and nothing a job result could be chosen for an unprompted conversation from',
+    !initiatives.getTopPending(0));
 
   console.log('\n5. Catch-up: one missed run, and only if it is still worth having');
   mode = 'ok';
@@ -267,8 +271,10 @@ const minutesAgo = (n) => new Date(Date.now() - n * 60_000).toISOString();
   const silentRun = runs(silent)[0];
   check('a run that produced no text is a failure, not a quiet success',
     silentRun.status === 'failed' && /returned no text/.test(silentRun.error || ''), JSON.stringify(silentRun));
-  check('…and nothing was posted to the panel for it',
-    !db.prepare("SELECT id FROM initiatives WHERE source_ref = ?").get(silentRun.id));
+  check('…and it is in the panel AS a failure rather than being hidden',
+    agentJobs.feed({ limit: 100 }).some(f => f.id === silentRun.id && f.status === 'failed'));
+  check('…with no result text pretending otherwise',
+    !agentJobs.feed({ limit: 100 }).find(f => f.id === silentRun.id).result_text);
 
   console.log('\n11. A successful run clears the streak');
   mode = 'ok';

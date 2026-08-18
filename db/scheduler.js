@@ -58,6 +58,10 @@ function dailyDir() { return path.join(memoryDir(), 'daily'); }
 
 /** Lazy requires — memory-manager owns the timer that calls back into here. */
 function factExtractor() { return require('./fact-extractor'); }
+// The ONE remaining use of the bell from here: a job that has disabled itself
+// after repeated failures. That is not a result — it is the entity telling her
+// something has stopped and needs her — so it belongs in the channel that can
+// reach her. Results go to the jobs panel; see the note where deliver() was.
 function initiatives() { return require('./initiatives'); }
 
 function opsLog(msg) {
@@ -415,20 +419,13 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
   const finishedAt = new Date();
   const durationMs = finishedAt.getTime() - startedAt.getTime();
 
-  // Deliver BEFORE the run row is written, so the row can carry the bell item's
-  // id. A delivery failure downgrades the run rather than being swallowed: a
-  // result nobody can read is not a completed job.
-  let initiativeId = null;
+  // DELIVERY IS NOW THE RUN ROW ITSELF (2026-08-18). See the note on the removed
+  // deliver() below: the result goes to the jobs panel, which reads job_runs
+  // directly, so writing the row IS delivering it. There is no second write that
+  // can fail halfway and no second copy of the text to disagree with this one.
+  const initiativeId = null;
   if (status === 'ok') {
-    try {
-      initiativeId = await deliver(job, runId, output, startedAt);
-    } catch (err) {
-      console.error('[Scheduler] delivery failed:', err.message);
-    }
-    if (!initiativeId) {
-      status = 'failed';
-      error = 'the job produced output but it could not be delivered to the notification panel';
-    }
+    dailyLog(`My scheduled job ran — "${job.description}" — and the result is in Ellie's jobs panel: ${output}`);
   }
 
   finishRun(runId, {
@@ -469,38 +466,37 @@ function recordDeferral(job, scheduledFor, why) {
 }
 
 /**
- * The bell item carrying a job's output.
+ * WHERE A SCHEDULED RESULT GOES — and why it stopped going to the bell.
  *
- * Job results go through the initiative table — that is the notification channel
- * — but they are EXEMPT from the pool machinery that everything else there is
- * subject to, and the exemption is the point rather than a shortcut. A candidate
- * observation may be deduped, re-scored, capped or expired, because the pool is
- * a queue of things SNH thinks are worth raising. A job result is not a
- * candidate: it is the record of something that already happened, on a schedule
- * a person approved. Deduping two similar digests would delete the evidence of a
- * run, which is the phantom-action bug wearing a tidier hat.
+ * There used to be a deliver() here that wrote the run's output into the
+ * initiatives table as a `job-result` row. It was exempted, by name, from every
+ * piece of the initiative pool's machinery — dedup, re-scoring, the stale sweep,
+ * the cap — because none of that machinery makes sense for a record of something
+ * that already happened. A queue whose every rule has to be switched off for one
+ * of its types is telling you that type belongs somewhere else.
  *
- * source_ref is the RUN id, not the job id, for the same reason: every run is
- * its own event, and pointing successive runs at one source would make the
- * second one look like a duplicate of the first.
+ * It does now. Results go to the JOBS panel (db/agent-jobs.js `feed`), which
+ * reads job_runs directly, and the channels are separated at the table:
+ *
+ *   ROBOT (jobs panel)  = results. NEVER opens a conversation.
+ *   BELL (initiatives)  = things the entity wants to SAY. Can still open one.
+ *
+ * That separation is the point rather than a tidy-up. A job result arriving in
+ * the queue that can start a conversation meant the most mechanical trigger in
+ * the system — a timer fired and a job finished — sat in the same channel as
+ * things he had decided were worth raising. If a finding IS worth saying
+ * something about, he raises an ordinary initiative about it in an ordinary
+ * turn, subject to the same judgement as anything else.
+ *
+ * Nothing replaced deliver(), because nothing needed to: the run row already
+ * holds output_text, so writing it is delivering it. The one thing lost with the
+ * bell item was a second copy of the text, which is not a loss.
+ *
+ * (`output_initiative_id` stays on job_runs, always null for new runs. The eight
+ * rows written before this change still point at their bell items, and those
+ * items still exist — relocated out of the pending pool, kept as history. See
+ * scripts/migrate-job-results.js.)
  */
-async function deliver(job, runId, output, at) {
-  const header =
-    `Scheduled job result — "${job.description}" ` +
-    `(job ${job.id.slice(0, 8)}, ran ${at.toLocaleString()}):`;
-  const id = await initiatives().addInitiative({
-    type: 'job-result',
-    content: `${header}\n\n${output}`,
-    sourceKind: 'scheduled-job',
-    sourceRef: runId,
-    priority: 6,
-    dedupe: false
-  });
-  if (id) {
-    dailyLog(`My scheduled job ran — "${job.description}" — and I reported to Ellie: ${output}`);
-  }
-  return id;
-}
 
 /**
  * Record the outcome on the job row, and stop a job that keeps failing.

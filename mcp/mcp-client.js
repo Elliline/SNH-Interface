@@ -8,6 +8,7 @@
 const SearXNGTool = require('./tools/searxng');
 const WebFetchTool = require('./tools/web-fetch');
 const CreateCronJobTool = require('./tools/create-cron-job');
+const StartBackgroundJobTool = require('./tools/start-background-job');
 const WriteMemoryTool = require('./tools/write-memory');
 const {
   MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
@@ -40,6 +41,14 @@ const { getConfig, getSearxngConfig } = require('../db/config');
 const BACKGROUND_TOOLS = [
   'memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections',
   'memory_jobs',
+  // 2026-08-18, for the agent-job queue: a handed-off job may look things up in
+  // the world as well as in the record. Both are READS — they change nothing,
+  // here or anywhere — and both remain per-step declarations, so nothing gains
+  // them by being background: the corrector does not ask for them and therefore
+  // does not have them. They ride on config.tools.searxng.enabled like every
+  // other appearance of the search stack, so a box with SearXNG off simply has
+  // them dropped by the registry intersection.
+  'web_search', 'web_fetch',
   // Phase 2c: the corrector's write actions. Background-only — see
   // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
   'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
@@ -106,6 +115,18 @@ class MCPClient {
       const cronTool = new CreateCronJobTool();
       this.tools.set(cronTool.name, cronTool);
       console.log(`MCP: Registered action tool "${cronTool.name}" (tier=${cronTool.tier}, propose-only)`);
+    }
+
+    // start_background_job — the async handoff. Registered on its own flag beside
+    // create_cron_job, for the same reason: it is an action tool and must be
+    // available when the search stack is off. NOT backgroundOnly and NOT in
+    // BACKGROUND_TOOLS — this one runs the other way round, chat-only, so a
+    // background job cannot start a background job.
+    const agentJobsCfg = (getConfig().tools && getConfig().tools.agentJobs) || {};
+    if (agentJobsCfg.enabled !== false) {
+      const jobTool = new StartBackgroundJobTool();
+      this.tools.set(jobTool.name, jobTool);
+      console.log(`MCP: Registered action tool "${jobTool.name}" (tier=${jobTool.tier}, starts work and returns immediately)`);
     }
 
     const memWriteCfg = (getConfig().tools && getConfig().tools.memoryWrite) || {};

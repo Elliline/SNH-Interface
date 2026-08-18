@@ -842,6 +842,90 @@ function initDatabase() {
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id)');
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at)');
 
+    // Panel state for a scheduled run. The jobs panel shows scheduled results
+    // beside handed-off ones, so it needs the same two stamps agent_jobs carries
+    // — and they are two different readers, which is why they are two columns:
+    //   seen_at      - ELLIE has looked at it in the jobs panel
+    //   announced_at - HE has been told about it at the top of a chat turn
+    // Neither implies the other. A result she read on her phone is still news to
+    // him, and one he led with is not thereby marked read for her.
+    const runCols = sqliteDb.prepare('PRAGMA table_info(job_runs)').all();
+    for (const [col, type, note] of [
+      ['seen_at', 'DATETIME', 'when Ellie read it in the jobs panel'],
+      ['announced_at', 'DATETIME', 'when it was handed to the entity in a chat turn']
+    ]) {
+      if (!runCols.some(c => c.name === col)) {
+        sqliteDb.exec(`ALTER TABLE job_runs ADD COLUMN ${col} ${type}`);
+        console.log(`Migration: added ${col} to job_runs (${note})`);
+      }
+    }
+
+    // ============ The agent-job queue — ROBOT, not BELL ============
+    //
+    // Work the entity starts mid-conversation and does NOT finish in the turn.
+    // The tool call writes a row and returns; the run happens on the agent pool,
+    // outside the request; the turn ends normally.
+    //
+    // ⚠ THIS TABLE IS NOT THE INITIATIVE TABLE, AND THE DIFFERENCE IS THE POINT.
+    //
+    //   ROBOT (here)      = results. A record of work that ran. It NEVER opens a
+    //                       conversation. It is a panel Ellie reads when she is
+    //                       ready, and nothing in this table's write path calls
+    //                       into db/initiatives.js — not "must not", DOES NOT.
+    //   BELL (initiatives)= things the entity WANTS TO SAY. That channel can
+    //                       still open a conversation, unchanged.
+    //
+    // A finding can LEAD TO a bell item — by him deciding, in an ordinary turn,
+    // that it is worth raising, subject to the same judgement as anything else
+    // he might say. Job completion is the most mechanical trigger there is, and
+    // giving it a channel of its own would let it bypass that judgement.
+    //
+    // STATUSES. Every one of them is visible in the panel; the whole reason this
+    // table exists rather than a promise held in memory is that a job must never
+    // be able to vanish:
+    //   queued      - written, not yet started. Survives a restart (re-enqueued).
+    //   running     - on the pool. The one transient status: it never survives a
+    //                 process, either finish() replaces it or the startup sweep
+    //                 does (see db/agent-jobs.js sweepInterrupted).
+    //   ok          - it ran and produced text.
+    //   failed      - it threw, timed out, or produced nothing. `error` says which.
+    //                 An empty answer is a failure with a cause, not a silence.
+    //   interrupted - a restart killed it mid-run. Re-queued once inside the
+    //                 grace window; past that it stays here, with the reason.
+    //   cancelled   - Ellie cancelled it. Only reachable while queued: an
+    //                 in-flight LLM call cannot be cleanly cancelled, and a
+    //                 button that claims otherwise is a lie.
+    //
+    // source: 'chat-handoff' today. The column exists so a later starter (a
+    // heartbeat step, a scheduled job spawning one) is a value rather than a
+    // schema change — it does not mean any other starter exists yet.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS agent_jobs (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,                -- short label, his words, for the panel
+        task TEXT NOT NULL,                 -- the instruction the run follows; it IS the prompt
+        why TEXT,                           -- one line: why it was worth handing off
+        status TEXT NOT NULL DEFAULT 'queued',
+        source TEXT DEFAULT 'chat-handoff',
+        conversation_id TEXT,               -- where he started it
+        message_id TEXT,                    -- the message that asked
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        started_at DATETIME,
+        finished_at DATETIME,
+        duration_ms INTEGER,
+        result_text TEXT,
+        error TEXT,
+        tool_calls INTEGER DEFAULT 0,
+        budget_json TEXT,                   -- the tool budget as it stood at the end
+        attempts INTEGER DEFAULT 0,         -- runs begun, including ones a restart killed
+        seen_at DATETIME,                   -- Ellie read it in the jobs panel
+        announced_at DATETIME               -- he was told about it in a chat turn
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_status ON agent_jobs(status)');
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at)');
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_finished ON agent_jobs(finished_at)');
+
     // Every tool call the entity makes and what came of it. Operational telemetry
     // → surfaced in the Thinking tab, never injected into chat. Rejected/capped
     // calls are logged too: a tool call that was refused is exactly the thing

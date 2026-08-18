@@ -3173,11 +3173,16 @@ async function loadInitiativeHistory() {
       return;
     }
     container.innerHTML = items.map(it => {
+      // 'relocated' — a job result that used to live in this queue and now lives
+      // in the jobs panel. Shown, never hidden: the item happened, and the
+      // history is where things that happened stay.
       const delivered = it.delivered_at
         ? `<span class="initiative-when">delivered ${escapeHtml(formatInitiativeTime(it.delivered_at))}${it.channel ? ` · ${escapeHtml(it.channel)}` : ''}</span>`
         : (it.status === 'expired'
             ? '<span class="initiative-when initiative-when-muted">expired without delivery</span>'
-            : (it.status === 'dismissed' ? '<span class="initiative-when initiative-when-muted">dismissed</span>' : ''));
+            : (it.status === 'relocated'
+                ? '<span class="initiative-when initiative-when-muted">moved to the jobs panel — the result is there, unchanged</span>'
+                : (it.status === 'dismissed' ? '<span class="initiative-when initiative-when-muted">dismissed</span>' : '')));
       return `
       <div class="initiative-item initiative-hist" data-id="${it.id}">
         <div class="initiative-item-head">
@@ -3201,6 +3206,185 @@ async function loadInitiativeHistory() {
 // Keep the bell current: on load and periodically.
 refreshInitiativeBadge();
 setInterval(refreshInitiativeBadge, 60000);
+
+// ---- Jobs panel (results of background work) ----
+//
+// The ROBOT channel. It polls the way the bell does, and it is deliberately
+// NOT the bell: nothing here can start a conversation. It is a panel to look at
+// when she is ready, and the badge is the only thing that ever asks for
+// attention — quietly, as a count.
+const jobsBtn = document.getElementById('jobsBtn');
+const jobsBadge = document.getElementById('jobsBadge');
+const jobsPanel = document.getElementById('jobsPanel');
+const jobsPanelOverlay = document.getElementById('jobsPanelOverlay');
+const jobsPanelClose = document.getElementById('jobsPanelClose');
+
+if (jobsBtn) jobsBtn.addEventListener('click', openJobsPanel);
+if (jobsPanelClose) jobsPanelClose.addEventListener('click', closeJobsPanel);
+if (jobsPanelOverlay) jobsPanelOverlay.addEventListener('click', closeJobsPanel);
+
+// Same backoff shape as the bell's poll, and for the same reason: a server
+// refusing requests must not look identical to one with nothing to report.
+let jobsBackoffUntil = 0;
+let jobsFailures = 0;
+
+async function refreshJobsBadge() {
+  if (!jobsBadge) return;
+  if (Date.now() < jobsBackoffUntil) return;
+  try {
+    const res = await fetch('/api/jobs/counts');
+    if (res.status === 429) {
+      jobsFailures++;
+      const waitMs = Math.min(15 * 60_000, 60_000 * Math.pow(2, jobsFailures));
+      jobsBackoffUntil = Date.now() + waitMs;
+      console.warn(`[Jobs] badge poll rate-limited; backing off ${Math.round(waitMs / 1000)}s`);
+      return;
+    }
+    if (!res.ok) { jobsFailures++; jobsBackoffUntil = Date.now() + 60_000; return; }
+    jobsFailures = 0;
+    const data = await res.json();
+    const unseen = data.unseen || 0;
+    const active = data.active || 0;
+    // The badge counts UNREAD RESULTS. Work still running shows as a spinner on
+    // the button instead — adding the two together would tick the badge up when
+    // a job STARTED, which reads as "there is something to read" when there is
+    // not. Nothing is waiting on her until something has finished.
+    if (unseen > 0) {
+      jobsBadge.textContent = unseen;
+      jobsBadge.style.display = 'inline-flex';
+    } else {
+      jobsBadge.style.display = 'none';
+    }
+    jobsBtn?.classList.toggle('jobs-running', active > 0);
+    jobsBtn?.setAttribute('title', active > 0
+      ? `Background jobs — ${active} running, ${unseen} unread`
+      : (unseen > 0 ? `Background jobs — ${unseen} unread` : 'Background jobs — results, not messages'));
+  } catch (e) { /* silent */ }
+}
+
+function openJobsPanel() {
+  jobsPanel?.classList.add('open');
+  jobsPanelOverlay?.classList.add('active');
+  loadJobsList();
+}
+
+function closeJobsPanel() {
+  jobsPanel?.classList.remove('open');
+  jobsPanelOverlay?.classList.remove('active');
+}
+
+/** Plain sentence for how long a run took. */
+function formatJobDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 90) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+const JOB_STATUS_NOTE = {
+  queued: 'Waiting to start.',
+  running: 'Running now.',
+  // Every terminal state says what it means for her, because a bare status word
+  // makes an interrupted job look like a failed one and a cancelled one look
+  // like a crash.
+  failed: 'It did not produce a result.',
+  interrupted: 'The server restarted while this was running.',
+  cancelled: 'You cancelled this before it started.'
+};
+
+async function loadJobsList() {
+  const container = document.getElementById('jobsList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading…</div>';
+  try {
+    const res = await fetch('/api/jobs?limit=60');
+    const data = await res.json();
+    const items = data.jobs || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">No background jobs yet.</div>';
+      refreshJobsBadge();
+      return;
+    }
+
+    container.innerHTML = items.map(it => {
+      const unread = !it.seen_at && ['ok', 'failed', 'interrupted', 'cancelled'].includes(it.status);
+      const kindLabel = it.kind === 'scheduled' ? 'scheduled' : 'started in chat';
+      const note = JOB_STATUS_NOTE[it.status] || '';
+      const body = it.status === 'ok'
+        ? escapeHtml(it.result_text || '')
+        : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`;
+      const meta = [
+        it.finished_at ? `finished ${escapeHtml(formatInitiativeTime(it.finished_at))}` : '',
+        it.duration_ms ? escapeHtml(formatJobDuration(it.duration_ms)) : '',
+        Number.isFinite(it.tool_calls) && it.tool_calls > 0 ? `${it.tool_calls} tool call${it.tool_calls === 1 ? '' : 's'}` : ''
+      ].filter(Boolean).join(' · ');
+
+      const actions = [];
+      if (it.cancellable) actions.push(`<button class="job-cancel" data-id="${escapeHtml(it.id)}">Cancel</button>`);
+      if (unread) actions.push(`<button class="job-seen" data-id="${escapeHtml(it.id)}" data-kind="${escapeHtml(it.kind)}">Mark read</button>`);
+
+      return `
+      <div class="initiative-item job-item ${unread ? 'job-unread' : ''}" data-id="${escapeHtml(it.id)}">
+        <div class="initiative-item-head">
+          <span class="job-status job-status-${escapeHtml(it.status)}">${escapeHtml(it.status)}</span>
+          <span class="job-kind">${escapeHtml(kindLabel)}</span>
+          <span class="initiative-time" title="${escapeHtml(it.created_at || '')}">${escapeHtml(formatInitiativeTime(it.created_at))}</span>
+        </div>
+        <div class="job-title">${escapeHtml(it.title || '')}</div>
+        ${it.status === 'queued' || it.status === 'running'
+          ? `<div class="initiative-note">${escapeHtml(note)} The result will appear here — it will not message you.</div>`
+          : `<div class="initiative-content">${body}</div>`}
+        ${meta ? `<div class="job-meta">${meta}</div>` : ''}
+        ${actions.length ? `<div class="initiative-actions">${actions.join('')}</div>` : ''}
+      </div>`;
+    }).join('');
+
+    container.querySelectorAll('.job-seen').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await fetch(`/api/jobs/${btn.dataset.id}/seen`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: btn.dataset.kind })
+          });
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+
+    container.querySelectorAll('.job-cancel').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const r = await fetch(`/api/jobs/${btn.dataset.id}/cancel`, { method: 'POST' });
+          if (!r.ok) {
+            // The refusal is shown, not swallowed — a running job cannot be
+            // stopped cleanly and she is told that rather than left with a
+            // button that appears to have done nothing.
+            const err = await r.json().catch(() => ({}));
+            btn.insertAdjacentHTML('afterend', `<span class="job-error"> ${escapeHtml(err.error || 'Could not cancel.')}</span>`);
+            return;
+          }
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+  } catch (error) {
+    console.error('[Jobs] Error loading list:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load</div>';
+  }
+}
+
+// The robot panel polls the way the bell does. While it is open the list itself
+// refreshes too, so a job finishing is visible without reopening it.
+refreshJobsBadge();
+setInterval(refreshJobsBadge, 60000);
+setInterval(() => { if (jobsPanel?.classList.contains('open')) loadJobsList(); }, 20000);
 
 function openMemoryPanel() {
   memoryPanel?.classList.add('open');

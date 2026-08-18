@@ -231,6 +231,45 @@ const DEFAULTS = {
     // essay is a job nobody reads.
     maxOutputTokens: 700
   },
+  // The agent-job queue (2026-08-18) — the async handoff.
+  //
+  // A chat turn can START work and END. The tool call writes a row and returns a
+  // job id; the run happens on the agent pool, outside the request path, and
+  // survives the response finishing and the browser closing. Results go to the
+  // JOBS panel, which never opens a conversation — see db/agent-jobs.js.
+  //
+  // A job is an AGENT RUN, exactly as a scheduled job is: its task prose becomes
+  // the prompt for one background model call with a READ-ONLY tool allowlist.
+  // Nothing here executes code, and start_background_job is deliberately absent
+  // from that allowlist, so a job cannot start a job.
+  agentJobs: {
+    enabled: true,
+    // How many jobs may run at once, at the pool's FULL width. The pool's own
+    // chat throttle still applies on top of this: while a chat request is in
+    // flight the whole background pool is concurrency 1, so a job started
+    // mid-conversation starts immediately and a second one waits. This cap is
+    // the other direction — it stops jobs from filling every slot the pool has
+    // and starving the corrector and the heartbeat.
+    maxConcurrent: 2,
+    maxQueued: 10,           // refuse past this, out loud, rather than queue forever
+    maxStartsPerHour: 6,     // trailing-hour cap, counted from the table (a restart grants no budget)
+    // Per-job budget. Same two-limit shape as scheduler/heartbeat, sized a
+    // little longer because the point of handing off is that it takes a while.
+    maxToolCallsPerJob: 12,
+    maxWallClockMs: 300000,  // 5 minutes
+    maxRoundsPerJob: 6,
+    // Output ceiling. A result is read in a panel and may be read aloud to him
+    // at the top of a turn, so a job that writes an essay is a job nobody reads.
+    maxOutputTokens: 700,
+    // How long after a restart an interrupted run is still worth redoing. An
+    // LLM call cannot be resumed, so the run is lost either way; the only
+    // question is whether repeating it is still useful. Safe to retry because
+    // every job in this phase is read-only. Exactly one retry, ever.
+    retryGraceMinutes: 30,
+    // Terminal rows older than this are pruned. The run they describe stays in
+    // the ops log; this table is a panel, not an archive.
+    retentionDays: 90
+  },
   // The corrector (Phase 2c) — the heartbeat step that repairs the corpus.
   //
   // Its own cadence, deliberately slower than the heartbeat: a pass is expensive
@@ -448,6 +487,13 @@ const DEFAULTS = {
       // is persistent by construction, so draining over several turns is
       // delivery, not loss.
       noticeTokens: 800,
+      // Background jobs that finished since he was last told. Zero on almost
+      // every turn — this block only renders when something actually landed.
+      // Measured against a real scheduled-job output: header 64 tokens, ~65 per
+      // job, so three jobs is ~250. The cap is the batch, not the count, for the
+      // same reason as noticeTokens.
+      jobTokens: 400,
+      maxAnnouncedJobs: 3,
       // The capability manifest block, which grows with every entry shipped.
       //
       // 700, not the 600 this was specified at, and the 100 is bought
@@ -607,6 +653,13 @@ const DEFAULTS = {
     memoryInspect: {
       enabled: true,
       maxCallsPerHour: 40
+    },
+    // start_background_job — the async handoff tool. Starts work and returns a
+    // job id immediately; the turn ends normally. Its rate cap lives in
+    // agentJobs.maxStartsPerHour rather than here, because the queue enforces it
+    // and one counter is better than two that can disagree.
+    agentJobs: {
+      enabled: true
     }
   },
   voice: {

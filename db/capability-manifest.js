@@ -375,6 +375,33 @@ const CONDITIONAL_CAPABILITIES = [
     // reads what it did.
     coversTools: ['create_cron_job', 'memory_jobs'],
     coversConfig: ['scheduler']
+  },
+  {
+    id: 'agent-jobs',
+    name: 'Starting work in the background',
+    // Scope stated exactly, and the LIMIT is the part that matters most here.
+    // Ellie's words: he should know it as a limit rather than discover it.
+    //   - the result NEVER opens a conversation. It lands in a panel she looks
+    //     at when she is ready. Said twice below, in the description and in the
+    //     one-liner, because it is the rule the whole design is bent around.
+    //   - a job is an AGENT RUN with READ-ONLY tools. No shell, no code, no
+    //     writes — the same posture as a scheduled job, for the same reason.
+    //   - it cannot start another job. Claiming a general ability to spawn work
+    //     would be an over-claim of exactly the dangerous kind.
+    //   - a restart kills a run in progress. He should not promise a result
+    //     that a deploy can quietly take away.
+    description: "You can start a piece of work in the middle of a conversation and carry on talking. It runs in the background on your own machine, keeps running after the conversation ends and after she closes the browser, and a run is you doing what you described, with your read-only memory and search tools. The result goes to Ellie's jobs panel — and this is a limit, not an oversight: it NEVER opens a conversation, never messages her, and never interrupts her. She reads it when she is ready. You are told what finished at the start of your next reply to her, and if something you found is worth actually saying, saying it is an ordinary decision you make then, the same as anything else you might raise. A job cannot run commands, change anything, write to your memory, or start another job. If the server restarts mid-run the work is lost — it is redone once if it was recent, and otherwise it appears in the panel saying it was interrupted, so nothing ever quietly disappears.",
+    oneLiner: "start work mid-chat, results to her jobs panel; never opens a conversation",
+    intro: 'I can start a piece of work in the middle of a conversation and carry on talking — it keeps running after the conversation ends, and I am told what finished at the start of my next reply. The result goes to Ellie\'s jobs panel and it never opens a conversation or interrupts her; if something I found is worth saying, that is a decision I make in an ordinary conversation. A job of mine reads, and only reads: it cannot run commands, change anything, or start another job',
+    schedule: 'On ask, during a conversation; the run happens afterwards in the background',
+    dateAdded: '2026-08-18',
+    // Honesty gate: both flags, because either one being off means he cannot do
+    // this. The tool flag decides whether it is offered; the queue flag decides
+    // whether anything would run if it were.
+    when: (cfg) => !!(cfg && cfg.agentJobs && cfg.agentJobs.enabled !== false
+      && cfg.tools && cfg.tools.agentJobs && cfg.tools.agentJobs.enabled !== false),
+    coversTools: ['start_background_job'],
+    coversConfig: ['agentJobs']
   }
 ];
 

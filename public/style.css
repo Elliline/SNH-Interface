@@ -3087,3 +3087,89 @@ a.msg-source:hover {
   max-height: 340px;
   overflow-y: auto;
 }
+
+
+/* ============ Jobs panel — the ROBOT channel ============
+   Deliberately quieter than the bell. The bell pulses because it holds things
+   SNH wants to SAY; this holds results, which wait. The only motion here is a
+   slow breathe while work is actually running, and the badge counts unread
+   results rather than everything in the list. */
+.jobs-btn {
+  position: relative;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: all 0.2s ease;
+}
+.jobs-btn:hover { background-color: var(--surface-hover); }
+.jobs-btn.jobs-running {
+  border-color: var(--secondary-color);
+  animation: jobs-breathe 2.4s ease-in-out infinite;
+}
+@keyframes jobs-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.jobs-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--secondary-color);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+
+.job-item { position: relative; }
+/* Unread is a left edge, not a colour wash: the result text has to stay
+   readable, and "unread" is a property of the row rather than of the finding. */
+.job-unread { border-left: 3px solid var(--secondary-color); }
+.job-title { font-weight: 600; margin: 2px 0 6px; font-size: 0.86rem; }
+.job-kind {
+  font-size: 0.66rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.job-meta { font-size: 0.66rem; color: var(--text-secondary); margin-top: 6px; }
+.job-status {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.job-status-ok { color: var(--success-color); }
+.job-status-running { color: var(--secondary-color); }
+.job-status-queued { color: var(--text-secondary); }
+/* Failed, interrupted and cancelled are three different things and are coloured
+   as three different things — an interrupted run is not a fault of the job, and
+   a cancelled one is hers. */
+.job-status-failed { color: var(--error-color); }
+.job-status-interrupted { color: var(--warning-color); }
+.job-status-cancelled { color: var(--text-secondary); }
+.job-error { color: var(--error-color); font-size: 0.76rem; }
+.job-seen, .job-cancel {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.job-seen:hover:not(:disabled), .job-cancel:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-color);
+}
+.job-seen:disabled, .job-cancel:disabled { opacity: 0.5; cursor: default; }

@@ -25,10 +25,13 @@ const agentPool = require('./db/agent-pool');
 const identity = require('./db/identity');
 const capabilityManifest = require('./db/capability-manifest');
 const initiatives = require('./db/initiatives');
+// The agent-job queue. Deliberately NOT initiatives: results go to the jobs
+// panel, which never opens a conversation — see db/agent-jobs.js.
+const agentJobs = require('./db/agent-jobs');
 const questionQueue = require('./db/questions');
 const { getCurrentDateTimeString, formatFactTimestamp } = require('./db/datetime');
 const injectionBudget = require('./db/injection-budget');
-const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent } = require('./db/tool-routing');
+const { classifyToolNeed, isTimeSensitive, classifySchedulingIntent, classifyMemoryWriteIntent, classifyMemoryReadIntent, classifyMemoryCorrectionIntent, classifyJobsIntent, classifyHandoffIntent } = require('./db/tool-routing');
 const { createToolArtifactFilter, stripToolArtifacts, CANNOT_CHECK } = require('./db/tool-artifacts');
 
 // MCP tool calling
@@ -40,6 +43,7 @@ const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearx
 // Routes
 const conversationsRouter = require('./routes/conversations');
 const memoryRouter = require('./routes/memory');
+const jobsRouter = require('./routes/jobs');
 
 const app = express();
 
@@ -330,6 +334,11 @@ app.use('/api/conversations', conversationsRouter);
 
 // Mount memory routes
 app.use('/api/memory', memoryRouter);
+
+// Mount the jobs routes — the ROBOT channel. Its own prefix, not a corner of
+// /api/memory, because job results are not initiatives and must not be served
+// by the endpoint the bell polls.
+app.use('/api/jobs', jobsRouter);
 
 // ============ Config API ============
 
@@ -1616,6 +1625,8 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const cronToolEnabled = !!(appConfig.tools && appConfig.tools.cron && appConfig.tools.cron.enabled !== false);
     const memoryWriteEnabled = !!(appConfig.tools && appConfig.tools.memoryWrite && appConfig.tools.memoryWrite.enabled !== false);
     const memoryInspectEnabled = !!(appConfig.tools && appConfig.tools.memoryInspect && appConfig.tools.memoryInspect.enabled !== false);
+    const agentJobsToolEnabled = !!(appConfig.tools && appConfig.tools.agentJobs && appConfig.tools.agentJobs.enabled !== false)
+      && !!(appConfig.agentJobs && appConfig.agentJobs.enabled !== false);
 
     // SECURITY: Validate inputs
     if (!isValidModelName(model)) {
@@ -1690,9 +1701,17 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // instead was call a tool that does not exist and then invent the answer.
     const needsJobsRead = memoryInspectEnabled && mcpClient.hasTool('memory_jobs')
       && classifyJobsIntent(userMessage.content);
-    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections || needsJobsRead;
+    // HANDOFF intent — she is asking for work rather than for an answer. This is
+    // only a reason to ENTER the loop; once in it he is handed the whole
+    // registry, so a research or memory turn that turns out to be bigger than a
+    // turn can be handed off without its own classifier firing. Whether a thing
+    // is worth handing off is his judgement, in the tool description — a regex
+    // cannot tell a two-second lookup from a twenty-minute sweep.
+    const needsHandoff = agentJobsToolEnabled && mcpClient.hasTool('start_background_job')
+      && classifyHandoffIntent(userMessage.content);
+    const needsTools = needsSearchTools || needsActionTools || needsMemoryWrite || needsMemoryRead || needsMemoryCorrections || needsJobsRead || needsHandoff;
     console.log('Tool routing:', needsTools
-      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections', needsJobsRead && 'jobs-read'].filter(Boolean).join(' + ')})`
+      ? `TOOLS (${[needsSearchTools && 'search/fetch', needsActionTools && 'scheduling', needsMemoryWrite && 'memory-write', needsMemoryRead && 'memory-read', needsMemoryCorrections && 'memory-corrections', needsJobsRead && 'jobs-read', needsHandoff && 'handoff'].filter(Boolean).join(' + ')})`
       : 'DIRECT (conversational, skipping tool loop)');
 
     // Should-I-search honesty guard: if the question is about current/changeable
@@ -1899,6 +1918,37 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
     } catch (initErr) {
       console.error('[Initiative] Greeting selection error:', initErr.message);
+    }
+
+    // === Background work that finished since he last spoke ===
+    //
+    // The chat-awareness half of the agent-job queue. Jobs he handed off, and
+    // scheduled jobs of his, that finished while nobody was talking to him, so
+    // he can lead with "that finished, here's what it found" instead of learning
+    // about his own work from her.
+    //
+    // NEXT TURN MEANS THE NEXT TURN SHE TAKES. This is the only place it fires:
+    // the heartbeat is not told, because the heartbeat is not a conversation and
+    // a finished job is not a reason to start one — that is the whole channel
+    // rule. The jobs panel stays the only place a result is delivered; this
+    // block just means he is not the last to know.
+    //
+    // Zero tokens on almost every turn: renderAnnouncementBlock returns null
+    // unless something actually landed. Measured with real output, one job is
+    // ~130 tokens and three are ~250, against memory.injection.jobTokens.
+    let announcedJobs = null;
+    try {
+      const rendered = agentJobs.renderAnnouncementBlock({
+        limit: injCfg.maxAnnouncedJobs ?? 3,
+        tokenCap: injCfg.jobTokens ?? 400
+      });
+      if (rendered) {
+        announcedJobs = rendered.items;
+        memoryParts.push({ kind: 'guidance', label: 'finished background work', text: rendered.text });
+        console.log(`[AgentJobs] Announcing ${rendered.items.length} finished job(s) to him (${rendered.tokens} tokens, convo ${convoId})`);
+      }
+    } catch (jobErr) {
+      console.error('[AgentJobs] Announcement render error:', jobErr.message);
     }
 
     // === Question queue: surface at most one pending question ===
@@ -2286,6 +2336,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       }
     } catch (ceilErr) {
       console.error('[Injection] Ceiling error (injecting untrimmed):', ceilErr.message);
+    }
+
+    // === Stamp the job announcements, and only now ===
+    //
+    // AFTER the ceiling, and only if the block is really in the message about to
+    // be sent. Same rule as the correction notices, and the same reason: a job
+    // stamped as announced by a block that was then trimmed is a result he is
+    // never told about again. Nothing expires an unannounced job, so the cost of
+    // stamping late is one turn's delay and the cost of stamping early is
+    // permanent silence.
+    if (announcedJobs && announcedJobs.length) {
+      try {
+        const inMessage = !!(memorySystemMessage && memorySystemMessage.content
+          && memorySystemMessage.content.includes('=== Background Work That Finished ==='));
+        if (inMessage) {
+          const n = agentJobs.markAnnounced(announcedJobs);
+          console.log(`[AgentJobs] Marked ${n} finished job(s) announced (convo ${convoId})`);
+        } else {
+          console.warn('[AgentJobs] Announcement block did not survive assembly — NOT stamping; it will be offered again next turn');
+        }
+      } catch (stampErr) {
+        console.error('[AgentJobs] Announcement stamping error:', stampErr.message);
+      }
     }
 
     // Observability: total injected system-context size. Exposed as the
@@ -3224,6 +3297,22 @@ app.listen(PORT, HOST, () => {
   memoryManager.startHeartbeat();
   memoryManager.startLivenessProbe();
   memoryManager.startScheduler();
+
+  // The agent-job queue's recovery pass, beside the scheduler's own.
+  //
+  // A restart kills an in-flight run — an LLM call cannot be resumed — so this
+  // closes every row a restart left open, WITH THE REASON, and re-queues the
+  // ones still young enough to be worth redoing. Queued rows are the easy half:
+  // they are just rows, so they survived, and they only need launching again.
+  // Without this a killed job would read as in-flight forever, which is the
+  // silent loss the whole table exists to refuse.
+  try {
+    const jobs = agentJobs.startup();
+    console.log(`  - Agent jobs: ${startupConfig.agentJobs?.enabled === false ? 'Disabled' : 'Enabled'}` +
+      ` (${jobs.closed} interrupted by the last restart, ${jobs.requeued} re-queued, ${jobs.resumed} launched)`);
+  } catch (e) {
+    console.error('[AgentJobs] startup failed:', e.message);
+  }
 
   // Hand the LIVE MCP registry to the manifest so tool capabilities are DERIVED
   // rather than restated. A registered tool no hand-written entry claims gets an
