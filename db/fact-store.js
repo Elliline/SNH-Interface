@@ -49,6 +49,100 @@ function identityLock() { return require('./identity-lock'); }
 function ledger() { return require('./corrections-ledger'); }
 
 /**
+ * EVERY CHANGE IS LEDGERED HERE, IN THE SAME TRANSACTION AS THE CHANGE.
+ *
+ * WHY IT MOVED (2026-08-18). The ledger call used to live in each CALLER, on the
+ * stated principle that the reason for a change is the caller's to tell. That
+ * principle is right and is kept. What was wrong was making it the only thing
+ * standing between a write and the record: measured on the live corpus, every
+ * self-fact supersession that had ever happened — 68 of them, including 19
+ * retired declarations, 3 at salience 9 — had NO ledger entry, because only the
+ * corrector and the hand-retract route ever filed one. `revert()` works by
+ * reading an entry, so all 68 were unrevertable: the Self tab's button and the
+ * CLI both had nothing to point at. What started it was a capability
+ * introduction retiring an unrelated salience-9 declaration on a 0.741 cosine
+ * match, undoable only by a hand-written repair script.
+ *
+ * "Every caller remembers" is not an invariant. It is a hope, and it failed 68
+ * times out of 68. So:
+ *
+ *   1. THE ROW CHANGE AND ITS ENTRY ARE ONE TRANSACTION. Not "write, then log" —
+ *      that ordering is what leaves a written row unrecorded when the second
+ *      step throws, which is the failure being fixed, and it is precisely how
+ *      the first attempt at this broke. Either both land or neither does. If the
+ *      ledger insert fails, the change is ROLLED BACK and the caller is told
+ *      why: an unrecordable change does not happen.
+ *   2. THE CALLER LAYERS ITS REASON ON TOP — `opts.ledger` at call time, or
+ *      `correctionsLedger.enrich(ledgerId, …)` on the id that comes back.
+ *      Callers that know more still say more; they just cannot be the reason
+ *      there is no record.
+ *   3. `reversible` is a promise about `revert()`, so it is set from what revert
+ *      can actually do: true where restore() puts the fact back, false where it
+ *      cannot (a reword or a re-point never left the active set). A ledger that
+ *      offers an undo it cannot perform is worse than one that says plainly it
+ *      cannot.
+ *
+ * The VECTOR write stays outside the transaction, because it is a different
+ * store and cannot join one. That is the pre-existing split reconcile() exists
+ * to catch, unchanged by this.
+ *
+ * A refusal or an unresolved raise still files its own entry at the caller: no
+ * row changed, so the funnel never sees it, and "nothing happened" is a
+ * statement only the caller is in a position to make.
+ */
+
+/** Plain-language defaults. Deliberately dry — the caller adds the why. */
+const DEFAULT_REASONS = {
+  supersede: 'This fact was replaced by a newer one that contradicts it. It is kept as history and points at the fact that replaced it. Whatever made the change recorded no reason of its own.',
+  retire: 'This fact was retired and is kept as history. Whatever made the change recorded no reason of its own.',
+  expire: 'This fact was expired — it had stopped being true of the present — and is kept as history. Whatever made the change recorded no reason of its own.',
+  reword: 'This fact\'s wording was changed in place, so it never left the active set and Revert cannot put it back. The wording before the change is recorded here, which is what a person would restore by hand.',
+  repoint: 'This retired fact was pointed at a different successor. The previous successor is recorded here.',
+  restore: 'This fact was brought back into active memory. It is active again, so there is nothing here for Revert to undo.'
+};
+
+/** What revert() can actually undo — it calls restore(), which reactivates a row. */
+const REVERSIBLE_BY_ACTION = {
+  supersede: true, retire: true, expire: true, reword: false, repoint: false, restore: false
+};
+
+/**
+ * Build the ledger row for a change. Called INSIDE the transaction that makes
+ * the change, and deliberately allowed to throw: a throw rolls the change back,
+ * which is the intended behaviour when a change cannot be recorded.
+ * @returns {string} ledger id
+ */
+function fileEntry(action, member, { survivor = null, opts = {}, targetText = null, survivorText = null, evidence = null } = {}) {
+  const supplied = (opts && typeof opts.ledger === 'object' && opts.ledger) ? opts.ledger : {};
+  const id = ledger().record({
+    passId: supplied.passId || null,
+    // 'intake' is the default tier: a write by the live pipelines (extraction,
+    // self-facts, write_memory) or by a person, as against the corrector's
+    // 'mechanical' and 'semantic' passes. A caller inside a pass says so, and
+    // its own tier is kept.
+    tier: supplied.tier || 'intake',
+    action,
+    subject: member.subject || null,
+    targetId: member.id,
+    targetText: targetText !== null ? targetText : member.content,
+    survivorId: survivor ? survivor.id : (supplied.survivorId || null),
+    survivorText: survivorText !== null ? survivorText : (survivor ? survivor.content : (supplied.survivorText || null)),
+    reason: supplied.reason || (opts && opts.reason) || DEFAULT_REASONS[action],
+    evidence: Object.assign(
+      { filed_by: 'fact-store funnel', caller: (opts && opts.caller) || null },
+      evidence || {},
+      supplied.evidence || {}
+    ),
+    reversible: supplied.reversible !== undefined ? supplied.reversible : REVERSIBLE_BY_ACTION[action]
+  });
+  // record() swallows its own errors and returns null. Here that is not
+  // survivable: no id means no entry, and no entry means the change must not
+  // stand. Throwing is what rolls it back.
+  if (!id) throw new Error(`the corrections ledger refused the entry for this ${action}, so the change was rolled back`);
+  return id;
+}
+
+/**
  * HE IS TOLD WHEN HIS SELF-VIEW CHANGES — raised HERE, at the funnel, so no
  * pipeline can take a self-fact away quietly.
  *
@@ -425,7 +519,22 @@ async function supersede(oldMemberId, newMemberId, opts = {}) {
   const refused = lockRefusal(oldMemberId, 'supersede', opts);
   if (refused) return refused;
 
-  const sqlite = memoryClusters().supersedeFact(oldMemberId, newMemberId);
+  const successor = getMember(newMemberId);
+
+  // The row change and its ledger entry, atomically. A throw inside rolls both
+  // back — see the funnel note above.
+  let sqlite = false, ledgerId = null;
+  try {
+    getSqliteDb().transaction(() => {
+      sqlite = memoryClusters().supersedeFact(oldMemberId, newMemberId);
+      if (!sqlite) return;   // nothing changed, so nothing to record
+      ledgerId = fileEntry('supersede', member, { survivor: successor, opts });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] supersede ${oldMemberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, vector: false, ledgerId: null, reason: err.message };
+  }
+
   if (!sqlite) {
     // Already superseded/retired. Still reconcile the other two stores — an
     // earlier partial write is exactly how the drift accumulated.
@@ -437,11 +546,11 @@ async function supersede(oldMemberId, newMemberId, opts = {}) {
   const vector = await dropVector(oldMemberId);
   if (!vector) reportVectorFailure('supersede', oldMemberId, member.content);
 
-  noticeSelfChange(member, { operation: 'superseded', successor: getMember(newMemberId), opts });
+  noticeSelfChange(member, { operation: 'superseded', successor, opts: Object.assign({}, opts, { ledgerId: opts.ledgerId || ledgerId }) });
 
   console.log(`[FactStore] superseded ${oldMemberId.slice(0, 8)} -> ${String(newMemberId).slice(0, 8)} ` +
-              `(sqlite=${sqlite} vector=${vector})`);
-  return { ok: true, sqlite, vector };
+              `(sqlite=${sqlite} vector=${vector} ledger=${ledgerId.slice(0, 8)})`);
+  return { ok: true, sqlite, vector, ledgerId };
 }
 
 /**
@@ -471,7 +580,13 @@ async function supersede(oldMemberId, newMemberId, opts = {}) {
  *
  * @returns {Promise<{ok: boolean, sqlite: boolean, previousSuccessor: string|null, reason?: string}>}
  */
-async function repoint(memberId, newSuccessorId, { deliberate = false } = {}) {
+async function repoint(memberId, newSuccessorId, opts = {}) {
+  // opts, not a destructured `{ deliberate }`: this function files a ledger
+  // entry now, and the entry reads `opts.ledger` for the caller's reason. The
+  // first attempt at this kept the destructured signature and referenced `opts`
+  // anyway — a ReferenceError thrown AFTER the row had been written, which is
+  // the exact shape of failure this whole change exists to remove.
+  const { deliberate = false } = opts;
   const db = getSqliteDb();
   const member = getMember(memberId);
   if (!db || !member) return { ok: false, sqlite: false, previousSuccessor: null, reason: 'no such fact' };
@@ -493,14 +608,28 @@ async function repoint(memberId, newSuccessorId, { deliberate = false } = {}) {
   if (refused) return refused;
 
   const previousSuccessor = member.successor_id || member.superseded_by || null;
-  const info = db.prepare(`
-    UPDATE cluster_members
-    SET successor_id = ?, superseded_by = ?, updated_at = ?
-    WHERE id = ? AND status != 'active'
-  `).run(newSuccessorId, newSuccessorId, new Date().toISOString(), memberId);
 
-  console.log(`[FactStore] re-pointed ${memberId.slice(0, 8)}: successor ${String(previousSuccessor).slice(0, 8)} -> ${String(newSuccessorId).slice(0, 8)} (sqlite=${info.changes > 0})`);
-  return { ok: info.changes > 0, sqlite: info.changes > 0, previousSuccessor };
+  let changed = 0, ledgerId = null;
+  try {
+    db.transaction(() => {
+      changed = db.prepare(`
+        UPDATE cluster_members
+        SET successor_id = ?, superseded_by = ?, updated_at = ?
+        WHERE id = ? AND status != 'active'
+      `).run(newSuccessorId, newSuccessorId, new Date().toISOString(), memberId).changes;
+      if (!changed) return;
+      ledgerId = fileEntry('repoint', member, {
+        survivor: successor, opts,
+        evidence: { previous_successor: previousSuccessor, new_successor: newSuccessorId }
+      });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] repoint ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, previousSuccessor, ledgerId: null, reason: err.message };
+  }
+
+  console.log(`[FactStore] re-pointed ${memberId.slice(0, 8)}: successor ${String(previousSuccessor).slice(0, 8)} -> ${String(newSuccessorId).slice(0, 8)} (sqlite=${changed > 0}${changed > 0 ? ` ledger=${ledgerId.slice(0, 8)}` : ''})`);
+  return { ok: changed > 0, sqlite: changed > 0, previousSuccessor, ledgerId };
 }
 
 /**
@@ -526,18 +655,30 @@ async function retire(memberId, opts = {}) {
   // 'retracted' — withdrawn by the person, with no successor. Distinct from
   // 'expired' (an event that aged out) and 'superseded' (replaced by a newer
   // fact), which is the whole point of recording the reason separately.
-  const info = db.prepare(`
-    UPDATE cluster_members
-    SET status = 'inactive', inactive_reason = 'retracted', updated_at = ?
-    WHERE id = ? AND status = 'active'
-  `).run(new Date().toISOString(), memberId);
+  let changed = 0, ledgerId = null;
+  try {
+    db.transaction(() => {
+      changed = db.prepare(`
+        UPDATE cluster_members
+        SET status = 'inactive', inactive_reason = 'retracted', updated_at = ?
+        WHERE id = ? AND status = 'active'
+      `).run(new Date().toISOString(), memberId).changes;
+      if (!changed) return;
+      ledgerId = fileEntry('retire', member, { opts, evidence: reason ? { caller_reason: reason } : null });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] retire ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, vector: false, ledgerId: null, reason: err.message };
+  }
 
   const vector = await dropVector(memberId);
   if (!vector) reportVectorFailure('retire', memberId, member.content);
-  if (info.changes > 0) noticeSelfChange(member, { operation: 'retired', opts });
+  if (changed > 0) {
+    noticeSelfChange(member, { operation: 'retired', opts: Object.assign({}, opts, { ledgerId: opts.ledgerId || ledgerId }) });
+  }
   console.log(`[FactStore] retired ${memberId.slice(0, 8)}${reason ? ` (${reason})` : ''} ` +
-              `(sqlite=${info.changes > 0} vector=${vector})`);
-  return { ok: info.changes > 0, sqlite: info.changes > 0, vector };
+              `(sqlite=${changed > 0} vector=${vector}${changed > 0 ? ` ledger=${ledgerId.slice(0, 8)}` : ''})`);
+  return { ok: changed > 0, sqlite: changed > 0, vector, ledgerId };
 }
 
 /**
@@ -565,17 +706,29 @@ async function expire(memberId, opts = {}) {
   const refused = lockRefusal(memberId, 'expire', { deliberate });
   if (refused) return refused;
 
-  const info = db.prepare(`
-    UPDATE cluster_members
-    SET status = 'inactive', inactive_reason = 'expired', updated_at = ?
-    WHERE id = ? AND status = 'active'
-  `).run(new Date().toISOString(), memberId);
+  let changed = 0, ledgerId = null;
+  try {
+    db.transaction(() => {
+      changed = db.prepare(`
+        UPDATE cluster_members
+        SET status = 'inactive', inactive_reason = 'expired', updated_at = ?
+        WHERE id = ? AND status = 'active'
+      `).run(new Date().toISOString(), memberId).changes;
+      if (!changed) return;
+      ledgerId = fileEntry('expire', member, { opts });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] expire ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, vector: false, ledgerId: null, reason: err.message };
+  }
 
   const vector = await dropVector(memberId);
   if (!vector) reportVectorFailure('expire', memberId, member.content);
-  if (info.changes > 0) noticeSelfChange(member, { operation: 'expired', opts });
-  console.log(`[FactStore] expired ${memberId.slice(0, 8)} (sqlite=${info.changes > 0} vector=${vector})`);
-  return { ok: info.changes > 0, sqlite: info.changes > 0, vector };
+  if (changed > 0) {
+    noticeSelfChange(member, { operation: 'expired', opts: Object.assign({}, opts, { ledgerId: opts.ledgerId || ledgerId }) });
+  }
+  console.log(`[FactStore] expired ${memberId.slice(0, 8)} (sqlite=${changed > 0} vector=${vector}${changed > 0 ? ` ledger=${ledgerId.slice(0, 8)}` : ''})`);
+  return { ok: changed > 0, sqlite: changed > 0, vector, ledgerId };
 }
 
 /**
@@ -593,7 +746,9 @@ async function expire(memberId, opts = {}) {
  *
  * @returns {Promise<{ok: boolean, sqlite: boolean, vector: boolean, reason?: string}>}
  */
-async function restore(memberId, { deliberate = false } = {}) {
+async function restore(memberId, opts = {}) {
+  // opts, not a destructured `{ deliberate }` — see the note on repoint.
+  const { deliberate = false } = opts;
   const db = getSqliteDb();
   const member = getMember(memberId);
   if (!db || !member) return { ok: false, sqlite: false, vector: false, reason: 'no such fact' };
@@ -602,16 +757,33 @@ async function restore(memberId, { deliberate = false } = {}) {
   const refused = lockRefusal(memberId, 'restore', { deliberate });
   if (refused) return refused;
 
-  const info = db.prepare(`
-    UPDATE cluster_members
-    SET status = 'active', inactive_reason = NULL, successor_id = NULL,
-        superseded_by = NULL, updated_at = ?
-    WHERE id = ?
-  `).run(new Date().toISOString(), memberId);
+  // Bringing a fact back is a change like any other, so it is recorded like any
+  // other — including when revert() is what called it. The entry is not itself
+  // reversible: revert() undoes things by calling restore(), and the row is
+  // already active, so offering an undo here would be offering a no-op.
+  let changed = 0, ledgerId = null;
+  try {
+    db.transaction(() => {
+      changed = db.prepare(`
+        UPDATE cluster_members
+        SET status = 'active', inactive_reason = NULL, successor_id = NULL,
+            superseded_by = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(new Date().toISOString(), memberId).changes;
+      if (!changed) return;
+      ledgerId = fileEntry('restore', member, {
+        opts,
+        evidence: { was: member.inactive_reason || 'inactive', previous_successor: member.successor_id || null }
+      });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] restore ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, vector: false, ledgerId: null, reason: err.message };
+  }
 
   const vector = await replaceVector(memberId, member.cluster_id, member.content);
-  console.log(`[FactStore] restored ${memberId.slice(0, 8)} (sqlite=${info.changes > 0} vector=${vector})`);
-  return { ok: info.changes > 0, sqlite: info.changes > 0, vector };
+  console.log(`[FactStore] restored ${memberId.slice(0, 8)} (sqlite=${changed > 0} vector=${vector}${changed > 0 ? ` ledger=${ledgerId.slice(0, 8)}` : ''})`);
+  return { ok: changed > 0, sqlite: changed > 0, vector, ledgerId };
 }
 
 /**
@@ -619,7 +791,9 @@ async function restore(memberId, { deliberate = false } = {}) {
  * SQLite row is updated rather than superseded, and the vector is regenerated
  * from the new text so retrieval matches what the fact now says.
  */
-async function reword(memberId, newContent, { deliberate = false } = {}) {
+async function reword(memberId, newContent, opts = {}) {
+  // opts, not a destructured `{ deliberate }` — see the note on repoint.
+  const { deliberate = false } = opts;
   const db = getSqliteDb();
   const member = getMember(memberId);
   if (!db || !member) return { ok: false, reason: 'no such fact' };
@@ -631,15 +805,28 @@ async function reword(memberId, newContent, { deliberate = false } = {}) {
   const refused = lockRefusal(memberId, 'reword', { deliberate });
   if (refused) return refused;
 
-  db.prepare('UPDATE cluster_members SET content = ?, updated_at = ? WHERE id = ?')
-    .run(clean, new Date().toISOString(), memberId);
+  // targetText is the wording BEFORE the change, survivorText the wording after,
+  // so the entry holds both halves. Not reversible by revert(): restore() only
+  // reactivates an inactive row and this one never left, so the entry says so
+  // and keeps the old wording for a person to put back by hand.
+  let ledgerId = null;
+  try {
+    db.transaction(() => {
+      db.prepare('UPDATE cluster_members SET content = ?, updated_at = ? WHERE id = ?')
+        .run(clean, new Date().toISOString(), memberId);
+      ledgerId = fileEntry('reword', member, { opts, targetText: member.content, survivorText: clean });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] reword ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, vector: false, ledgerId: null, reason: err.message };
+  }
 
   // The injected block re-renders from this row on the next request, so there is
   // nothing else to update for the text itself — only the vector, which is what
   // retrieval matches on.
   const vector = await replaceVector(memberId, member.cluster_id, clean);
-  console.log(`[FactStore] reworded ${memberId.slice(0, 8)} (sqlite=true vector=${vector})`);
-  return { ok: true, sqlite: true, vector };
+  console.log(`[FactStore] reworded ${memberId.slice(0, 8)} (sqlite=true vector=${vector} ledger=${ledgerId.slice(0, 8)})`);
+  return { ok: true, sqlite: true, vector, ledgerId };
 }
 
 /**

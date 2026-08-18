@@ -193,14 +193,38 @@ two contracts.
   edit or delete — never hidden, because nothing here is deleted and hiding them
   would be its own lie.
 
-- **A hand-retraction is ledgered like any other change.** `DELETE
-  /api/memory/fact/:id` writes a `retract` entry (`corrections_ledger`,
-  reversible, `reason_code: user-requested-removal`) so the Self tab's Revert and
-  `scripts/revert-correction.js` work on it unchanged — both read `target_id` and
-  call `restore`, and neither cares whether a person or the corrector filed it.
-  The entry is written at the ROUTE, not in `factStore.retire`: the ledger's
-  `reason` is the caller's to tell, and the sweep scripts and the staging carry
-  already write their own.
+- **Every change is ledgered BY THE WRITE, in the same transaction as the write.**
+  This rule was the other way round until 2026-08-18 — each caller filed its own
+  entry, on the principle that the reason for a change is the caller's to tell.
+  The principle is right and is kept. Making it the *only* thing between a write
+  and the record was the mistake: measured on the live corpus, all 68 self-fact
+  supersessions that had ever happened had no entry at all — 19 of them retired
+  declarations, 3 at salience 9 — because only the corrector and the hand-retract
+  route ever filed one. `revert()` works by reading an entry, so none of the 68
+  could be undone; the Self tab's button and the CLI both had nothing to point
+  at. "Every caller remembers" is not an invariant. It is a hope, and it had
+  failed every single time.
+  - `supersede`, `retire`, `expire`, `reword`, `repoint` and `restore` each open
+    a transaction, change the row, and file the entry inside it. **Not "write,
+    then log"** — that ordering leaves a written row unrecorded whenever the
+    second step throws, which is exactly how the first attempt at this fix broke
+    (`reword`/`repoint` referenced an `opts` their signatures did not bind, and
+    threw a ReferenceError after the row was already written). If the entry
+    cannot be filed the change is ROLLED BACK and the caller is told why: an
+    unrecordable change does not happen.
+  - **The caller layers its reason on top** — `opts.ledger` at call time, or
+    `correctionsLedger.enrich(ledgerId, …)` on the id the write returns. The
+    corrector enriches (its tools return `ledger_id`), so do the hand-retract
+    route and the repair scripts. Two entries for one change is a ledger that
+    double-counts, so nothing files a second one.
+  - **`reversible` is a promise about `revert()`**, set from what revert can
+    actually do: true for supersede/retire/expire, false for reword/repoint/
+    restore, which never left the active set. A ledger offering an undo it cannot
+    perform is worse than one that says plainly it cannot.
+  - A refusal or an unresolved raise still files its own entry at the caller. No
+    row changed, so the funnel never sees it, and "nothing happened" is a
+    statement only the caller can make.
+  - Verify with `node scripts/test-ledger-funnel.js`.
 
 ## ⚠️ The heartbeat has hands, and exactly one step uses them
 

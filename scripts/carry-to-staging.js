@@ -1191,10 +1191,11 @@ async function apply(which) {
     const res = await factStore.retire(row.id, { reason, deliberate: true });
     if (!res.ok) { console.error(`ABORT: retire failed — ${res.reason}`); process.exit(1); }
 
-    ledger.record({
+    // The retire above filed the entry (fact-store funnel, same transaction —
+    // 2026-08-18); this adds the reason it was taken back out.
+    ledger.enrich(res.ledgerId, {
       passId: `withdraw-${new Date().toISOString().replace(/[:.]/g, '-')}`,
       tier: 'mechanical', action: 'carry-withdrawn', subject: row.subject || 'user',
-      targetId: row.id, targetText: row.content,
       reason: `This fact was carried across from the live corpus during the merge and then taken back out. ${reason} It is retired in staging, not deleted, and the live corpus still holds it unchanged.`,
       evidence: {
         undoes_carry: carryEntry ? carryEntry.id : null,

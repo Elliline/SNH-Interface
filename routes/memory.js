@@ -1358,20 +1358,20 @@ router.delete('/fact/:id', async (req, res) => {
     // work on a hand-retraction — they read `target_id` and call restore, and
     // neither cares whether a person or the corrector filed the entry.
     //
-    // Written HERE rather than inside factStore.retire because the ledger's
-    // `reason` is the caller's to tell: the sweep scripts and the staging carry
-    // already write their own, and a generic entry from the store would either
-    // duplicate theirs or say nothing worth reading.
-    let ledgerId = null;
-    if (retired.ok) {
+    // THE ENTRY IS NOW FILED BY THE WRITE (2026-08-18), inside the same
+    // transaction as the row change — see the funnel note in db/fact-store.js.
+    // This route no longer files its own, because two entries for one removal is
+    // a ledger that double-counts. What it does instead is ENRICH the entry the
+    // write already filed: the reason is still the caller's to tell, and only
+    // this caller knows a person clicked the button.
+    let ledgerId = retired.ledgerId || null;
+    if (retired.ok && ledgerId) {
       const correctionsLedger = require('../db/corrections-ledger');
-      ledgerId = correctionsLedger.record({
+      correctionsLedger.enrich(ledgerId, {
         passId: `manual-retract-${new Date().toISOString().slice(0, 10)}`,
         tier: 'mechanical',
         action: 'retract',
         subject: member.subject || 'user',
-        targetId: id,
-        targetText: member.content,
         reason: 'Ellie removed this fact by hand from the Memory tab. Retired, not deleted — the row is kept as history and can be restored.',
         evidence: {
           reason_code: 'user-requested-removal',

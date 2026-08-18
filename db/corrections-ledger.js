@@ -58,6 +58,72 @@ function record(e) {
   }
 }
 
+/**
+ * Improve an entry that already exists, rather than filing a second one.
+ *
+ * WHY THIS EXISTS (2026-08-18). The entry is now created at the WRITE — in the
+ * fact-store funnel — because "every caller remembers to file one" is not an
+ * invariant, and measured on the live corpus it had failed 68 times out of 68.
+ * But the funnel only knows what it can see: which row changed, and into what.
+ * The REASON is still the caller's to tell, and callers that know more — the
+ * corrector, with its pass id, its dominance axis and its evidence; the
+ * hand-retract route, which knows a person asked — say more by enriching the
+ * entry the write already filed.
+ *
+ * One write, one entry, improved in place. The alternative was letting those
+ * callers file their own on top, which is two rows describing one change, and a
+ * ledger that double-counts is a ledger nobody can total.
+ *
+ * NEVER OVERWRITES WITH NOTHING. Only fields actually supplied are written, so a
+ * caller that knows the reason but not the evidence cannot blank the evidence.
+ * An unknown id is a no-op that says so rather than inserting — a "correction"
+ * with no change behind it is exactly what this table must not contain.
+ *
+ * @param {string} id - the ledger id returned by the write
+ * @param {Object} fields - any of: passId, tier, action, subject, reason,
+ *   evidence (merged into what is there), survivorId, survivorText, reversible
+ * @returns {boolean} true if a row was updated
+ */
+function enrich(id, fields = {}) {
+  const db = getSqliteDb();
+  if (!db || !id) return false;
+  try {
+    const row = db.prepare('SELECT * FROM corrections_ledger WHERE id = ?').get(id);
+    if (!row) {
+      console.warn(`[Ledger] enrich: no entry ${String(id).slice(0, 8)} — nothing updated`);
+      return false;
+    }
+
+    const sets = [];
+    const vals = [];
+    const put = (col, val) => { sets.push(`${col} = ?`); vals.push(val); };
+
+    if (fields.passId !== undefined) put('pass_id', fields.passId);
+    if (fields.tier !== undefined) put('tier', fields.tier);
+    if (fields.action !== undefined) put('action', fields.action);
+    if (fields.subject !== undefined) put('subject', fields.subject);
+    if (fields.reason !== undefined) put('reason', fields.reason);
+    if (fields.survivorId !== undefined) put('survivor_id', fields.survivorId);
+    if (fields.survivorText !== undefined) put('survivor_text', fields.survivorText);
+    if (fields.reversible !== undefined) put('reversible', fields.reversible ? 1 : 0);
+    if (fields.evidence !== undefined) {
+      // Merged, not replaced: the funnel records how the write reached it, and
+      // that is still true after the caller adds why it made it.
+      let existing = {};
+      try { existing = row.evidence ? JSON.parse(row.evidence) : {}; } catch { existing = {}; }
+      put('evidence', JSON.stringify(Object.assign({}, existing, fields.evidence || {})));
+    }
+
+    if (!sets.length) return false;
+    vals.push(row.id);
+    const info = db.prepare(`UPDATE corrections_ledger SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    return info.changes > 0;
+  } catch (err) {
+    console.error('[Ledger] enrich failed:', err.message);
+    return false;
+  }
+}
+
 function get(id) {
   const db = getSqliteDb();
   if (!db || !id) return null;
@@ -312,6 +378,6 @@ function deleteNotice(id) {
 }
 
 module.exports = {
-  record, get, list, markReverted, revert, summarize,
+  record, enrich, get, list, markReverted, revert, summarize,
   addNotice, unseenNotices, markNoticesSeen, deleteNotice
 };

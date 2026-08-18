@@ -215,9 +215,10 @@ function carryMap(d) {
       ).run(row.id);
       if (stale.changes) console.log(`[Finalize] cleared ${stale.changes} stale dangling-successor record(s) for ${row.id.slice(0, 8)} — its pointer resolves again`);
     } catch (err) { console.warn(`[Finalize] could not clear stale record: ${err.message}`); }
-    ledger.record({
+    // The repoint filed its own entry (fact-store funnel, same transaction —
+    // 2026-08-18). Enriched, not filed again: one change, one entry.
+    ledger.enrich(res.ledgerId, {
       passId, tier: 'mechanical', action: 'repoint', subject: row.subject || 'user',
-      targetId: row.id, targetText: row.content,
       survivorId: target, survivorText: null,
       reason: 'This fact had been replaced by a newer one, and the rebuild discarded the newer one before writing the corpus again — so the record said "replaced by something that is no longer here". The fact it pointed at was carried back in from the live corpus, so the pointer now leads to it again. The retirement itself is unchanged.',
       evidence: { previous_successor: row.successor_id, new_successor: target, resolved_by: 'carried_from_live' }

@@ -449,12 +449,33 @@ async function act(pass, { tool, args, entry }) {
   }
 
   planned.applied = true;
-  planned.ledgerId = ledger().record({
+
+  // THE ENTRY ALREADY EXISTS (2026-08-18). The write filed it, inside the same
+  // transaction as the row change — see the funnel note in db/fact-store.js —
+  // and the tool handed its id back. So this ENRICHES rather than records: one
+  // change, one entry, with the pass id, the dominance axis and the evidence
+  // that only the corrector knows layered on top of it.
+  //
+  // The fallback below is not belt-and-braces, it is the honest case: if a tool
+  // ever returns no id (an older tool, a path that did not go through the
+  // funnel), filing one here is better than losing the reason entirely. It is
+  // logged, because that would mean a write path had slipped out of the funnel
+  // and that is worth knowing about.
+  const filedId = result && result.ledger_id;
+  const fields = {
     passId: pass.passId, tier: entry.tier, action: entry.action, subject: entry.subject,
-    targetId: entry.targetId, targetText: entry.targetText,
     survivorId: entry.survivorId, survivorText: entry.survivorText,
     reason: entry.reason, evidence: entry.evidence, reversible: entry.reversible !== false
-  });
+  };
+  if (filedId && ledger().enrich(filedId, fields)) {
+    planned.ledgerId = filedId;
+  } else {
+    if (filedId) console.warn(`[Corrector] could not enrich ledger entry ${String(filedId).slice(0, 8)} — filing a fresh one`);
+    else console.warn(`[Corrector] tool "${tool}" returned no ledger id — the write may not have gone through the fact-store funnel`);
+    planned.ledgerId = ledger().record(Object.assign({
+      targetId: entry.targetId, targetText: entry.targetText
+    }, fields));
+  }
   return result;
 }
 

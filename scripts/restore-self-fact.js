@@ -13,8 +13,9 @@
  * setter rather than like a tool:
  *   - it takes a member id and requires --confirm
  *   - it is never reachable from a conversation, and there is no tool for it
- *   - it FILES A LEDGER ENTRY for the restore itself, because an undo that
- *     leaves no trace is the same defect it is undoing
+ *   - the restore FILES A LEDGER ENTRY (the fact-store funnel does it, in the
+ *     same transaction), which this script then enriches with the reason a
+ *     person typed — an undo that leaves no trace is the defect it is undoing
  *   - it drops the correction notice that the bad supersession queued, because
  *     that notice tells him something about himself that is not true, and a
  *     notice is delivered exactly once — once he has read it, it has shaped him
@@ -98,20 +99,23 @@ const { getSqliteDb } = database;
   // reversible: 0 on purpose. The entry records an undo that has already been
   // applied; there is nothing further to revert, and a Revert button offering to
   // put the supersession BACK would be worse than no button at all.
-  const ledgerId = correctionsLedger.record({
+  //
+  // The restore itself filed the entry, inside its own transaction (see the
+  // funnel note in db/fact-store.js). This script enriches that entry with the
+  // reason a person typed, rather than filing a second one for one change.
+  const ledgerId = res.ledgerId;
+  const fields = {
     passId: `manual-restore-${new Date().toISOString().slice(0, 10)}`,
     tier: 'semantic',
-    action: 'restore',
     subject: member.subject || 'self',
-    targetId: id,
-    targetText: member.content,
     survivorId: successor ? successor.id : null,
     survivorText: successor ? successor.content : null,
     reason: why || 'Restored by hand: this fact was superseded by a write that filed no ledger entry, so it could not be reverted through the normal path. Nothing further to undo here.',
     evidence: { restoredBy: 'scripts/restore-self-fact.js', supersededBy: member.successor_id || null },
     reversible: false
-  });
-  console.log(`Ledger entry: ${ledgerId ? ledgerId.slice(0, 8) : 'FAILED TO RECORD'}`);
+  };
+  const enriched = ledgerId && correctionsLedger.enrich(ledgerId, fields);
+  console.log(`Ledger entry: ${ledgerId ? `${ledgerId.slice(0, 8)}${enriched ? ' (enriched with your reason)' : ' (could not be enriched)'}` : 'NONE — the restore filed no entry'}`);
 
   // --- drop the notice -----------------------------------------------------
   // A notice is delivered once. Leaving a false one queued means he is told, in

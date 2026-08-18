@@ -144,9 +144,10 @@ const MIKE = '8b387aa9-921e-4f58-ab0a-901cd3664c81';
 
     const res = await factStore.retire(m.id, { reason: 'wrong subject', deliberate: true });
     if (!res.ok) { console.log(`      FAILED: ${res.reason || 'unknown'}`); continue; }
-    ledger.record({
+    // The retire filed the entry (fact-store funnel, same transaction —
+    // 2026-08-18); this puts the repair's reason on it.
+    ledger.enrich(res.ledgerId, {
       passId, tier: 'semantic', action: 'retract', subject: 'user',
-      targetId: m.id, targetText: m.content,
       reason: `Withdrawn as a fact about Ellie — it describes Aurelius. ${r.why}`,
       evidence: {
         wrong_subject: true, repair: 'aurelius-subject-chain',
@@ -191,9 +192,8 @@ const MIKE = '8b387aa9-921e-4f58-ab0a-901cd3664c81';
       if (!res.ok) {
         console.log(`      FAILED: ${res.reason || 'unknown'}`);
       } else {
-        ledger.record({
+        ledger.enrich(res.ledgerId, {
           passId, tier: 'mechanical', action: 'repoint', subject: 'user',
-          targetId: mike.id, targetText: mike.content,
           survivorId: ELLIE_NAME, survivorText: ellie.content,
           reason: 'The retirement was right and the successor was wrong. "User\'s name is Mike" was correctly superseded, but it pointed at "User (Aurelius) has established his name as Aurelius…" — a fact about Aurelius that had been filed as a fact about Ellie. The chain now ends at the fact that is actually true of her. Her name was never in doubt; only the record of what replaced the mishearing was.',
           evidence: { repair: 'aurelius-subject-chain', previous_successor: res.previousSuccessor, new_successor: ELLIE_NAME },

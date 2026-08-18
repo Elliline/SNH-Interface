@@ -102,7 +102,11 @@ class MergeFactsTool extends BaseCorrectTool {
       detectedBy: 'corrector-merge'
     });
 
-    return { status: 'merged', loser_id: loserId, survivor_id: survivorId, vector_cleared: res.vector };
+    // ledger_id rides back so the corrector can ENRICH the entry the write
+    // already filed (2026-08-18) rather than filing a second one for the same
+    // change. The funnel records that the change happened; the corrector alone
+    // knows which pass made it and on what evidence.
+    return { status: 'merged', loser_id: loserId, survivor_id: survivorId, vector_cleared: res.vector, ledger_id: res.ledgerId || null };
   }
 }
 
@@ -125,7 +129,7 @@ class ExpireFactTool extends BaseCorrectTool {
     const res = await factStore.expire(args.fact_id);
     if (res.locked) return { status: 'refused_locked', written: false, message: res.reason };
     if (!res.ok) return { error: res.reason || 'expire failed' };
-    return { status: 'expired', fact_id: args.fact_id, vector_cleared: res.vector };
+    return { status: 'expired', fact_id: args.fact_id, vector_cleared: res.vector, ledger_id: res.ledgerId || null };
   }
 }
 
@@ -155,7 +159,7 @@ class SupersedeFactTool extends BaseCorrectTool {
     // and the corrector has to be able to record that it was told no.
     if (res.locked) return { status: 'refused_locked', written: false, message: res.reason };
     if (!res.ok) return { error: res.reason || 'supersede failed' };
-    return { status: 'superseded', old_id: oldId, new_id: newId, vector_cleared: res.vector };
+    return { status: 'superseded', old_id: oldId, new_id: newId, vector_cleared: res.vector, ledger_id: res.ledgerId || null };
   }
 }
 

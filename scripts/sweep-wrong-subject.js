@@ -104,9 +104,11 @@ const trunc = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim();
     });
     if (!res.ok) { failed++; console.error(`[Sweep] FAILED ${s.id.slice(0, 8)}: ${res.reason}`); continue; }
     retired++;
-    ledger.record({
+    // The retire filed the entry itself (the fact-store funnel, in the same
+    // transaction — 2026-08-18). Enriched here rather than filed again: one
+    // change, one entry, with the sweep's reason on top.
+    ledger.enrich(res.ledgerId, {
       passId, tier: 'mechanical', action: 'wrong-subject-retired', subject: 'user',
-      targetId: s.id, targetText: s.content,
       survivorId: s.twin.memberId, survivorText: s.twin.content,
       reason: `This was stored as a fact about Ellie but describes the assistant. It originated with the daily-log archiver, whose prompt used to rewrite his own reflections into the third person about her (its current source is "${s.source}" because the corrector and the merge have rewritten the row since). He already holds the same thing about himself — "${trunc(s.twin.content, 120)}" — at ${s.twin.similarity.toFixed(3)}, so nothing is lost by withdrawing the copy. Retired, not deleted; it can be restored.`,
       evidence: {
