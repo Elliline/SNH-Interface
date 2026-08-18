@@ -1920,6 +1920,38 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.error('[Initiative] Greeting selection error:', initErr.message);
     }
 
+    // === She has said she is not waiting ===
+    //
+    // The description tells him WHEN to hand work off; this tells him that the
+    // condition is met right now, in this message. Both halves are needed, and
+    // the reason is what happened on 2026-08-18: the tool was in the payload,
+    // fourth of eleven, on a turn whose message said "Take your time, I'm going
+    // to keep chatting while you work" — and he searched once and answered
+    // inline anyway. A tool he can use immediately will always win an argument
+    // conducted only inside a tool description.
+    //
+    // It fires exactly when classifyHandoffIntent does, so it cannot nudge a
+    // turn that was never offered the tool, and it says BOTH things: hand off
+    // the digging, and still answer what you already know. Ending a turn with
+    // only "I'll come back to you" is the other failure, and it happened live
+    // too.
+    if (needsHandoff && mcpClient.hasTool('start_background_job')) {
+      memoryParts.push({
+        kind: 'guidance',
+        label: 'she is not waiting',
+        text:
+          '=== She Has Said She Is Not Waiting For This ===\n' +
+          'Her message grants you time — she is not sitting waiting on this reply. If answering it ' +
+          'properly needs real digging (more than a couple of searches, or several sources compared), ' +
+          'hand that part to a background agent with start_background_job: it can run a dozen searches ' +
+          'and read whole pages, where you get two or three searches and snippets.\n' +
+          'Then answer her anyway in this same turn with what you already know. Starting a job is not ' +
+          'a reason to say nothing — a reply that only promises to come back later leaves her with ' +
+          'nothing, and she asked you.'
+      });
+      console.log(`[Handoff] She granted time — nudging toward start_background_job (convo ${convoId})`);
+    }
+
     // === Background work that finished since he last spoke ===
     //
     // The chat-awareness half of the agent-job queue. Jobs he handed off, and

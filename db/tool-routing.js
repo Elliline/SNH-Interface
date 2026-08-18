@@ -612,46 +612,69 @@ function classifyJobsIntent(text) {
  * lives: a research question that turns out to be bigger than a turn can be
  * handed off rather than half-answered.
  */
-const HANDOFF_PATTERNS = [
-  // Go and do it — an instruction to work, not to answer.
-  // "into/through" only: a bare "dig in!" is encouragement, not an instruction.
+/**
+ * SHE HAS SAID SHE IS NOT WAITING — the clearest handoff signal there is, kept
+ * as its own list because it also OVERRIDES the immediacy negatives below.
+ *
+ * "…as inference backends as of right now" cancelled a research request on
+ * 2026-08-18: "right now" is in the immediacy list, meant to catch "answer right
+ * now", and it fired on a phrase that meant "current information". A message
+ * that grants time and asks for current facts is not asking to be rushed, and
+ * the grant is the more specific signal of the two.
+ */
+const TIME_GRANT_PATTERNS = [
+  /\b(take your time|take as long as you need|take all the time you need)\b/,
+  /\bno (rush|hurry)\b/,
+  /\bdon'?t (rush|hurry)\b/,
+  /\b(whenever|when) you (get a chance|can|have time|have a moment|get to it|are done|finish)\b/,
+  /\bi'?(ll| will) (keep|carry on) (chatting|talking)\b/,
+  /\bwhile you (work|dig|research|look)\b/,
+  /\bwhile i('?m| am) (out|away|asleep|gone|at work|not (here|around))\b/,
+  /\b(come back to me|get back to me|let me know when|report back|tell me when you'?re done)\b/,
+  /\bin the background\b/,
+  /\bbackground job\b/,
+];
+
+/**
+ * A request to go and DO something, as opposed to a question to answer.
+ */
+const HANDOFF_WORK_PATTERNS = [
   /\b(dig|digging) (into|through)\b/,
   /\b(look|go look|have a look|go through|comb|trawl|sift) (in)?to\b.{0,40}\b(and|then)?\s*(report|tell me|let me know|come back)\b/,
   /\b(go|go and|please)\s+(look|research|investigate|check|review|read|analy[sz]e|work)\b/,
   /\b(research|investigate|audit|survey|inventory|catalogue|catalog)\b.{0,40}\b(for me|and (tell|let|report|come back))\b/,
   /\bwork (on|through) (it|this|that)\b.{0,20}\b(background|while|later|whenever)\b/,
   /\b(start|kick off|get started on|begin) (a|an|the)?\s*(job|task|search|review|audit|dig|investigation)\b/,
-  /\bin the background\b/,
-  /\bbackground job\b/,
-
-  // Explicit grant of time — the clearest handoff signal there is, because it
-  // says outright that she is not waiting for this reply.
-  /\b(take your time|no rush|no hurry|whenever you (get a chance|can|have time|get to it)|when you have (a )?(chance|time|a moment))\b/,
-  /\b(come back to me|get back to me|let me know when|tell me when you'?re done|report back)\b/,
-  /\bdon'?t (rush|hurry)\b/,
-  /\bwhile i('?m| am) (out|away|asleep|gone|at work|not (here|around))\b/,
   /\b(overnight|later today|by (tonight|tomorrow|morning))\b.{0,30}\b(look|check|find|work|research|review)\b/,
 ];
 
 /**
- * Not a handoff. "Take your time" said about something else entirely, and the
- * ordinary conversational uses of "look into" that are really "what do you
- * think" — those are answered, not queued.
+ * She wants it NOW. Cancels a work request — but NOT a time grant, because a
+ * message that says both ("current info as of right now… take as long as you
+ * need") has told you plainly which it means.
  */
-const HANDOFF_NEGATIVES = [
-  /\b(quick|quickly|right now|real quick|off the top of your head|just tell me|in a sentence|briefly)\b/,
-  /\bdon'?t (bother|worry about it)\b/,
-  /\bnever ?mind\b/,
+const IMMEDIACY_NEGATIVES = [
+  /\b(quick|quickly|real quick|off the top of your head|just tell me|in a sentence|briefly)\b/,
+  /\bright now\b/,
 ];
 
 /**
- * @param {string} text - the user's message
- * @returns {boolean} true when she is asking for work that may outlive the turn
+ * She wants it dropped. Cancels everything, grant included: "take your time —
+ * actually, never mind" is not a handoff.
  */
+const HANDOFF_NEGATIVES = [
+  /\bdon'?t (bother|worry about it)\b/,
+  /\bnever ?mind\b/,
+  /\bforget (it|about it|that)\b/,
+];
+
 function classifyHandoffIntent(text) {
   const t = String(text || '').toLowerCase();
-  if (HANDOFF_NEGATIVES.some(r => r.test(t))) return false;
-  return HANDOFF_PATTERNS.some(r => r.test(t));
+  if (HANDOFF_NEGATIVES.some(r => r.test(t))) return false;   // dropped entirely
+  const granted = TIME_GRANT_PATTERNS.some(r => r.test(t));
+  if (granted) return true;                                   // a grant outranks "right now"
+  if (IMMEDIACY_NEGATIVES.some(r => r.test(t))) return false;
+  return HANDOFF_WORK_PATTERNS.some(r => r.test(t));
 }
 
 module.exports = {

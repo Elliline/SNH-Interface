@@ -371,6 +371,25 @@ Four more things that are load-bearing if you touch this:
   corrector's three writes, and `start_background_job` itself are all absent —
   the last one structurally, since it is registered chat-side and is not in
   `MCPClient.BACKGROUND_TOOLS`. Widening that list is a decision, not a knob.
+- **The description says WHEN, and a guidance block says "now".** Shipped, the
+  tool described mechanics and prohibitions only: every reason to delegate was
+  self-assessed, while the reason not to was concrete and always satisfiable —
+  it *can* answer now, `web_search` is in the same list. Two research prompts
+  that explicitly granted time were answered inline and no job was queued. The
+  triggers are observable now (she granted time; more than ~2 searches or
+  several sources; over a minute of work), the trade is stated as a gain, and
+  `classifyHandoffIntent` firing also pushes a `guidance` block saying she is
+  not waiting. A tool the model can use immediately will always win an argument
+  conducted only inside a tool description.
+- **Handing off never means answering nothing.** Both halves failed live within a
+  day of each other. The guard is BOTH/AND in the description and again in the
+  tool's return message: say what you already know this turn, hand off the
+  digging. A turn that only promises to come back has given her nothing.
+- **A time grant outranks "right now".** `classifyHandoffIntent` keeps immediacy
+  negatives (`quick`, `right now`) separate from hard ones (`never mind`): a
+  message asking for current facts *and* granting time is not asking to be
+  rushed. "…as inference backends as of right now" had been cancelling exactly
+  that kind of request.
 - **A restart kills a run, so the loss is made loud.** The row is written before
   the work starts; `sweepInterrupted()` closes every `running` row as
   `interrupted` WITH THE REASON, and re-queues it once if it is inside

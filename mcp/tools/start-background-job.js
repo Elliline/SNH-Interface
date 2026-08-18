@@ -35,14 +35,37 @@ const { getConfig } = require('../../db/config');
 class StartBackgroundJobTool {
   constructor() {
     this.name = 'start_background_job';
+    // WHEN, IN OBSERVABLE TERMS — rewritten 2026-08-18 after it failed live.
+    //
+    // The first version described mechanics and prohibitions and never said
+    // when. Every reason to delegate was self-assessed ("more digging than she
+    // should sit and wait for"), while the reason not to was concrete and always
+    // satisfiable — it CAN answer now, it has web_search in the same tool list.
+    // Two research prompts that explicitly granted time were answered inline
+    // instead, in 10s and 82s, and no job was ever queued.
+    //
+    // So: the triggers are things he can observe in her message or count on his
+    // fingers, the trade is stated as a gain rather than a cost, and the "do not
+    // punt" guard is BOTH/AND rather than a reason to stay inline — because the
+    // failure it prevents also happened live: handed a job, he told her he could
+    // not answer this turn and gave her nothing, while knowing plenty already.
     this.description =
-      'Start a piece of work in the background and come back to the conversation right away. ' +
-      'Use it when answering properly would need more digging than she should sit and wait for — ' +
-      'several searches, a sweep through memory, anything you would otherwise apologise for the length of. ' +
-      'Calling this does NOT give you the answer: it starts the work and returns a job id, and the result ' +
-      'goes to her jobs panel, which does not notify her and never opens a conversation. ' +
-      'Do not use it for something you can simply answer now, and do not use it as a way to promise her a ' +
-      'message later. Starting a job does not excuse you from answering what you can in this turn.';
+      'Hand a piece of work to a background agent and carry on talking. ' +
+      'USE IT WHEN ANY OF THESE IS TRUE: she has said she is not waiting — "take your time", ' +
+      '"take as long as you need", "I\'ll keep chatting", "while I\'m out"; or the answer needs ' +
+      'more than about two searches, or several sources compared against each other; or the work ' +
+      'would take you more than a minute. ' +
+      'WHAT YOU GAIN: the agent can run a dozen searches and read whole pages. Answering inline ' +
+      'gets you two or three searches and the snippets around them. For anything needing current ' +
+      'detail from several places, the handed-off version is simply the better answer. ' +
+      'BOTH, NOT EITHER: starting a job never means saying nothing now. Tell her what you already ' +
+      'know from memory and training in this same turn — she asked you, not the agent — and hand ' +
+      'off only the part that needs real digging. A turn that just says "I will come back to you" ' +
+      'has given her nothing, and that is a failure whether or not the job succeeds. ' +
+      'A single lookup — one search, one fact — is not a job: answer that yourself. ' +
+      'Calling this does NOT return the answer to you: it starts the work and returns a job id. ' +
+      'The result goes to her jobs panel, which does not notify her and never opens a conversation; ' +
+      'you are told what it found at the start of a later reply, and that is when you tell her.';
     this.parameters = {
       type: 'object',
       properties: {
@@ -127,9 +150,11 @@ class StartBackgroundJobTool {
       message:
         'Started — not finished. The work is running in the background now and will keep running after ' +
         'this conversation ends. You do NOT have the result and must not describe what it will say. ' +
-        'Tell her you have started it and roughly what it will cover. It lands in her jobs panel when it ' +
-        'is done — it will not message her — and you will be told about it at the start of a later reply, ' +
-        'which is when you can tell her what it found.'
+        'NOW ANSWER HER: say you have started it and what it will cover, and then tell her what you ' +
+        'already know about this from memory and training. Do not end the turn having said only that ' +
+        'you will come back to her — that leaves her with nothing, and she asked you. It lands in her ' +
+        'jobs panel when it is done — it will not message her — and you are told about it at the start ' +
+        'of a later reply, which is when you tell her what it found.'
     };
   }
 }
