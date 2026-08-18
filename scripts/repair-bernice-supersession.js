@@ -80,8 +80,20 @@ const REPAIRS = [
 
     if (!apply) continue;
 
-    if (!mc.supersedeFact(r.oldId, r.newId)) {
-      console.log(`  !! supersedeFact reported no change — skipping follow-ups`);
+    // Through the funnel, so the change is ledgered and revertible — see the
+    // note in scripts/dedupe-self-facts.js. Calling memoryClusters directly
+    // writes the row and skips both the identity lock and the ledger entry.
+    const factStore = require(path.join(ROOT, 'db/fact-store'));
+    const supRes = await factStore.supersede(r.oldId, r.newId, {
+      caller: 'scripts/repair-bernice-supersession.js',
+      ledger: {
+        tier: 'mechanical',
+        reason: `Manual repair: "${String(oldFact.content).slice(0, 90)}" was corrected to "${String(newFact.content).slice(0, 90)}" and the old one had never been retired.`,
+        evidence: { repair: 'correction-supersession' }
+      }
+    });
+    if (!supRes.ok) {
+      console.log(`  !! supersede reported no change (${supRes.reason || 'unknown'}) — skipping follow-ups`);
       continue;
     }
     applied++;

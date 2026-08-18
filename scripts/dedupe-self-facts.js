@@ -91,9 +91,25 @@ function cosine(a, b) {
     process.exit(0);
   }
 
+  // THROUGH THE FUNNEL (2026-08-18), not straight at memoryClusters. That call
+  // writes the row and nothing else: it skips the identity lock, and since the
+  // ledger entry became part of the write it skips that too — so a re-run of
+  // this script would mint exactly the unrevertable changes the funnel exists to
+  // prevent. Locked facts are already excluded above; going through fact-store
+  // means they would be refused anyway, which is the belt this wants.
+  const factStore = require(path.join(ROOT, 'db/fact-store'));
   let done = 0;
   for (const s of supersessions) {
-    if (mc.supersedeFact(s.dupId, s.keepId)) done++;
+    const res = await factStore.supersede(s.dupId, s.keepId, {
+      caller: 'scripts/dedupe-self-facts.js',
+      ledger: {
+        tier: 'mechanical',
+        reason: `Two self-facts said the same thing; this one was folded into "${String(s.keepContent).slice(0, 100)}" and kept as history.`,
+        evidence: { repair: 'dedupe-self-facts', kept_id: s.keepId }
+      }
+    });
+    if (res.ok) done++;
+    else console.log(`  !! ${s.dupId.slice(0, 8)} not superseded: ${res.reason || 'unknown'}`);
   }
   console.log(`\nApplied: ${done} self-fact(s) superseded (kept ${kept.length} active).`);
   process.exit(0);

@@ -227,6 +227,38 @@ function check(name, ok, detail) {
   check('…and the locked fact is untouched', row(named).status === 'active');
 
   // =========================================================================
+  console.log('\n── Nothing may slip back OUT of the funnel ──');
+  // A structural check, not a behavioural one, and it is here because the whole
+  // 118-row hole came from write paths that simply did not go through the place
+  // the rule lives. `memoryClusters.supersedeFact` writes the row and nothing
+  // else — no identity lock, and since 2026-08-18 no ledger entry — so anything
+  // calling it directly is a change that cannot be undone and could take a locked
+  // fact. Exactly one caller is legitimate.
+  const sourceFiles = [];
+  for (const dir of ['db', 'routes', 'mcp', 'mcp/tools', 'scripts']) {
+    const full = path.join(ROOT, dir);
+    if (!fs.existsSync(full)) continue;
+    for (const f of fs.readdirSync(full)) {
+      if (f.endsWith('.js')) sourceFiles.push(path.join(dir, f));
+    }
+  }
+  const directCallers = sourceFiles.filter(rel => {
+    const body = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    return /\bsupersedeFact\s*\(/.test(body) && !/function supersedeFact/.test(body);
+  }).filter(rel => rel !== path.join('db', 'fact-store.js'));
+  check('db/fact-store.js is the only thing that calls supersedeFact directly',
+    directCallers.length === 0, directCallers.join(', '));
+
+  // Same question from the other side: nobody writes the retirement by hand.
+  const rawWriters = sourceFiles.filter(rel => {
+    if (rel === path.join('db', 'fact-store.js') || rel === path.join('db', 'memory-clusters.js')) return false;
+    if (rel === path.join('db', 'database.js')) return false;   // one-time schema migrations
+    const body = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    return /UPDATE\s+cluster_members[\s\S]{0,80}status\s*=\s*'inactive'/i.test(body);
+  });
+  check('nothing outside the funnel sets a fact inactive with raw SQL',
+    rawWriters.length === 0, rawWriters.join(', '));
+
   console.log('\n── Nothing was deleted anywhere in this run ──');
   check('every seeded row still exists',
     db.prepare('SELECT COUNT(*) n FROM cluster_members').get().n === n,

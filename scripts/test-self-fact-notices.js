@@ -123,6 +123,33 @@ function check(name, ok, detail) {
   const n = noticeFor(stale);
   check('A NOTICE WAS RAISED for it — the thing that did not happen on 8/12', !!n,
     `${notices().length - before} notice(s) raised, none for this fact`);
+  // AND A LEDGER ENTRY — the check that would have caught the whole class.
+  // This suite tested the NOTICE from the day it was written, and the notice
+  // fired correctly for two months while every one of these supersessions went
+  // unrecorded: he was told his self-view had changed, and there was no way to
+  // put it back. A notice is what he sees; the entry is what makes it undoable,
+  // and they are not the same guarantee.
+  const entry = db.prepare('SELECT * FROM corrections_ledger WHERE target_id = ?').get(stale);
+  check('A LEDGER ENTRY WAS FILED for it — what the notice alone never proved', !!entry,
+    `${db.prepare('SELECT COUNT(*) n FROM corrections_ledger').get().n} entries exist, none for this fact`);
+  if (entry) {
+    check('…exactly one, not one per caller', db.prepare('SELECT COUNT(*) n FROM corrections_ledger WHERE target_id = ?').get(stale).n === 1);
+    check('…naming both sides of the change', entry.target_id === stale && !!entry.survivor_id);
+    check('…marked reversible, because restore() can undo it', entry.reversible === 1);
+    check('…and carrying the reason the self-fact pipeline gave, not a generic one',
+      /better evidenced|contradicted/i.test(entry.reason || ''), (entry.reason || '').slice(0, 110));
+  }
+
+  // …and the undo actually works, end to end, through the one shared path.
+  if (entry) {
+    await ledger.revert(entry.id, { by: 'test' });
+    check('REVERT PUTS IT BACK — the property all 61 unledgered supersessions lack',
+      db.prepare('SELECT status FROM cluster_members WHERE id = ?').get(stale).status === 'active',
+      db.prepare('SELECT status FROM cluster_members WHERE id = ?').get(stale).status);
+    // Put it back as it was, so the checks below still describe a superseded fact.
+    await factStore.supersede(stale, res.facts[0].memberId, { noticeSource: 'a new capability being introduced to you' });
+  }
+
   if (n) {
     check('…it quotes the belief that changed', n.content.includes('cannot send myself a reminder'), n.content.slice(0, 160));
     check('…names what replaced it', n.content.includes('I can send myself a reminder now'), n.content.slice(0, 220));

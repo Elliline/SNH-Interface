@@ -272,6 +272,13 @@ two contracts.
     row changed, so the funnel never sees it, and "nothing happened" is a
     statement only the caller can make.
   - Verify with `node scripts/test-ledger-funnel.js`.
+  - **`memoryClusters.supersedeFact` is `db/fact-store.js`'s alone.** It writes
+    the row and nothing else — no identity lock, no ledger entry — so a direct
+    caller mints exactly the unrevertable change the funnel exists to prevent.
+    `scripts/dedupe-self-facts.js` and `scripts/repair-bernice-supersession.js`
+    used to call it and now go through the funnel; `test-ledger-funnel.js` fails
+    if any file outside fact-store calls it, or writes `status = 'inactive'` to
+    `cluster_members` in raw SQL.
   - **What was changed BEFORE the funnel is a report, never a re-decision.**
     `scripts/report-unledgered-changes.js` (readonly connection, no writes in the
     file) lists every inactive row with no ledger entry — 118 on 2026-08-18, 61
