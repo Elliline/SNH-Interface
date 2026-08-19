@@ -1860,6 +1860,22 @@ async function loadSettingsBrainTab() {
         desc: 'How long a job result may be. A job hands back a file rather than a sentence, so this has to hold the whole file — a complete 150-line module is around 2,500 tokens. Set it too low and the result stops mid-function; the card will say it was cut off, but the writing is still lost.'
       },
       {
+        key: 'generation.scheduledJobThinkingTokens',
+        label: 'Thinking budget, scheduled jobs (tokens)',
+        type: 'number', step: '1024', min: 0,
+        value: config.generation?.scheduledJobThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. The same need as agent jobs above, on the runs that go off on a schedule — a digest still has to be worked out before it can be written. Smaller than a job because a scheduled run is a smaller piece of work by design: a third of the tool calls and a fifth of the wall clock.'
+      },
+      {
+        key: 'generation.scheduledJobResponseTokens',
+        label: 'Answer budget, scheduled jobs (tokens)',
+        type: 'number', step: '512', min: 64,
+        value: config.generation?.scheduledJobResponseTokens,
+        desc: 'How long a scheduled run\'s result may be. This one arrives every time the schedule fires, so it is set below the agent-job budget on purpose — long enough for a real report, short enough that a daily one stays readable. Too low and the run stops mid-sentence; the card will say it was cut off.'
+      },
+      {
         key: 'generation.backgroundThinkingTokens',
         label: 'Thinking budget, background work (tokens)',
         type: 'number', step: '64', min: 0,

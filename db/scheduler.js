@@ -86,8 +86,45 @@ const JOB_TOOLS = [
   'memory_corrections', 'memory_jobs'
 ];
 
+/**
+ * The run statuses that ARE A RESULT — a thing she can open and read.
+ *
+ * `partial` joined them on 2026-08-19 and that is why this is a constant rather
+ * than a literal. The status was filtered by `IN ('ok','failed')` in six places
+ * across two files — the panel feed, the announcement queue, the unread badge,
+ * the times-run count, lastExecutedRun, and the tick's counters — and every one
+ * of them would have silently dropped a partial run on the floor while the row
+ * sat in the database looking fine. A seventh place will be added one day; it
+ * should not be possible to add a status and forget one of them.
+ *
+ * `deferred` and `skipped` are deliberately NOT here. They are records of a run
+ * that did not happen, not results, and putting them in a feed of results is
+ * exactly the noise the panel exists to avoid.
+ */
+const RESULT_STATUSES = ['ok', 'partial', 'failed'];
+
+/**
+ * A config key that MOVED must not go quiet where it used to live.
+ * scheduler.maxOutputTokens became generation.scheduledJobResponseTokens on
+ * 2026-08-19. Same warning, same reasoning, as the agent path's.
+ */
+let warnedDeadOutputKey = false;
+function warnDeadOutputKey(value) {
+  if (warnedDeadOutputKey) return;
+  warnedDeadOutputKey = true;
+  const line =
+    `scheduler.maxOutputTokens (${value}) in data/config.json is NO LONGER READ — ` +
+    `the scheduled-run answer budget moved to generation.scheduledJobResponseTokens ` +
+    `(Settings -> Thinking and Answer Budgets). Delete the old key; it is doing nothing.`;
+  console.warn(`[Scheduler] ${line}`);
+  opsLog(line);
+}
+
 function cfg() {
-  const c = getConfig().scheduler || {};
+  const all = getConfig();
+  const c = all.scheduler || {};
+  const gen = all.generation || {};
+  if (c.maxOutputTokens !== undefined) warnDeadOutputKey(c.maxOutputTokens);
   return {
     enabled: c.enabled !== false,
     tickSeconds: Math.max(10, c.tickSeconds ?? 60),
@@ -96,7 +133,10 @@ function cfg() {
     maxToolCallsPerRun: Math.max(1, c.maxToolCallsPerRun ?? 12),
     maxWallClockMsPerRun: Math.max(5000, c.maxWallClockMsPerRun ?? 180000),
     maxRoundsPerRun: Math.max(1, c.maxRoundsPerRun ?? 6),
-    maxOutputTokens: Math.max(64, c.maxOutputTokens ?? 700)
+    // Both halves of the run's generation budget, from `generation` so they are
+    // read against the chat and agent-job rows rather than apart from them.
+    answerTokens: Math.max(64, gen.scheduledJobResponseTokens ?? 4096),
+    thinkingTokens: Number.isFinite(gen.scheduledJobThinkingTokens) ? gen.scheduledJobThinkingTokens : null
   };
 }
 
@@ -252,8 +292,9 @@ function lastExecutedRun(jobId) {
   const db = getSqliteDb();
   if (!db) return null;
   return db.prepare(
-    "SELECT * FROM job_runs WHERE job_id = ? AND status IN ('ok','failed') ORDER BY datetime(started_at) DESC LIMIT 1"
-  ).get(jobId) || null;
+    `SELECT * FROM job_runs WHERE job_id = ? AND status IN (${RESULT_STATUSES.map(() => '?').join(',')})
+     ORDER BY datetime(started_at) DESC LIMIT 1`
+  ).get(jobId, ...RESULT_STATUSES) || null;
 }
 
 /** Is a previous run of this job still open? The re-entrancy check's disk half. */
@@ -392,13 +433,33 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
       () => memoryManager.callLLM(
         systemPrompt(job, allowed, lastRun && lastRun.started_at),
         job.description,
-        { maxTokens: c.maxOutputTokens, toolSession: session }
+        { maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens, toolSession: session }
       ),
       `scheduled-job:${job.id.slice(0, 8)}`
     );
     output = String(res && res.content || '').trim();
     budget = (res && res.budget) || session.summary();
     toolCalls = Array.isArray(res && res.toolCalls) ? res.toolCalls.length : 0;
+
+    // A RUN THAT HIT ITS CEILING IS NOT A RUN THAT FINISHED. Same defect the
+    // agent path had until 2026-08-19 and the same fix: callLLM has always
+    // returned `truncated` off finish_reason 'length', and this function closed
+    // every non-empty run as `ok` without ever looking at it. A cron digest cut
+    // off mid-sentence arrived on the panel indistinguishable from a whole one,
+    // every morning, for as long as the ceiling was too low.
+    //
+    // `partial` keeps the text — it is real work — and names the limit, because
+    // "stopped early" is not something anyone can act on and "the answer budget
+    // is 4096" is.
+    if (output && (res.truncated || res.outOfRounds || (budget && budget.exhausted))) {
+      status = 'partial';
+      error = res.truncated
+        ? `it hit the answer budget (${c.answerTokens} tokens) and stopped mid-result — what is above is cut off, not finished. Raise "Answer budget, scheduled jobs" in Settings if this keeps happening`
+        : res.outOfRounds
+          ? `it ran out of tool rounds (${c.maxRoundsPerRun}) before it was finished — what is above is what it had`
+          : `it stopped early: ${budget.exhausted} — what is above is what it had`;
+    }
+
     if (!output) {
       // An empty answer is a failure with a specific cause, not a quiet success.
       // Reported as one so the failure counter can eventually stop it.
@@ -426,6 +487,8 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
   const initiativeId = null;
   if (status === 'ok') {
     dailyLog(`My scheduled job ran — "${job.description}" — and the result is in Ellie's jobs panel: ${output}`);
+  } else if (status === 'partial') {
+    dailyLog(`My scheduled job ran — "${job.description}" — and stopped before it finished (${error}). What it did write is in Ellie's jobs panel: ${output}`);
   }
 
   finishRun(runId, {
@@ -511,15 +574,35 @@ function applyOutcome(job, { status, error, at, durationMs, trigger, toolCalls }
   const db = getSqliteDb();
   if (!db) return;
 
-  if (status === 'ok') {
+  // `partial` IS ARMED LIKE A SUCCESS, and getting this wrong would have been
+  // the worst bug in the change. The branch below returns without arming for
+  // anything that is not `ok` or `failed` — correct for deferred and skipped,
+  // which are records of a run that did not happen — so a `partial` falling
+  // through it would have left next_run_at NULL and the job would simply never
+  // run again. No error, no disabled_reason, no alert: a cron job that quietly
+  // stops, which is the exact class of silent loss this subsystem is written
+  // against.
+  //
+  // consecutive_failures is RESET, not incremented. A run that produced a
+  // truncated result did its work and hit a ceiling; that is a budget to raise,
+  // not an engine that is failing, and letting it accumulate toward
+  // maxConsecutiveFailures would disable a job for the crime of having more to
+  // say than its budget allowed — throwing away results she can actually read.
+  // The card and the ops line carry the signal instead.
+  if (status === 'ok' || status === 'partial') {
     db.prepare(`
       UPDATE cron_jobs
-      SET last_run_at = ?, last_status = 'ok', run_count = COALESCE(run_count, 0) + 1,
+      SET last_run_at = ?, last_status = ?, run_count = COALESCE(run_count, 0) + 1,
           consecutive_failures = 0
       WHERE id = ?
-    `).run(at.toISOString(), job.id);
-    armJob(job.id, { from: at, reason: 'after a successful run' });
-    opsLog(`Scheduled job ran: "${job.description}" (${job.id.slice(0, 8)}, ${trigger}) — ok in ${(durationMs / 1000).toFixed(1)}s, ${toolCalls} tool call(s).`);
+    `).run(at.toISOString(), status, job.id);
+    armJob(job.id, {
+      from: at,
+      reason: status === 'ok' ? 'after a successful run' : 'after a run that stopped short'
+    });
+    opsLog(status === 'ok'
+      ? `Scheduled job ran: "${job.description}" (${job.id.slice(0, 8)}, ${trigger}) — ok in ${(durationMs / 1000).toFixed(1)}s, ${toolCalls} tool call(s).`
+      : `Scheduled job ran PARTIAL: "${job.description}" (${job.id.slice(0, 8)}, ${trigger}) — ${(durationMs / 1000).toFixed(1)}s, ${toolCalls} tool call(s). It wrote up what it had. Why it stopped: ${error}`);
     return;
   }
 
@@ -595,7 +678,7 @@ async function tick({ now = new Date() } = {}) {
     return { due: due.length, ran: 0, deferred: due.length };
   }
 
-  const out = { due: due.length, ran: 0, skipped: 0, failed: 0, deferred: 0 };
+  const out = { due: due.length, ran: 0, skipped: 0, failed: 0, deferred: 0, partial: 0 };
   for (const job of due) {
     const scheduledFor = job.next_run_at;
     const lateMs = now.getTime() - new Date(scheduledFor).getTime();
@@ -623,6 +706,7 @@ async function tick({ now = new Date() } = {}) {
     const trigger = lateMs > c.tickSeconds * 1000 * 2 ? 'catchup' : 'schedule';
     const res = await runJob(job, { trigger, scheduledFor });
     if (res.status === 'ok') out.ran++;
+    else if (res.status === 'partial') { out.ran++; out.partial++; }
     else if (res.status === 'failed') out.failed++;
     else if (res.status === 'deferred') out.deferred++;
   }
@@ -660,13 +744,17 @@ function runtimeState(jobId) {
   const job = db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(jobId);
   if (!job) return null;
   const last = lastExecutedRun(jobId);
-  const runs = db.prepare('SELECT COUNT(*) n FROM job_runs WHERE job_id = ? AND status IN (\'ok\',\'failed\')').get(jobId).n;
+  const runs = db.prepare(
+    `SELECT COUNT(*) n FROM job_runs WHERE job_id = ? AND status IN (${RESULT_STATUSES.map(() => '?').join(',')})`
+  ).get(jobId, ...RESULT_STATUSES).n;
   return {
     armed: !!job.next_run_at,
     nextRunAt: job.next_run_at || null,
     lastRunAt: job.last_run_at || null,
     lastStatus: job.last_status || null,
-    lastError: last && last.status === 'failed' ? last.error : null,
+    // A partial run's reason is the thing worth surfacing here — it names a
+    // budget she can change. Reporting only `failed` hid it.
+    lastError: last && (last.status === 'failed' || last.status === 'partial') ? last.error : null,
     lastRunId: last ? last.id : null,
     timesRun: runs,
     consecutiveFailures: job.consecutive_failures || 0,
@@ -697,6 +785,7 @@ function schedulerState() {
 
 module.exports = {
   JOB_TOOLS,
+  RESULT_STATUSES,
   tick,
   runJob,
   runNow,

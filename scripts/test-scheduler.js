@@ -52,10 +52,23 @@ function check(name, ok, detail) {
 let mode = 'ok';
 let lastPrompt = null;
 let callCount = 0;
-memoryManager.callLLM = async (systemPrompt, userPrompt) => {
+let lastOptions = null;
+memoryManager.callLLM = async (systemPrompt, userPrompt, options) => {
   callCount++;
   lastPrompt = { systemPrompt, userPrompt };
+  lastOptions = options || {};
   if (mode === 'throw') throw new Error('Brain circuit open — skipping LLM call (engine wedged)');
+  // A run that wrote real work and was cut off at max_tokens. Nothing else about
+  // it looks wrong: the tool call worked, the budget is not exhausted, it did not
+  // run out of rounds. Only finish_reason said 'length'.
+  if (mode === 'truncated') {
+    return {
+      content: 'Since yesterday: two facts merged, one event moved to the day log, and the corrector raised one pair it could not sep',
+      provider: 'stub', truncated: true,
+      toolCalls: [{ name: 'memory_corrections', args: {}, ok: true }],
+      budget: { calls: 2, maxCalls: 12, exhausted: null }
+    };
+  }
   if (mode === 'empty') return { content: '   ', provider: 'stub', truncated: false, toolCalls: [], budget: {} };
   if (mode === 'slow') {
     await new Promise(r => setTimeout(r, 150));
@@ -309,6 +322,82 @@ const minutesAgo = (n) => new Date(Date.now() - n * 60_000).toISOString();
   cronJobs.revertAllKidCreated({ note: 'test' });
   check('a reverted job stops claiming a next run', !job(toRevert).next_run_at);
   check('…and is no longer due', !scheduler.dueJobs(new Date(Date.now() + 86400_000)).some(j => j.id === toRevert));
+
+  console.log('\n14. A run cut off at its answer budget says so — and still re-arms');
+  // THE BUG THIS SECTION EXISTS FOR is not the status, it is applyOutcome. Its
+  // middle branch returns without arming for anything that is not ok or failed,
+  // so a `partial` falling through would leave next_run_at NULL and the job would
+  // never run again — no error, no disabled_reason, no alert. A cron job that
+  // quietly stops is the exact silent loss this whole subsystem is written
+  // against, and it would have been introduced BY the fix for a different
+  // silent loss.
+  mode = 'truncated';
+  const cut = makeJob({ description: 'Nightly digest' });
+  cronJobs.approve(cut);
+  const beforeArm = job(cut).next_run_at;
+
+  // Drain the announcement queue first. pendingAnnouncements deliberately caps a
+  // batch at 10, and by this point in the file there are more than 10 unannounced
+  // rows whose finished_at ties at datetime()'s one-second granularity — so
+  // "is my row in the batch" would be a coin flip rather than an assertion about
+  // the status filter, which is the thing under test.
+  const drain = require(path.join(ROOT, 'db/agent-jobs'));
+  for (let i = 0; i < 20; i++) {
+    const batch = drain.pendingAnnouncements({ limit: 10 });
+    if (!batch.length) break;
+    drain.markAnnounced(batch);
+  }
+
+  const cutRes = await scheduler.runNow(cut);
+
+  check('a truncated run is NOT ok', cutRes.status !== 'ok', cutRes.status);
+  check('it is partial — the text is real work, not a failure', cutRes.status === 'partial', cutRes.status);
+  check('the run row carries the text whole',
+    /two facts merged/.test((runs(cut).slice(-1)[0] || {}).output_text || ''));
+  check('and the row names the limit it hit',
+    /answer budget \(4096 tokens\)/.test((runs(cut).slice(-1)[0] || {}).error || ''),
+    (runs(cut).slice(-1)[0] || {}).error);
+  check('…saying plainly that the result is cut off rather than finished',
+    /cut off, not finished/.test((runs(cut).slice(-1)[0] || {}).error || ''));
+
+  check('THE JOB IS STILL ARMED — a partial must not silently stop the schedule',
+    !!job(cut).next_run_at, `next_run_at=${job(cut).next_run_at} (was ${beforeArm})`);
+  check('last_status records partial, not ok and not failed',
+    job(cut).last_status === 'partial', job(cut).last_status);
+  check('the failure streak is RESET, not incremented — a ceiling is not an engine failing',
+    job(cut).consecutive_failures === 0, String(job(cut).consecutive_failures));
+  check('and the run counted as a run', job(cut).run_count >= 1, String(job(cut).run_count));
+
+  check('the scheduling call carried its own answer budget',
+    lastOptions.maxTokens === 4096, JSON.stringify(lastOptions));
+  check('…and its own thinking budget field, empty on this box',
+    'thinkingTokens' in lastOptions && lastOptions.thinkingTokens === null, JSON.stringify(lastOptions));
+
+  // Six filters used to read status IN ('ok','failed'). Each one would have
+  // dropped this row while it sat in the database looking fine.
+  const aj = require(path.join(ROOT, 'db/agent-jobs'));
+  const cutRunId = runs(cut).slice(-1)[0].id;
+  check('a partial run reaches the jobs panel feed',
+    aj.feed({ limit: 50 }).some(f => f.kind === 'scheduled' && f.id === cutRunId));
+  check('…and the announcement queue, so he is told what she can see',
+    aj.pendingAnnouncements({ limit: 50 }).some(a => a.id === cutRunId));
+  check('…and the unread badge counts it',
+    aj.counts().unseen > 0, JSON.stringify(aj.counts()));
+  check('…and runtimeState surfaces the reason, which names a budget she can change',
+    /answer budget/.test(scheduler.runtimeState(cut).lastError || ''),
+    scheduler.runtimeState(cut).lastError);
+  check('…and it counts toward timesRun', scheduler.runtimeState(cut).timesRun >= 1,
+    String(scheduler.runtimeState(cut).timesRun));
+  check('RESULT_STATUSES is the one list all of those read',
+    JSON.stringify(scheduler.RESULT_STATUSES) === JSON.stringify(['ok', 'partial', 'failed']),
+    JSON.stringify(scheduler.RESULT_STATUSES));
+
+  // And the streak really is cleared: a failure after a partial starts from 1.
+  mode = 'throw';
+  await scheduler.runNow(cut);
+  check('a failure after a partial starts the streak at 1, not 2',
+    job(cut).consecutive_failures === 1, String(job(cut).consecutive_failures));
+  mode = 'ok';
 
   const bar = '='.repeat(74);
   console.log(`\n${bar}`);

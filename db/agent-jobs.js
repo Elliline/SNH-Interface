@@ -68,6 +68,12 @@ function opsDir() { return path.join(memoryDir(), 'ops'); }
 /** Lazy requires — these modules load us back. */
 function factExtractor() { return require('./fact-extractor'); }
 function memoryManager() { return require('./memory-manager'); }
+/**
+ * The scheduler owns job_runs and therefore owns which of its statuses count as
+ * a result. Lazily required and read at call time rather than copied, because a
+ * copy is how `partial` came to be missing from six filters at once.
+ */
+function runResultStatuses() { return require('./scheduler').RESULT_STATUSES; }
 
 function opsLog(msg) {
   try { factExtractor().appendToOpsLog(msg, opsDir()); } catch { /* console is the floor */ }
@@ -847,12 +853,13 @@ function feed({ limit = 50 } = {}) {
     cancellable: j.status === 'queued'
   }));
 
+  const RS = runResultStatuses();
   const runs = db.prepare(`
     SELECT r.*, c.description AS job_description, c.schedule AS job_schedule
     FROM job_runs r LEFT JOIN cron_jobs c ON c.id = r.job_id
-    WHERE r.status IN ('ok','failed')
+    WHERE r.status IN (${RS.map(() => '?').join(',')})
     ORDER BY datetime(r.started_at) DESC LIMIT ?
-  `).all(lim).map(r => ({
+  `).all(...RS, lim).map(r => ({
     kind: 'scheduled',
     id: r.id,
     title: r.job_description || 'a scheduled job',
@@ -884,9 +891,10 @@ function counts() {
   const unseenJobs = db.prepare(
     `SELECT COUNT(*) n FROM agent_jobs WHERE seen_at IS NULL AND status IN (${TERMINAL.map(() => '?').join(',')})`
   ).get(...TERMINAL).n;
+  const RS3 = runResultStatuses();
   const unseenRuns = db.prepare(
-    "SELECT COUNT(*) n FROM job_runs WHERE seen_at IS NULL AND status IN ('ok','failed')"
-  ).get().n;
+    `SELECT COUNT(*) n FROM job_runs WHERE seen_at IS NULL AND status IN (${RS3.map(() => '?').join(',')})`
+  ).get(...RS3).n;
   const active = activeCount();
   return { unseen: unseenJobs + unseenRuns, active, total: unseenJobs + unseenRuns + active };
 }
@@ -919,13 +927,14 @@ function pendingAnnouncements({ limit = 3 } = {}) {
     finished_at: j.finished_at, text: j.result_text, error: j.error, duration_ms: j.duration_ms
   }));
 
+  const RS2 = runResultStatuses();
   const runs = db.prepare(`
     SELECT r.id, r.status, r.finished_at, r.output_text, r.error, r.duration_ms,
            c.description AS job_description
     FROM job_runs r LEFT JOIN cron_jobs c ON c.id = r.job_id
-    WHERE r.announced_at IS NULL AND r.status IN ('ok','failed')
+    WHERE r.announced_at IS NULL AND r.status IN (${RS2.map(() => '?').join(',')})
     ORDER BY datetime(r.finished_at) DESC LIMIT ?
-  `).all(lim).map(r => ({
+  `).all(...RS2, lim).map(r => ({
     kind: 'scheduled', id: r.id, title: r.job_description || 'a scheduled job', status: r.status,
     finished_at: r.finished_at, text: r.output_text, error: r.error, duration_ms: r.duration_ms
   }));

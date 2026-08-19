@@ -197,6 +197,20 @@ const DEFAULTS = {
   // back to backgroundThinkingTokens any more. Empty means nothing is sent, and
   // on a thinking model an unbounded think inside a bounded max_tokens is the
   // 2026-08-15 empty-reply failure. Set it.
+  // SCHEDULED RUNS HAD THE SAME DEFECT, one subsystem over (2026-08-19).
+  // scheduler.maxOutputTokens was 700 — a fifth of the agent job's already-too-
+  // small 2000 — and the thinking half came from backgroundThinkingTokens the
+  // same way. A cron run that hit the ceiling closed as `ok` on the same panel,
+  // because the scheduler had no `partial` status at all.
+  //
+  //   scheduledJobResponseTokens 4096 — HALF the agent job's, deliberately. A
+  //     scheduled run is a recurring digest, and it is a smaller job by
+  //     construction: 12 tool calls to a job's 40, 6 rounds to 16, 3 minutes of
+  //     wall clock to 15. 700 could not hold a real report; 4096 holds a long
+  //     one, and something that arrives every morning should stay readable.
+  //   scheduledJobThinkingTokens null — ships empty for the same reason as every
+  //     other field here. 8192 is the number to set on a reasoning box, half the
+  //     agent job's 16384, keeping the same ratio as the answer budgets.
   generation: {
     reasoningEffort: null,
     thinkingTokens: null,
@@ -205,7 +219,9 @@ const DEFAULTS = {
     extractionThinkingTokens: null,
     extractionTimeoutMs: null,
     agentJobThinkingTokens: null,
-    agentJobResponseTokens: 8192
+    agentJobResponseTokens: 8192,
+    scheduledJobThinkingTokens: null,
+    scheduledJobResponseTokens: 4096
   },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
@@ -286,10 +302,12 @@ const DEFAULTS = {
     // corpus sweep.
     maxToolCallsPerRun: 12,
     maxWallClockMsPerRun: 180000,
-    maxRoundsPerRun: 6,
-    // Output ceiling. A bell item is read in a panel, so a job that writes an
-    // essay is a job nobody reads.
-    maxOutputTokens: 700
+    maxRoundsPerRun: 6
+    // Output tokens MOVED OUT of this block on 2026-08-19 — see
+    // generation.scheduledJobResponseTokens, beside the chat, agent-job and
+    // background rows. Same reasoning as the agent path: the answer budget and
+    // the thinking budget have to be read against each other, and they cannot be
+    // when they live in different sections and only one of them is on a screen.
   },
   // The agent-job queue (2026-08-18) — the async handoff.
   //
