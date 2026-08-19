@@ -17,7 +17,13 @@ const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
 const { MemoryJobsTool } = require('./tools/jobs-inspect');
-const { getConfig, getSearchConfig } = require('../db/config');
+// Read config THROUGH THE MODULE OBJECT rather than destructuring at load time —
+// the rule db/agent-jobs.js and mcp/tools/web-search.js already follow. Two
+// reasons, both live: the config seen here is always the one the process holds
+// right now, and a test can substitute one without writing to the live
+// data/config.json, which is deliberately NOT redirected by SNH_DATA_DIR.
+function getConfig() { return require('../db/config').getConfig(); }
+function getSearchConfig() { return require('../db/config').getSearchConfig(); }
 
 /**
  * Tools a BACKGROUND step may be handed.
@@ -64,6 +70,160 @@ const BACKGROUND_TOOLS = [
  */
 const BACKGROUND_WRITE_TOOLS = ['memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'];
 
+/**
+ * THE CATALOGUE — every tool this system has, what gates it, and what its
+ * settings are. One table, two readers: MCPClient.loadConfig() registers from it,
+ * and describeCatalogue() renders the Tools tab from it.
+ *
+ * Adding a tool means adding a row here, which is not extra work — it is how a
+ * tool gets registered at all. The point is that there is nowhere else to also
+ * remember: the settings page has no list of its own, so it cannot fall behind
+ * the way it did (three of fourteen tools shown, 2026-08-18).
+ *
+ * Per row:
+ *   id/title    the function name, and a human name for the page
+ *   Tool        the class. Constructed to read its name, description and tier —
+ *               the page shows the model's own description, not a second copy.
+ *   card        which section of the page it belongs to
+ *   gate        ({cfg, registered}) => boolean. THE registration decision.
+ *   gateWhy     the sentence shown when the gate is closed. Never "disabled" on
+ *               its own — why it is off is the useful half.
+ *   toggle      the config path the page's switch writes, or null when the row
+ *               has no switch of its own (see toggleNote).
+ *   fields      other settings, as dotted config paths the existing declarative
+ *               binding already knows how to fold into a partial.
+ */
+const TOOL_CATALOGUE = [
+  {
+    id: 'web_search',
+    title: 'Web search',
+    Tool: WebSearchTool,
+    card: 'search',
+    // Composite by nature: the tool exists when ANY provider can actually be
+    // called, so its switch is the per-provider switches below rather than one of
+    // its own. Turning both providers off is how you turn search off.
+    gate: () => getSearchConfig().any,
+    gateWhy: () => {
+      const chain = getSearchConfig();
+      return chain.providers.length
+        ? `no search provider is available (${chain.providers.map(p => `${p.name}: ${p.why}`).join('; ')})`
+        : 'no search providers are configured';
+    },
+    toggle: null,
+    toggleNote: 'Switched on by its providers — turn the providers below on or off.',
+    note: ({ cfg }) => {
+      const chain = getSearchConfig();
+      return `providers in order: ${chain.providers.map(p => p.available ? p.name : `${p.name} (unavailable: ${p.why})`).join(' → ') || 'none'}`;
+    }
+  },
+  {
+    id: 'web_fetch',
+    title: 'Read a web page',
+    Tool: WebFetchTool,
+    card: 'search',
+    // Rides on SEARCH specifically, not on "any tool at all": fetching a page is
+    // only useful when a search produced the URL, and action tools registering
+    // must not drag it along.
+    gate: ({ registered }) => registered.has('web_search'),
+    gateWhy: () => 'web search is off, and a page fetch is only useful for a URL a search produced',
+    toggle: null,
+    toggleNote: 'Comes with web search.'
+  },
+  {
+    id: 'create_cron_job',
+    title: 'Propose a scheduled job',
+    Tool: CreateCronJobTool,
+    card: 'cron',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.cron) || {}).enabled !== false,
+    gateWhy: () => 'turned off here',
+    toggle: 'tools.cron.enabled',
+    fields: [
+      { path: 'tools.cron.maxProposalsPerHour', label: 'Proposals per hour', type: 'number', min: 1, max: 50,
+        hint: 'Proposals in any trailing hour, approved or not. Past this the tool refuses and says so.' },
+      { path: 'tools.cron.maxKidCreatedJobs', label: 'Live jobs he may have created', type: 'number', min: 1, max: 100,
+        hint: 'Hard ceiling on jobs of his own that exist at once.' }
+    ]
+  },
+  {
+    id: 'start_background_job',
+    title: 'Hand work to a background agent',
+    Tool: StartBackgroundJobTool,
+    card: 'jobs',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.agentJobs) || {}).enabled !== false,
+    gateWhy: () => 'turned off here',
+    toggle: 'tools.agentJobs.enabled',
+    fields: [
+      { path: 'tools.agentJobs.dispatchBuildRequests', label: 'Dispatch "build me a thing" asks', type: 'toggle',
+        hint: 'Tier 2 of the handoff triggers. Naming an agent yourself always dispatches, whatever this says.' },
+      { path: 'agentJobs.maxStartsPerHour', label: 'Jobs he may start per hour', type: 'number', min: 1, max: 60 },
+      { path: 'agentJobs.maxConcurrent', label: 'Jobs running at once', type: 'number', min: 1, max: 8 },
+      { path: 'agentJobs.maxToolCallsPerJob', label: 'Tool calls per job', type: 'number', min: 1, max: 200,
+        hint: 'Billed units: an error or an empty search costs a quarter of one.' },
+      { path: 'agentJobs.maxRoundsPerJob', label: 'Tool rounds per job', type: 'number', min: 1, max: 40,
+        hint: 'One round is one model turn, which may make several calls.' }
+    ]
+  },
+  {
+    id: 'write_memory',
+    title: 'Write something to memory',
+    Tool: WriteMemoryTool,
+    card: 'memoryWrite',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.memoryWrite) || {}).enabled !== false,
+    gateWhy: () => 'turned off here',
+    toggle: 'tools.memoryWrite.enabled',
+    writes: true,
+    fields: [
+      { path: 'tools.memoryWrite.maxWritesPerHour', label: 'Writes per hour', type: 'number', min: 1, max: 200 }
+    ]
+  },
+
+  // The read set. One config flag, one rate cap, one backing module — registered
+  // together on purpose, because a half-registered set would only ever be a bug.
+  // Each still gets its own row on the page (they are separate tools to him), and
+  // each row says plainly that the switch is shared.
+  ...[
+    ['memory_search', 'Search his own memory', MemorySearchTool],
+    ['memory_list', 'List facts and clusters', MemoryListTool],
+    ['memory_count', 'Count what matches', MemoryCountTool],
+    ['memory_get', 'Open one fact in full', MemoryGetTool],
+    ['memory_corrections', 'Read the corrections ledger', MemoryCorrectionsTool],
+    ['memory_jobs', 'Look at his scheduled jobs', MemoryJobsTool]
+  ].map(([id, title, Tool]) => ({
+    id,
+    title,
+    Tool,
+    card: 'memoryInspect',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.memoryInspect) || {}).enabled !== false,
+    gateWhy: () => 'the memory-reading set is turned off here',
+    toggle: 'tools.memoryInspect.enabled',
+    toggleNote: 'These six share one switch and one rate cap — turning one off turns off the set.',
+    fields: id === 'memory_search'
+      ? [{ path: 'tools.memoryInspect.maxCallsPerHour', label: 'Lookups per hour (shared by all six)', type: 'number', min: 1, max: 500 }]
+      : []
+  })),
+
+  // The corrector's three write actions. Registered UNCONDITIONALLY and marked
+  // backgroundOnly, so they are structurally absent from every chat turn: a tool
+  // that exists but is unreachable is easier to reason about than one that
+  // vanishes from the registry and takes the manifest's drift-check with it.
+  // Their real switch is corrector.enabled, which decides whether the step that
+  // declares them ever runs — so that is what the page offers.
+  ...[
+    ['memory_merge_facts', 'Fold two duplicate facts together', MergeFactsTool],
+    ['memory_expire_fact', 'Move a passing event out of memory', ExpireFactTool],
+    ['memory_supersede_fact', 'Retire a fact a newer one replaces', SupersedeFactTool]
+  ].map(([id, title, Tool]) => ({
+    id,
+    title,
+    Tool,
+    card: 'correctorWrites',
+    gate: () => true,
+    toggle: 'corrector.enabled',
+    toggleNote: 'Always registered, and never offered in a conversation. This switch is the corrector itself — off means nothing ever calls these.',
+    writes: true
+  }))
+];
+
 let sharedInstance = null;
 
 class MCPClient {
@@ -72,108 +232,88 @@ class MCPClient {
   }
 
   /**
-   * Register the enabled tools. Every tool's on/off state and endpoint comes from
-   * db/config.js — the SINGLE source of truth.
+   * Register the enabled tools, FROM THE CATALOGUE.
    *
-   * There used to be a second one. mcp/tools.json carried its own `enabled` flag
-   * that decided REGISTRATION, while config.tools.searxng.enabled decided ROUTING
-   * (server.js) and whether the capability manifest claimed web search. Two
-   * independent flags for one capability meant they could disagree, and in the
-   * disagreeing direction the tool registered, appeared in the model's tool list,
-   * and was then never routed to — available-looking and inert. tools.json also
-   * carried a duplicate `endpoint`, already dead because the search tool resolves
-   * its own providers from config on every call. The file is gone; one flag per
-   * capability, in config, which is the pattern create_cron_job already used.
+   * Every tool's on/off state and endpoint comes from db/config.js — the SINGLE
+   * source of truth. There used to be a second one: mcp/tools.json carried its own
+   * `enabled` flag that decided REGISTRATION while config decided ROUTING, and in
+   * the disagreeing direction the tool registered, appeared in the model's tool
+   * list, and was never routed to — available-looking and inert. One flag per
+   * capability, in config.
+   *
+   * THIS USED TO BE A HAND-WRITTEN IF-CHAIN, and that is how the Tools tab came to
+   * show three of fourteen tools (2026-08-18). The chain knew which config key
+   * gated which tool; the settings page had that knowledge copied into it by hand,
+   * so every tool shipped after the page was written was invisible in the UI. Two
+   * copies of one fact, and only one of them maintained.
+   *
+   * So the gates are DATA now — TOOL_CATALOGUE — and both readers derive from it:
+   * this method registers what its gates admit, and describeCatalogue() renders the
+   * settings page from the same rows. A tool added tomorrow appears in the UI
+   * because it had to be added here to exist at all.
    */
   loadConfig() {
     this.tools.clear();
+    const cfg = getConfig();
+    const registered = new Set();
 
-    // web_search — registered when ANY provider can actually be called, and the
-    // chain behind it is resolved per call (mcp/tools/web-search.js). Note what
-    // "available" means: not just an `enabled` flag, but the prerequisite too —
-    // Exa with no EXA_API_KEY in the environment is not available, and on a box
-    // with SearXNG off as well there is no search tool at all, which is the same
-    // honest absence this has always had.
-    const search = getSearchConfig();
-    if (search.any) {
-      const tool = new WebSearchTool();
-      this.tools.set(tool.name, tool);
-      const shape = search.providers
-        .map(p => p.available ? p.name : `${p.name} (unavailable: ${p.why})`)
-        .join(' → ');
-      console.log(`MCP: Registered tool "${tool.name}" -> providers in order: ${shape}`);
-    } else {
-      const why = search.providers.map(p => `${p.name}: ${p.why}`).join('; ') || 'no providers configured';
-      console.log(`MCP: Skipping "web_search" — no provider is available (${why})`);
-    }
-
-    // web_fetch rides along with SEARCH tools specifically — fetching a page is
-    // only useful when there is a search that produced the URL. Note this checks
-    // for a search tool rather than "any tool at all": action tools register
-    // below and must not drag web_fetch on with them.
-    if (this.tools.has('web_search') && !this.tools.has('web_fetch')) {
-      const webFetch = new WebFetchTool();
-      this.tools.set(webFetch.name, webFetch);
-      console.log('MCP: Registered built-in tool "web_fetch"');
-    }
-
-    // Action tools register independently of the search stack. create_cron_job
-    // is gated only on its own config flag — it must be available when SearXNG
-    // is off, which is the default.
-    const cronCfg = (getConfig().tools && getConfig().tools.cron) || {};
-    if (cronCfg.enabled !== false) {
-      const cronTool = new CreateCronJobTool();
-      this.tools.set(cronTool.name, cronTool);
-      console.log(`MCP: Registered action tool "${cronTool.name}" (tier=${cronTool.tier}, propose-only)`);
-    }
-
-    // start_background_job — the async handoff. Registered on its own flag beside
-    // create_cron_job, for the same reason: it is an action tool and must be
-    // available when the search stack is off. NOT backgroundOnly and NOT in
-    // BACKGROUND_TOOLS — this one runs the other way round, chat-only, so a
-    // background job cannot start a background job.
-    const agentJobsCfg = (getConfig().tools && getConfig().tools.agentJobs) || {};
-    if (agentJobsCfg.enabled !== false) {
-      const jobTool = new StartBackgroundJobTool();
-      this.tools.set(jobTool.name, jobTool);
-      console.log(`MCP: Registered action tool "${jobTool.name}" (tier=${jobTool.tier}, starts work and returns immediately)`);
-    }
-
-    const memWriteCfg = (getConfig().tools && getConfig().tools.memoryWrite) || {};
-    if (memWriteCfg.enabled !== false) {
-      const writeTool = new WriteMemoryTool();
-      this.tools.set(writeTool.name, writeTool);
-      console.log(`MCP: Registered action tool "${writeTool.name}" (tier=${writeTool.tier}, direct-execute)`);
-    }
-
-    // Read tools. Registered as a set — they share one config flag, one rate cap
-    // and one backing module, so a half-registered set would only ever be a bug.
-    const memInspectCfg = (getConfig().tools && getConfig().tools.memoryInspect) || {};
-    if (memInspectCfg.enabled !== false) {
-      // memory_jobs rides with them: same tier, same rate cap, same "reads the
-      // record, changes nothing" contract. It reads a different table, which is
-      // why it has its own backing module, but it is the same capability from
-      // his side — looking at what is already written down.
-      for (const Tool of [MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool, MemoryJobsTool]) {
-        const t = new Tool();
-        this.tools.set(t.name, t);
+    for (const entry of TOOL_CATALOGUE) {
+      const admitted = entry.gate({ cfg, registered });
+      if (!admitted) {
+        console.log(`MCP: Skipping "${entry.id}" — ${entry.gateWhy ? entry.gateWhy({ cfg, registered }) : 'its gate is closed'}`);
+        continue;
       }
-      console.log('MCP: Registered read tools [memory_search, memory_list, memory_count, memory_get, memory_corrections, memory_jobs] (tier=read, no writes)');
+      const tool = new entry.Tool();
+      this.tools.set(tool.name, tool);
+      registered.add(tool.name);
+      console.log(`MCP: Registered "${tool.name}"${entry.note ? ` — ${entry.note({ cfg })}` : ''}`);
     }
-
-    // Corrector write actions. Registered unconditionally so the corrector can
-    // always reach them, and marked backgroundOnly so they never appear in a
-    // chat turn's tool schema. Their gate is corrector.enabled, checked by the
-    // heartbeat step that declares them — not by registration, because a tool
-    // that exists but is unreachable is easier to reason about than one that
-    // vanishes from the registry and takes the manifest's drift-check with it.
-    for (const Tool of [MergeFactsTool, ExpireFactTool, SupersedeFactTool]) {
-      const t = new Tool();
-      this.tools.set(t.name, t);
-    }
-    console.log('MCP: Registered corrector write actions [memory_merge_facts, memory_expire_fact, memory_supersede_fact] (background only, never offered in chat)');
 
     console.log(`MCP: ${this.tools.size} tool(s) ready: [${this.getToolNames().join(', ')}]`);
+  }
+
+  /**
+   * THE SETTINGS PAGE'S DATA, derived from the same catalogue registration uses.
+   *
+   * Includes tools that are currently switched OFF, which is the whole point: a
+   * page that listed only what is registered would lose the row for anything you
+   * turned off, leaving no way to turn it back on. Each row says whether it is
+   * registered right now and, when it is not, why.
+   *
+   * Instantiating a tool to read its name and description is safe — every
+   * constructor here is pure — and it means the page shows the SAME description
+   * the model is given, rather than a second one written for humans that can drift.
+   */
+  describeCatalogue() {
+    const cfg = getConfig();
+    const registered = new Set();
+    // Replay the gates in order so `registered` is what it would be after a real
+    // load — web_fetch's gate reads it.
+    const rows = [];
+    for (const entry of TOOL_CATALOGUE) {
+      const admitted = !!entry.gate({ cfg, registered });
+      if (admitted) registered.add(entry.id);
+      const tool = new entry.Tool();
+      const tier = typeof tool.getTierMetadata === 'function' ? tool.getTierMetadata() : null;
+      rows.push({
+        id: entry.id,
+        title: entry.title,
+        card: entry.card,
+        description: tool.description || '',
+        registered: admitted,
+        why: admitted ? null : (entry.gateWhy ? entry.gateWhy({ cfg, registered }) : 'its gate is closed'),
+        toggle: entry.toggle || null,
+        toggleNote: entry.toggleNote || null,
+        fields: entry.fields || [],
+        backgroundOnly: !!tool.backgroundOnly,
+        availableInChat: !tool.backgroundOnly,
+        availableToBackground: BACKGROUND_TOOLS.includes(entry.id),
+        writes: BACKGROUND_WRITE_TOOLS.includes(entry.id) || !!entry.writes,
+        tier: tier ? tier.tier : (tool.backgroundOnly ? 'background' : 'read'),
+        rateCaps: tier && tier.rateCaps ? tier.rateCaps : null
+      });
+    }
+    return rows;
   }
 
   /**
@@ -310,6 +450,7 @@ MCPClient.shared = function shared() {
   return sharedInstance;
 };
 
+MCPClient.TOOL_CATALOGUE = TOOL_CATALOGUE;
 MCPClient.BACKGROUND_TOOLS = BACKGROUND_TOOLS;
 MCPClient.BACKGROUND_WRITE_TOOLS = BACKGROUND_WRITE_TOOLS;
 

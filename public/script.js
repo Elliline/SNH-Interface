@@ -2350,45 +2350,285 @@ async function loadSettingsToolsTab() {
   if (!container) return;
 
   const generation = ++toolsTabLoadGeneration;
+  container.innerHTML = '<div class="memory-loading">Loading tools…</div>';
 
-  // Read BOTH the on/off toggle and the URL from server config — the single source
-  // of truth (item 3). The host used to live in localStorage, so the settings UI
-  // and the actual search path disagreed; now the field saves to config.
-  let searxngEnabled = false;
-  let searxngUrl = '';
+  // EVERYTHING ON THIS PAGE COMES FROM /api/tools, which derives it from the tool
+  // catalogue registration uses. There is no list of tools in this file, and there
+  // must never be one again: the previous version of this tab had its own
+  // hand-written list, so of fourteen registered tools it showed three, and every
+  // tool shipped after the page was written was invisible here.
+  let data;
   try {
-    const resp = await fetch('/api/config');
+    const resp = await fetch('/api/tools');
     if (generation !== toolsTabLoadGeneration) return;
-    if (resp.ok) {
-      const config = await resp.json();
-      const sx = (config.tools && config.tools.searxng) || {};
-      searxngEnabled = !!sx.enabled;
-      searxngUrl = sx.url || sx.endpoint || '';
-    }
-  } catch (e) { /* use default */ }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    data = await resp.json();
+  } catch (e) {
+    container.innerHTML = `<div class="settings-section"><p class="settings-hint">Could not load the tool list: ${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
   if (generation !== toolsTabLoadGeneration) return;
 
-  container.innerHTML = `
-    <div class="settings-section">
-      <h3>Web Search</h3>
-      <p class="settings-hint">SearXNG is used for AI-powered web search</p>
-      <div class="setting-item toggle-row">
-        <label for="settings-searxngEnabled">Enabled</label>
-        <label class="toggle-switch">
-          <input type="checkbox" id="settings-searxngEnabled" data-config-key="tools.searxng.enabled" ${searxngEnabled ? 'checked' : ''}>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-      <div class="setting-item">
-        <label for="settings-searxngHost">SearXNG URL</label>
-        <input type="text" id="settings-searxngHost" class="api-key-input" data-config-key="tools.searxng.url" placeholder="http://localhost:8888" value="${escapeHtml(searxngUrl)}">
-      </div>
+  const html = [];
+
+  html.push(`
+    <div class="settings-section tools-summary">
+      <h3>Tools</h3>
+      <p class="settings-hint">
+        ${data.registeredCount} of ${data.catalogueCount} tools are switched on right now. This list is generated
+        from the registry, so anything added to SNH appears here on its own.
+        Secrets are stored encrypted (${escapeHtml(data.secretStore.algorithm)}, key
+        ${data.secretStore.keySource === 'env' ? 'supplied by the environment' : 'held on this machine'}) and are never
+        sent back to this page after saving.
+      </p>
     </div>
-    <div class="settings-section">
-      <h3>MCP Connections</h3>
-      <p class="settings-hint">Model Context Protocol tool connections — coming soon</p>
+  `);
+
+  for (const card of data.cards) {
+    const rows = data.tools.filter(t => t.card === card.id);
+    if (!rows.length) continue;
+
+    html.push(`<div class="settings-section"><h3>${escapeHtml(card.title)}</h3>`);
+    html.push(`<p class="settings-hint">${escapeHtml(card.blurb)}</p>`);
+
+    // The search card carries the provider chain: each provider's own switch AND
+    // its place in the order, because "off" and "second" are different states.
+    if (card.id === 'search') html.push(renderSearchProviders(data.search));
+
+    for (const t of rows) html.push(renderToolRow(t));
+    html.push('</div>');
+  }
+
+  container.innerHTML = html.join('');
+  wireToolsTab();
+}
+
+/** One tool: what it is, whether it is on, its switch, and its own settings. */
+function renderToolRow(t) {
+  const tags = [];
+  if (t.writes) tags.push('<span class="tool-tag tool-tag-writes">writes</span>');
+  else tags.push('<span class="tool-tag">read-only</span>');
+  if (t.backgroundOnly) tags.push('<span class="tool-tag">background only</span>');
+  else if (t.availableToBackground) tags.push('<span class="tool-tag">chat + background</span>');
+  else tags.push('<span class="tool-tag">chat only</span>');
+
+  // The switch, when the row has one of its own. A row without one says what
+  // decides it instead — an unexplained missing control reads as a broken page.
+  const toggle = t.toggle
+    ? `<label class="toggle-switch">
+         <input type="checkbox" data-config-key="${escapeHtml(t.toggle)}" ${t.toggleValue ? 'checked' : ''}>
+         <span class="toggle-slider"></span>
+       </label>`
+    : '<span class="tool-derived">—</span>';
+
+  const fields = (t.fields || []).map(f => renderToolField(f)).join('');
+
+  return `
+    <div class="tool-row ${t.registered ? '' : 'tool-row-off'}">
+      <div class="tool-row-head">
+        <div class="tool-row-id">
+          <code>${escapeHtml(t.id)}</code>
+          <span class="tool-row-title">${escapeHtml(t.title)}</span>
+        </div>
+        <div class="tool-row-state">
+          <span class="tool-state ${t.registered ? 'tool-state-on' : 'tool-state-off'}">${t.registered ? 'on' : 'off'}</span>
+          ${toggle}
+        </div>
+      </div>
+      <div class="tool-row-tags">${tags.join('')}</div>
+      <p class="tool-row-desc">${escapeHtml(t.description)}</p>
+      ${!t.registered && t.why ? `<p class="tool-row-why">Off because: ${escapeHtml(t.why)}</p>` : ''}
+      ${t.toggleNote ? `<p class="tool-row-note">${escapeHtml(t.toggleNote)}</p>` : ''}
+      ${fields ? `<div class="tool-row-fields">${fields}</div>` : ''}
     </div>
   `;
+}
+
+/**
+ * A bound field. Nothing here knows what the setting MEANS: it renders whatever
+ * the registry declared and binds it by dotted path, which is the same mechanism
+ * the Brain and Chat tabs already save through.
+ */
+function renderToolField(f) {
+  const id = `tool-field-${f.path.replace(/[^\w]/g, '-')}`;
+  if (f.type === 'toggle') {
+    return `
+      <div class="setting-item toggle-row tool-field">
+        <label for="${id}">${escapeHtml(f.label)}${f.hint ? `<span class="setting-hint-inline">${escapeHtml(f.hint)}</span>` : ''}</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="${id}" data-config-key="${escapeHtml(f.path)}" ${f.value ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>`;
+  }
+  const attrs = [
+    f.type === 'number' ? 'type="number"' : 'type="text"',
+    f.min != null ? `min="${f.min}"` : '',
+    f.max != null ? `max="${f.max}"` : '',
+    f.placeholder ? `placeholder="${escapeHtml(f.placeholder)}"` : ''
+  ].filter(Boolean).join(' ');
+  return `
+    <div class="setting-item tool-field">
+      <label for="${id}">${escapeHtml(f.label)}${f.hint ? `<span class="setting-hint-inline">${escapeHtml(f.hint)}</span>` : ''}</label>
+      <input ${attrs} id="${id}" data-config-key="${escapeHtml(f.path)}" value="${f.value == null ? '' : escapeHtml(String(f.value))}">
+    </div>`;
+}
+
+/**
+ * The provider chain: a switch and a position per provider, plus a key field for
+ * any provider that declared a secret.
+ *
+ * Position is a select rather than drag-and-drop on purpose — with two providers
+ * "which is tried first" is a two-way choice, and a select says so plainly. It is
+ * collected separately from the dotted-path binding because an ORDER is an array,
+ * which a dotted path cannot express; the voice tab's active-provider selects
+ * already work this way.
+ */
+function renderSearchProviders(search) {
+  const n = search.providers.length;
+  const rows = search.providers.map(p => {
+    const posOptions = Array.from({ length: n }, (_, i) => i + 1)
+      .map(i => `<option value="${i}" ${p.position === i ? 'selected' : ''}>${i}</option>`).join('');
+
+    const secret = p.secret ? renderSecretField(p.secret) : '';
+    const fields = (p.fields || []).map(f => renderToolField(f)).join('');
+
+    return `
+      <div class="provider-row ${p.enabled ? '' : 'provider-row-off'}">
+        <div class="tool-row-head">
+          <div class="tool-row-id">
+            <span class="provider-label">${escapeHtml(p.label)}</span>
+            <span class="tool-state ${p.available ? 'tool-state-on' : 'tool-state-off'}">${p.available ? 'available' : (p.enabled ? 'not usable yet' : 'off')}</span>
+          </div>
+          <div class="tool-row-state">
+            <label class="provider-pos">tried
+              <select data-search-order="${escapeHtml(p.id)}" ${p.enabled ? '' : 'disabled'}>${posOptions}</select>
+            </label>
+            <label class="toggle-switch">
+              <input type="checkbox" data-config-key="${escapeHtml(p.toggle)}" data-provider-toggle="${escapeHtml(p.id)}" ${p.enabled ? 'checked' : ''}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <p class="tool-row-desc">${escapeHtml(p.blurb)}</p>
+        ${p.enabled && !p.available && p.why ? `<p class="tool-row-why">Not usable yet: ${escapeHtml(p.why)}</p>` : ''}
+        ${!p.enabled ? '<p class="tool-row-note">Switched off — it is not in the chain at all, and nothing is tried against it.</p>' : ''}
+        ${secret}
+        ${fields ? `<div class="tool-row-fields">${fields}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  const orderLine = search.order.length
+    ? `Tried in this order: ${search.order.join(' → ')}.`
+    : 'No provider is switched on, so web search is off. He will say he cannot search rather than answering as though he had.';
+
+  return `<div class="provider-chain">
+    <p class="settings-hint provider-order-line">${escapeHtml(orderLine)}</p>
+    ${rows}
+  </div>`;
+}
+
+/**
+ * A WRITE-ONLY key field.
+ *
+ * It never carries a value: the server does not send one, and this input is
+ * rendered empty every time, including immediately after a successful save. What
+ * it shows instead is STATUS — set or not, where from, when. Typing into it and
+ * saving replaces the stored key; clearing it and pressing Clear removes it.
+ *
+ * The env-override line matters more than it looks: a key typed here while the
+ * same name sits in .env is stored and then ignored, and someone would otherwise
+ * spend an afternoon on that.
+ */
+function renderSecretField(secret) {
+  const st = secret.status || {};
+  const id = `secret-${secret.env}`;
+  let state;
+  if (st.envOverrides) {
+    state = `<span class="secret-state secret-state-warn">set in .env — that wins over anything saved here</span>`;
+  } else if (st.source === 'env') {
+    state = `<span class="secret-state secret-state-on">set in .env</span>`;
+  } else if (st.set) {
+    state = `<span class="secret-state secret-state-on">saved${st.updatedAt ? ` ${escapeHtml(new Date(st.updatedAt).toLocaleString())}` : ''}</span>`;
+  } else {
+    state = '<span class="secret-state secret-state-off">not set</span>';
+  }
+
+  return `
+    <div class="setting-item secret-field">
+      <label for="${id}">${escapeHtml(secret.label)} ${state}</label>
+      <div class="secret-input-row">
+        <input type="password" id="${id}" class="api-key-input" data-secret="${escapeHtml(secret.env)}"
+               autocomplete="new-password" placeholder="${st.set ? 'Saved — type a new key to replace it' : 'Paste the key here'}" value="">
+        <button type="button" class="secret-clear" data-secret-clear="${escapeHtml(secret.env)}" ${st.storedToo ? '' : 'disabled'}>Clear</button>
+      </div>
+      ${secret.hint ? `<p class="tool-row-note">${escapeHtml(secret.hint)}</p>` : ''}
+      ${st.error ? `<p class="tool-row-why">${escapeHtml(st.error)}</p>` : ''}
+    </div>`;
+}
+
+/** Live wiring: a provider switch takes it out of the order without a save first. */
+function wireToolsTab() {
+  document.querySelectorAll('#settingsTabTools [data-provider-toggle]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const id = cb.dataset.providerToggle;
+      const sel = document.querySelector(`#settingsTabTools [data-search-order="${id}"]`);
+      if (sel) sel.disabled = !cb.checked;
+      cb.closest('.provider-row')?.classList.toggle('provider-row-off', !cb.checked);
+    });
+  });
+
+  // Clearing a key is its own action rather than a save-time side effect: an empty
+  // password field is the normal state of this input, so treating empty as "delete"
+  // on save would wipe the key every time anything else on the page was saved.
+  document.querySelectorAll('#settingsTabTools [data-secret-clear]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.secretClear;
+      if (!confirm(`Remove the stored ${name}? Anything using it stops working until a new one is saved.`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/tools/secrets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secrets: { [name]: null } })
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+        await loadSettingsToolsTab();
+      } catch (e) {
+        alert(`Could not clear ${name}: ${e.message}`);
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+/**
+ * Collect and save the secret fields. Separate from the config save because it is
+ * a separate contract: values go one way, and only a NON-EMPTY field is a change.
+ * @returns {Promise<string[]>} the names actually saved
+ */
+async function saveToolSecrets() {
+  const payload = {};
+  document.querySelectorAll('#settingsTabTools [data-secret]').forEach(input => {
+    const v = input.value;                     // not trimmed to death: keys can be odd
+    if (v && v.trim()) payload[input.dataset.secret] = v.trim();
+  });
+  if (!Object.keys(payload).length) return [];
+
+  const res = await fetch('/api/tools/secrets', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secrets: payload })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+  // Wipe the inputs the moment they are saved, so the value is not sitting in the
+  // DOM for the rest of the session. The re-render below leaves them empty anyway;
+  // this covers the seconds in between.
+  document.querySelectorAll('#settingsTabTools [data-secret]').forEach(i => { i.value = ''; });
+  return Object.keys(payload);
 }
 
 function loadSettingsAboutTab() {
@@ -2487,6 +2727,32 @@ async function saveSettingsHandler() {
     partial.models[role].model = input.value;
   });
 
+  // SEARCH PROVIDER ORDER — an array, which a dotted path cannot express, so it
+  // gets its own collector exactly as the voice tab's active-provider selects do.
+  //
+  // A provider whose switch is OFF is left out of the order entirely. That is the
+  // difference the UI has to be able to say: "SearXNG off" and "SearXNG second"
+  // are different states, and an order that still listed a disabled provider
+  // would put it back in the chain to be skipped on every search.
+  const orderSelects = Array.from(document.querySelectorAll('#settingsTabTools [data-search-order]'));
+  if (orderSelects.length) {
+    const picked = orderSelects
+      .map(sel => {
+        const id = sel.dataset.searchOrder;
+        const toggle = document.querySelector(`#settingsTabTools [data-provider-toggle="${id}"]`);
+        return { id, pos: parseInt(sel.value, 10) || 99, on: !toggle || toggle.checked };
+      })
+      .filter(p => p.on)
+      // Ties are possible — two selects can both read "1" until one is changed —
+      // and a stable sort keeps the displayed order, which is the least surprising
+      // reading of an ambiguous form.
+      .sort((a, b) => a.pos - b.pos)
+      .map(p => p.id);
+    if (!partial.tools) partial.tools = {};
+    if (!partial.tools.search) partial.tools.search = {};
+    partial.tools.search.order = picked;
+  }
+
   // Voice active selections
   document.querySelectorAll('#settingsTabVoice [data-voice-category][data-voice-field="active"]').forEach(select => {
     const category = select.dataset.voiceCategory;
@@ -2519,11 +2785,35 @@ async function saveSettingsHandler() {
     }
   }
 
+  // SECRETS SAVE SEPARATELY, and their failure is reported separately: a key that
+  // did not store while everything else did is exactly the case where one cheerful
+  // "Settings saved." would be a lie.
+  let savedSecrets = [];
+  try {
+    savedSecrets = await saveToolSecrets();
+  } catch (error) {
+    console.error('[Settings] Error saving secrets:', error);
+    if (statusEl) {
+      statusEl.className = 'config-status error';
+      statusEl.textContent = 'Settings saved, but the key did not: ' + error.message;
+      setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 6000);
+    }
+    return;
+  }
+
   if (statusEl) {
     statusEl.className = 'config-status success';
-    statusEl.textContent = 'Settings saved.';
-    setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 3000);
+    statusEl.textContent = savedSecrets.length
+      ? `Settings saved. ${savedSecrets.join(', ')} stored, encrypted.`
+      : 'Settings saved.';
+    setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 4000);
   }
+
+  // Re-render the tab from the server so every state line — what is on, what is in
+  // the order, whether a key is set — is the server's answer rather than the form's
+  // idea of it.
+  const toolsTab = document.getElementById('settingsTabTools');
+  if (toolsTab && toolsTab.innerHTML.trim()) await loadSettingsToolsTab();
 
   await loadProviders();
 }

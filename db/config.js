@@ -984,8 +984,8 @@ function getVoiceProvider(category) {
  * built-in default. `enabled` gates whether the search path runs at all.
  * @returns {{ enabled: boolean, url: string }}
  */
-function getSearxngConfig() {
-  const cfg = getConfig();
+function getSearxngConfig(configOverride = null) {
+  const cfg = configOverride || getConfig();
   const sx = (cfg.tools && cfg.tools.searxng) || {};
   return {
     enabled: !!sx.enabled,
@@ -1000,14 +1000,34 @@ function getSearxngConfig() {
  * @returns {{ enabled: boolean, available: boolean, url: string, apiKey: string|null,
  *            type: string, numResults: number, timeoutMs: number, textChars: number }}
  */
-function getExaConfig() {
-  const cfg = getConfig();
+function getExaConfig(configOverride = null) {
+  // The optional argument is a TEST SEAM, and the same one selfFactSupersessionBar
+  // uses: the logic is what is worth testing, and it cannot be tested by writing
+  // to data/config.json — that file is the live one and is deliberately not
+  // redirected by SNH_DATA_DIR. Callers in the system pass nothing.
+  const cfg = configOverride || getConfig();
   const ex = (cfg.tools && cfg.tools.exa) || {};
-  const apiKey = (process.env.EXA_API_KEY || '').trim() || null;
+  // THE KEY COMES FROM THE SECRET STORE, environment first (db/secrets.js).
+  // Required lazily and defensively: config is loaded by every entry point,
+  // including ones that run before data/ exists, and a settings page that cannot
+  // render because a secrets file is missing would be worse than one that shows
+  // the key as unset.
+  let apiKey = null, keySource = null;
+  try {
+    const got = require('./secrets').get('EXA_API_KEY');
+    apiKey = got.value;
+    keySource = got.source;
+  } catch (err) {
+    console.error('[Config] could not read EXA_API_KEY:', err.message);
+  }
   const enabled = ex.enabled !== false;
   return {
     enabled,
     available: enabled && !!apiKey,
+    // Which of .env and the settings page answered. Reported so the UI can say
+    // that a stored key is being overridden rather than leaving someone to wonder
+    // why the one they just typed made no difference.
+    keySource,
     url: ex.url || 'https://api.exa.ai/search',
     apiKey,
     type: ex.type || 'auto',
@@ -1029,38 +1049,56 @@ function getExaConfig() {
  *
  * @returns {{ any: boolean, order: string[], providers: Array<{name, available, config, why: string|null}> }}
  */
-function getSearchConfig() {
-  const cfg = getConfig();
+function getSearchConfig(configOverride = null) {
+  const cfg = configOverride || getConfig();
   const configured = (cfg.tools && cfg.tools.search && Array.isArray(cfg.tools.search.order))
     ? cfg.tools.search.order
     : ['exa', 'searxng'];
 
-  const exa = getExaConfig();
-  const searxng = getSearxngConfig();
+  // Threaded through, so an injected config governs the whole chain rather than
+  // half of it — a seam that only reached the top level would compute a provider
+  // list from the test's config and its availability from the live one.
+  const exa = getExaConfig(cfg);
+  const searxng = getSearxngConfig(cfg);
 
   const describe = {
     exa: () => ({
       name: 'exa',
+      enabledInConfig: exa.enabled,
       available: exa.available,
       config: exa,
       why: exa.available ? null
-        : (!exa.enabled ? 'config.tools.exa.enabled is false' : 'no EXA_API_KEY in the environment')
+        : (!exa.enabled ? 'switched off in settings' : 'no API key has been set for it')
     }),
     searxng: () => ({
       name: 'searxng',
-      available: !!searxng.enabled,
+      enabledInConfig: !!searxng.enabled,
+      available: !!searxng.enabled && !!searxng.url,
       config: { url: searxng.url, timeoutMs: 8000 },
-      why: searxng.enabled ? null : 'config.tools.searxng.enabled is false'
+      why: !searxng.enabled ? 'switched off in settings' : (!searxng.url ? 'no instance URL is set' : null)
     })
   };
 
   // Unknown names in the order list are dropped rather than guessed at — same
   // rule as the background tool allowlist: the list is a ceiling, not a request.
-  const providers = configured.map(n => describe[n] && describe[n]()).filter(Boolean);
+  const all = configured.map(n => describe[n] && describe[n]()).filter(Boolean);
+
+  // OFF AND MISCONFIGURED ARE DIFFERENT, so they leave the chain differently.
+  //
+  // A provider you switched OFF is not in the chain at all: it is not tried, and
+  // it writes no "skipped" row on every search — you decided, and there is nothing
+  // to report. A provider that is ON but cannot run (Exa with no key) STAYS in the
+  // chain and is skipped loudly, because that is a misconfiguration and the log
+  // saying so is how anyone finds out. "SearXNG off" and "SearXNG as the fallback"
+  // are different states and both have to be expressible.
+  const providers = all.filter(p => p.enabledInConfig);
   return {
     any: providers.some(p => p.available),
     order: providers.map(p => p.name),
-    providers
+    providers,
+    // Every known provider with its switch state, for the settings page: the page
+    // must show what is off, or there is no way to turn it back on.
+    allProviders: all
   };
 }
 

@@ -170,4 +170,46 @@ const PROVIDERS = {
   searxng: searxngSearch
 };
 
-module.exports = { PROVIDERS, exaSearch, searxngSearch, resolveExaType, EXA_ALLOWED_TYPES, SNIPPET_CHARS };
+/**
+ * WHAT THE SETTINGS PAGE SHOWS FOR EACH PROVIDER — declared here, beside the
+ * provider it describes, for the same reason the tool catalogue lives beside
+ * registration: a page with its own list of providers is a list that falls behind.
+ * Add a provider to PROVIDERS and to this array and it appears in the UI, with its
+ * own switch, its own place in the order, and its own key field if it needs one.
+ *
+ * `secret` is the env-style name db/secrets.js stores it under. Declaring it here
+ * is what makes the key field appear; nothing in the page knows about Exa.
+ */
+const SEARCH_PROVIDER_SPECS = [
+  {
+    id: 'exa',
+    label: 'Exa',
+    blurb: 'Hosted search index. Fast, and it returns page text with each result.',
+    toggle: 'tools.exa.enabled',
+    secret: {
+      env: 'EXA_API_KEY',
+      label: 'Exa API key',
+      hint: 'From exa.ai. Stored encrypted on this machine and never shown again after saving. The free tier stops with a 402 rather than billing.'
+    },
+    fields: [
+      { path: 'tools.exa.numResults', label: 'Results per search', type: 'number', min: 1, max: 25 },
+      { path: 'tools.exa.timeoutMs', label: 'Timeout (ms)', type: 'number', min: 1000, max: 30000 },
+      { path: 'tools.exa.url', label: 'Endpoint', type: 'text', placeholder: 'https://api.exa.ai/search',
+        hint: 'Only change this for a proxy. The Search endpoint only — deep/agentic types are refused in code.' }
+    ]
+  },
+  {
+    id: 'searxng',
+    label: 'SearXNG',
+    blurb: 'Your own instance. No account, no metering, and it keeps working when a hosted index does not.',
+    toggle: 'tools.searxng.enabled',
+    fields: [
+      { path: 'tools.searxng.url', label: 'Instance URL', type: 'text', placeholder: 'http://localhost:8888' }
+    ]
+  }
+];
+
+module.exports = {
+  PROVIDERS, SEARCH_PROVIDER_SPECS,
+  exaSearch, searxngSearch, resolveExaType, EXA_ALLOWED_TYPES, SNIPPET_CHARS
+};

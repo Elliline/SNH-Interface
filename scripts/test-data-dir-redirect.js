@@ -18,8 +18,8 @@
  *     ops ledger.
  *
  * So the audit is a test rather than a sweep somebody remembers to redo. It is a
- * grep with an allowlist, and the allowlist has exactly two entries, each of
- * which is the reason it is allowed.
+ * grep with an allowlist, and every entry in the allowlist IS the reason it is
+ * allowed — three of them, all configuration rather than corpus.
  *
  * PURE. Reads source files; touches no database and no model.
  *
@@ -40,7 +40,9 @@ const ALLOWED = {
   'db/database.js':
     'defines DATA_DIR — this is the redirect itself, and the __dirname form is its fallback when SNH_DATA_DIR is unset',
   'db/config.js':
-    'configuration is not corpus. A staging run is the same system pointed at a different store and must use the same models and thresholds; redirecting it would silently fall back to bare DEFAULTS because data-staging holds no config.json'
+    'configuration is not corpus. A staging run is the same system pointed at a different store and must use the same models and thresholds; redirecting it would silently fall back to bare DEFAULTS because data-staging holds no config.json',
+  'db/secrets.js':
+    'secrets are configuration, for the same reason config.json is (2026-08-18). What happens when a staging run writes this? Nothing: the file is written only by the settings route, which a replay never calls, and it holds no corpus — the worst case of SHARING it is that a throwaway instance can search with the same API key, which is exactly what makes a verification run measure live behaviour. Redirecting it would give every throwaway instance an empty key store, so search would silently fall back to a different provider than live uses. SNH_SECRETS_PATH moves it explicitly where a deployment or a test needs that'
 };
 
 // A data path built from the module's own location rather than the process's.

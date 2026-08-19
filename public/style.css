@@ -3217,3 +3217,146 @@ a.msg-source:hover {
   border-bottom: 1px solid var(--border-color);
 }
 .job-elapsed { font-size: 0.66rem; color: var(--secondary-color); margin-left: 6px; }
+
+/* ============ Tools tab: registry-generated rows ============ */
+/* One row per registered-or-not tool, plus the search provider chain. Everything
+   here is laid out for a list that GROWS — a tool added to the registry lands on
+   this page with no CSS written for it. */
+
+.tools-summary .settings-hint { margin-bottom: 0; }
+
+.tool-row, .provider-row {
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background-color: var(--background-color);
+}
+
+/* A switched-off row stays fully legible — it is the row you came here to turn
+   back on. Dimmed, never hidden. */
+.tool-row-off, .provider-row-off { opacity: 0.72; }
+
+.tool-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tool-row-id { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tool-row-id code {
+  font-family: monospace;
+  font-size: 0.86rem;
+  color: var(--text-color);
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.tool-row-title { font-size: 0.95rem; font-weight: 500; color: var(--text-color); }
+.provider-label { font-size: 1rem; font-weight: 600; color: var(--text-color); }
+
+.tool-row-state { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+.tool-state {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tool-state-on { color: var(--success-color); }
+.tool-state-off { color: var(--text-secondary); }
+
+/* A row whose switch lives elsewhere shows this instead of a dead toggle — an
+   unexplained missing control reads as a broken page. */
+.tool-derived { color: var(--text-secondary); font-size: 0.9rem; padding: 0 12px; }
+
+.tool-row-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.tool-tag {
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.tool-tag-writes { color: var(--warning-color); border-color: var(--warning-color); }
+
+/* The model's own description, verbatim. Small, because it is reference material
+   rather than the thing being decided. */
+.tool-row-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin: 8px 0 0;
+  line-height: 1.45;
+}
+.tool-row-why { font-size: 0.78rem; color: var(--warning-color); margin: 6px 0 0; }
+.tool-row-note { font-size: 0.76rem; color: var(--text-secondary); margin: 6px 0 0; font-style: italic; }
+
+.tool-row-fields {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-color);
+}
+.tool-field { margin-bottom: 12px; }
+.tool-field:last-child { margin-bottom: 0; }
+.tool-field input[type="text"], .tool-field input[type="number"] {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 0.9rem;
+}
+.setting-hint-inline {
+  display: block;
+  font-weight: 400;
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+}
+
+.provider-chain { margin-bottom: 18px; }
+.provider-order-line { margin-bottom: 10px; font-weight: 500; }
+.provider-pos { font-size: 0.76rem; color: var(--text-secondary); margin-bottom: 0; display: flex; align-items: center; gap: 5px; }
+.provider-pos select {
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 0.8rem;
+}
+.provider-pos select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* A write-only key field. It renders empty every time, including right after a
+   successful save — the state line beside the label is the only thing that says
+   whether one is held. */
+.secret-field { margin-top: 12px; }
+.secret-input-row { display: flex; gap: 8px; align-items: center; }
+.secret-clear {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.secret-clear:hover:not(:disabled) { color: var(--error-color); border-color: var(--error-color); }
+.secret-clear:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.secret-state {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: 6px;
+}
+.secret-state-on { color: var(--success-color); }
+.secret-state-off { color: var(--text-secondary); }
+.secret-state-warn { color: var(--warning-color); }

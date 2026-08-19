@@ -44,6 +44,7 @@ const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearx
 const conversationsRouter = require('./routes/conversations');
 const memoryRouter = require('./routes/memory');
 const jobsRouter = require('./routes/jobs');
+const toolsRouter = require('./routes/tools');
 
 const app = express();
 
@@ -339,6 +340,10 @@ app.use('/api/memory', memoryRouter);
 // /api/memory, because job results are not initiatives and must not be served
 // by the endpoint the bell polls.
 app.use('/api/jobs', jobsRouter);
+// The Tools tab's data: the tool catalogue, the search provider chain, and secret
+// STATUS. Its own router because secrets are its own contract — write-only, and
+// never part of the /api/config payload that the browser reads whole.
+app.use('/api/tools', toolsRouter);
 
 // ============ Config API ============
 
@@ -3545,6 +3550,11 @@ app.listen(PORT, HOST, () => {
         (p.name === 'searxng' ? ` (${p.config.url})` : ''));
     }
     if (!chain.any) console.log('  - none available — web_search is not registered');
+    // Where secrets are held, and how. Printed because "encrypted at rest" is a
+    // claim, and a claim about security should be checkable from the log of the
+    // process making it.
+    const sh = require('./db/secrets').health();
+    console.log(`  - secrets: ${sh.stored} stored, ${sh.algorithm}, key ${sh.keySource === 'env' ? 'from SNH_SECRET_KEY' : sh.keySource === 'file' ? 'on this machine' : 'not created yet'}`);
   }
   const startupConfig = getConfig();
   const startupTts = getVoiceProvider('tts');

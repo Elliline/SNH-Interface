@@ -196,15 +196,19 @@ const CONDITIONAL_CAPABILITIES = [
     schedule: 'When a question needs current info (only while a search provider is available)',
     dateAdded: '2026-07-23',
     // TRUE WHEN A PROVIDER CAN ACTUALLY BE CALLED, which is not the same as a
-    // flag being on: Exa needs EXA_API_KEY in the environment, and the honest
-    // condition is "either provider is usable". This predicate reads config only
-    // — the env half is checked here directly rather than through
-    // getSearchConfig(), because a manifest that imports the resolver would be
-    // asserting its own correctness.
+    // flag being on: Exa needs a key, and the honest condition is "either provider
+    // is usable". The key half is a STATUS LOOKUP (db/secrets.js — is one set, from
+    // the environment or from the encrypted store) rather than a call to
+    // getSearchConfig(), because a manifest that asked the resolver would be
+    // asserting its own correctness. Checking process.env alone was wrong the
+    // moment a key could be saved from the settings page, and it would have made
+    // the manifest under-claim silently.
     when: (cfg) => {
       const t = (cfg && cfg.tools) || {};
-      const exaUsable = !!(t.exa && t.exa.enabled !== false && (process.env.EXA_API_KEY || '').trim());
-      const searxngUsable = !!(t.searxng && t.searxng.enabled);
+      let keySet = false;
+      try { keySet = !!require('./secrets').status('EXA_API_KEY').set; } catch { keySet = false; }
+      const exaUsable = !!(t.exa && t.exa.enabled !== false && keySet);
+      const searxngUsable = !!(t.searxng && t.searxng.enabled && (t.searxng.url || process.env.SEARXNG_HOST));
       return exaUsable || searxngUsable;
     },
     // Machine link to the MCP tools this entry accounts for. Any registered tool

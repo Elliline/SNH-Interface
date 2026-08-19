@@ -492,11 +492,13 @@ jobs, because one of them being quietly stale is exactly what nobody would notic
 The model never picks a provider; the routing is code (`mcp/tools/web-search.js`),
 and offering the choice would double the schema for a question with one answer.
 
-- **The key is environment-only.** `EXA_API_KEY` in `.env`, never
-  `data/config.json` — that file is served by routes, written by the settings UI
-  and copied into staging seeds, and a secret in it leaks through all three.
-  `db/config.js` calls `dotenv` itself so scripts and cron entry points see it too,
-  not just `server.js`. `getSearchConfig()` is the single answer to "how does a
+- **The key is a SECRET, not config.** `EXA_API_KEY` comes from the encrypted
+  store or the environment (`db/secrets.js` — see *The Tools tab is generated, and
+  a secret goes one way*), never from `data/config.json`, which is served by
+  routes, written by the settings UI and copied into staging seeds. It is settable
+  from the browser, so a fresh install needs no shell.
+  `db/config.js` calls `dotenv` itself so scripts and cron entry points see `.env`
+  too, not just `server.js`. `getSearchConfig()` is the single answer to "how does a
   search run right now": order, plus per-provider availability, where availability
   means the prerequisite as well as the flag. `web_search` registers when ANY
   provider is available, and with none it is absent exactly as before.
@@ -531,6 +533,78 @@ and offering the choice would double the schema for a question with one answer.
   `execute()` is not `(args, context)` is a bug in the tool.
 - Verify with `node scripts/test-search-providers.js` (stubbed `fetch` — no
   credit is spent).
+
+## ⚠️ The Tools tab is generated, and a secret goes one way
+
+Two rules, and both are the same rule twice: **one fact, one place.**
+
+**The page is derived from the registry.** `mcp/mcp-client.js` holds
+`TOOL_CATALOGUE` — one row per tool, carrying its class, its gate, the config path
+its switch writes, and its other settings as dotted paths. `loadConfig()` registers
+from it and `describeCatalogue()` renders the settings page from it, so a tool
+cannot exist without appearing in the UI. Before this, registration was a
+hand-written if-chain and the Tools tab carried a list of its own: fourteen tools
+were registered and **three** were on the page, and every tool shipped after the
+page was written was invisible there. Three things to keep:
+
+- **The page lists tools that are OFF.** A page built from what is *registered*
+  loses the row for anything you switch off, which leaves no way to switch it back
+  on. Each row says whether it is registered right now and, when it is not, why —
+  "off because: turned off here", never a missing row.
+- **A row's description is the tool's own.** `describeCatalogue()` reads
+  `tool.description`, the text the model is given. A second human-facing copy would
+  be a second thing to maintain, and the two would drift.
+- **A row with no switch of its own says what decides it instead.** `web_search` is
+  gated on a provider being available, `web_fetch` rides on `web_search`, and the
+  corrector's three writes are always registered but reachable only by a step
+  `corrector.enabled` governs. An unexplained missing control reads as a broken
+  page. Verify with `node scripts/test-tools-settings.js`, which adds a dummy tool
+  to the catalogue and asserts a fifteenth row appears with no page edit.
+
+**Secrets are write-only, encrypted, and not in config.** `db/secrets.js` holds
+them in `data/secrets.json` — AES-256-GCM per secret, random IV, and the secret's
+NAME as additional authenticated data, so a ciphertext moved to another slot fails
+rather than becoming that other secret. The key is 32 bytes in `data/.secret-key`
+(mode 0600) or from `SNH_SECRET_KEY` where a platform injects one. Both files sit
+beside `config.json` and are NOT redirected by `SNH_DATA_DIR`, for the reason
+config is not: a throwaway instance that could not see the key would search
+differently from live, and a verification against it would measure the wrong thing.
+`SNH_SECRETS_PATH` / `SNH_SECRET_KEY_PATH` move them where a deployment or a test
+needs that (`scripts/test-tools-settings.js` does, so it never opens the live ones).
+
+- **Never in `data/config.json`.** `GET /api/config` returns that file whole, so a
+  key in it is served to the browser on every settings load. A separate file means
+  there is no redaction step to forget.
+- **The server never puts any part of a value in a response.** No preview, no
+  last-four, no length — status only: set or not, from where, when. "Write-only"
+  survives the next convenience feature only if there is nothing to trim back to.
+  The test asserts the key is absent from the real `GET /api/tools` payload,
+  including any prefix of it.
+- **Env still wins, and the UI SAYS so.** `process.env.EXA_API_KEY` overrides the
+  store, so everything reading `.env` keeps working — and `status()` reports
+  `envOverrides`, because a key typed into the UI while a stale one sits in `.env`
+  is stored and then ignored, which is an afternoon nobody should lose.
+- **What the encryption is worth, stated plainly:** it protects a copied data
+  directory, a backup, a synced folder, a committed file. It does not protect
+  against anything running as this user, since the key sits beside the data. Fixing
+  that means a passphrase at every boot (no unattended restart, and systemd
+  restarts this service) or an external KMS (not self-hosted). Do not claim more
+  than that in the UI.
+- **Only a DECLARED secret name is writable.** The route is not a general-purpose
+  writer of environment-shaped keys into a file: a name has to come from a tool's or
+  a provider's own declaration, which is also what makes its field appear.
+
+**Off and second are different states.** `tools.<provider>.enabled` is the switch;
+`tools.search.order` is the ordering. A provider switched OFF is dropped from the
+chain entirely — not tried, and no "skipped" row on every search, because you
+decided and there is nothing to report. A provider that is ON but cannot run (Exa
+with no key) STAYS in the chain and is skipped **loudly**, because that is a
+misconfiguration and the log is how anyone finds out. `getSearchConfig()` returns
+`providers` (the live chain) and `allProviders` (every known provider with its
+switch state) — the page needs the second one, or it cannot show you what is off.
+It also takes an optional config argument, the same test seam
+`selfFactSupersessionBar` uses: the chain logic cannot be tested by writing to the
+live `data/config.json`.
 
 ## ⚠️ The replay redirects a PROCESS, not a call
 
