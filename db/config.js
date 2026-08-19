@@ -7,6 +7,15 @@
 const fs = require('fs');
 const path = require('path');
 
+// SECRETS COME FROM THE ENVIRONMENT, AND EVERY ENTRY POINT NEEDS THEM.
+// server.js already called this, which was enough while the only env values were
+// hosts that had config fallbacks. EXA_API_KEY has no fallback: a script, a test
+// or a cron entry point that never loaded .env would see search silently fall
+// back to SearXNG and report that as the truth. dotenv does not overwrite an
+// already-set variable, so a real environment still wins, and calling it twice
+// is a no-op.
+try { require('dotenv').config(); } catch { /* .env is optional */ }
+
 /**
  * DELIBERATELY NOT redirected by SNH_DATA_DIR, and the only such path left.
  *
@@ -195,7 +204,18 @@ const DEFAULTS = {
       maxWallClockMsPerStep: 120000,
       // Rounds of the tool loop within a single callLLM. A round is one model
       // turn, which may emit several tool calls.
-      maxRoundsPerCall: 5
+      maxRoundsPerCall: 5,
+      // WHAT A DEAD CALL COSTS (2026-08-18). A call that errors, or a search that
+      // comes back empty, bills this instead of 1 — see toolCallCost in
+      // db/memory-manager.js for the exact rule and its exceptions. The budget is
+      // meant to bound WORK DONE, and a job that spent all twelve of its calls on
+      // the same broken-URL error had done none.
+      failedCallCost: 0.25,
+      // And the floor under the discount: no session may make more than this
+      // multiple of its budget in RAW calls, whatever they were worth. Without
+      // it, a quarter-price failure lets an everything-fails loop run four times
+      // as long as an everything-works one.
+      attemptCeilingMultiple: 2
     }
   },
   // The scheduler (2026-08-12) — the thing that finally runs an approved job.
@@ -253,14 +273,31 @@ const DEFAULTS = {
     maxConcurrent: 2,
     maxQueued: 10,           // refuse past this, out loud, rather than queue forever
     maxStartsPerHour: 6,     // trailing-hour cap, counted from the table (a restart grants no budget)
-    // Per-job budget. Same two-limit shape as scheduler/heartbeat, sized a
-    // little longer because the point of handing off is that it takes a while.
-    maxToolCallsPerJob: 12,
-    maxWallClockMs: 300000,  // 5 minutes
-    maxRoundsPerJob: 6,
+    // Per-job budget, RAISED 2026-08-18 after a real job hit every one of these
+    // and returned nothing. What it was measured against:
+    //
+    //   rounds were the limit that actually bound. 6 rounds at 2–3 calls a round
+    //     is nine calls, so the 12-call budget was decorative — a job could not
+    //     reach it before running out of turns. 16 rounds is the number that
+    //     makes 40 calls reachable.
+    //   40 calls is roughly a dozen searches plus the fetches to read what they
+    //     found, which is the depth the tool description already promises her
+    //     ("it can run a dozen searches and read whole pages").
+    //   15 minutes of a GPU that is already his. Chat still preempts: the agent
+    //     pool drops to concurrency 1 while a request is in flight.
+    //   2000 output tokens because 700 cannot hold a Python script, and a job
+    //     that is asked to produce something has to be able to produce it.
+    //
+    // The billed-vs-raw accounting is in createToolSession: an error or an empty
+    // search bills a quarter, with a hard ceiling of 2× the budget in raw
+    // attempts underneath. So 40 is 40 pieces of WORK, not 40 tries.
+    maxToolCallsPerJob: 40,
+    maxWallClockMs: 900000,  // 15 minutes
+    maxRoundsPerJob: 16,
     // Output ceiling. A result is read in a panel and may be read aloud to him
-    // at the top of a turn, so a job that writes an essay is a job nobody reads.
-    maxOutputTokens: 700,
+    // at the top of a turn, so a job that writes an essay is a job nobody reads
+    // — but a job asked for a script has to be able to write one.
+    maxOutputTokens: 2000,
     // How long after a restart an interrupted run is still worth redoing. An
     // LLM call cannot be resumed, so the run is lost either way; the only
     // question is whether repeating it is still useful. Safe to retry because
@@ -634,6 +671,31 @@ const DEFAULTS = {
   // URL used to live only in the client's localStorage + a hardcoded server
   // fallback, so settings and reality disagreed; now it's config.)
   tools: {
+    // WHICH PROVIDER RUNS FIRST — one list, read by both the chat path and the
+    // agent-job path, because the answer is the same for both: try the fast
+    // hosted index, keep the self-hosted one as the thing that still works when
+    // the account is spent. The model never sees this; it calls `web_search` and
+    // the chain is code (mcp/tools/web-search.js).
+    //
+    // A provider missing its prerequisite is SKIPPED, not an error — with no
+    // EXA_API_KEY the chain is just SearXNG, which is exactly what it was before
+    // 2026-08-18.
+    search: { order: ['exa', 'searxng'] },
+    // Exa's /search endpoint. The KEY IS NOT HERE — it comes from EXA_API_KEY in
+    // the environment, because this file is served by routes, written by the
+    // settings UI and copied into staging seeds, and a secret in it would leak
+    // through all three.
+    //
+    // Free tier as of 2026-08-18: $10 of credit a month, 5 queries/sec, no
+    // payment method on file — so it STOPS with a 402 rather than billing. The
+    // 402 is surfaced in words, not swallowed (see search-providers.js).
+    //
+    // `type` is pinned to a non-agentic search. Deep Search and the Agent
+    // endpoint are deliberately unreachable: they do the multi-step research
+    // SNH does itself, with its own tools and its own memory, and buying that
+    // from an API would move the thinking off the machine. Any `deep*` value
+    // here is refused in code, not just discouraged in this comment.
+    exa: { enabled: true, url: 'https://api.exa.ai/search', type: 'auto', numResults: 5, timeoutMs: 8000, textChars: 1000 },
     searxng: { enabled: false, url: 'http://localhost:8888' },
     // create_cron_job — the first action tool. PROPOSE ONLY: a call raises an
     // initiative for Ellie to approve or reject in the bell panel; nothing is
@@ -931,4 +993,75 @@ function getSearxngConfig() {
   };
 }
 
-module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance, getVoiceProvider, getSearxngConfig };
+/**
+ * Resolve the effective EXA search config. Same shape and same rules as
+ * getSearxngConfig, with one difference that matters: the KEY comes from the
+ * environment and nowhere else, so `enabled` alone is not availability.
+ * @returns {{ enabled: boolean, available: boolean, url: string, apiKey: string|null,
+ *            type: string, numResults: number, timeoutMs: number, textChars: number }}
+ */
+function getExaConfig() {
+  const cfg = getConfig();
+  const ex = (cfg.tools && cfg.tools.exa) || {};
+  const apiKey = (process.env.EXA_API_KEY || '').trim() || null;
+  const enabled = ex.enabled !== false;
+  return {
+    enabled,
+    available: enabled && !!apiKey,
+    url: ex.url || 'https://api.exa.ai/search',
+    apiKey,
+    type: ex.type || 'auto',
+    numResults: Math.min(Math.max(1, ex.numResults ?? 5), 25),
+    timeoutMs: Math.max(1000, ex.timeoutMs ?? 8000),
+    textChars: Math.max(200, ex.textChars ?? 1000)
+  };
+}
+
+/**
+ * THE ONE ANSWER to "how does a search run right now" — provider order, and for
+ * each provider whether it can actually be called.
+ *
+ * Both the chat path and the agent-job path read this, and so does the tool
+ * registry when it decides whether `web_search` exists at all. One function,
+ * because two would be two answers: that is the mistake mcp/tools.json made with
+ * its own `enabled` flag, and it produced a tool that appeared in the model's
+ * list and was never routed to.
+ *
+ * @returns {{ any: boolean, order: string[], providers: Array<{name, available, config, why: string|null}> }}
+ */
+function getSearchConfig() {
+  const cfg = getConfig();
+  const configured = (cfg.tools && cfg.tools.search && Array.isArray(cfg.tools.search.order))
+    ? cfg.tools.search.order
+    : ['exa', 'searxng'];
+
+  const exa = getExaConfig();
+  const searxng = getSearxngConfig();
+
+  const describe = {
+    exa: () => ({
+      name: 'exa',
+      available: exa.available,
+      config: exa,
+      why: exa.available ? null
+        : (!exa.enabled ? 'config.tools.exa.enabled is false' : 'no EXA_API_KEY in the environment')
+    }),
+    searxng: () => ({
+      name: 'searxng',
+      available: !!searxng.enabled,
+      config: { url: searxng.url, timeoutMs: 8000 },
+      why: searxng.enabled ? null : 'config.tools.searxng.enabled is false'
+    })
+  };
+
+  // Unknown names in the order list are dropped rather than guessed at — same
+  // rule as the background tool allowlist: the list is a ceiling, not a request.
+  const providers = configured.map(n => describe[n] && describe[n]()).filter(Boolean);
+  return {
+    any: providers.some(p => p.available),
+    order: providers.map(p => p.name),
+    providers
+  };
+}
+
+module.exports = { getConfig, updateConfig, loadConfig, getProviderInstance, getVoiceProvider, getSearxngConfig, getExaConfig, getSearchConfig };

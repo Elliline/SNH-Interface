@@ -94,8 +94,20 @@ const JOB_TOOLS = [
   'web_search', 'web_fetch'
 ];
 
-/** Statuses a job cannot leave. */
-const TERMINAL = ['ok', 'failed', 'interrupted', 'cancelled'];
+/**
+ * Statuses a job cannot leave.
+ *
+ * `partial` was added 2026-08-18 and it is the honest third answer. Before it
+ * there were two: `ok`, which claims the job did what it set out to do, and
+ * `failed`, which reads as "nothing came of this". A run that spent its budget on
+ * dead searches and then wrote up the memory work it HAD finished is neither —
+ * calling it ok over-claims, calling it failed throws away a real result, and
+ * throwing away a real result is exactly what happened.
+ *
+ * It is terminal like the others, counted in the badge like the others, announced
+ * like the others. The only thing that differs is what the panel says on the card.
+ */
+const TERMINAL = ['ok', 'partial', 'failed', 'interrupted', 'cancelled'];
 
 function cfg() {
   const c = getConfig().agentJobs || {};
@@ -313,10 +325,27 @@ function systemPrompt(job, tools) {
     (job.why ? `Why you handed it off: "${job.why}"\n` : '') +
     `\n` +
     (tools.length
-      ? `You have these read-only tools: ${tools.join(', ')}. Use them. This job is worth nothing if you ` +
-        `answer from impression — everything you report must come from a tool result.\n\n`
-      : `You have NO tools in this run, which means you cannot look anything up. Say that plainly as the ` +
-        `result rather than answering from impression.\n\n`) +
+      ? `You have these read-only tools: ${tools.join(', ')}. Use them.\n\n` +
+        // TWO KINDS OF JOB, AND THE OLD PROMPT ONLY ADMITTED ONE.
+        //
+        // It said "everything you report must come from a tool result", full
+        // stop. That is exactly right for a job that reports on the world or on
+        // the record, and it is wrong — flatly, self-defeatingly wrong — for a
+        // job asked to PRODUCE something. Asked on 2026-08-18 to write a Python
+        // calculator, a run under that instruction has no legal move: no tool
+        // returns a calculator, so the only compliant answer is to report that
+        // it found none. The rule is kept and scoped to what it was for: CLAIMS
+        // ABOUT FACTS. What he makes, he makes out of what he knows.
+        `TWO DIFFERENT THINGS, AND THEY HAVE DIFFERENT RULES:\n` +
+        `- ANYTHING YOU ASSERT AS FACT — about the world, about your memory, about what happened — must ` +
+        `come from a tool result in this run. Never state a number, a date or an event you did not read ` +
+        `from one.\n` +
+        `- ANYTHING YOU ARE ASKED TO PRODUCE — a script, a draft, a plan, a piece of writing — you write ` +
+        `yourself, out of what you know. That is not answering from impression; that is the work. Use the ` +
+        `tools to check facts it depends on, and say which parts you could not check.\n\n`
+      : `You have NO tools in this run, which means you cannot look anything up. If this job needs facts, ` +
+        `say plainly that you could not check them rather than answering from impression. If it asks you to ` +
+        `WRITE something, write it — that needs no tools.\n\n`) +
     // The same two-sided instruction the scheduler carries, and for the same
     // measured reason: told only not to invent, the model discovers that
     // "nothing to report" is always safe, and a job that always reports nothing
@@ -331,11 +360,128 @@ function systemPrompt(job, tools) {
     `treating what you were given as all there is.\n\n` +
     `WHAT TO WRITE. A few plain sentences to Ellie, in your own voice — what you found, and what it means ` +
     `if it means anything. No headings, no preamble like "here is the result", no restating the task back ` +
-    `to her. If the honest answer is short, keep it short.\n\n` +
+    `to her. If the honest answer is short, keep it short. If she asked for something built, the thing ` +
+    `itself IS the result: put the script or the draft in the answer.\n\n` +
+    // The empty-card rule, said to him as well as enforced in code below.
+    `YOU MUST WRITE SOMETHING. Whatever state you are in when you stop — out of tool calls, out of time, ` +
+    `every lookup failing — write up what you have and say where it stops and why. An empty result is the ` +
+    `one outcome that tells her nothing at all, and it throws away whatever you did manage to do.\n\n` +
     `THIS IS NOT A MESSAGE TO HER. It lands in a panel; it does not open a conversation and it does not ` +
     `interrupt her. If what you find turns out to be worth actually SAYING to her, that is a separate ` +
     `decision you make in an ordinary conversation later — not something this run does.`
   );
+}
+
+/**
+ * A one-line, human account of WHY a run stopped where it did.
+ *
+ * Written from the budget summary and the tool record rather than from a status
+ * word, because "it did not produce a result" was all the panel could say and it
+ * was the least useful true sentence available.
+ */
+function describeStop(calls = [], budget = null, c = cfg()) {
+  const dead = calls.filter(k => k && k.productive === false).length;
+  const bits = [];
+  if (budget && budget.exhausted) bits.push(budget.exhausted);
+  else if (calls.length) bits.push(`it made ${calls.length} tool call(s)`);
+  if (dead) bits.push(`${dead} of its calls came back empty or failed`);
+  if (!bits.length) bits.push('it stopped without writing an answer');
+  return `${bits.join('; ')} — what is in the result is what it had when it stopped`;
+}
+
+/**
+ * ONE MORE CALL, NO TOOLS: write up what you have.
+ *
+ * The first and better of the two salvage attempts. It is a fresh callLLM with no
+ * toolSession — so it cannot look anything else up, cannot spend more budget, and
+ * cannot loop — carrying a compact record of what this run actually did. What
+ * comes back is a real partial answer in his own voice.
+ *
+ * Returns null rather than throwing: the caller has a deterministic fallback and
+ * a salvage attempt that fails must not turn a partial job into a crashed one.
+ */
+async function salvageWriteup(job, calls = [], budget = null, c = cfg()) {
+  const mm = memoryManager();
+  const record = calls.length
+    ? calls.map((k, i) => {
+      const what = k && k.name ? k.name : 'a tool';
+      const arg = k && k.args ? JSON.stringify(k.args).slice(0, 160) : '';
+      const how = k && k.productive === false
+        ? `nothing usable came back${k.note ? ` (${k.note})` : ''}`
+        : 'it returned something usable';
+      return `${i + 1}. ${what} ${arg} → ${how}`;
+    }).join('\n')
+    : '(no tool calls were made at all)';
+
+  const system =
+    `You are Aurelius, closing out one of your own background jobs that stopped before it wrote anything. ` +
+    `You have no tools now and cannot look anything else up.\n\n` +
+    `THE JOB was: "${job.task}"\n\n` +
+    `WHAT THE RUN ACTUALLY DID:\n${record}\n` +
+    (budget && budget.exhausted ? `\nWhy it stopped: ${budget.exhausted}\n` : '') +
+    `\nWrite the result for Ellie's jobs panel now, in a few plain sentences in your own voice:\n` +
+    `- What you managed to establish, if anything. Only what a tool result above actually supports.\n` +
+    `- If the job asked you to WRITE or BUILD something, write it now from your own knowledge — that ` +
+    `needs no tools, and it is the result.\n` +
+    `- Where it stopped and why, plainly. If your lookups failed, say they failed — do NOT report that as ` +
+    `having found nothing, because those are different things and only one of them is about the world.\n` +
+    `Do not apologise, do not describe this as a salvage, and do not answer with nothing.`;
+
+  try {
+    const res = await mm.callLLM(system, job.task, { maxTokens: c.maxOutputTokens });
+    const text = String(res && res.content || '').trim();
+    return text || null;
+  } catch (err) {
+    console.warn(`[AgentJobs] salvage writeup failed: ${err && err.message}`);
+    return null;
+  }
+}
+
+/**
+ * THE FLOOR. No model, no network, cannot come back empty.
+ *
+ * Reached only when the run wrote nothing AND the salvage call could not either —
+ * which in practice means the brain is unreachable. It is a thin card and it is
+ * an honest one: what was asked, what ran, what came back, where it stopped. The
+ * invariant it defends is simple and absolute: a job that started has a result
+ * she can read.
+ */
+function mechanicalAccount(job, calls = [], budget = null, c = cfg(), thrownError = null) {
+  const dead = calls.filter(k => k && k.productive === false);
+  const lines = [];
+
+  lines.push(`I could not write this up properly, so this is the plain account of what happened.`);
+  lines.push('');
+  lines.push(`What I set out to do: ${job.task}`);
+  lines.push('');
+
+  if (!calls.length) {
+    // Careful with this sentence. When the run THREW, the tool record is lost
+    // with it — so "it looked nothing up" would be a claim, not a fact, and it
+    // would be false whenever the throw came in a later round. Say what is
+    // actually known: there is no record.
+    lines.push(thrownError
+      ? `The run failed and I have no record of what it managed to look up first. The error was: ${thrownError}`
+      : `No tools were called at all, and no answer was produced.`);
+  } else {
+    lines.push(`I made ${calls.length} tool call(s): ${calls.map(k => k.name).join(', ')}.`);
+    if (dead.length) {
+      lines.push(`${dead.length} of them came back empty or failed${dead[0] && dead[0].note ? ` (${dead[0].note})` : ''}.`);
+    }
+    if (dead.length === calls.length) {
+      lines.push(`Nothing usable came back from any of them, so there is nothing here I can tell you about ` +
+        `the thing itself — that is a failure of my lookups, not a finding that there is nothing to find.`);
+    } else {
+      lines.push(`Some of them did return something, but I stopped before turning it into an answer.`);
+    }
+  }
+
+  if (budget && budget.exhausted) lines.push(`Why it stopped: ${budget.exhausted}.`);
+  if (thrownError && calls.length) lines.push(`The run then failed with: ${thrownError}`);
+  lines.push('');
+  lines.push(`Ask me again and I will run it properly.`);
+
+  return lines.join('\n');
 }
 
 /**
@@ -389,6 +535,7 @@ async function runJob(id) {
   console.log(`[AgentJobs] === running ${id.slice(0, 8)}: "${job.title}" ===`);
 
   let status = 'ok', error = null, output = '', budget = null, toolCalls = 0;
+  let calls = [];
   try {
     const res = await mm.callLLM(
       systemPrompt(job, allowed),
@@ -397,26 +544,69 @@ async function runJob(id) {
     );
     output = String(res && res.content || '').trim();
     budget = (res && res.budget) || session.summary();
-    toolCalls = Array.isArray(res && res.toolCalls) ? res.toolCalls.length : 0;
+    calls = Array.isArray(res && res.toolCalls) ? res.toolCalls : [];
+    toolCalls = calls.length;
+
+    // A run that was CUT SHORT but still wrote something is not "ok". The text is
+    // kept in full and the card says which it was — see TERMINAL on `partial`.
+    if (output && (res.outOfRounds || (budget && budget.exhausted))) {
+      status = 'partial';
+      error = res.outOfRounds
+        ? `it ran out of tool rounds (${c.maxRoundsPerJob}) before it was finished — what is above is what it had`
+        : `it stopped early: ${budget.exhausted} — what is above is what it had`;
+    }
+
     if (!output) {
-      // An empty answer is a failure with a specific cause, not a quiet success.
-      status = 'failed';
-      error = toolCalls
-        ? `the model made ${toolCalls} tool call(s) but returned no text`
-        : 'the model returned no text';
+      // === AN EMPTY RESULT CARD IS NOT ALLOWED TO HAPPEN ===
+      //
+      // 2026-08-18: a job spent all twelve of its tool calls on searches that
+      // failed with the same broken-URL error, produced no text, and was closed
+      // as `failed` with result_text NULL. The panel card was empty — and the
+      // memory work it had already completed, before it ever reached a search,
+      // went in the bin with it. The work was done. Only the writing-up was
+      // missing, and nothing asked for it.
+      //
+      // Two attempts, in order of how much they can say:
+      //   1. ASK IT TO WRITE UP WHAT IT HAS — one more call, no tools, with the
+      //      run's own tool record in front of it. This is where a real partial
+      //      answer comes from.
+      //   2. FAILING THAT, WRITE THE ACCOUNT OURSELVES — deterministic, no model
+      //      involved, so it cannot itself come back empty. It is a thinner
+      //      thing than a writeup and it is still a hundred times better than a
+      //      blank card: it says what ran, what came back, and where it stopped.
+      const salvaged = await salvageWriteup(job, calls, budget, c);
+      if (salvaged) {
+        output = salvaged;
+        status = 'partial';
+        error = describeStop(calls, budget, c);
+        console.warn(`[AgentJobs] ${id.slice(0, 8)} produced no answer — salvaged a writeup from ${toolCalls} tool call(s)`);
+      } else {
+        output = mechanicalAccount(job, calls, budget, c);
+        status = 'partial';
+        error = describeStop(calls, budget, c);
+        console.warn(`[AgentJobs] ${id.slice(0, 8)} produced no answer and no writeup — wrote the mechanical account instead`);
+      }
     }
   } catch (err) {
     status = 'failed';
     error = err && err.message ? err.message : String(err);
     budget = session.summary();
     console.error(`[AgentJobs] ${id.slice(0, 8)} failed:`, error);
+    // Even a thrown run writes what it has. The throw is usually the brain being
+    // unreachable, and then there is nothing to write up but the attempt — which
+    // is still a card that says what happened rather than one that says nothing.
+    calls = Array.isArray(calls) ? calls : [];
+    toolCalls = calls.length;
+    output = mechanicalAccount(job, calls, budget, c, error);
   }
 
   const done = finish(id, { status, resultText: output || null, error, toolCalls, budget });
   const secs = done ? (done.duration_ms / 1000).toFixed(1) : '?';
   const line = status === 'ok'
     ? `Background job finished: "${job.title}" (${id.slice(0, 8)}) — ok in ${secs}s, ${toolCalls} tool call(s).`
-    : `Background job FAILED: "${job.title}" (${id.slice(0, 8)}) — ${error}`;
+    : status === 'partial'
+      ? `Background job finished PARTIAL: "${job.title}" (${id.slice(0, 8)}) — ${secs}s, ${toolCalls} tool call(s). It wrote up what it had. Why it stopped: ${error}`
+      : `Background job FAILED: "${job.title}" (${id.slice(0, 8)}) — ${error}`;
   console.log(`[AgentJobs] ${line}`);
   opsLog(line);
   return done;
@@ -805,9 +995,16 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
   let used = estTokens(header + footer);
   for (const it of items) {
     const when = it.finished_at ? new Date(it.finished_at).toLocaleString() : 'recently';
+    // WHAT HE IS TOLD MATCHES WHAT IS ON THE CARD. Before `partial` existed this
+    // read "status is ok, or it produced nothing" — so a run that wrote up half
+    // an answer was announced to him as having produced nothing, and he had no
+    // way to mention to her a result that was sitting in her panel.
+    const text = String(it.text || '').trim();
     const body = it.status === 'ok'
-      ? String(it.text || '').trim()
-      : `It did not produce a result. What went wrong: ${it.error || 'unrecorded'}.`;
+      ? text
+      : (text
+        ? `${text}\n  (This one stopped short of finishing: ${it.error || 'reason unrecorded'}. What is above is what it had.)`
+        : `It did not produce a result. What went wrong: ${it.error || 'unrecorded'}.`);
     const label = it.kind === 'scheduled' ? 'scheduled job' : 'job you started';
     const line = `- (${label}) "${it.title}" — finished ${when}: ${body}`;
     const t = estTokens(line);
@@ -827,6 +1024,10 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
 module.exports = {
   JOB_TOOLS,
   TERMINAL,
+  // Exported for test: the two halves of "a job always writes something" are
+  // pure functions, and the floor especially must be provable without a model.
+  describeStop,
+  mechanicalAccount,
   enqueue,
   runJob,
   drain,

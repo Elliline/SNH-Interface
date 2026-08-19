@@ -661,6 +661,18 @@ async function sendMessage(inputModality = 'typed') {
     // Refresh conversation list to show the new/updated conversation
     loadConversations();
 
+    // AND THE ROBOT BUTTON, NOW RATHER THAN IN UP TO A MINUTE.
+    //
+    // The turn that just finished is the most likely moment for a job to have
+    // started, and the badge poll sits at 60s while nothing is known to be
+    // running — so the pulse that says "something is working" arrived up to a
+    // minute after the reply that started it, which reads as nothing having
+    // happened. One extra request per turn buys the indicator being true when she
+    // looks at it. refreshJobsBadge also steps the poll up to 15s on its own once
+    // it sees something active.
+    refreshJobsBadge();
+    if (jobsPanel?.classList.contains('open')) loadJobsList();
+
   } catch (error) {
     console.error('Error sending message:', error);
     ttsChunker.cancel();
@@ -3312,6 +3324,7 @@ const JOB_STATUS_NOTE = {
   // Every terminal state says what it means for her, because a bare status word
   // makes an interrupted job look like a failed one and a cancelled one look
   // like a crash.
+  partial: 'It stopped before finishing and wrote up what it had.',
   failed: 'It did not produce a result.',
   interrupted: 'The server restarted while this was running.',
   cancelled: 'You cancelled this before it started.'
@@ -3353,12 +3366,21 @@ async function loadJobsList() {
     items.sort((a, b) => rank(a) - rank(b) || (new Date(b.created_at || 0) - new Date(a.created_at || 0)));
 
     container.innerHTML = items.map(it => {
-      const unread = !it.seen_at && ['ok', 'failed', 'interrupted', 'cancelled'].includes(it.status);
+      const unread = !it.seen_at && ['ok', 'partial', 'failed', 'interrupted', 'cancelled'].includes(it.status);
       const kindLabel = it.kind === 'scheduled' ? 'scheduled' : 'started in chat';
       const note = JOB_STATUS_NOTE[it.status] || '';
+      // TEXT WINS OVER STATUS. This used to render result_text only for `ok`, so
+      // a run that stopped early and wrote up what it had displayed as an error
+      // and nothing else — the work was in the database and invisible on screen,
+      // which is the same class of bug as the retired fact that redrew as live.
+      // If there is text, she reads the text; the reason it stopped goes
+      // underneath it, where it explains the result rather than replacing it.
+      const partialText = (it.status !== 'ok' && it.result_text) ? escapeHtml(it.result_text) : '';
       const body = it.status === 'ok'
         ? escapeHtml(it.result_text || '')
-        : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`;
+        : (partialText
+          ? `${partialText}<div class="job-error job-cutshort">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</div>`
+          : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`);
       // Elapsed, for the ones still going — "running" with no clock on it tells
       // her nothing about whether to keep waiting.
       const elapsed = (it.status === 'running' && it.started_at)

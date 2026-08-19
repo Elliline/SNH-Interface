@@ -85,6 +85,51 @@ function memberIdFilter(id) {
 // ============ Background tool budget ============
 
 /**
+ * WHAT ONE TOOL CALL COST, and why the answer is not always 1.
+ *
+ * Pure and exported so the rule is testable without a model in the loop, and so
+ * "a search that found nothing is not progress" is a line of code rather than an
+ * intention. Deliberately NARROW — three cases, each with a reason:
+ *
+ *   - A result carrying `error` is a call that did not happen. Any tool.
+ *   - An empty SEARCH is a call that happened and answered nothing: web_search
+ *     with no results, memory_search with no matches. Both are the shape the
+ *     failing job spent its whole budget on.
+ *   - Everything else bills in full, and memory_count is the case that shows why
+ *     the rule has to be narrow: `count: 0` is not a failure, it is the ANSWER,
+ *     and discounting it would pay a job to ask questions whose answer is zero.
+ *
+ * The memory_search exception has an exception of its own. A search with no
+ * ACTIVE matches but a note about inactive ones ("you no longer hold this, and
+ * here is what replaced it") has told him something true and useful, so it bills
+ * in full.
+ *
+ * @param {string} name - the tool called
+ * @param {Object} result - what it returned
+ * @param {number} failedCost - what an unproductive call bills
+ * @returns {{cost: number, productive: boolean, why: string}}
+ */
+function toolCallCost(name, result, failedCost = 0.25) {
+  const r = result || {};
+  if (r.error) return { cost: failedCost, productive: false, why: 'the call returned an error' };
+
+  if (name === 'web_search') {
+    const n = Array.isArray(r.results) ? r.results.length : 0;
+    if (n === 0) return { cost: failedCost, productive: false, why: 'the search returned no results' };
+  }
+
+  if (name === 'memory_search') {
+    const n = Array.isArray(r.results) ? r.results.length : 0;
+    const toldSomethingAnyway = !!r.note || (r.also_inactive || 0) > 0;
+    if (n === 0 && !toldSomethingAnyway) {
+      return { cost: failedCost, productive: false, why: 'nothing in memory matched' };
+    }
+  }
+
+  return { cost: 1, productive: true, why: 'a usable result' };
+}
+
+/**
  * A per-step tool budget.
  *
  * Created by runStep when a step declares a tool allowlist, and threaded into
@@ -100,6 +145,7 @@ function memberIdFilter(id) {
  */
 function createToolSession(stepName, allowedTools = [], overrides = {}) {
   const cfg = (getConfig().heartbeat && getConfig().heartbeat.toolBudget) || {};
+  const maxCalls = Math.max(1, overrides.maxCalls ?? cfg.maxCallsPerStep ?? 12);
   return {
     stepName,
     allowedTools,
@@ -107,19 +153,58 @@ function createToolSession(stepName, allowedTools = [], overrides = {}) {
     // than any other background role. A single shared number would either starve
     // it or over-grant everything else, so its budget lives in corrector.* and is
     // handed in here — one session, one set of limits, no second accounting.
-    maxCalls: Math.max(1, overrides.maxCalls ?? cfg.maxCallsPerStep ?? 12),
+    maxCalls,
     maxWallMs: Math.max(1000, overrides.maxWallMs ?? cfg.maxWallClockMsPerStep ?? 120000),
     maxRounds: Math.max(1, overrides.maxRounds ?? cfg.maxRoundsPerCall ?? 5),
+    // A FAILED CALL IS NOT PROGRESS, AND IS NOT PRICED LIKE IT (2026-08-18).
+    //
+    // A background job spent its whole allowance of 12 calls on searches that
+    // all failed with the same broken-URL error, and stopped having learned
+    // nothing. Charging a dead call what a real result costs makes the budget
+    // measure ATTEMPTS when the thing worth bounding is WORK DONE.
+    //
+    // So the budget is billed in units: a usable result costs 1, an error or an
+    // empty search costs `failedCallCost`. And because a discount alone would
+    // let an everything-fails loop run four times as long, there is a hard raw
+    // ceiling on attempts underneath it (`maxAttempts`) — that is the limit that
+    // binds when a provider is down, and it binds on the count of what actually
+    // happened rather than on what it was worth.
+    failedCallCost: Math.min(1, Math.max(0, overrides.failedCallCost ?? cfg.failedCallCost ?? 0.25)),
+    maxAttempts: Math.max(1, overrides.maxAttempts ?? Math.ceil(maxCalls * (cfg.attemptCeilingMultiple ?? 2))),
+    // `calls` stays the RAW count of calls made — it is what the logs, the panel
+    // and every existing reader mean by "tool calls", and a billed figure in that
+    // field would quietly change what those numbers say. `billed` is the budget.
     calls: 0,
+    billed: 0,
+    failedCalls: 0,
     startedMs: Date.now(),
     exhaustedReason: null,
 
     /** @returns {string|null} the reason the budget is spent, or null */
     spent() {
-      if (this.calls >= this.maxCalls) return `call budget spent (${this.calls}/${this.maxCalls} tool calls)`;
+      if (this.billed >= this.maxCalls) {
+        const spentOn = this.failedCalls
+          ? `${this.calls} call(s), ${this.failedCalls} of them empty or failed`
+          : `${this.calls} call(s)`;
+        return `call budget spent (${this.billed.toFixed(2)}/${this.maxCalls} billed over ${spentOn})`;
+      }
+      if (this.calls >= this.maxAttempts) {
+        return `attempt ceiling reached (${this.calls}/${this.maxAttempts} calls, ${this.failedCalls} of them empty or failed — nothing is coming back, so it stopped trying)`;
+      }
       const elapsed = Date.now() - this.startedMs;
       if (elapsed >= this.maxWallMs) return `time budget spent (${Math.round(elapsed / 1000)}s of ${Math.round(this.maxWallMs / 1000)}s)`;
       return null;
+    },
+
+    /**
+     * Bill one completed call. Named and separate so what a call COST is
+     * decided in one place and is testable without a model in the loop.
+     */
+    charge(name, result) {
+      const { cost, productive } = toolCallCost(name, result, this.failedCallCost);
+      this.billed += cost;
+      if (!productive) this.failedCalls++;
+      return cost;
     },
 
     /** Record that the budget bound. Loud by construction — never silent. */
@@ -137,6 +222,11 @@ function createToolSession(stepName, allowedTools = [], overrides = {}) {
         tools: this.allowedTools,
         calls: this.calls,
         maxCalls: this.maxCalls,
+        // Both numbers, always: "12 calls" and "12 calls of which 9 were dead"
+        // are different reports, and only the second one explains a thin result.
+        billed: Math.round(this.billed * 100) / 100,
+        failedCalls: this.failedCalls,
+        maxAttempts: this.maxAttempts,
         elapsedMs: Date.now() - this.startedMs,
         maxWallMs: this.maxWallMs,
         exhausted: this.exhaustedReason
@@ -159,14 +249,24 @@ async function executeBackgroundTool(session, name, args) {
   const MCPClient = require('../mcp/mcp-client');
   const client = MCPClient.shared();
   if (!session.allowedTools.includes(name)) {
+    // Not billed and not counted: nothing was called. A refusal by the allowlist
+    // is a fact about the step's declaration, not about its budget.
     return { error: `Tool "${name}" is not available to this background step.` };
   }
   session.calls++;
+  let result;
   try {
-    return await client.executeTool(name, args, { caller: `heartbeat:${session.stepName}` });
+    result = await client.executeTool(name, args, { caller: session.stepName });
   } catch (err) {
-    return { error: `Tool execution failed: ${err.message}` };
+    result = { error: `Tool execution failed: ${err.message}` };
   }
+  // BILLED HERE, once, from the actual result — never at the call site. A caller
+  // that decides its own cost is a caller that can forget to.
+  const cost = session.charge(name, result);
+  if (cost < 1) {
+    console.log(`[Heartbeat] ${session.stepName} ${name} was unproductive (${toolCallCost(name, result, session.failedCallCost).why}) — billed ${cost}, ${session.billed.toFixed(2)}/${session.maxCalls}`);
+  }
+  return result;
 }
 
 /**
@@ -228,7 +328,7 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
     if (offerTools) roundBody.tools = specs;
 
     console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
-                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.calls}/${session.maxCalls} used)` : ' (no tools — budget spent)'}`);
+                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
 
     const response = await fetch(url, {
       method: 'POST',
@@ -277,19 +377,76 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
       }
 
       const result = await executeBackgroundTool(session, name, args);
-      toolCalls.push({ name, args, ok: !result?.error });
+      // `note` carries WHY a call was worth nothing, so a caller writing up a
+      // thin run can say "four searches, all empty" instead of "no results".
+      const worth = toolCallCost(name, result, session.failedCallCost);
+      toolCalls.push({ name, args, ok: !result?.error, productive: worth.productive, note: worth.productive ? null : worth.why });
       convo.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
     }
   }
 
-  // Rounds exhausted with the model still asking. Return what it last said
-  // rather than throwing — a step that looked things up and ran out of rounds
-  // has done real work.
+  // ROUNDS EXHAUSTED WITH THE MODEL STILL ASKING — AND IT STILL HAS TO WRITE.
+  //
+  // This used to `return { content: '' }`, and that empty string is exactly how a
+  // real job was thrown away on 2026-08-18: it spent every round on searches that
+  // failed, the loop ran out, the caller received no text, and the memory work it
+  // had ALREADY DONE went in the bin behind an empty panel card. The work was
+  // done; only the writeup was missing.
+  //
+  // So the last thing a run out of rounds does is write up what it has. Tools are
+  // withdrawn (nothing is offered, so nothing can be asked for), the whole tool
+  // transcript is still in `convo`, and the instruction is explicit about what an
+  // honest partial answer looks like. One extra turn, and it is the difference
+  // between a result and nothing.
   session.exhaust(`round budget spent (${session.maxRounds} rounds)`);
+
+  const dead = toolCalls.filter(c => !c.productive).length;
+  convo.push({
+    role: 'user',
+    content:
+      'STOP LOOKING THINGS UP — you are out of tool rounds and have no tools for this turn. ' +
+      `You made ${toolCalls.length} tool call(s)${dead ? `, ${dead} of which came back empty or failed` : ''}. ` +
+      'Write up what you have NOW, from the tool results above. Say what you found, and say plainly which ' +
+      'part you could not finish and why. If the lookups failed, say that they failed rather than reporting ' +
+      'the gap as an absence of anything to find. Do not invent anything to fill it, and do not answer with ' +
+      'nothing — a partial answer that says where it stops is worth something; silence is worth nothing.'
+  });
+
+  try {
+    const lastBody = { ...body, messages: convo };
+    delete lastBody.tools;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(lastBody),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
+      const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
+      closeCircuit();
+      return {
+        content: stripChannelMarkers(msg.content),
+        provider: providerName,
+        truncated: finishReason === 'length',
+        toolCalls,
+        budget: session.summary(),
+        // The caller needs to know this was cut short even when the text reads
+        // whole — a partial run reported as complete is the same lie in a nicer
+        // shape.
+        outOfRounds: true
+      };
+    }
+    console.warn(`[Heartbeat] ${session.stepName} writeup turn failed with HTTP ${response.status}`);
+  } catch (err) {
+    console.warn(`[Heartbeat] ${session.stepName} writeup turn failed: ${err.message}`);
+  }
+
   closeCircuit();
   return {
     content: '', provider: providerName, truncated: false,
-    toolCalls, budget: session.summary()
+    toolCalls, budget: session.summary(), outOfRounds: true
   };
 }
 
@@ -2429,4 +2586,4 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool };
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost };

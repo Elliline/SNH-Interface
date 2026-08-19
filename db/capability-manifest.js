@@ -190,12 +190,23 @@ const CONDITIONAL_CAPABILITIES = [
   {
     id: 'web-search',
     name: 'Web search',
-    description: "When a question is about current or changeable facts, you can search the web (via SearXNG) and read pages, and your answer marks and cites the actual source links it drew from. Those links are kept with the message, so if you're later asked to cite, you read the real sources instead of reconstructing them.",
-    oneLiner: "search the web; answer with the real links used",
+    description: "When a question is about current or changeable facts, you can search the web and read pages, and your answer marks and cites the actual source links it drew from. Those links are kept with the message, so if you're later asked to cite, you read the real sources instead of reconstructing them. Two search services sit behind one tool: Exa is tried first, and if it fails or finds nothing the local SearXNG instance is tried instead — you don't choose between them and don't need to know which ran. If both come back empty, that is a real empty answer and you say so rather than filling it in. The same chain serves your background jobs, and every search is logged with which service ran and whether it returned anything.",
+    oneLiner: "search the web (Exa, then local SearXNG); answer with the real links used",
     intro: 'I can search the web for current facts and answer with the actual source links I drew from',
-    schedule: 'When a question needs current info (only while search is enabled)',
+    schedule: 'When a question needs current info (only while a search provider is available)',
     dateAdded: '2026-07-23',
-    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.searxng && cfg.tools.searxng.enabled),
+    // TRUE WHEN A PROVIDER CAN ACTUALLY BE CALLED, which is not the same as a
+    // flag being on: Exa needs EXA_API_KEY in the environment, and the honest
+    // condition is "either provider is usable". This predicate reads config only
+    // — the env half is checked here directly rather than through
+    // getSearchConfig(), because a manifest that imports the resolver would be
+    // asserting its own correctness.
+    when: (cfg) => {
+      const t = (cfg && cfg.tools) || {};
+      const exaUsable = !!(t.exa && t.exa.enabled !== false && (process.env.EXA_API_KEY || '').trim());
+      const searxngUsable = !!(t.searxng && t.searxng.enabled);
+      return exaUsable || searxngUsable;
+    },
     // Machine link to the MCP tools this entry accounts for. Any registered tool
     // NOT claimed by some entry gets a derived entry instead of silently going
     // unmentioned — which is exactly how web_fetch had no coverage at all.
@@ -203,9 +214,12 @@ const CONDITIONAL_CAPABILITIES = [
     // Explicit config keys this entry accounts for. Declared, not guessed:
     // matching "tools.searxng" to an entry called "web-search" by string
     // similarity fails, and a check that cries wolf gets ignored.
-    coversConfig: ['tools.searxng'],
+    coversConfig: ['tools.searxng', 'tools.exa', 'tools.search'],
     // Probed by checkDrift(). A registered organ whose service is unreachable
-    // must not keep reading as live.
+    // must not keep reading as live. Only SearXNG is probed: it is a local
+    // service that can simply be down, whereas probing Exa would mean spending a
+    // metered credit at every boot to learn something the first real search
+    // reports anyway (and reports in the ops log when it falls back).
     probes: (cfg) => [{ name: 'SearXNG', url: (cfg.tools && cfg.tools.searxng && cfg.tools.searxng.url) || 'http://localhost:8888' }]
   },
   {
@@ -390,7 +404,7 @@ const CONDITIONAL_CAPABILITIES = [
     //     would be an over-claim of exactly the dangerous kind.
     //   - a restart kills a run in progress. He should not promise a result
     //     that a deploy can quietly take away.
-    description: "You can start a piece of work in the middle of a conversation and carry on talking. It runs in the background on your own machine, keeps running after the conversation ends and after she closes the browser, and a run is you doing what you described, with your read-only memory and search tools. The result goes to Ellie's jobs panel — and this is a limit, not an oversight: it NEVER opens a conversation, never messages her, and never interrupts her. She reads it when she is ready. You are told what finished at the start of your next reply to her, and if something you found is worth actually saying, saying it is an ordinary decision you make then, the same as anything else you might raise. A job cannot run commands, change anything, write to your memory, or start another job. If the server restarts mid-run the work is lost — it is redone once if it was recent, and otherwise it appears in the panel saying it was interrupted, so nothing ever quietly disappears.",
+    description: "You can start a piece of work in the middle of a conversation and carry on talking. It runs in the background on your own machine, keeps running after the conversation ends and after she closes the browser, and a run is you doing what you described, with your read-only memory and search tools. The result goes to Ellie's jobs panel — and this is a limit, not an oversight: it NEVER opens a conversation, never messages her, and never interrupts her. She reads it when she is ready. You are told what finished at the start of your next reply to her, and if something you found is worth actually saying, saying it is an ordinary decision you make then, the same as anything else you might raise. A job cannot run commands, change anything, write to your memory, or start another job — it can WRITE a script or a draft, but nothing in a run executes it. However a run ends — out of tool calls, out of time, every lookup failing — it writes up what it had rather than landing as an empty card, and the panel says it stopped short and why. If the server restarts mid-run the work is lost — it is redone once if it was recent, and otherwise it appears in the panel saying it was interrupted, so nothing ever quietly disappears.",
     oneLiner: "start work mid-chat, results to her jobs panel; never opens a conversation",
     intro: 'I can start a piece of work in the middle of a conversation and carry on talking — it keeps running after the conversation ends, and I am told what finished at the start of my next reply. The result goes to Ellie\'s jobs panel and it never opens a conversation or interrupts her; if something I found is worth saying, that is a decision I make in an ordinary conversation. A job of mine reads, and only reads: it cannot run commands, change anything, or start another job',
     schedule: 'On ask, during a conversation; the run happens afterwards in the background',
@@ -401,7 +415,12 @@ const CONDITIONAL_CAPABILITIES = [
     when: (cfg) => !!(cfg && cfg.agentJobs && cfg.agentJobs.enabled !== false
       && cfg.tools && cfg.tools.agentJobs && cfg.tools.agentJobs.enabled !== false),
     coversTools: ['start_background_job'],
-    coversConfig: ['agentJobs']
+    // Both keys: `agentJobs` holds the queue's budgets, `tools.agentJobs` holds
+    // the tool's own on/off flag and the tier-2 dispatch switch. Declaring only
+    // the first left the startup drift check warning about an uncovered enabled
+    // service on every boot, and a check that cries wolf is a check that gets
+    // ignored.
+    coversConfig: ['agentJobs', 'tools.agentJobs']
   }
 ];
 

@@ -22,6 +22,17 @@
  *     as many words, that he does not have one yet and must not describe what it
  *     will say.
  *
+ * SHE MAY NAME THE MECHANISM, AND THEN IT IS NOT A JUDGEMENT CALL (2026-08-18).
+ * "Use and agent and write me a python script for a calculator": tier 1 fired,
+ * the guidance block fired, this tool was fourth of eleven in the payload — and
+ * the model returned no tool calls and the sentence "I have started a background
+ * job to write a Python calculator script." Two things were missing and both are
+ * fixed here: the description was written entirely about RESEARCH, so a request
+ * to produce something matched nothing in it; and it never said that her naming
+ * an agent settles the question. The server also forces the call on that signal
+ * and backstops it after the reply, because a tool description is an argument and
+ * an argument can be lost.
+ *
  * DIRECT-EXECUTE, not propose-only, unlike create_cron_job. Starting a read-only
  * background lookup is not a decision that needs Ellie's approval — it changes
  * nothing, costs a few minutes of a GPU that is already his to use, and the
@@ -51,13 +62,19 @@ class StartBackgroundJobTool {
     // not answer this turn and gave her nothing, while knowing plenty already.
     this.description =
       'Hand a piece of work to a background agent and carry on talking. ' +
-      'USE IT WHEN ANY OF THESE IS TRUE: she has said she is not waiting — "take your time", ' +
+      'IF SHE ASKS FOR AN AGENT, CALL THIS. "Use an agent", "send an agent", "start a background job" — ' +
+      'that is her decision already made, and it does not matter what the work is: research, a writeup, ' +
+      'a script, a plan. Do not weigh it up and do not answer inline instead. ' +
+      'ALSO USE IT WHEN ANY OF THESE IS TRUE: she has said she is not waiting — "take your time", ' +
       '"take as long as you need", "I\'ll keep chatting", "while I\'m out"; or the answer needs ' +
       'more than about two searches, or several sources compared against each other; or the work ' +
       'would take you more than a minute. ' +
       'WHAT YOU GAIN: the agent can run a dozen searches and read whole pages. Answering inline ' +
       'gets you two or three searches and the snippets around them. For anything needing current ' +
       'detail from several places, the handed-off version is simply the better answer. ' +
+      'IT CAN PRODUCE AS WELL AS LOOK UP: a run can write the thing she asked for — a script, a draft, ' +
+      'a writeup — out of what it knows, and use its tools to check the facts that thing depends on. ' +
+      'It cannot RUN what it writes; nothing in a job executes code. ' +
       'BOTH, NOT EITHER: starting a job never means saying nothing now. Tell her what you already ' +
       'know from memory and training in this same turn — she asked you, not the agent — and hand ' +
       'off only the part that needs real digging. A turn that just says "I will come back to you" ' +

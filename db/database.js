@@ -945,6 +945,30 @@ function initDatabase() {
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_tool_call_log_created ON tool_call_log(created_at)`);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_tool_call_log_tool ON tool_call_log(tool)`);
 
+    // Every SEARCH provider attempt — see db/search-log.js for why this is its
+    // own table rather than a `tool` value in tool_call_log. One tool call can
+    // try Exa and then SearXNG, and the two attempts have different outcomes;
+    // squeezing both into one row would lose exactly the fact worth keeping.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS search_call_log (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        provider TEXT NOT NULL,             -- exa | searxng
+        query TEXT NOT NULL,
+        num_results INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL,              -- results | empty | error | skipped
+        detail TEXT,                        -- the error, or why it was skipped
+        caller TEXT,                        -- chat | agent-job:3f9a1c2b | heartbeat:corrector
+        latency_ms INTEGER,
+        attempt_id TEXT,                    -- groups the providers tried for ONE tool call
+        served INTEGER NOT NULL DEFAULT 0,  -- 1 for the attempt whose results were used
+        cost_usd REAL                       -- when the provider reports one
+      )
+    `);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_search_call_log_created ON search_call_log(created_at)`);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_search_call_log_provider ON search_call_log(provider)`);
+    sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_search_call_log_attempt ON search_call_log(attempt_id)`);
+
     // Conversations may be started by SNH itself (unprompted initiatives).
     const convCols = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
     if (!convCols.some(c => c.name === 'initiated_by')) {

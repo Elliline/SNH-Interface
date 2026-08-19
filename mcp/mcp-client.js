@@ -5,7 +5,7 @@
  * - Execute tool calls by routing to the correct tool implementation
  */
 
-const SearXNGTool = require('./tools/searxng');
+const WebSearchTool = require('./tools/web-search');
 const WebFetchTool = require('./tools/web-fetch');
 const CreateCronJobTool = require('./tools/create-cron-job');
 const StartBackgroundJobTool = require('./tools/start-background-job');
@@ -17,7 +17,7 @@ const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
 const { MemoryJobsTool } = require('./tools/jobs-inspect');
-const { getConfig, getSearxngConfig } = require('../db/config');
+const { getConfig, getSearchConfig } = require('../db/config');
 
 /**
  * Tools a BACKGROUND step may be handed.
@@ -45,9 +45,10 @@ const BACKGROUND_TOOLS = [
   // the world as well as in the record. Both are READS — they change nothing,
   // here or anywhere — and both remain per-step declarations, so nothing gains
   // them by being background: the corrector does not ask for them and therefore
-  // does not have them. They ride on config.tools.searxng.enabled like every
-  // other appearance of the search stack, so a box with SearXNG off simply has
-  // them dropped by the registry intersection.
+  // does not have them. They ride on whether a search PROVIDER is available
+  // (getSearchConfig().any — Exa with a key, or SearXNG enabled) like every other
+  // appearance of the search stack, so a box with no provider simply has them
+  // dropped by the registry intersection.
   'web_search', 'web_fetch',
   // Phase 2c: the corrector's write actions. Background-only — see
   // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
@@ -80,21 +81,30 @@ class MCPClient {
    * independent flags for one capability meant they could disagree, and in the
    * disagreeing direction the tool registered, appeared in the model's tool list,
    * and was then never routed to — available-looking and inert. tools.json also
-   * carried a duplicate `endpoint`, already dead because the chat path overrides
-   * it with getSearxngConfig().url on every call. The file is gone; one flag per
+   * carried a duplicate `endpoint`, already dead because the search tool resolves
+   * its own providers from config on every call. The file is gone; one flag per
    * capability, in config, which is the pattern create_cron_job already used.
    */
   loadConfig() {
     this.tools.clear();
 
-    // web_search — same flag the chat path and the manifest read, same URL.
-    const searxng = getSearxngConfig();
-    if (searxng.enabled) {
-      const tool = new SearXNGTool(searxng.url);
+    // web_search — registered when ANY provider can actually be called, and the
+    // chain behind it is resolved per call (mcp/tools/web-search.js). Note what
+    // "available" means: not just an `enabled` flag, but the prerequisite too —
+    // Exa with no EXA_API_KEY in the environment is not available, and on a box
+    // with SearXNG off as well there is no search tool at all, which is the same
+    // honest absence this has always had.
+    const search = getSearchConfig();
+    if (search.any) {
+      const tool = new WebSearchTool();
       this.tools.set(tool.name, tool);
-      console.log(`MCP: Registered tool "${tool.name}" -> endpoint ${searxng.url}`);
+      const shape = search.providers
+        .map(p => p.available ? p.name : `${p.name} (unavailable: ${p.why})`)
+        .join(' → ');
+      console.log(`MCP: Registered tool "${tool.name}" -> providers in order: ${shape}`);
     } else {
-      console.log('MCP: Skipping "web_search" — config.tools.searxng.enabled is false');
+      const why = search.providers.map(p => `${p.name}: ${p.why}`).join('; ') || 'no providers configured';
+      console.log(`MCP: Skipping "web_search" — no provider is available (${why})`);
     }
 
     // web_fetch rides along with SEARCH tools specifically — fetching a page is
@@ -209,9 +219,10 @@ class MCPClient {
    * Execute a tool call by name
    * @param {string} toolName - The tool function name
    * @param {Object} args - The parsed arguments for the tool
-   * @param {Object} context - Optional context. `searxngHost` overrides the
-   *   configured SearXNG instance for web_search; anything else is passed to the
-   *   tool as its context object.
+   * @param {Object} context - Optional context, passed through UNCHANGED as
+   *   every tool's second argument. web_search reads `caller` for its log and
+   *   `searxngHost` (a string) as a SearXNG endpoint override; action tools read
+   *   `conversationId`/`messageId`. Nothing is reshaped here.
    * @returns {Object} Tool execution result
    */
   async executeTool(toolName, args, context = {}) {
@@ -221,33 +232,28 @@ class MCPClient {
     }
 
     try {
-      // web_search IS THE ODD ONE: its execute() is (args, endpointOverride) —
-      // a positional STRING — while every other tool takes (args, context).
+      // EVERY TOOL HAS THE SAME SIGNATURE: (args, context). There is no special
+      // case here any more, and the one that used to live here is the reason the
+      // rule is stated this loudly.
       //
-      // That difference broke the agent worker on 2026-08-18. The old line here
-      // was `if (toolName === 'web_search' && context.searxngHost)`, so the
-      // chat path — which passes { searxngHost } — worked, and every path that
-      // does not — the background tool loop passes { caller } — fell through to
-      // the generic call and handed the CONTEXT OBJECT to a parameter used as a
-      // URL base. The real error, verbatim:
+      // web_search was the odd one — `execute(args, endpointOverride)`, a
+      // positional STRING. On 2026-08-18 the chat path passed { searxngHost } and
+      // worked; the background tool loop passed { caller } and handed the CONTEXT
+      // OBJECT to a parameter used as a URL base:
       //
       //   Search failed: Failed to parse URL from [object Object]/search?q=…
       //
-      // Seven of those inside one job in 11 seconds, and the model reported it
-      // to Ellie as "an issue with the search tool", which is all it could see.
+      // Seven of those inside one job in 11 seconds, reported to Ellie as "an
+      // issue with the search tool", which is all the model could see. The first
+      // fix resolved the endpoint HERE, at this call site. That worked and was
+      // still wrong in shape: a contract one tool alone breaks is a contract the
+      // next call site forgets. web_search now takes (args, context) like the
+      // rest and resolves its own providers, so this function no longer knows
+      // which tool it is calling. Anything added here whose execute() is not
+      // (args, context) is a bug in the tool, not a case for this switch.
       //
-      // The endpoint is now RESOLVED HERE, from the same getSearxngConfig() the
-      // chat path reads, so a caller that says nothing gets the configured
-      // instance instead of a broken URL. An explicit override is still
-      // honoured, and only if it is actually a string — the shape that caused
-      // this cannot be passed through again.
-      if (toolName === 'web_search') {
-        const override = typeof context.searxngHost === 'string' ? context.searxngHost : null;
-        return await tool.execute(args, override || getSearxngConfig().url);
-      }
-      // Everything else gets the context object as its second argument. Action
-      // tools need it (create_cron_job records which conversation proposed the
-      // job); web_fetch takes only args and ignores it.
+      // Action tools read the context (create_cron_job records which conversation
+      // proposed the job); web_fetch takes only args and ignores it.
       return await tool.execute(args, context);
     } catch (error) {
       return { error: `Tool execution failed: ${error.message}` };

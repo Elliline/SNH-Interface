@@ -3158,7 +3158,19 @@ a.msg-source:hover {
 .job-status-failed { color: var(--error-color); }
 .job-status-interrupted { color: var(--warning-color); }
 .job-status-cancelled { color: var(--text-secondary); }
+/* PARTIAL is a result, not a fault: it reads as a caution beside the ok green,
+   never as the red of a job that produced nothing. */
+.job-status-partial { color: var(--warning-color); }
 .job-error { color: var(--error-color); font-size: 0.76rem; }
+/* Why a partial run stopped, under the text it did write. Muted and separated,
+   because the RESULT is the thing she is reading and this only explains it. */
+.job-cutshort {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-color);
+  color: var(--warning-color);
+  font-size: 0.72rem;
+}
 .job-seen, .job-cancel {
   padding: 4px 10px;
   font-size: 0.7rem;

@@ -420,6 +420,53 @@ Four more things that are load-bearing if you touch this:
   message asking for current facts *and* granting time is not asking to be
   rushed. "…as inference backends as of right now" had been cancelling exactly
   that kind of request.
+- **Tier 1 is a decision she already made, so the call is FORCED and then
+  backstopped.** Tier 1 was never gated — `classifyHandoffSignal` returns it
+  before it reads `allowBuild` — and on 2026-08-18 that was not enough: "Use and
+  agent and write me a python script for a calculator" fired tier 1, fired the
+  guidance block, had the tool fourth of eleven in the payload, and came back
+  `tool_calls: []` with "I have started a background job to write a Python
+  calculator script." Nothing blocked it; the suggestion was declined. So there
+  are now three layers, and the third is the only one that cannot be argued with:
+  the description says her naming an agent settles it; the first tool round pins
+  `tool_choice` to `start_background_job` (retried unforced if the engine refuses,
+  and Ollama ignores the field); and if the turn still ends with no row, **the
+  server enqueues one from her message verbatim and says so in the reply**. Tier 1
+  only — tiers 2–4 are inferences about the shape of the work, and forcing one
+  would dispatch a job she never asked for.
+- **A job may PRODUCE, not only report.** The run prompt said "everything you
+  report must come from a tool result", full stop — under which a job asked to
+  write a calculator has no legal move, because no tool returns one. The rule is
+  kept and scoped: anything asserted **as fact** must come from a tool result in
+  that run; anything she asked to be **produced** — a script, a draft, a plan — he
+  writes himself, from what he knows, using tools to check what it depends on. A
+  job still cannot execute what it writes.
+- **A job that started has a result she can read. Always.** The car job spent all
+  twelve of its calls on searches failing with the same broken-URL error, returned
+  no text, and closed as `failed` with `result_text` NULL — an empty card, and the
+  memory work it had finished before it ever reached a search went in the bin with
+  it. The work was done; only the writing-up was missing, and nothing asked for
+  it. Three layers now: `runToolLoop` spends its last round on a **no-tools
+  writeup turn** instead of returning `content: ''`; `salvageWriteup()` asks once
+  more, without tools, carrying the run's own tool record; and
+  `mechanicalAccount()` is the floor — deterministic, no model, so it cannot come
+  back empty either. A cut-short run is **`partial`**, the honest third status:
+  `ok` over-claims and `failed` throws away a real result. The panel shows the
+  text with the reason it stopped underneath — never instead of it — and the
+  announcement block tells him the same thing her card says.
+- **A failed call is not priced like progress.** The budget bills in units:
+  a usable result costs 1, an error (any tool) or an empty `web_search` /
+  `memory_search` costs `heartbeat.toolBudget.failedCallCost` (0.25). The rule is
+  `toolCallCost()` — pure, exported, tested — and it is deliberately narrow:
+  `memory_count` returning 0 bills in full, because there zero **is** the answer,
+  and an empty `memory_search` that surfaced inactive facts bills in full too. A
+  discount alone would let an everything-fails loop run four times as long, so a
+  raw **attempt ceiling** of 2× the budget sits underneath it and is what binds
+  when a provider is down. `session.calls` stays the raw count — it is what the
+  logs and the panel mean by "tool calls" — and `session.billed` is the budget.
+  Job budgets were raised with it: 40 calls, **16 rounds** (6 rounds at 2–3 calls
+  each made the 12-call budget decorative — rounds were what actually bound), 15
+  minutes, 2000 output tokens because 700 cannot hold a script.
 - **A restart kills a run, so the loss is made loud.** The row is written before
   the work starts; `sweepInterrupted()` closes every `running` row as
   `interrupted` WITH THE REASON, and re-queues it once if it is inside
@@ -435,6 +482,55 @@ Four more things that are load-bearing if you touch this:
 - **The badge counts unread RESULTS, not work in progress.** Running jobs show as
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
+
+## ⚠️ One search tool, a provider chain, and every call on the record
+
+`web_search` is one tool with two providers behind it (2026-08-18). **Exa's
+`/search` first, SearXNG as the fallback**, order from `config.tools.search.order`,
+tried in turn until one returns results — the same chain for chat and for agent
+jobs, because one of them being quietly stale is exactly what nobody would notice.
+The model never picks a provider; the routing is code (`mcp/tools/web-search.js`),
+and offering the choice would double the schema for a question with one answer.
+
+- **The key is environment-only.** `EXA_API_KEY` in `.env`, never
+  `data/config.json` — that file is served by routes, written by the settings UI
+  and copied into staging seeds, and a secret in it leaks through all three.
+  `db/config.js` calls `dotenv` itself so scripts and cron entry points see it too,
+  not just `server.js`. `getSearchConfig()` is the single answer to "how does a
+  search run right now": order, plus per-provider availability, where availability
+  means the prerequisite as well as the flag. `web_search` registers when ANY
+  provider is available, and with none it is absent exactly as before.
+- **Search-endpoint only, enforced in code.** `type` is pinned to
+  `auto`/`fast`/`instant` and any `deep*` value is refused by `resolveExaType()`
+  and downgraded, with the refusal logged. Deep Search and the Agent endpoint do
+  the multi-step research SNH does itself, with its own tools and its own memory,
+  on its own GPU; buying that from an API moves the thinking off the machine. The
+  free tier has no payment method, so it stops with **402** rather than billing —
+  that 402 is surfaced in words ("the monthly credit is spent… nothing was
+  billed"), never left as a status code to be rediscovered in six weeks.
+- **Empty and broken are different facts.** A provider that worked and found
+  nothing (`ok`, zero results) is a real answer; a provider that failed is not.
+  Both fall through to the next provider, and both are logged distinctly. When
+  **every** provider is empty the result says which were tried and that the answer
+  is nothing — never a bare empty array, which is what gets filled in from memory.
+- **Every provider ATTEMPT writes a row** to `search_call_log` (`db/search-log.js`)
+  with provider, query, count, outcome, caller, latency and reported cost, sharing
+  one `attempt_id` per tool call — so Exa-then-SearXNG reads as one search with two
+  steps. A fallback that worked also writes an ops line, because a working fallback
+  means the provider before it is failing and nothing else would say so. Read it
+  with `node scripts/search-log.js`. This exists because on 2026-08-18 "was it Exa
+  or SearXNG, and did it return anything" was answerable only by reading a journal
+  by hand, and it cost hours.
+- **`web_search` no longer has its own signature.** It is `(args, context)` like
+  every other tool, and the special case in `MCPClient.executeTool` is **gone**.
+  The old positional-string shape worked on the chat path and handed the context
+  object to a URL base on every other path (`Failed to parse URL from [object
+  Object]/search?q=…`, seven times in one job). Resolving the endpoint at the call
+  site fixed the symptom and kept the defect: a contract one tool alone breaks is
+  a contract the next call site forgets. Anything added to the registry whose
+  `execute()` is not `(args, context)` is a bug in the tool.
+- Verify with `node scripts/test-search-providers.js` (stubbed `fetch` — no
+  credit is spent).
 
 ## ⚠️ The replay redirects a PROCESS, not a call
 

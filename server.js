@@ -38,7 +38,7 @@ const { createToolArtifactFilter, stripToolArtifacts, CANNOT_CHECK } = require('
 const MCPClient = require('./mcp/mcp-client');
 
 // Configuration
-const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearxngConfig } = require('./db/config');
+const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearxngConfig, getSearchConfig } = require('./db/config');
 
 // Routes
 const conversationsRouter = require('./routes/conversations');
@@ -1251,9 +1251,17 @@ app.post('/api/instance/models', async (req, res) => {
   }
 });
 
-// ============ SearXNG Web Search ============
+// ============ Web Search ============
 
-// SearXNG search endpoint
+/**
+ * The same provider chain the model uses, over HTTP.
+ *
+ * It used to be its own hand-rolled SearXNG fetch — a SECOND search
+ * implementation, which meant a second answer to "which provider ran and did it
+ * find anything", and only one of the two was logged. It now goes through the
+ * registered web_search tool, so Exa-then-SearXNG, the fallback and the
+ * search_call_log row are identical whoever asked.
+ */
 app.post('/api/search', async (req, res) => {
   try {
     const { query, searxngHost } = req.body;
@@ -1262,31 +1270,29 @@ app.post('/api/search', async (req, res) => {
       return res.status(400).json({ error: 'Invalid search query' });
     }
 
-    // SECURITY: Validate custom SearXNG host
-    const host = searxngHost ? (isValidOllamaHost(searxngHost) ? searxngHost : null) : SEARXNG_HOST;
-    if (!host) {
-      return res.status(400).json({ error: 'Invalid SearXNG host' });
+    // SECURITY: a custom SearXNG host is still validated before it is honoured.
+    // An invalid one is dropped rather than refusing the search — the chain has
+    // a configured instance to fall back on.
+    const host = searxngHost && isValidOllamaHost(searxngHost) ? searxngHost : undefined;
+
+    const tool = mcpClient.tools.get('web_search');
+    if (!tool) {
+      return res.status(503).json({ error: 'No search provider is available', results: [] });
     }
 
-    const searchUrl = `${host}/search?q=${encodeURIComponent(query)}&format=json`;
-    const response = await fetch(searchUrl, {
-      signal: AbortSignal.timeout(5000)
+    const out = await tool.execute({ query, num_results: 5 }, { caller: 'api', searxngHost: host });
+    if (out && out.error) {
+      return res.status(503).json({ error: out.error, results: [] });
+    }
+
+    // Legacy response shape kept: the client reads {url, title, content}.
+    res.json({
+      results: (out.results || []).map(r => ({ url: r.url, title: r.title, content: r.snippet })),
+      provider: out.provider || null,
+      providers_tried: out.providers_tried || []
     });
-
-    if (!response.ok) {
-      throw new Error(`SearXNG returned ${response.status}`);
-    }
-
-    const data = await response.json();
-    const results = (data.results || []).slice(0, 5).map(r => ({
-      url: r.url,
-      title: r.title,
-      content: r.content
-    }));
-
-    res.json({ results });
   } catch (error) {
-    console.error('SearXNG search error:', error.message);
+    console.error('Web search error:', error.message);
     res.status(503).json({ error: 'Search service unavailable', results: [] });
   }
 });
@@ -1742,6 +1748,29 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // What the classifiers become is a SAFETY NET rather than the mechanism: they
     // add guidance ("she is not waiting", "she asked for an agent by name") on
     // top of a tool set the model already has. Right order.
+
+    // === SHE NAMED THE AGENT: THE CALL IS FORCED, NOT SUGGESTED ===
+    //
+    // Tier 1 has never been gated — classifyHandoffSignal returns it before it
+    // ever looks at allowBuild — and on 2026-08-18 that was not enough. "Use and
+    // agent and write me a python script for a calculator": tier 1 fired, the
+    // guidance block fired, start_background_job was fourth of eleven tools in
+    // the payload, and the model returned `tool_calls: []` with the words "I have
+    // started a background job to write a Python calculator script." The phantom
+    // guard caught the claim. The job should have been real.
+    //
+    // So the third attempt at this stops arguing. On tier 1 the FIRST tool round
+    // pins tool_choice to start_background_job, which takes the decision out of
+    // the model's hands for exactly the case where she already made it. Rounds
+    // after the first are free — it still answers her in the same turn, which is
+    // the other half of the rule.
+    //
+    // Tier 1 ONLY. Tiers 2–4 are inferences about the shape of the work and
+    // forcing one would dispatch a job she never asked for; tier 1 is her naming
+    // the mechanism, and the cost of being wrong is one read-only job in a panel.
+    const forceHandoffCall = needsHandoff && handoffSignal.tier === 1
+      && mcpClient.hasTool('start_background_job');
+
     const classifierWouldHaveGated = needsSearchTools || needsActionTools || needsMemoryWrite
       || needsMemoryRead || needsMemoryCorrections || needsJobsRead || needsHandoff;
     const needsTools = mcpClient.hasTools();
@@ -2630,17 +2659,33 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
           console.log(`MCP [ollama]: Tool call round ${round + 1}/${MAX_TOOL_ROUNDS}`);
 
-          const toolResponse = await fetch(`${host}/api/chat`, {
+          // Tier 1 only, first round only: pin the call. A named tool_choice is
+          // OpenAI-shaped and vLLM honours it; Ollama's /api/chat ignores an
+          // unknown field, which is why the backstop after the reply exists and
+          // is not optional. If the engine REFUSES the request outright, the same
+          // round is retried without the pin rather than losing the turn — a
+          // forced call is worth having, and it is not worth a failed reply.
+          const forceThisRound = forceHandoffCall && round === 0;
+          const postRound = (forced) => fetch(`${host}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model,
               messages: prepareOutboundMessages(ollamaMessages, `ollama tool-round ${round + 1}`),
               tools,
+              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {}),
               stream: false
             }),
             signal: AbortSignal.timeout(120000)
           });
+
+          if (forceThisRound) console.log('MCP [ollama]: FORCING start_background_job this round — she named the agent (tier 1)');
+          let toolResponse = await postRound(forceThisRound);
+
+          if (!toolResponse.ok && forceThisRound) {
+            console.warn(`MCP [ollama]: engine refused the forced tool_choice (${toolResponse.status}) — retrying this round unforced`);
+            toolResponse = await postRound(false);
+          }
 
           if (!toolResponse.ok) {
             console.error(`MCP [ollama]: Tool call request failed with ${toolResponse.status}`);
@@ -2861,7 +2906,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
           console.log(`MCP [${providerLabel}]: Tool call round ${round + 1}/${MAX_TOOL_ROUNDS}`);
 
-          const toolResponse = await fetch(`${llamacppHost}/v1/chat/completions`, {
+          // Tier 1 only, first round only: pin the call. A named tool_choice is
+          // OpenAI-shaped and vLLM honours it; Ollama's /api/chat ignores an
+          // unknown field, which is why the backstop after the reply exists and
+          // is not optional. If the engine REFUSES the request outright, the same
+          // round is retried without the pin rather than losing the turn — a
+          // forced call is worth having, and it is not worth a failed reply.
+          const forceThisRound = forceHandoffCall && round === 0;
+          const postRound = (forced) => fetch(`${llamacppHost}/v1/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2873,10 +2925,21 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               // the wire format is canonicalised.
               messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} tool-round ${round + 1}`),
               tools,
+              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {}),
               ...generationParams(providerType)
             }),
             signal: AbortSignal.timeout(120000) // 2 minute timeout per tool round
           });
+
+          if (forceThisRound) console.log(`MCP [${providerLabel}]: FORCING start_background_job this round — she named the agent (tier 1)`);
+          let toolResponse = await postRound(forceThisRound);
+
+          if (!toolResponse.ok && forceThisRound) {
+            const errBody = await toolResponse.text().catch(() => '');
+            console.warn(`MCP [${providerLabel}]: engine refused the forced tool_choice (${toolResponse.status}: ${errBody.substring(0, 120)}) — retrying this round unforced`);
+            try { factExtractor.appendToOpsLog(`The engine refused a forced start_background_job (HTTP ${toolResponse.status}). The round was retried without it; the tier-1 backstop still applies.`, db.getOpsDir()); } catch { /* console is the floor */ }
+            toolResponse = await postRound(false);
+          }
 
           if (!toolResponse.ok) {
             const errBody = await toolResponse.text().catch(() => '');
@@ -3270,29 +3333,78 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // first person, only when this conversation created no row in this turn. A
       // false positive here would append a correction to a true statement, which
       // is its own kind of lie, so the patterns are the ones he actually writes.
+      //
+      // === AND THE TIER-1 BACKSTOP: SHE NAMED THE AGENT, SO IT GOES ===
+      //
+      // The forced tool_choice above is the first line and it is not a guarantee:
+      // Ollama ignores the field, an engine may refuse it, and a refused pin
+      // falls back to an unforced round on purpose. So the invariant is closed
+      // HERE, where it is checkable rather than hoped for — if she named the
+      // agent and this turn created no row, the server creates it from her own
+      // words and SAYS SO in the reply she is reading.
+      //
+      // It runs whether or not he claimed a job. A tier-1 turn that quietly
+      // answered inline is the same failure with better manners: she asked for an
+      // agent, and "it goes, regardless of what the request is about" is the rule.
+      // Same doctrine as the ledger funnel and the phantom guard — the outcome is
+      // made true, and the truth is what reaches her.
       try {
         const claimsDispatch = /\b(i(?:'ve| have)? (?:just )?(?:started|kicked off|queued|launched|dispatched|handed (?:this|that|it) (?:off|over))|i(?:'m| am) (?:now )?running (?:this|that|it) in the background|(?:i(?:'ve| have)? )?(?:handed|passed) (?:this|that|it) (?:off )?to (?:a|an|the|my) (?:background )?agent|background job (?:has been|is) (?:started|running)|the agent is (?:now )?(?:working|running))\b/i.test(fullResponse);
-        if (claimsDispatch) {
-          const created = agentJobs.jobsStartedInTurn(convoId, turnStartedAt);
-          if (created.length === 0) {
-            const line = `PHANTOM DISPATCH: the reply claims a background job was started, and no agent_jobs row was created in this turn (convo ${convoId}).`;
-            console.error(`[AgentJobs] ${line}`);
-            try { factExtractor.appendToOpsLog(line + ` Reply began: "${fullResponse.slice(0, 160).replace(/\s+/g, ' ')}"`, db.getOpsDir()); } catch { /* console is the floor */ }
+        const created = agentJobs.jobsStartedInTurn(convoId, turnStartedAt);
 
-            // The correction is APPENDED TO THE TURN, not swallowed into a log,
-            // because she is the one who was told the false thing and she is
-            // reading this reply, not the ops ledger.
-            const correction = '\n\n---\n\n**Correction — no job was actually started.** I said above that I had ' +
-              'handed this to a background agent; that did not happen. Nothing is running, and nothing will ' +
-              'appear in the jobs panel for it. Ask me again and I will either start one properly or tell you ' +
-              'plainly that I cannot.';
-            fullResponse += correction;
-            res.write(contentType === 'text/event-stream'
-              ? `data: ${JSON.stringify({ choices: [{ delta: { content: correction } }] })}\n\n`
-              : `${JSON.stringify({ message: { content: correction } })}\n`);
+        const append = (text) => {
+          fullResponse += text;
+          res.write(contentType === 'text/event-stream'
+            ? `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+            : `${JSON.stringify({ message: { content: text } })}\n`);
+        };
+
+        if (created.length === 0 && forceHandoffCall) {
+          // Her message IS the task: it is what she asked for, in her words, and
+          // the run sees the task and not the conversation. A model rewrite would
+          // be the better prompt on a good day and a paraphrase of the wrong thing
+          // on a bad one — and on a bad one is precisely when this path runs.
+          const asked = String(userMessage.content || '').trim();
+          const title = asked.length > 70 ? `${asked.slice(0, 67)}…` : asked;
+          const started = agentJobs.enqueue({
+            title: title || 'the work she asked an agent for',
+            task: asked,
+            why: 'She asked for an agent by name. The reply did not start one, so the server did.',
+            conversationId: convoId,
+            messageId: userMsgId,
+            source: 'tier1-backstop'
+          });
+
+          if (started.ok) {
+            const line = `TIER-1 BACKSTOP: she named the agent and the reply started no job, so one was queued from her message (${started.id.slice(0, 8)}, convo ${convoId}).`;
+            console.warn(`[AgentJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line + ` Task: "${asked.slice(0, 160).replace(/\s+/g, ' ')}"`, db.getOpsDir()); } catch { /* console is the floor */ }
+            append(claimsDispatch
+              // He said it; now it is true. She is told which, because "started"
+              // and "started after the fact" are different facts about her turn.
+              ? `\n\n---\n\n*(Job \`${started.id.slice(0, 8)}\` is queued and running — it will land in the jobs panel. My reply above said I had started it before I actually had; it is real now.)*`
+              : `\n\n---\n\n*(You asked for an agent, so one is queued — job \`${started.id.slice(0, 8)}\`, working from your message as written. It will land in the jobs panel when it is done; it will not message you.)*`);
           } else {
-            console.log(`[AgentJobs] dispatch claim checks out — ${created.length} job(s) created in this turn`);
+            // A refusal is a fact too, and the reason is the queue's, not mine.
+            const line = `TIER-1 BACKSTOP REFUSED: ${started.error} (convo ${convoId}).`;
+            console.warn(`[AgentJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line, db.getOpsDir()); } catch { /* console is the floor */ }
+            append(`\n\n---\n\n**No agent was started.** You asked for one and I could not queue it: ${started.error}`);
           }
+        } else if (claimsDispatch && created.length === 0) {
+          const line = `PHANTOM DISPATCH: the reply claims a background job was started, and no agent_jobs row was created in this turn (convo ${convoId}).`;
+          console.error(`[AgentJobs] ${line}`);
+          try { factExtractor.appendToOpsLog(line + ` Reply began: "${fullResponse.slice(0, 160).replace(/\s+/g, ' ')}"`, db.getOpsDir()); } catch { /* console is the floor */ }
+
+          // The correction is APPENDED TO THE TURN, not swallowed into a log,
+          // because she is the one who was told the false thing and she is
+          // reading this reply, not the ops ledger.
+          append('\n\n---\n\n**Correction — no job was actually started.** I said above that I had ' +
+            'handed this to a background agent; that did not happen. Nothing is running, and nothing will ' +
+            'appear in the jobs panel for it. Ask me again and I will either start one properly or tell you ' +
+            'plainly that I cannot.');
+        } else if (claimsDispatch) {
+          console.log(`[AgentJobs] dispatch claim checks out — ${created.length} job(s) created in this turn`);
         }
       } catch (phantomErr) {
         console.error('[AgentJobs] phantom-dispatch check failed:', phantomErr.message);
@@ -3422,7 +3534,18 @@ app.listen(PORT, HOST, () => {
   console.log(`  - Grok: ${GROK_API_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`  - SquatchServe: ${SQUATCHSERVE_HOST}`);
   console.log(`  - Llama.cpp: ${LLAMACPP_HOST}`);
-  console.log(`  - SearXNG: ${SEARXNG_HOST}`);
+  // Search says the ORDER and whether each provider can actually be called — the
+  // question that cost hours on 2026-08-18 was "which one ran", and the answer
+  // starts at boot.
+  {
+    const chain = getSearchConfig();
+    console.log('Web search providers (in order):');
+    for (const p of chain.providers) {
+      console.log(`  - ${p.name}: ${p.available ? 'available' : `UNAVAILABLE — ${p.why}`}` +
+        (p.name === 'searxng' ? ` (${p.config.url})` : ''));
+    }
+    if (!chain.any) console.log('  - none available — web_search is not registered');
+  }
   const startupConfig = getConfig();
   const startupTts = getVoiceProvider('tts');
   const startupStt = getVoiceProvider('stt');

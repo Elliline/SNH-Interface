@@ -56,8 +56,8 @@ config.getConfig = () => {
   const c = realGetConfig();
   c.agentJobs = Object.assign({
     enabled: true, maxConcurrent: 2, maxQueued: 10, maxStartsPerHour: 6,
-    maxToolCallsPerJob: 12, maxWallClockMs: 300000, maxRoundsPerJob: 6,
-    maxOutputTokens: 700, retryGraceMinutes: 30, retentionDays: 90
+    maxToolCallsPerJob: 40, maxWallClockMs: 900000, maxRoundsPerJob: 16,
+    maxOutputTokens: 2000, retryGraceMinutes: 30, retentionDays: 90
   }, jobCfg);
   return c;
 };
@@ -67,11 +67,35 @@ let mode = 'ok';
 let lastPrompt = null;
 let callCount = 0;
 let releaseSlow = null;
+// Every prompt the stub was handed, so the SALVAGE call can be told apart from
+// the run call — they are two calls with two different jobs and the second one
+// is the thing under test.
+const prompts = [];
 memoryManager.callLLM = async (systemPrompt, userPrompt, options) => {
   callCount++;
   lastPrompt = { systemPrompt, userPrompt, options };
+  prompts.push({ systemPrompt, userPrompt, hadSession: !!(options && options.toolSession) });
   if (mode === 'throw') throw new Error('Brain circuit open — skipping LLM call (engine wedged)');
-  if (mode === 'empty') return { content: '  ', provider: 'stub', toolCalls: [{ name: 'memory_count' }], budget: {} };
+  // Empty run, then a salvage call that CAN write: this is the ordinary
+  // "budget ran out before it wrote anything" path.
+  if (mode === 'empty') {
+    if (options && options.toolSession) {
+      return { content: '  ', provider: 'stub', toolCalls: [{ name: 'web_search', args: { query: 'cars' }, ok: true, productive: false, note: 'the search returned no results' }], budget: { calls: 4, maxCalls: 40, billed: 1, failedCalls: 4, exhausted: 'attempt ceiling reached (80/80 calls, 80 of them empty or failed)' } };
+    }
+    return { content: 'Every search came back empty, so I have nothing on the cars themselves. What I did establish first: you have three vehicle facts in memory, all from July.', provider: 'stub', toolCalls: [], budget: {} };
+  }
+  // Nothing can write — the brain is up for the run and gone for the salvage.
+  // This is the floor: the mechanical account has to carry the card alone.
+  if (mode === 'empty-and-mute') {
+    if (options && options.toolSession) {
+      return { content: '', provider: 'stub', toolCalls: [{ name: 'web_search', args: { query: 'x' }, ok: false, productive: false, note: 'the call returned an error' }], budget: { calls: 6, maxCalls: 40, billed: 1.5, failedCalls: 6, exhausted: 'time budget spent (900s of 900s)' } };
+    }
+    throw new Error('brain unreachable for the salvage call too');
+  }
+  // A run that wrote something AND was cut short — partial with real text.
+  if (mode === 'cut-short') {
+    return { content: 'Here is what I got to before I ran out of rounds: two of the three suppliers list a price.', provider: 'stub', toolCalls: [{ name: 'web_search', args: {}, ok: true, productive: true }], budget: { calls: 30, maxCalls: 40, billed: 30, failedCalls: 0, exhausted: null }, outOfRounds: true };
+  }
   if (mode === 'hold') {
     // Blocks until the test lets it go — the only way to observe a job while it
     // is genuinely in flight.
@@ -140,18 +164,82 @@ async function settle(id, ms = 3000) {
   check('a throw is recorded as failed', threwDone.status === 'failed', threwDone.status);
   check('the reason is the real one, not a placeholder', /circuit open/i.test(threwDone.error || ''), threwDone.error);
   check('a failed job still has a finish time', !!threwDone.finished_at);
+  check('and even a thrown run writes an account rather than leaving an empty card',
+    !!(threwDone.result_text || '').trim(), JSON.stringify(threwDone.result_text));
+  check('which says what it does not know rather than claiming it looked nothing up',
+    /no record of what it managed to look up/.test(threwDone.result_text || ''), threwDone.result_text);
 
+  // =========================================================================
+  console.log('\n── AN EMPTY RESULT CARD IS IMPOSSIBLE ──');
+  // 2026-08-18: a job spent every tool call on searches that failed, returned no
+  // text, and was closed as `failed` with result_text NULL. The panel card was
+  // blank — and the memory work it had finished BEFORE it ever reached a search
+  // went in the bin with it. The work was done; only the writeup was missing.
   mode = 'empty';
-  const silent = agentJobs.enqueue({ title: 'a job that says nothing', task: 'anything' });
+  prompts.length = 0;
+  const silent = agentJobs.enqueue({ title: 'a job that says nothing', task: 'What are the cars worth?' });
   const silentDone = await settle(silent.id);
-  check('empty output is a FAILURE, not a quiet success', silentDone.status === 'failed', silentDone.status);
-  check('and it says the tools were called but no text came back',
-    /tool call\(s\) but returned no text/.test(silentDone.error || ''), silentDone.error);
+  check('it is PARTIAL — not ok, and not a failure that throws the work away',
+    silentDone.status === 'partial', silentDone.status);
+  check('and it WROTE something', !!(silentDone.result_text || '').trim(), JSON.stringify(silentDone.result_text));
+  check('the text is the salvaged writeup, not a placeholder',
+    /nothing on the cars themselves/.test(silentDone.result_text || ''), silentDone.result_text);
+  check('the reason it stopped is recorded beside it', /attempt ceiling|empty or failed/.test(silentDone.error || ''), silentDone.error);
+  check('the salvage call was made WITHOUT tools — it cannot spend more budget',
+    prompts.length === 2 && prompts[0].hadSession === true && prompts[1].hadSession === false,
+    JSON.stringify(prompts.map(p => p.hadSession)));
+  check('the salvage prompt carried the record of what the run actually did',
+    /web_search/.test(prompts[1].systemPrompt) && /no results/.test(prompts[1].systemPrompt));
+  check('and told it that failed lookups are not a finding of nothing',
+    /do NOT report that as having found nothing/i.test(prompts[1].systemPrompt));
+
+  // The floor: nothing can write, and the card is STILL not empty.
+  mode = 'empty-and-mute';
+  const mute = agentJobs.enqueue({ title: 'nothing can write this', task: 'Check the supplier prices.' });
+  const muteDone = await settle(mute.id);
+  check('a job whose salvage call also fails still writes a result',
+    !!(muteDone.result_text || '').trim(), JSON.stringify(muteDone.result_text));
+  check('the mechanical account says what was asked', /Check the supplier prices/.test(muteDone.result_text || ''));
+  check('…what ran', /tool call\(s\)/.test(muteDone.result_text || ''));
+  check('…that the lookups failing is not a finding',
+    /not a finding that there is nothing to find/.test(muteDone.result_text || ''), muteDone.result_text);
+  check('…and where it stopped', /Why it stopped/.test(muteDone.result_text || ''));
+  check('it is still partial rather than a silent failure', muteDone.status === 'partial', muteDone.status);
+
+  // The mechanical account is pure — provable with no model anywhere near it.
+  const floor = agentJobs.mechanicalAccount(
+    { task: 'find the thing' },
+    [{ name: 'web_search', productive: false, note: 'the search returned no results' },
+     { name: 'web_search', productive: false, note: 'the search returned no results' }],
+    { exhausted: 'call budget spent (40.00/40 billed over 43 call(s), 40 of them empty or failed)' },
+    { maxRoundsPerJob: 16 }
+  );
+  check('the floor is never empty, with no model involved at all', floor.trim().length > 80);
+  check('and it never claims a finding it does not have',
+    /failure of my lookups/.test(floor), floor);
+
+  // A run that DID write but was cut short is partial too — the text is hers to
+  // read and the reason sits beside it, not instead of it.
+  mode = 'cut-short';
+  const cut = agentJobs.enqueue({ title: 'stopped early', task: 'Compare the three suppliers.' });
+  const cutDone = await settle(cut.id);
+  check('a cut-short run with real text is partial', cutDone.status === 'partial', cutDone.status);
+  check('its text is kept whole', /two of the three suppliers/.test(cutDone.result_text || ''));
+  check('and it says it ran out of rounds', /ran out of tool rounds/.test(cutDone.error || ''), cutDone.error);
+
+  // What HE is told has to match what is on her card.
+  const partialBlock = agentJobs.renderAnnouncementBlock({ limit: 5 });
+  check('a partial job is announced with its text, not as "produced no result"',
+    /two of the three suppliers|nothing on the cars themselves/.test(partialBlock.text)
+    && !/^It did not produce a result/m.test(partialBlock.text), partialBlock.text.slice(0, 300));
+  check('and it is marked as having stopped short', /stopped short of finishing/.test(partialBlock.text));
 
   // =========================================================================
   console.log('\n── Concurrency: past the cap a job waits, and the wait is visible ──');
   mode = 'hold';
-  jobCfg = { maxConcurrent: 1 };
+  // The trailing-hour start cap is tested on its own below; here it must not be
+  // what refuses the second job, or this section would pass for the wrong reason.
+  jobCfg = { maxConcurrent: 1, maxStartsPerHour: 1000 };
   const first = agentJobs.enqueue({ title: 'the one in flight', task: 'hold' });
   await sleep(50);
   const second = agentJobs.enqueue({ title: 'the one waiting', task: 'hold too' });
@@ -175,7 +263,7 @@ async function settle(id, ms = 3000) {
 
   // =========================================================================
   console.log('\n── A restart: nothing is lost silently ──');
-  jobCfg = { maxConcurrent: 2, retryGraceMinutes: 30 };
+  jobCfg = { maxConcurrent: 2, retryGraceMinutes: 30, maxStartsPerHour: 1000 };
   mode = 'ok';
 
   // Three rows left `running` by a process that died, in the three states the
@@ -310,8 +398,8 @@ async function settle(id, ms = 3000) {
     !!job(queuedSurvivor));
 
   // =========================================================================
-  console.log('\n── The worker reaches the SAME search instance the chat path does ──');
-  // 2026-08-18: it did not. web_search's execute() is (args, endpointOverride) —
+  console.log('\n── The worker reaches the SAME search stack the chat path does ──');
+  // 2026-08-18: it did not. web_search's execute() was (args, endpointOverride) —
   // a positional STRING — while every other tool takes (args, context), and
   // executeTool only passed the string when the caller supplied `searxngHost`.
   // The chat path does; the background tool loop passes { caller }, so the whole
@@ -320,37 +408,37 @@ async function settle(id, ms = 3000) {
   //   Search failed: Failed to parse URL from [object Object]/search?q=…
   //
   // Seven of those inside one job in 11 seconds, reported to Ellie as "an issue
-  // with the search tool" because that is all the model could see. Asserted on
-  // ENDPOINT RESOLUTION rather than on a live search, so the check still means
-  // something when the upstream engines are rate-limited.
+  // with the search tool" because that is all the model could see.
+  //
+  // The signature is now uniform, so what this asserts has changed with it: the
+  // second argument reaches the tool AS THE CONTEXT OBJECT, unreshaped, whoever
+  // called. The provider chain behind it is tested in test-search-providers.js;
+  // what matters here is that a worker context is not mangled on the way in.
   const MCPClient = require(path.join(ROOT, 'mcp/mcp-client'));
   const client = MCPClient.shared();
   const searchTool = client.tools.get('web_search');
   if (!searchTool) {
-    check('web_search is registered (SearXNG enabled in config)', false, 'not registered — cannot check the worker path');
+    check('web_search is registered (a search provider is available)', false, 'not registered — cannot check the worker path');
   } else {
     const realExecute = searchTool.execute.bind(searchTool);
-    let sawEndpoint = null;
-    searchTool.execute = async (args, endpoint) => { sawEndpoint = endpoint; return { results: [] }; };
-    const { getSearxngConfig } = require(path.join(ROOT, 'db/config'));
-    const configured = getSearxngConfig().url;
+    let sawSecondArg = 'never called';
+    searchTool.execute = async (args, context) => { sawSecondArg = context; return { results: [] }; };
 
-    await client.executeTool('web_search', { query: 'x' }, { caller: 'heartbeat:agent-job:test' });
-    check('a worker-context search gets the configured URL, not the context object',
-      sawEndpoint === configured, JSON.stringify(sawEndpoint));
+    await client.executeTool('web_search', { query: 'x' }, { caller: 'agent-job:test' });
+    check('a worker context arrives as an object, with its caller intact',
+      sawSecondArg && typeof sawSecondArg === 'object' && sawSecondArg.caller === 'agent-job:test',
+      JSON.stringify(sawSecondArg));
 
     await client.executeTool('web_search', { query: 'x' }, {});
-    check('…and so does a call with no context at all', sawEndpoint === configured, JSON.stringify(sawEndpoint));
+    check('…and a call with no context at all gets an object, not a string',
+      sawSecondArg && typeof sawSecondArg === 'object', JSON.stringify(sawSecondArg));
 
-    await client.executeTool('web_search', { query: 'x' }, { searxngHost: 'http://example.test:9999' });
-    check('an explicit string override is still honoured', sawEndpoint === 'http://example.test:9999', JSON.stringify(sawEndpoint));
+    await client.executeTool('web_search', { query: 'x' }, { caller: 'chat', searxngHost: 'http://example.test:9999' });
+    check('a searxngHost override rides along as a named field',
+      sawSecondArg.searxngHost === 'http://example.test:9999', JSON.stringify(sawSecondArg));
 
-    await client.executeTool('web_search', { query: 'x' }, { searxngHost: { not: 'a string' } });
-    check('a non-string override is refused and the configured URL used instead',
-      sawEndpoint === configured, JSON.stringify(sawEndpoint));
-
-    check('nothing here introduced a second SearXNG endpoint',
-      configured === (require(path.join(ROOT, 'db/config')).getSearxngConfig().url), configured);
+    check('nothing is passed positionally as a URL any more',
+      typeof sawSecondArg !== 'string', typeof sawSecondArg);
     searchTool.execute = realExecute;
   }
 
