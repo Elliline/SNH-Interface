@@ -22,6 +22,41 @@ const path = require('path');
 
 const DAILY_DIR = require('./database').getDailyDir();
 
+/**
+ * Ops-log handle. Resolved per call rather than at module load, because
+ * SNH_DATA_DIR redirects a PROCESS and a value captured at require() time would
+ * write a throwaway run's telemetry into the live corpus.
+ */
+function opsLog(msg) {
+  try {
+    factExtractor.appendToOpsLog(msg, require('./database').getOpsDir());
+  } catch { /* console is the floor */ }
+}
+
+/**
+ * THE SCORER'S ANSWER BUDGET, and it is the reason every item scored 6.
+ *
+ * This was 8 — enough for the bare integer the prompt asks for, and measured as
+ * enough on a model that does not think. On a reasoning model it is not, and the
+ * arithmetic is the whole story: callLLM sends max_tokens = maxTokens +
+ * backgroundThinkingTokens and thinking_token_budget = backgroundThinkingTokens,
+ * so with 8 and 256 the wire carried 264/256. max_tokens is a HARD TOTAL, so the
+ * answer's guaranteed floor is whatever `maxTokens` is — 8 — no matter how the
+ * thinking budget is set. A model whose reasoning channel has just been
+ * force-closed at 256 tends to write a short lead-in before the number, that
+ * lead-in ate the 8, `match(/\d+/)` found nothing, and the item silently kept
+ * the priority it already had. Most initiatives are CREATED at 6
+ * (noticeReflectionInsight's default; every job-result row), so "kept what it
+ * had" and "scored 6" are the same picture from outside.
+ *
+ * Raising backgroundThinkingTokens could never have fixed this: it moves the
+ * total and the thinking allowance by the same amount and leaves the answer
+ * floor exactly where it was. 32 is the fix, and it is here rather than in
+ * config because it is not a preference — it is the room a one-integer answer
+ * needs, and no box should have to discover that number for itself.
+ */
+const SCORE_ANSWER_TOKENS = 32;
+
 function initiativeConfig() {
   const cfg = getConfig();
   return Object.assign({
@@ -622,20 +657,55 @@ async function prioritize() {
     let pending = initiatives.listPending({ limit: 100 });
     if (pending.length > 0) {
       const { callLLM } = require('./memory-manager');
+      // A SCORE THAT DID NOT PARSE IS NOT A SCORE. Falling back to the priority
+      // the item already had is the right behaviour — a failed call must not
+      // reorder her queue — but doing it WITHOUT SAYING SO is what hid a scorer
+      // that had stopped working for two months: every item kept its birth
+      // priority, the pass reported success, and the only symptom was a column
+      // of sixes that nothing was counting. `truncated` was on the response
+      // object the whole time and was destructured away.
+      let unscored = 0, truncatedScores = 0;
       const scored = await agentPool.runBatch(
         pending.map(it => async () => {
           const sys = prioritizerSystemPrompt(it.type);
           const user = `Item: "${it.content}"\n\nScore (1-10)?`;
-          const { content } = await callLLM(sys, user, { maxTokens: 8 });
+          const { content, truncated } = await callLLM(sys, user, { maxTokens: SCORE_ANSWER_TOKENS });
           const m = (content || '').match(/\d+/);
-          return { id: it.id, priority: m ? parseInt(m[0], 10) : it.priority };
+          if (!m) {
+            unscored++;
+            if (truncated) truncatedScores++;
+            console.warn(
+              `[Initiatives] scoring returned no integer for ${it.id.slice(0, 8)}` +
+              `${truncated ? ` — TRUNCATED at ${SCORE_ANSWER_TOKENS} answer tokens` : ''}; ` +
+              `keeping priority ${it.priority}. Raw: ${JSON.stringify(String(content || '').slice(0, 80))}`
+            );
+          }
+          return { id: it.id, priority: m ? parseInt(m[0], 10) : it.priority, parsed: !!m };
         }),
         'initiative-prioritize'
       );
       for (const s of scored) {
         if (s.status === 'fulfilled' && s.value) {
-          if (initiatives.updatePriority(s.value.id, s.value.priority)) result.rescored++;
+          // `parsed` gates the count, not updatePriority's return: a fallback
+          // writes the priority the item already had, which is a successful
+          // write of nothing. Counting those as re-scored is how a pass that
+          // scored zero items reported "re-scored 4".
+          const changed = initiatives.updatePriority(s.value.id, s.value.priority);
+          if (changed && s.value.parsed) result.rescored++;
         }
+      }
+      result.unscored = unscored;
+      result.truncatedScores = truncatedScores;
+      // One line for the pass, not one per item — a starved scorer fails on
+      // every item of every pass, and seventeen identical lines is the wallpaper
+      // that buried this in the first place. Said only when it happened.
+      if (unscored > 0) {
+        const line =
+          `Initiative scoring could not read a score for ${unscored} of ${pending.length} item(s)` +
+          `${truncatedScores ? `, ${truncatedScores} of them TRUNCATED at the ${SCORE_ANSWER_TOKENS}-token answer budget` : ''}` +
+          ` — those kept the priority they already had. If this is most of the pass, the scorer is not scoring.`;
+        console.warn(`[Initiatives] ${line}`);
+        opsLog(line);
       }
     }
 
@@ -822,6 +892,7 @@ module.exports = {
   generateLogFollowup,
   prioritize,
   prioritizerSystemPrompt,
+  SCORE_ANSWER_TOKENS,
   deliverUnprompted,
   startDiscussion,
   inQuietHours,
