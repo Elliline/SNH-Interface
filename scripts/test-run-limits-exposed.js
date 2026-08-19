@@ -89,7 +89,7 @@ console.log('\n── The generation budgets and the call timeout ──');
 for (const k of [
   'generation.agentJobThinkingTokens', 'generation.agentJobResponseTokens',
   'generation.scheduledJobThinkingTokens', 'generation.scheduledJobResponseTokens',
-  'generation.llmTimeoutTokensPerSecond', 'generation.llmTimeoutFloorMs'
+  'generation.stallTimeoutMs', 'generation.firstTokenTimeoutMs'
 ]) {
   check(`${k} has a row`, exposed(k));
 }
@@ -105,6 +105,12 @@ const aj = fs.readFileSync(path.join(ROOT, 'db/agent-jobs.js'), 'utf8');
 const wf = fs.readFileSync(path.join(ROOT, 'mcp/tools/web-fetch.js'), 'utf8');
 check('the LLM call timeout is not the old baked-in formula',
   !/\/ 45 \* 1000 \* 2/.test(mm), 'wireMaxTokens / 45 * 1000 * 2 is back in callLLM');
+check('and the rate-based timeout is RETIRED, not living beside the stall one',
+  !/llmTimeoutTokensPerSecond|llmTimeoutFloorMs/.test(
+    require('fs').readFileSync(path.join(ROOT, 'db/config.js'), 'utf8').split('DEFAULTS')[1] || ''),
+  'a rate-based kill is still a second way to kill a job');
+check('the background path streams, so a stall can be seen at all',
+  !/stream: false, max_tokens: wireMaxTokens/.test(mm), 'callLLM is still non-streaming');
 check('the circuit breaker threshold is not a module constant',
   !/CIRCUIT_TIMEOUT_THRESHOLD\s*=\s*\d/.test(mm));
 check('the retry count is not the literal `< 2`',

@@ -1903,18 +1903,18 @@ async function loadSettingsBrainTab() {
         desc: 'How long to wait for extraction before giving up on an exchange. Anything it does not finish in time is not remembered.'
       },
       {
-        key: 'generation.llmTimeoutTokensPerSecond',
-        label: 'Slowest generation speed to plan for (tokens/sec)',
-        type: 'number', step: '5', min: 1,
-        value: config.generation?.llmTimeoutTokensPerSecond,
-        desc: 'Sets how long to wait for one model call: the wait is the whole budget above, thinking plus answer, divided by this. It is a hard cut-off — when it runs out the call is abandoned and the run fails, mid-sentence, with nothing kept. Set it too high and you are claiming the machine is faster than it is, and the biggest jobs are the first to be killed. This machine measures around 39; 20 is deliberately pessimistic, and raising a budget without checking this is how a raised budget starts killing jobs.'
+        key: 'generation.stallTimeoutMs',
+        label: 'Give up if no new text arrives for (ms)',
+        type: 'number', step: '10000', min: 5000,
+        value: config.generation?.stallTimeoutMs,
+        desc: 'Once a reply has started, this is how long a gap is allowed before the call is abandoned. It measures the GAP between pieces of text, not how fast the whole thing is, so a slow answer is never killed for being slow — only a dead one is. That matters when several agents run at once, because each one gets slower as the others start and a speed-based limit would kill exactly the work you asked for. 60000 is a minute; the real gap under heavy load is under a tenth of a second.'
       },
       {
-        key: 'generation.llmTimeoutFloorMs',
-        label: 'Minimum wait for one model call (ms)',
-        type: 'number', step: '10000', min: 1000,
-        value: config.generation?.llmTimeoutFloorMs,
-        desc: 'The wait never drops below this, however small the budget. It exists for the many tiny background calls, where the calculated wait would be a second or two and any ordinary hiccup would fail them.'
+        key: 'generation.firstTokenTimeoutMs',
+        label: 'Give up if the reply never starts within (ms)',
+        type: 'number', step: '30000', min: 5000,
+        value: config.generation?.firstTokenTimeoutMs,
+        desc: 'Before any text arrives, silence is normal — the request may still be queued behind others, and reading a long conversation takes time before the first word comes out. So this is much longer than the gap limit above. Raise it if you run many agents at once and see jobs failing before they start; that is a queue that is deeper than this allows, not a broken engine.'
       }
     ]));
 

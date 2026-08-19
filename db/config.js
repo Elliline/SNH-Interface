@@ -222,22 +222,40 @@ const DEFAULTS = {
     agentJobResponseTokens: 8192,
     scheduledJobThinkingTokens: null,
     scheduledJobResponseTokens: 4096,
-    // THE TIMEOUT ON ONE LLM CALL, which was a formula with three numbers baked
-    // into it: max(60000, wireMaxTokens / 45 * 1000 * 2). 45 was an assumed
-    // generation rate and 2 was a safety margin, so the real quantity — the
-    // slowest rate worth planning for — was 22.5 tok/s and appeared nowhere.
+    // HOW A CALL IS KILLED, and it is no longer a predicted duration.
     //
-    // It matters because it is a HARD KILL: the request aborts, the run fails,
-    // and the bigger the answer budget the more likely it binds. Raising a
-    // budget without raising this is how a budget rise turns into a dead job.
+    // llmTimeoutTokensPerSecond and llmTimeoutFloorMs lived here for one day and
+    // are RETIRED, not kept alongside these: a second way to kill a job is a
+    // second thing to discover the hard way. The rate they encoded was never a
+    // property of the engine, it was a property of how many streams were running
+    // — measured on this GB10 at 8-bit, per stream: 33.3 tok/s alone, 19.7 at 8
+    // concurrent, 15.6 at 64, 10.6 at 128. A timeout derived from it got
+    // stricter exactly as the system did more of what it exists to do.
     //
-    // Stated as a rate rather than a duration because the duration depends on
-    // the budget: timeout = max(floor, (thinking + answer) / rate). Measured on
-    // this GB10 at 8-bit: ~39 tok/s at a 6k prompt. 20 is the planning rate —
-    // about half of measured, slightly more generous than the old effective
-    // 22.5, and a number a person can check against reality.
-    llmTimeoutTokensPerSecond: 20,
-    llmTimeoutFloorMs: 60000
+    // A stall is indifferent to that. Tokens still arriving means the job is
+    // working, however slowly; nothing for a minute means the engine is wedged.
+    // It is also far quicker at the job: the old formula gave an 8192 + 16384
+    // token run 1,229s before it would notice a dead engine. This notices in 60.
+    //
+    // TWO LIMITS BECAUSE SILENCE MEANS DIFFERENT THINGS AT DIFFERENT TIMES.
+    //   stallTimeoutMs — after the first token. At the worst load measured here
+    //     a token lands every ~95ms, so 60s is roughly 630x the real gap, and it
+    //     still clears the longest legitimate pause (a full 131k-token prefill
+    //     being scheduled ahead of you is ~26s of work).
+    //   firstTokenTimeoutMs — before it, where silence is NORMAL. This covers
+    //     queue wait as well as prefill: past --max-num-seqs vLLM holds requests
+    //     in `waiting` deliberately, and that wait belongs to the queue depth,
+    //     not to us. Measured time-to-first-token here: 0.13s alone, 1.24s at
+    //     128 concurrent — so 300s is ~240x the worst seen, which is the right
+    //     margin for a limit whose real job is noticing a dead engine. Raise it
+    //     if you run queues deep enough to wait longer than that.
+    //
+    // Both are DEFAULTS FOR THE SMALLEST MACHINE, not for this one. A 12GB card
+    // running a smaller model at a few tokens a second is still nowhere near a
+    // 60s gap between tokens, and that is the point: neither number scales with
+    // the budget, the model, or how many agents are running.
+    stallTimeoutMs: 60000,
+    firstTokenTimeoutMs: 300000
   },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a

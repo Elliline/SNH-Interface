@@ -305,6 +305,201 @@ function stripChannelMarkers(text) {
 }
 
 /**
+ * A RETIRED KEY THAT SURVIVES IN A BOX'S OWN CONFIG IS THE TRAP.
+ *
+ * generation.llmTimeoutTokensPerSecond and llmTimeoutFloorMs were removed from
+ * DEFAULTS when stall detection landed, but any box that ever saved its settings
+ * while they existed has them written into data/config.json — where they read as
+ * live knobs governing how a call is killed, and govern nothing. Said once per
+ * process, the same way the two retired output-token keys are.
+ */
+let warnedRetiredRateKnobs = false;
+function warnRetiredRateKnobs(gen) {
+  if (warnedRetiredRateKnobs) return;
+  const stale = ['llmTimeoutTokensPerSecond', 'llmTimeoutFloorMs'].filter(k => gen[k] !== undefined);
+  if (!stale.length) return;
+  warnedRetiredRateKnobs = true;
+  const line =
+    `generation.${stale.join(' and generation.')} in data/config.json ${stale.length > 1 ? 'are' : 'is'} ` +
+    `NO LONGER READ — calls are killed on a STALL now (generation.stallTimeoutMs / firstTokenTimeoutMs), ` +
+    `not on a duration predicted from a tokens-per-second rate. Delete the old key${stale.length > 1 ? 's' : ''}; ` +
+    `${stale.length > 1 ? 'they do' : 'it does'} nothing.`;
+  console.warn(`[Heartbeat] ${line}`);
+  try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* console is the floor */ }
+}
+
+/**
+ * ONE STREAMED CHAT COMPLETION, KILLED ON A STALL RATHER THAN ON A PREDICTION.
+ *
+ * The background path used to send `stream: false` under a timeout computed from
+ * an assumed tokens-per-second rate. That rate is not a property of the engine —
+ * it is a property of how many streams are running. Measured on this GB10 at
+ * 8-bit, per stream: 33.3 tok/s alone, 19.7 at 8 concurrent, 15.6 at 64, 10.6 at
+ * 128. So the more agents run at once, the more likely each one is killed for
+ * being slow, and a memory system whose whole point is parallel background work
+ * was punishing itself for doing it. That is why the concurrency cap sat at 2.
+ *
+ * A STALL DOES NOT CARE HOW MANY STREAMS ARE RUNNING. If tokens are still
+ * arriving the job is working, however slowly; if none have arrived for a minute
+ * the engine is wedged, which is the failure this ever existed to catch. It also
+ * catches it far sooner: the old formula gave an 8192+16384-token job 1,229s
+ * before it would notice a dead engine. This notices in 60.
+ *
+ * TWO LIMITS, BECAUSE "NOTHING YET" MEANS DIFFERENT THINGS AT DIFFERENT TIMES.
+ *   firstTokenMs — before the first token, silence is NORMAL. It covers queue
+ *     wait as well as prefill: past --max-num-seqs vLLM holds requests in
+ *     `waiting` by design, and that wait is bounded by the queue, not by us.
+ *     Generous on purpose (measured TTFT here: 0.13s alone, 1.24s at 128).
+ *   stallMs — after the first token, silence means something is wrong. At the
+ *     worst measured load a token arrives every ~95ms, so 60s is ~630x the gap.
+ *
+ * WHAT COUNTS AS PROGRESS is deliberately narrow: content, reasoning, or tool-call
+ * deltas. A bare keep-alive does NOT reset the clock — an engine sending
+ * heartbeats while producing nothing is precisely the stall being detected.
+ * Bursty delivery is fine and is the reason this measures GAPS rather than rate:
+ * fifty tokens, ten seconds of nothing, fifty more reads as a 10s gap.
+ *
+ * Returns a body in the NON-STREAMING SHAPE. Every reader downstream —
+ * provider.extract, reasoningFromResponse, extractFinishReason, and
+ * runToolLoop's own `data.choices[0].message` — is unchanged and cannot tell
+ * this happened. The risk of the conversion is confined to this function.
+ *
+ * @returns {Promise<object>} { choices: [{ message, finish_reason }] } or
+ *                            { message, done_reason } for the Ollama shape
+ */
+async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label }) {
+  const controller = new AbortController();
+  let lastProgress = Date.now();
+  let sawFirstToken = false;
+  let killReason = null;
+
+  // A 1s watchdog rather than a race of timers: one place decides, and the
+  // deadline it applies changes the moment the first token lands.
+  const watchdog = setInterval(() => {
+    const idle = Date.now() - lastProgress;
+    const limit = sawFirstToken ? stallMs : firstTokenMs;
+    if (idle >= limit) {
+      killReason = sawFirstToken
+        ? `stalled — no tokens for ${Math.round(idle / 1000)}s (limit ${Math.round(stallMs / 1000)}s)`
+        : `timed out waiting for the first token after ${Math.round(idle / 1000)}s (limit ${Math.round(firstTokenMs / 1000)}s)`;
+      controller.abort();
+    }
+  }, 1000);
+
+  const progress = () => { lastProgress = Date.now(); sawFirstToken = true; };
+
+  let content = '';
+  let reasoning = '';
+  let finishReason = '';
+  const toolAcc = new Map();   // call index -> the call being assembled
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.body) throw new Error('no response body to stream');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Both wire formats are line-delimited; the difference is only whether a
+      // line carries an SSE `data: ` prefix. Split on newlines and keep the
+      // trailing fragment, because a chunk can end mid-line.
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        let payload = line;
+        if (openAiStyle) {
+          if (!line.startsWith('data:')) continue;   // SSE comments/keep-alives
+          payload = line.slice(5).trim();
+          if (payload === '[DONE]') continue;
+        }
+
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+
+        const delta = openAiStyle ? (obj.choices?.[0]?.delta || {}) : (obj.message || {});
+        const fr = openAiStyle ? obj.choices?.[0]?.finish_reason : obj.done_reason;
+        if (fr) finishReason = fr;
+
+        if (typeof delta.content === 'string' && delta.content.length) {
+          content += delta.content;
+          progress();
+        }
+        const r = reasoningChannel.extractReasoning(delta);
+        if (r) { reasoning += r; progress(); }
+
+        // TOOL CALLS ARRIVE IN PIECES on the OpenAI wire: one fragment per
+        // chunk, keyed by `index`, with `arguments` split across as many chunks
+        // as the JSON needs. `name` normally lands whole in the first fragment,
+        // but it is APPENDED rather than assigned so a build that splits it is
+        // handled too — appending is a no-op in the common case and the only
+        // thing that works in the uncommon one. Ollama sends them whole.
+        const deltaCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+        for (let i = 0; i < deltaCalls.length; i++) {
+          const tc = deltaCalls[i];
+          const idx = Number.isInteger(tc.index) ? tc.index : i;
+          const cur = toolAcc.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) cur.id = tc.id;
+          if (tc.type) cur.type = tc.type;
+          if (tc.function?.name) cur.function.name += tc.function.name;
+          if (tc.function?.arguments !== undefined && tc.function.arguments !== null) {
+            // Ollama hands back an object here rather than a string fragment.
+            cur.function.arguments = typeof tc.function.arguments === 'string'
+              ? cur.function.arguments + tc.function.arguments
+              : tc.function.arguments;
+          }
+          toolAcc.set(idx, cur);
+          progress();
+        }
+      }
+    }
+
+    // THE ABORT MAY LAND AS A CLEAN CLOSE rather than a rejection, depending on
+    // how the runtime tears the stream down. Without this the function would
+    // return whatever it had accumulated before the stall, as a finished answer
+    // — the exact "looks complete and is not" failure the partial-result work
+    // exists to prevent, reintroduced one layer lower. If the watchdog fired,
+    // this call failed, however the reader chose to end.
+    if (killReason) throw new Error(killReason);
+  } catch (err) {
+    if (killReason) {
+      // Named so the log says which limit bound, and typed so the existing
+      // circuit-breaker classifier still counts it as a timeout — a wedge has to
+      // keep tripping the breaker exactly as it did before.
+      const e = new Error(`${label ? `${label}: ` : ''}${killReason}`);
+      e.name = 'TimeoutError';
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearInterval(watchdog);
+  }
+
+  const toolCalls = [...toolAcc.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+  const message = { role: 'assistant', content };
+  if (reasoning) message.reasoning = reasoning;
+  if (toolCalls.length) message.tool_calls = toolCalls;
+
+  return openAiStyle
+    ? { choices: [{ message, finish_reason: finishReason }] }
+    : { message, done_reason: finishReason };
+}
+
+/**
  * The background tool loop.
  *
  * Same shape as the chat path's loop, deliberately: model turn → tool calls →
@@ -318,7 +513,7 @@ function stripChannelMarkers(text) {
  * without them, so the step gets an answer built from what it managed to look up
  * rather than nothing at all.
  */
-async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutMs, providerName }) {
+async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts, providerName }) {
   const MCPClient = require('../mcp/mcp-client');
   const client = MCPClient.shared();
   const specs = client.getToolsForOpenAISubset(session.allowedTools);
@@ -340,14 +535,11 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
     console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
                 `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(roundBody),
-      signal: AbortSignal.timeout(timeoutMs)
+    const data = await streamChat({
+      url, body: roundBody, openAiStyle,
+      firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
+      label: `${session.stepName} round ${round + 1}`
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json();
 
     const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
     const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
@@ -425,14 +617,12 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
   try {
     const lastBody = { ...body, messages: convo };
     delete lastBody.tools;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(lastBody),
-      signal: AbortSignal.timeout(timeoutMs)
-    });
-    if (response.ok) {
-      const data = await response.json();
+    {
+      const data = await streamChat({
+        url, body: lastBody, openAiStyle,
+        firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
+        label: `${session.stepName} writeup`
+      });
       const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
       const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
       closeCircuit();
@@ -448,7 +638,6 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
         outOfRounds: true
       };
     }
-    console.warn(`[Heartbeat] ${session.stepName} writeup turn failed with HTTP ${response.status}`);
   } catch (err) {
     console.warn(`[Heartbeat] ${session.stepName} writeup turn failed: ${err.message}`);
   }
@@ -535,27 +724,31 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   // Sizing on the wire total can only ever LENGTHEN a timeout, so no existing
   // caller can start failing because of this.
   //
-  // The planning rate and the floor are config now (generation.llmTimeout*),
-  // because this is a hard kill: the request aborts, the run fails, and the
-  // bigger the answer budget the more likely it binds. A budget raised without
-  // this raised with it is a budget rise that kills jobs.
-  const rate = Number.isFinite(gen.llmTimeoutTokensPerSecond) && gen.llmTimeoutTokensPerSecond > 0
-    ? gen.llmTimeoutTokensPerSecond : 20;
-  const floorMs = Number.isFinite(gen.llmTimeoutFloorMs) && gen.llmTimeoutFloorMs > 0
-    ? gen.llmTimeoutFloorMs : 60000;
-  const timeoutMs = Math.max(floorMs, Math.ceil(wireMaxTokens / rate * 1000));
+  // STALL LIMITS, NOT A PREDICTED DURATION. The rate-based calculation this
+  // replaces got worse the more agents ran at once, which is the opposite of
+  // what a background system needs — see the note on streamChat. Neither of
+  // these scales with the budget, so raising a budget can no longer kill a job.
+  warnRetiredRateKnobs(gen);
+  const timeouts = {
+    stallMs: Number.isFinite(gen.stallTimeoutMs) && gen.stallTimeoutMs > 0
+      ? gen.stallTimeoutMs : 60000,
+    firstTokenMs: Number.isFinite(gen.firstTokenTimeoutMs) && gen.firstTokenTimeoutMs > 0
+      ? gen.firstTokenTimeoutMs : 300000
+  };
 
   let url, body, extract, extractFinishReason;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
     url = `${host}/v1/chat/completions`;
-    body = { messages, stream: false, max_tokens: wireMaxTokens };
+    // No `stream` key here: streamChat owns that, and leaving a `stream: false`
+    // behind would read as "this path does not stream" when it does.
+    body = { messages, max_tokens: wireMaxTokens };
     if (bgThinking > 0) body.thinking_token_budget = bgThinking;
     if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
     extract = (data) => data.choices?.[0]?.message?.content || '';
     extractFinishReason = (data) => data.choices?.[0]?.finish_reason || '';
   } else {
     url = `${host}/api/chat`;
-    body = { model: heartbeatModel.model, messages, stream: false, options: { num_predict: maxTokens } };
+    body = { model: heartbeatModel.model, messages, options: { num_predict: maxTokens } };
     extract = (data) => data.message?.content || '';
     extractFinishReason = (data) => data.done_reason || '';
   }
@@ -567,7 +760,7 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
     return runToolLoop({
       session: options.toolSession,
       openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
-      url, body, messages, timeoutMs,
+      url, body, messages, timeouts,
       providerName: `${heartbeatModel.provider}/${heartbeatModel.model}`
     });
   }
@@ -586,19 +779,17 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
 
   for (const provider of providers) {
     try {
-      console.log(`[Heartbeat] Trying ${provider.name} → ${provider.url} (max_tokens: ${maxTokens}, timeout: ${timeoutMs}ms)`);
-      const response = await fetch(provider.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(provider.body),
-        signal: AbortSignal.timeout(timeoutMs)
+      console.log(`[Heartbeat] Trying ${provider.name} → ${provider.url} ` +
+                  `(max_tokens: ${maxTokens}, stall ${Math.round(timeouts.stallMs / 1000)}s, ` +
+                  `first token ${Math.round(timeouts.firstTokenMs / 1000)}s)`);
+      const data = await streamChat({
+        url: provider.url,
+        body: provider.body,
+        openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
+        firstTokenMs: timeouts.firstTokenMs,
+        stallMs: timeouts.stallMs,
+        label: provider.name
       });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
       const content = provider.extract(data);
       // The thinking channel, read through the one shared reader. It is never
       // folded into content — it is returned so a caller can show it, and named
@@ -2623,4 +2814,7 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost };
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
+  // Exported for test: streaming tool-call reassembly and the stall clock are
+  // the two things in this file that cannot be proven from the outside.
+  streamChat };
