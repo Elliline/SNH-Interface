@@ -362,7 +362,9 @@ const DEFAULTS = {
     // mid-conversation starts immediately and a second one waits. This cap is
     // the other direction — it stops jobs from filling every slot the pool has
     // and starving the corrector and the heartbeat.
-    maxConcurrent: 2,
+    // maxConcurrent MOVED to agentPool.lanes.agentJobs on 2026-08-19 — it was a
+    // second cap on the same quantity, gating before the pool ever saw the job,
+    // so the lower of the two always won silently.
     maxQueued: 10,           // refuse past this, out loud, rather than queue forever
     maxStartsPerHour: 6,     // trailing-hour cap, counted from the table (a restart grants no budget)
     // Per-job budget, RAISED 2026-08-18 after a real job hit every one of these
@@ -446,7 +448,46 @@ const DEFAULTS = {
   // Background LLM concurrency against the shared vLLM engine. Kept modest (3)
   // so background passes never starve chat or pile abandoned requests onto the
   // engine — over-saturation was a contributing cause of the brain wedge.
-  agentPool: { concurrency: 3 },
+  // THE BACKGROUND POOL, IN LANES (2026-08-19).
+  //
+  // It was one bucket with one cap, and every kind of work competed in it: a
+  // swarm of agent jobs, the scheduled runs, memory repair, the heartbeat. One
+  // busy kind starved the others, and the only protection chat had was a blunt
+  // "throttle everything to 1 while a reply is being written", which stopped
+  // background work dead every time the user typed.
+  //
+  // Now each kind has its own queue and its own cap, and they are drained
+  // round-robin so a busy lane cannot starve a quiet one.
+  //
+  // CHAT IS NOT A LANE, DELIBERATELY. It does not go through this pool and must
+  // not: queueing the user's reply behind anything is the one latency
+  // regression that is never worth it. What chat gets instead is RESERVED
+  // HEADROOM — backgroundDuringChat is how much background work may run while a
+  // reply is being written, and it is chat's cap expressed honestly.
+  //
+  // DEFAULTS ARE FOR THE SMALLEST MACHINE THIS COULD INSTALL ON, not for the
+  // box that measured them. On a 12GB card running a small model, KV cache is
+  // the binding constraint long before throughput is: a few thousand tokens of
+  // context per stream is all there is, so a deep lane means vLLM queueing and
+  // preempting rather than a crash. That degrades into slowness, and slowness no
+  // longer kills anything now that calls are killed on a stall rather than on a
+  // predicted duration. Anyone with real hardware raises these in Settings; the
+  // measurement on this GB10 supports far more (64 concurrent streams cost each
+  // stream only 2.1x its solo speed).
+  agentPool: {
+    lanes: {
+      agentJobs: 8,      // her call, and the measured curve supports much more
+      scheduled: 2,      // fires unattended; should never own the machine
+      background: 4      // memory repair, the heartbeat, extraction, scoring
+    },
+    // The sum is bounded separately, because three caps that each look
+    // reasonable can still add up to a machine that cannot answer.
+    maxTotalBackground: 12,
+    // Chat's reserved headroom. Was effectively 1 — background stopped dead
+    // whenever a reply was being written. 2 keeps most of the engine for the
+    // reply while letting background inch forward instead of stalling.
+    backgroundDuringChat: 2
+  },
   // The mid-cycle circuit breaker's trip point, which was CIRCUIT_TIMEOUT_THRESHOLD
   // in db/memory-manager.js. After this many consecutive callLLM timeouts every
   // subsequent call fast-fails until something succeeds — so it is the limit that

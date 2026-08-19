@@ -27,6 +27,7 @@ const JUDGE_MS = 150;
 
 const db = require('../db/database');
 const agentPool = require('../db/agent-pool');
+const { getConfig } = require('../db/config');
 const memoryClusters = require('../db/memory-clusters');
 const factExtractor = require('../db/fact-extractor');
 const corrector = require('../db/corrector');
@@ -98,11 +99,21 @@ async function peakDuring(work) {
   check(r.peak <= 3, `and stayed within the configured width (peak ${r.peak} <= 3)`);
 
   console.log('\n── …and yield to chat ──');
+  // WHAT "YIELD" MEANS CHANGED ON 2026-08-19, and the property is the same one.
+  // It used to be a flat throttle to 1: background stopped dead the instant a
+  // reply started being written. It is now agentPool.backgroundDuringChat —
+  // chat's reserved headroom, a number rather than a rule — so what is asserted
+  // is that chat still gets the machine, not that the number is 1. Setting it to
+  // 1 reproduces the old behaviour exactly, and the check below proves that,
+  // because the guarantee the corrector depends on must still be available.
+  const reserved = (getConfig().agentPool || {}).backgroundDuringChat ?? 2;
   pass = { ...pass, passId: 'test-2', plan: [], unresolved: [] };
   agentPool.beginChat();
   try {
     r = await peakDuring(() => corrector.expireDatedEvents(pass, {}));
-    check(r.peak === 1, `throttled to concurrency 1 while chat is in flight (peak ${r.peak})`);
+    check(r.peak <= reserved && r.peak >= 1,
+      `held to chat's reserved headroom while a reply is in flight (peak ${r.peak} <= ${reserved})`);
+    check(r.peak < 3, `and well below the full width it had a moment ago (peak ${r.peak} < 3)`);
   } finally {
     agentPool.endChat();
   }

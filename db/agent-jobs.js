@@ -124,6 +124,18 @@ const TERMINAL = ['ok', 'partial', 'failed', 'interrupted', 'cancelled'];
  * budget while something else set it — which is the two-sources-of-truth defect
  * with the sources a screen apart. Said once per process, not once per job.
  */
+let warnedDeadConcurrencyKey = false;
+function warnDeadConcurrencyKey(value) {
+  if (warnedDeadConcurrencyKey) return;
+  warnedDeadConcurrencyKey = true;
+  const line =
+    `agentJobs.maxConcurrent (${value}) in data/config.json is NO LONGER READ — how many jobs run at ` +
+    `once is agentPool.lanes.agentJobs now (Settings -> Background lanes), so it cannot disagree with ` +
+    `the lane that schedules them. Delete the old key; it is doing nothing.`;
+  console.warn(`[AgentJobs] ${line}`);
+  opsLog(line);
+}
+
 let warnedDeadOutputKey = false;
 function warnDeadOutputKey(value) {
   if (warnedDeadOutputKey) return;
@@ -141,9 +153,15 @@ function cfg() {
   const c = all.agentJobs || {};
   const gen = all.generation || {};
   if (c.maxOutputTokens !== undefined) warnDeadOutputKey(c.maxOutputTokens);
+  if (c.maxConcurrent !== undefined) warnDeadConcurrencyKey(c.maxConcurrent);
   return {
     enabled: c.enabled !== false,
-    maxConcurrent: Math.max(1, c.maxConcurrent ?? 2),
+    // ONE NUMBER, IN THE LANE. agentJobs.maxConcurrent was a second cap on the
+    // same quantity — it gated here, before the pool ever saw the job, so the
+    // lower of the two always won and the lane cap was decoration. It is read
+    // from the pool now and enforced here, which keeps the surplus visible as
+    // `queued` rows in her panel rather than hidden inside the pool's own queue.
+    maxConcurrent: agentPool.laneCap('agentJobs'),
     maxQueued: Math.max(1, c.maxQueued ?? 10),
     maxStartsPerHour: Math.max(1, c.maxStartsPerHour ?? 6),
     maxToolCallsPerJob: Math.max(1, c.maxToolCallsPerJob ?? 12),
@@ -298,7 +316,7 @@ function launch(id) {
   if (inFlight.has(id)) return false;
   inFlight.add(id);
 
-  agentPool.schedule(() => runJob(id), `agent-job:${id.slice(0, 8)}`)
+  agentPool.schedule(() => runJob(id), `agent-job:${id.slice(0, 8)}`, 'agentJobs')
     .catch(err => {
       // runJob does not throw; if it somehow does, the row must still be closed.
       console.error(`[AgentJobs] ${id.slice(0, 8)} escaped its own error handling:`, err && err.message);

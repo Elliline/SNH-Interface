@@ -31,41 +31,110 @@ const { getLocalDateStamp } = require('./datetime');
 // Background-pass telemetry is operational, not cognitive, so it goes to the
 // ops log (Thinking tab) rather than the daily log that gets injected into chat.
 const OPS_DIR = require('./database').getOpsDir();
-const DEFAULT_CONCURRENCY = 3;
+const LANE_DEFAULTS = { agentJobs: 8, scheduled: 2, background: 4 };
+/** The lane anything unlabelled lands in. Every existing caller keeps working. */
+const DEFAULT_LANE = 'background';
+const LANES = Object.keys(LANE_DEFAULTS);
+
+/**
+ * agentPool.concurrency became agentPool.lanes.background. A box that set the
+ * old key has it sitting in data/config.json reading like the thing that governs
+ * background width, governing nothing. Said once per process.
+ */
+let warnedDeadConcurrency = false;
+function warnDeadConcurrency(value) {
+  if (warnedDeadConcurrency) return;
+  warnedDeadConcurrency = true;
+  console.warn(`[AgentPool] agentPool.concurrency (${value}) in data/config.json is NO LONGER READ — ` +
+    `background width is agentPool.lanes.background now, and the other kinds of work have lanes of ` +
+    `their own (Settings -> Background lanes). Delete the old key; it is doing nothing.`);
+}
 
 class AgentPool {
   constructor() {
-    this._queue = [];          // [{ taskFn, resolve, reject, label }]
-    this._active = 0;          // tasks currently running
-    this._chatInFlight = 0;    // >0 → throttle to concurrency 1
+    // One FIFO per lane. Separate queues rather than one queue with a priority
+    // field, because the property wanted is "a swarm of agent jobs cannot make
+    // the heartbeat wait", and that is a statement about queues, not ordering.
+    this._lanes = {};
+    for (const lane of LANES) this._lanes[lane] = { queue: [], active: 0 };
+    this._rr = 0;              // round-robin cursor, so no lane starves another
+    this._chatInFlight = 0;    // >0 → background drops to its reserved headroom
     this._pass = null;         // current instrumentation pass, or null
   }
 
-  /** Configured full-width concurrency (config.agentPool.concurrency, default 6). */
-  _configuredConcurrency() {
-    const cfg = getConfig();
-    const n = cfg.agentPool && Number.isInteger(cfg.agentPool.concurrency)
-      ? cfg.agentPool.concurrency
-      : DEFAULT_CONCURRENCY;
-    return Math.max(1, n);
+  _poolCfg() {
+    const c = (getConfig().agentPool) || {};
+    if (c.concurrency !== undefined) warnDeadConcurrency(c.concurrency);
+    return c;
   }
 
-  /** Effective concurrency right now — 1 while chat is in flight, else full width. */
+  /** This lane's own cap. */
+  _laneCap(lane) {
+    const c = this._poolCfg();
+    const n = (c.lanes || {})[lane];
+    return Math.max(1, Number.isInteger(n) ? n : LANE_DEFAULTS[lane] ?? LANE_DEFAULTS.background);
+  }
+
+  /**
+   * The ceiling across every lane at once. While a reply is being written this
+   * collapses to chat's reserved headroom — that is what chat has instead of a
+   * lane of its own, because the user's turn must never queue behind anything.
+   */
+  _totalCap() {
+    const c = this._poolCfg();
+    if (this._chatInFlight > 0) {
+      return Math.max(1, Number.isInteger(c.backgroundDuringChat) ? c.backgroundDuringChat : 2);
+    }
+    return Math.max(1, Number.isInteger(c.maxTotalBackground) ? c.maxTotalBackground : 12);
+  }
+
+  _totalActive() {
+    return LANES.reduce((n, lane) => n + this._lanes[lane].active, 0);
+  }
+
+  _totalQueued() {
+    return LANES.reduce((n, lane) => n + this._lanes[lane].queue.length, 0);
+  }
+
+  /** Back-compat for readers that asked the old question. */
   _effectiveConcurrency() {
-    return this._chatInFlight > 0 ? 1 : this._configuredConcurrency();
+    return this._totalCap();
   }
 
   isChatInFlight() {
     return this._chatInFlight > 0;
   }
 
+  /**
+   * A lane's cap, for a caller that gates work BEFORE handing it over.
+   *
+   * agent-jobs.js does: it holds surplus jobs at `queued` in the database rather
+   * than inside this pool, so the panel can show "N running, N queued" and the
+   * log can say why. That is worth keeping — but it must be the SAME number, or
+   * the lower of the two silently wins and the other is decoration. It used to
+   * be: agentJobs.maxConcurrent was 2 and would have capped a lane set to 8.
+   */
+  laneCap(lane) {
+    return this._laneCap(LANES.includes(lane) ? lane : DEFAULT_LANE);
+  }
+
   /** How many tasks are queued or running (for instrumentation/debug). */
   stats() {
+    const lanes = {};
+    for (const lane of LANES) {
+      lanes[lane] = {
+        active: this._lanes[lane].active,
+        queued: this._lanes[lane].queue.length,
+        cap: this._laneCap(lane)
+      };
+    }
     return {
-      active: this._active,
-      queued: this._queue.length,
+      active: this._totalActive(),
+      queued: this._totalQueued(),
       chatInFlight: this._chatInFlight,
-      effectiveConcurrency: this._effectiveConcurrency()
+      effectiveConcurrency: this._totalCap(),
+      totalCap: this._totalCap(),
+      lanes
     };
   }
 
@@ -76,7 +145,7 @@ class AgentPool {
     this._chatInFlight++;
     if (this._pass) this._pass.throttled = true;
     if (this._chatInFlight === 1) {
-      console.log('[AgentPool] Chat in flight — throttling background pool to concurrency 1');
+      console.log(`[AgentPool] Chat in flight — background held to its reserved headroom (${this._totalCap()})`);
     }
   }
 
@@ -84,7 +153,7 @@ class AgentPool {
   endChat() {
     if (this._chatInFlight > 0) this._chatInFlight--;
     if (this._chatInFlight === 0) {
-      console.log('[AgentPool] Chat cleared — background pool resuming full concurrency');
+      console.log(`[AgentPool] Chat cleared — background lanes back to full width (${this._totalCap()})`);
       this._drain(); // fill slots freed up by the restored width
     }
   }
@@ -99,22 +168,47 @@ class AgentPool {
    * @param {string} [label] - short label for instrumentation/logging
    * @returns {Promise<any>}
    */
-  schedule(taskFn, label = 'task') {
+  schedule(taskFn, label = 'task', lane = DEFAULT_LANE) {
+    const key = LANES.includes(lane) ? lane : DEFAULT_LANE;
     return new Promise((resolve, reject) => {
-      this._queue.push({ taskFn, resolve, reject, label });
+      this._lanes[key].queue.push({ taskFn, resolve, reject, label });
       if (this._pass) this._pass.scheduled++;
       this._drain();
     });
   }
 
-  /** Launch queued tasks up to the current effective concurrency. */
+  /**
+   * Launch queued work, round-robin across lanes.
+   *
+   * Two conditions, and both have to hold: the lane must be under ITS cap, and
+   * the pool must be under the total. The round-robin cursor is what makes the
+   * lanes fair — draining them in a fixed order would let a full agentJobs queue
+   * take every freed slot and leave the heartbeat waiting behind eight jobs,
+   * which is the starvation this exists to prevent, rebuilt one level down.
+   */
   _drain() {
-    while (this._active < this._effectiveConcurrency() && this._queue.length > 0) {
-      const job = this._queue.shift();
-      this._active++;
+    for (;;) {
+      if (this._totalActive() >= this._totalCap()) return;
+
+      let picked = null;
+      for (let i = 0; i < LANES.length; i++) {
+        const lane = LANES[(this._rr + i) % LANES.length];
+        const st = this._lanes[lane];
+        if (st.queue.length > 0 && st.active < this._laneCap(lane)) {
+          picked = lane;
+          this._rr = (this._rr + i + 1) % LANES.length;
+          break;
+        }
+      }
+      if (!picked) return;   // everything queued is behind its own lane's cap
+
+      const st = this._lanes[picked];
+      const job = st.queue.shift();
+      st.active++;
       if (this._pass) {
         this._pass.started++;
-        if (this._active > this._pass.peakActive) this._pass.peakActive = this._active;
+        const total = this._totalActive();
+        if (total > this._pass.peakActive) this._pass.peakActive = total;
       }
       Promise.resolve()
         .then(() => job.taskFn())
@@ -123,7 +217,7 @@ class AgentPool {
           (err) => { if (this._pass) this._pass.failed++; job.reject(err); }
         )
         .finally(() => {
-          this._active--;
+          st.active--;
           this._drain();
         });
     }
@@ -137,9 +231,9 @@ class AgentPool {
    * @param {string} [label]
    * @returns {Promise<Array<{status: 'fulfilled'|'rejected', value?: any, reason?: any}>>}
    */
-  async runBatch(taskFns, label = 'batch') {
+  async runBatch(taskFns, label = 'batch', lane = DEFAULT_LANE) {
     return Promise.all(taskFns.map((fn, i) =>
-      this.schedule(fn, `${label}[${i}]`)
+      this.schedule(fn, `${label}[${i}]`, lane)
         .then(value => ({ status: 'fulfilled', value }))
         .catch(reason => {
           const msg = reason && reason.message ? reason.message : String(reason);

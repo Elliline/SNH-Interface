@@ -72,9 +72,15 @@ console.log('── Every per-run limit has a settings row ──');
 const missing = [];
 for (const [prefix, read] of BLOCKS) {
   const block = read() || {};
-  for (const leaf of Object.keys(block)) {
-    if (typeof block[leaf] === 'object' && block[leaf] !== null) continue;  // nested blocks listed separately
+  walk(block, prefix, missing);
+  }
+
+/** Recurse: a nested block (agentPool.lanes.*) is where a limit hides best. */
+function walk(node, prefix, missing) {
+  for (const leaf of Object.keys(node || {})) {
+    const v = node[leaf];
     const dotted = `${prefix}.${leaf}`;
+    if (v && typeof v === 'object' && !Array.isArray(v)) { walk(v, dotted, missing); continue; }
     if (EXEMPT[dotted]) continue;
     if (!exposed(dotted)) missing.push(dotted);
   }

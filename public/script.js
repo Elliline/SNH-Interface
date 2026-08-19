@@ -1955,13 +1955,7 @@ async function loadSettingsBrainTab() {
         value: config.agentJobs?.maxWallClockMs,
         desc: '900000 is 15 minutes. The clock starts when the job starts and does not stop for anything. Too low and deep research is cut off part way; too high and a stuck job sits in the panel looking alive. Live chat still takes priority over it either way.'
       },
-      {
-        key: 'agentJobs.maxConcurrent',
-        label: 'Jobs running at once',
-        type: 'number', step: '1', min: 1,
-        value: config.agentJobs?.maxConcurrent,
-        desc: 'Past this, a started job waits its turn. Kept low so jobs cannot fill every background slot and starve the memory repair and the heartbeat. Raising it makes jobs finish sooner and makes everything else on this machine slower while they do.'
-      },
+
       {
         key: 'agentJobs.maxQueued',
         label: 'Jobs waiting in the queue',
@@ -2055,11 +2049,39 @@ async function loadSettingsBrainTab() {
     // felt everywhere rather than in one queue.
     container.appendChild(createConfigSection('Background engine limits', [
       {
-        key: 'agentPool.concurrency',
+        key: 'agentPool.lanes.agentJobs',
+        label: 'Agent jobs running at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.lanes?.agentJobs,
+        desc: 'Agent jobs have a queue of their own, so a pile of them can no longer make the memory repair or the heartbeat wait behind them. Each one still gets slower as the others run — that is normal and nothing is killed for it any more — so the real cost of raising this is that every job takes longer, not that any of them fail. On a small graphics card the limit you hit first is memory for held conversations, which shows up as jobs queueing rather than anything breaking.'
+      },
+      {
+        key: 'agentPool.lanes.scheduled',
+        label: 'Scheduled runs at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.lanes?.scheduled,
+        desc: 'Scheduled runs fire unattended, often overnight, so they get a narrow lane on purpose — they should never be the reason something you are waiting on is slow. Raising it only helps if you have many jobs due at the same minute.'
+      },
+      {
+        key: 'agentPool.lanes.background',
         label: 'Background tasks at once',
         type: 'number', step: '1', min: 1,
-        value: config.agentPool?.concurrency,
-        desc: 'The full width of the background queue that jobs, scheduled runs, memory repair and the heartbeat all share. While a chat message is being answered this drops to 1 automatically so the reply keeps the GPU. Raising it gets background work done sooner at the cost of everything else it is running beside.'
+        value: config.agentPool?.lanes?.background,
+        desc: 'Everything else that thinks in the background: memory repair, the heartbeat, pulling facts out of what was said, scoring what matters. Its own lane, so a swarm of agent jobs cannot stop the memory from being tidied.'
+      },
+      {
+        key: 'agentPool.maxTotalBackground',
+        label: 'Total background tasks at once, across all lanes',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.maxTotalBackground,
+        desc: 'The ceiling over all three lanes together. Three caps that each look reasonable can still add up to a machine that cannot answer, so this is the number that decides how loaded the engine ever gets. Lower it first if replies start feeling sluggish while work is running.'
+      },
+      {
+        key: 'agentPool.backgroundDuringChat',
+        label: 'Background tasks allowed while a reply is being written',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.backgroundDuringChat,
+        desc: 'What a chat turn reserves for itself. Chat never queues behind background work — it goes straight to the engine — so this is how that promise is kept: while a reply is being written, background is held down to this many. It used to be 1, which stopped background work dead every time you typed. Set it to 1 for the fastest possible replies, higher to let background keep moving while you talk.'
       },
       {
         key: 'heartbeat.toolBudget.failedCallCost',

@@ -435,7 +435,8 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
         job.description,
         { maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens, toolSession: session }
       ),
-      `scheduled-job:${job.id.slice(0, 8)}`
+      `scheduled-job:${job.id.slice(0, 8)}`,
+      'scheduled'
     );
     output = String(res && res.content || '').trim();
     budget = (res && res.budget) || session.summary();
