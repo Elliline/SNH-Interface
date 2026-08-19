@@ -158,6 +158,24 @@ const engine = require('../db/initiative-engine');
     'the already-used entry was withheld from the model');
   check(trace.entries.length === 2, `only the 2 unused entries were offered (got ${trace.entries.length})`);
 
+  console.log('\n── But an entry whose follow-up expired UNREAD comes back ──');
+  // The pool cap and the stale sweep both expire a pending initiative without
+  // anyone having seen it. Withholding on source alone burned the entry forever
+  // on behalf of a question that was never asked, and decayed the window pass by
+  // pass. Expired means unread means still actionable.
+  sqlite.prepare("UPDATE initiatives SET status = 'expired'").run();
+  mockReply = JSON.stringify({
+    candidates: ['the philosophical depth comment'],
+    sourceEntry: 1,
+    followup: 'Asking again, because nobody ever saw the first one.',
+    reasoning: 'the earlier raise expired unread'
+  });
+  trace = await engine.generateLogFollowup({ days: 3, dailyDir: DAILY });
+  check(trace.entries.some(e => e.id === usedSourceRef),
+    'the entry behind an expired-unread follow-up was offered again');
+  check(trace.entries.length === 3, `all 3 entries back in view (got ${trace.entries.length})`);
+  check(trace.skipped === false, 'and it could raise on it again');
+
   console.log('\n── An error is not a decline ──');
   memoryManager.callLLM = async () => { throw new Error('engine unreachable'); };
   sqlite.prepare("UPDATE initiatives SET status = 'dismissed'").run();

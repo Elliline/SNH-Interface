@@ -415,17 +415,26 @@ async function generateLogFollowup({ days = null, dailyDir = null } = {}) {
       return trace;
     }
 
-    // Entries already followed up on, ever. addInitiative dedupes by source
-    // against pending AND delivered, but doing it here too means the model is
-    // never shown an entry it cannot act on — otherwise it can spend its one
-    // choice on something that will be silently folded, which reads as a raise
-    // in the trace and produces nothing.
+    // Entries already followed up on. addInitiative dedupes by source against
+    // pending AND delivered, but doing it here too means the model is never
+    // shown an entry it cannot act on — otherwise it can spend its one choice
+    // on something that will be silently folded, which reads as a raise in the
+    // trace and produces nothing.
+    //
+    // 'expired' is deliberately NOT in that list. An entry whose only follow-up
+    // was capped out of the pool or swept as stale was never read by anyone, so
+    // it is still actionable and must come back into view. Filtering on source
+    // alone burned an entry permanently on behalf of a question that was never
+    // asked: measured over the first seven passes it decayed the window 18 -> 15
+    // while delivering one of three raises, and left alone it eats the corpus.
     const sqlite = getSqliteDb();
     let usedRefs = new Set();
     if (sqlite) {
       try {
         const rows = sqlite.prepare(
-          "SELECT source_ref FROM initiatives WHERE source_kind = 'daily-log' AND source_ref IS NOT NULL"
+          `SELECT source_ref FROM initiatives
+           WHERE source_kind = 'daily-log' AND source_ref IS NOT NULL
+             AND status IN ('pending', 'delivered', 'dismissed')`
         ).all();
         usedRefs = new Set(rows.map(r => r.source_ref));
       } catch (e) {
