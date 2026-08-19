@@ -465,7 +465,9 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeoutM
  * @param {string} systemPrompt
  * @param {string} userPrompt
  * @param {Object} [options]
- * @param {number} [options.maxTokens]
+ * @param {number} [options.maxTokens] - the ANSWER budget; thinking is added on top
+ * @param {number} [options.thinkingTokens] - this call's own thinking budget,
+ *   overriding generation.backgroundThinkingTokens. Omit to use the background one.
  * @param {Object} [options.toolSession] - per-step budget from createToolSession
  * @returns {Promise<{content: string, provider: string, truncated: boolean, toolCalls?: Array}>}
  */
@@ -481,15 +483,18 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   const inst = getProviderInstance(heartbeatModel.provider, heartbeatModel.instance);
   const host = inst ? inst.host : 'http://localhost:11434';
   const maxTokens = options.maxTokens ?? 1024;
+  // A caller may bring its OWN thinking budget instead of the background one.
+  // Agent jobs do (generation.agentJobThinkingTokens): a job is not a small
+  // judgement call, and until 2026-08-19 it silently borrowed the budget written
+  // for one. null/undefined here means "use the background budget", which is
+  // what all twenty other call sites still do.
+  const thinkingOverride = Number.isFinite(options.thinkingTokens) ? options.thinkingTokens : null;
   // Date/time awareness for all heartbeat/audit roles (single shared injection).
   const datedSystemPrompt = `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
   const messages = [
     { role: 'system', content: datedSystemPrompt },
     { role: 'user', content: userPrompt }
   ];
-
-  // Scale fetch timeout to token budget: max_tokens / 45 tok/s * 1000ms * 2x safety margin
-  const timeoutMs = Math.max(60000, Math.ceil(maxTokens / 45 * 1000 * 2));
 
   // Build provider call based on config
   // THE CALLER'S maxTokens IS THE ANSWER BUDGET, AND ON A REASONING MODEL THAT
@@ -505,8 +510,25 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   // null (the shipped default) sends neither field, so a non-reasoning box gets
   // byte-identical requests. vLLM extension, so OpenAI-style local engines only.
   const gen = config.generation || {};
-  const bgThinking = Number.isFinite(gen.backgroundThinkingTokens) ? gen.backgroundThinkingTokens : null;
+  const bgThinking = thinkingOverride !== null
+    ? thinkingOverride
+    : (Number.isFinite(gen.backgroundThinkingTokens) ? gen.backgroundThinkingTokens : null);
   const wireMaxTokens = bgThinking > 0 ? maxTokens + bgThinking : maxTokens;
+
+  // THE TIMEOUT IS SIZED ON WHAT THE ENGINE WILL ACTUALLY GENERATE, which is the
+  // wire total — thinking plus answer — not the answer alone. It read `maxTokens`
+  // until 2026-08-19, which was harmless while the thinking budget was 256 next
+  // to a 120-token answer and stops being harmless the moment a caller brings a
+  // real one: an agent job at 8192 answer + 16384 thinking would have been given
+  // 6 minutes to generate 24,576 tokens, and at the ~39 tok/s this GPU actually
+  // decodes that is a 10-minute job aborted at minute six with nothing to show.
+  // Sizing on the wire total can only ever LENGTHEN a timeout, so no existing
+  // caller can start failing because of this.
+  //
+  // 45 tok/s is the divisor and the measured rate is ~39 (2026-08-19, 8-bit
+  // weights, 6k-token prompt) — the 2x margin is what covers the gap, and it is
+  // the reason the constant has not been re-tuned.
+  const timeoutMs = Math.max(60000, Math.ceil(wireMaxTokens / 45 * 1000 * 2));
 
   let url, body, extract, extractFinishReason;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {

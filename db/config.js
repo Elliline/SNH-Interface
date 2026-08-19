@@ -159,13 +159,53 @@ const DEFAULTS = {
   //
   // null for all three, for the same reason as above — a box with a non-reasoning
   // model must send exactly what it sends today.
+  //
+  // AGENT JOBS ARE THE THIRD BUDGET, AND UNTIL 2026-08-19 THEY HAD HALF OF ONE.
+  //
+  // A job sized its ANSWER through agentJobs.maxOutputTokens (2000) and got its
+  // THINKING from backgroundThinkingTokens — the budget written for a 120-token
+  // salience score. So the most expensive path in the system was running on the
+  // cheapest path's thinking allowance, and nothing said so: the two numbers
+  // lived in different sections and neither one named the job path.
+  //
+  // What that cost, measured on the aiserver 2026-08-18: three coding jobs in a
+  // row stopped mid-file. The wire carried max_tokens = 2000 + 256 = 2256 for a
+  // run asked to produce a complete module, against chat's 16384 + 8192 = 24576
+  // for a run asked to produce a paragraph.
+  //
+  // So the job path now has both halves of its own, and they are sized for what
+  // a job actually produces:
+  //
+  //   agentJobResponseTokens 8192 — PARITY WITH CHAT, and parity is the whole
+  //     argument. A job's deliverable is a file, not a sentence; there is no
+  //     reading on which it should be capped BELOW what he can say in one chat
+  //     message, and 2000 capped it at a quarter. For scale, a complete 150-line
+  //     Python module with docstrings runs about 2,000-2,500 tokens, so 8192 is
+  //     roughly 3x a whole file — room for the module plus the notes around it,
+  //     not room for an essay.
+  //   agentJobThinkingTokens null — SHIPPED EMPTY like every other field here,
+  //     for the same reason: this box's model has no reasoning channel and the
+  //     default must reproduce today's request byte for byte. A reasoning box
+  //     sets it in its own data/config.json (Settings → Thinking and Answer
+  //     Budgets). 16384 is the number to set, again at parity with chat: on
+  //     Qwen 3.8 the expensive part of a job is not the writing, it is the
+  //     self-review — it drafts the module, writes tests against it, runs them
+  //     in its head and revises before it answers. That pass is the work, not
+  //     padding around it, and it is where the old budget went.
+  //
+  // NOTE FOR A REASONING BOX: leaving agentJobThinkingTokens empty does NOT fall
+  // back to backgroundThinkingTokens any more. Empty means nothing is sent, and
+  // on a thinking model an unbounded think inside a bounded max_tokens is the
+  // 2026-08-15 empty-reply failure. Set it.
   generation: {
     reasoningEffort: null,
     thinkingTokens: null,
     responseTokens: null,
     backgroundThinkingTokens: null,
     extractionThinkingTokens: null,
-    extractionTimeoutMs: null
+    extractionTimeoutMs: null,
+    agentJobThinkingTokens: null,
+    agentJobResponseTokens: 8192
   },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
@@ -285,8 +325,12 @@ const DEFAULTS = {
     //     ("it can run a dozen searches and read whole pages").
     //   15 minutes of a GPU that is already his. Chat still preempts: the agent
     //     pool drops to concurrency 1 while a request is in flight.
-    //   2000 output tokens because 700 cannot hold a Python script, and a job
-    //     that is asked to produce something has to be able to produce it.
+    //   output tokens MOVED OUT of this block on 2026-08-19 — see
+    //     generation.agentJobResponseTokens. It sat here as maxOutputTokens
+    //     while the job's thinking budget sat in `generation`, which is how a
+    //     job ended up sized for its answer and unsized for its thinking with
+    //     nothing on either screen to say so. Both halves are now one section,
+    //     next to the chat and background rows they have to be read against.
     //
     // The billed-vs-raw accounting is in createToolSession: an error or an empty
     // search bills a quarter, with a hard ceiling of 2× the budget in raw
@@ -294,10 +338,6 @@ const DEFAULTS = {
     maxToolCallsPerJob: 40,
     maxWallClockMs: 900000,  // 15 minutes
     maxRoundsPerJob: 16,
-    // Output ceiling. A result is read in a panel and may be read aloud to him
-    // at the top of a turn, so a job that writes an essay is a job nobody reads
-    // — but a job asked for a script has to be able to write one.
-    maxOutputTokens: 2000,
     // How long after a restart an interrupted run is still worth redoing. An
     // LLM call cannot be resumed, so the run is lost either way; the only
     // question is whether repeating it is still useful. Safe to retry because

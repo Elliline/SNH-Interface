@@ -52,13 +52,18 @@ function check(name, ok, detail) {
 // --- the config stub ------------------------------------------------------
 const realGetConfig = config.getConfig;
 let jobCfg = {};
+let genCfg = {};
 config.getConfig = () => {
   const c = realGetConfig();
   c.agentJobs = Object.assign({
     enabled: true, maxConcurrent: 2, maxQueued: 10, maxStartsPerHour: 6,
     maxToolCallsPerJob: 40, maxWallClockMs: 900000, maxRoundsPerJob: 16,
-    maxOutputTokens: 2000, retryGraceMinutes: 30, retentionDays: 90
+    retryGraceMinutes: 30, retentionDays: 90
   }, jobCfg);
+  // The job's generation budget lives here as of 2026-08-19, not under agentJobs.
+  c.generation = Object.assign({}, c.generation, {
+    agentJobResponseTokens: 8192, agentJobThinkingTokens: null
+  }, genCfg);
   return c;
 };
 
@@ -95,6 +100,18 @@ memoryManager.callLLM = async (systemPrompt, userPrompt, options) => {
   // A run that wrote something AND was cut short — partial with real text.
   if (mode === 'cut-short') {
     return { content: 'Here is what I got to before I ran out of rounds: two of the three suppliers list a price.', provider: 'stub', toolCalls: [{ name: 'web_search', args: {}, ok: true, productive: true }], budget: { calls: 30, maxCalls: 40, billed: 30, failedCalls: 0, exhausted: null }, outOfRounds: true };
+  }
+  // A run that wrote a real, useful-looking result AND was cut off at max_tokens.
+  // The point of the fixture is that NOTHING else about it looks wrong: the tool
+  // call succeeded, the budget is not exhausted, it did not run out of rounds.
+  // Only finish_reason said 'length', and that used to be discarded.
+  if (mode === 'truncated') {
+    return {
+      content: 'import argparse\\n\\ndef parse_line(line):\\n    # parse one log line\\n    parts = line.split()\\n    return {ts: parts[0], level: parts[1]}\\n\\ndef summari',
+      provider: 'stub', truncated: true,
+      toolCalls: [{ name: 'memory_search', args: {}, ok: true, productive: true }],
+      budget: { calls: 2, maxCalls: 40, billed: 2, failedCalls: 0, exhausted: null }
+    };
   }
   if (mode === 'hold') {
     // Blocks until the test lets it go — the only way to observe a job while it
@@ -233,6 +250,42 @@ async function settle(id, ms = 3000) {
     /two of the three suppliers|nothing on the cars themselves/.test(partialBlock.text)
     && !/^It did not produce a result/m.test(partialBlock.text), partialBlock.text.slice(0, 300));
   check('and it is marked as having stopped short', /stopped short of finishing/.test(partialBlock.text));
+
+  // =========================================================================
+  // A truncated result USED TO LAND AS `ok`. runToolLoop returned `truncated` off
+  // finish_reason 'length' and runJob never read it, so a job that stopped
+  // mid-function presented as a finished one — an output that looks complete and
+  // is not, which is the phantom-dispatch failure wearing a different hat.
+  console.log('\n── A job cut off at its answer budget says so ──');
+  mode = 'truncated';
+  jobCfg = { maxStartsPerHour: 1000 };
+  const trunc = agentJobs.enqueue({ title: 'write logstats.py', task: 'Write a log statistics module.' });
+  const truncDone = await settle(trunc.id);
+  check('a truncated run is NOT ok', truncDone.status !== 'ok', truncDone.status);
+  check('it is partial — the text is real work, not a failure', truncDone.status === 'partial', truncDone.status);
+  check('the truncated text is kept whole, not thrown away',
+    /def parse_line/.test(truncDone.result_text || ''), JSON.stringify((truncDone.result_text || '').slice(0, 60)));
+  check('the card names the limit it hit, not a vague "stopped early"',
+    /answer budget \(8192 tokens\)/.test(truncDone.error || ''), truncDone.error);
+  check('and says plainly that the result is cut off rather than finished',
+    /cut off, not finished/.test(truncDone.error || ''), truncDone.error);
+  check('truncation is reported ahead of the other cut-short reasons',
+    !/ran out of tool rounds/.test(truncDone.error || ''), truncDone.error);
+
+  const truncBlock = agentJobs.renderAnnouncementBlock({ limit: 20, tokenCap: 20000 });
+  check('and HE is told it stopped short too, matching her card',
+    /stopped short of finishing/.test(truncBlock.text) && /answer budget/.test(truncBlock.text),
+    truncBlock.text.slice(0, 400));
+
+  // The budget the run was actually given comes from `generation`, and changing
+  // it there changes what the card reports — one number, one place.
+  genCfg = { agentJobResponseTokens: 4096 };
+  const trunc2 = agentJobs.enqueue({ title: 'write logstats.py again', task: 'Write a log statistics module.' });
+  const trunc2Done = await settle(trunc2.id);
+  check('the reported limit tracks generation.agentJobResponseTokens',
+    /answer budget \(4096 tokens\)/.test((trunc2Done || {}).error || ''), JSON.stringify(trunc2Done));
+  genCfg = {};
+  jobCfg = {};
 
   // =========================================================================
   console.log('\n── Concurrency: past the cap a job waits, and the wait is visible ──');

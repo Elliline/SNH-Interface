@@ -109,8 +109,32 @@ const JOB_TOOLS = [
  */
 const TERMINAL = ['ok', 'partial', 'failed', 'interrupted', 'cancelled'];
 
+/**
+ * A config key that MOVED must not go quiet where it used to live.
+ *
+ * agentJobs.maxOutputTokens became generation.agentJobResponseTokens on
+ * 2026-08-19. A box that set the old one in its data/config.json would otherwise
+ * keep it there, unread, looking exactly like the thing setting the job's answer
+ * budget while something else set it — which is the two-sources-of-truth defect
+ * with the sources a screen apart. Said once per process, not once per job.
+ */
+let warnedDeadOutputKey = false;
+function warnDeadOutputKey(value) {
+  if (warnedDeadOutputKey) return;
+  warnedDeadOutputKey = true;
+  const line =
+    `agentJobs.maxOutputTokens (${value}) in data/config.json is NO LONGER READ — ` +
+    `the job answer budget moved to generation.agentJobResponseTokens ` +
+    `(Settings -> Thinking and Answer Budgets). Delete the old key; it is doing nothing.`;
+  console.warn(`[AgentJobs] ${line}`);
+  opsLog(line);
+}
+
 function cfg() {
-  const c = getConfig().agentJobs || {};
+  const all = getConfig();
+  const c = all.agentJobs || {};
+  const gen = all.generation || {};
+  if (c.maxOutputTokens !== undefined) warnDeadOutputKey(c.maxOutputTokens);
   return {
     enabled: c.enabled !== false,
     maxConcurrent: Math.max(1, c.maxConcurrent ?? 2),
@@ -119,7 +143,12 @@ function cfg() {
     maxToolCallsPerJob: Math.max(1, c.maxToolCallsPerJob ?? 12),
     maxWallClockMs: Math.max(5000, c.maxWallClockMs ?? 300000),
     maxRoundsPerJob: Math.max(1, c.maxRoundsPerJob ?? 6),
-    maxOutputTokens: Math.max(64, c.maxOutputTokens ?? 700),
+    // The two halves of the job's generation budget, both from `generation` so
+    // they are read against the chat and background rows rather than apart from
+    // them. The answer budget is always sent (it always has been); the thinking
+    // budget is null-means-send-nothing like every other field in that section.
+    answerTokens: Math.max(64, gen.agentJobResponseTokens ?? 8192),
+    thinkingTokens: Number.isFinite(gen.agentJobThinkingTokens) ? gen.agentJobThinkingTokens : null,
     retryGraceMinutes: Math.max(0, c.retryGraceMinutes ?? 30),
     retentionDays: Math.max(1, c.retentionDays ?? 90)
   };
@@ -428,7 +457,8 @@ async function salvageWriteup(job, calls = [], budget = null, c = cfg()) {
     `Do not apologise, do not describe this as a salvage, and do not answer with nothing.`;
 
   try {
-    const res = await mm.callLLM(system, job.task, { maxTokens: c.maxOutputTokens });
+    const res = await mm.callLLM(system, job.task,
+      { maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens });
     const text = String(res && res.content || '').trim();
     return text || null;
   } catch (err) {
@@ -540,7 +570,7 @@ async function runJob(id) {
     const res = await mm.callLLM(
       systemPrompt(job, allowed),
       job.task,
-      { maxTokens: c.maxOutputTokens, toolSession: session }
+      { maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens, toolSession: session }
     );
     output = String(res && res.content || '').trim();
     budget = (res && res.budget) || session.summary();
@@ -549,11 +579,29 @@ async function runJob(id) {
 
     // A run that was CUT SHORT but still wrote something is not "ok". The text is
     // kept in full and the card says which it was — see TERMINAL on `partial`.
-    if (output && (res.outOfRounds || (budget && budget.exhausted))) {
+    //
+    // HITTING THE ANSWER BUDGET IS THE THIRD WAY TO BE CUT SHORT, and it was the
+    // one nothing looked at. `runToolLoop` has always returned `truncated` off
+    // finish_reason === 'length'; this function read `outOfRounds` and
+    // `budget.exhausted` beside it and dropped `truncated` on the floor. So a job
+    // that generated right up to max_tokens and stopped mid-token landed as `ok`
+    // with a full-looking card. Measured cost (2026-08-18, aiserver): three
+    // coding jobs cut off mid-function, all three presenting as finished.
+    //
+    // This is the same class as the phantom dispatch — an output that reads as
+    // complete and is not — and it gets the same answer: the run does not get to
+    // claim it finished, and the card names the limit it hit. Truncation is
+    // checked FIRST because it is the most specific reason and the only one that
+    // says WHERE the result stops. A run can be out of rounds AND truncated; the
+    // cut mid-sentence is what she is looking at, and it is the one with an
+    // action attached — raise the budget.
+    if (output && (res.truncated || res.outOfRounds || (budget && budget.exhausted))) {
       status = 'partial';
-      error = res.outOfRounds
-        ? `it ran out of tool rounds (${c.maxRoundsPerJob}) before it was finished — what is above is what it had`
-        : `it stopped early: ${budget.exhausted} — what is above is what it had`;
+      error = res.truncated
+        ? `it hit the answer budget (${c.answerTokens} tokens) and stopped mid-result — what is above is cut off, not finished. Raise "Answer budget, agent jobs" in Settings if this keeps happening`
+        : res.outOfRounds
+          ? `it ran out of tool rounds (${c.maxRoundsPerJob}) before it was finished — what is above is what it had`
+          : `it stopped early: ${budget.exhausted} — what is above is what it had`;
     }
 
     if (!output) {

@@ -163,8 +163,16 @@ check('a job gets 40 tool calls', aj.maxToolCallsPerJob === 40, String(aj.maxToo
 check('and 16 rounds — rounds were the limit that actually bound at 6',
   aj.maxRoundsPerJob === 16, String(aj.maxRoundsPerJob));
 check('15 minutes of wall clock', aj.maxWallClockMs === 900000, String(aj.maxWallClockMs));
-check('and 2000 output tokens, because 700 cannot hold a script',
-  aj.maxOutputTokens === 2000, String(aj.maxOutputTokens));
+// The answer budget moved to `generation` on 2026-08-19 and was raised to chat
+// parity — a job hands back a file, and 2000 tokens held about a third of one.
+const gen = getConfig().generation;
+check('the job answer budget is 8192, at parity with chat',
+  gen.agentJobResponseTokens === 8192, String(gen.agentJobResponseTokens));
+check('and it no longer lives under agentJobs, where it could disagree with the thinking half',
+  aj.maxOutputTokens === undefined,
+  `agentJobs.maxOutputTokens is still set to ${aj.maxOutputTokens} in data/config.json — delete it, it is not read`);
+check('the job thinking budget ships empty, like every other field in that section',
+  gen.agentJobThinkingTokens === null, String(gen.agentJobThinkingTokens));
 check('rounds × 2-3 calls now reaches the call budget rather than starving it',
   aj.maxRoundsPerJob * 2 >= aj.maxToolCallsPerJob * 0.75,
   `${aj.maxRoundsPerJob} rounds vs ${aj.maxToolCallsPerJob} calls`);

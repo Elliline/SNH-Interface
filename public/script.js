@@ -1844,6 +1844,22 @@ async function loadSettingsBrainTab() {
         desc: 'How long a reply may be. Empty means the engine allows as much as the context window has left; setting it too low cuts answers off mid-sentence with no warning.'
       },
       {
+        key: 'generation.agentJobThinkingTokens',
+        label: 'Thinking budget, agent jobs (tokens)',
+        type: 'number', step: '1024', min: 0,
+        value: config.generation?.agentJobThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. A job is not a chat turn: before it answers it drafts the thing you asked for, writes its own checks against the draft and revises. That self-review is the work, not padding around it, and it needs room of its own — a job used to borrow the background budget below, which is sized for scoring one fact.'
+      },
+      {
+        key: 'generation.agentJobResponseTokens',
+        label: 'Answer budget, agent jobs (tokens)',
+        type: 'number', step: '1024', min: 64,
+        value: config.generation?.agentJobResponseTokens,
+        desc: 'How long a job result may be. A job hands back a file rather than a sentence, so this has to hold the whole file — a complete 150-line module is around 2,500 tokens. Set it too low and the result stops mid-function; the card will say it was cut off, but the writing is still lost.'
+      },
+      {
         key: 'generation.backgroundThinkingTokens',
         label: 'Thinking budget, background work (tokens)',
         type: 'number', step: '64', min: 0,
