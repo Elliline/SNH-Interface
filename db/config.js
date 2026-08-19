@@ -221,7 +221,23 @@ const DEFAULTS = {
     agentJobThinkingTokens: null,
     agentJobResponseTokens: 8192,
     scheduledJobThinkingTokens: null,
-    scheduledJobResponseTokens: 4096
+    scheduledJobResponseTokens: 4096,
+    // THE TIMEOUT ON ONE LLM CALL, which was a formula with three numbers baked
+    // into it: max(60000, wireMaxTokens / 45 * 1000 * 2). 45 was an assumed
+    // generation rate and 2 was a safety margin, so the real quantity — the
+    // slowest rate worth planning for — was 22.5 tok/s and appeared nowhere.
+    //
+    // It matters because it is a HARD KILL: the request aborts, the run fails,
+    // and the bigger the answer budget the more likely it binds. Raising a
+    // budget without raising this is how a budget rise turns into a dead job.
+    //
+    // Stated as a rate rather than a duration because the duration depends on
+    // the budget: timeout = max(floor, (thinking + answer) / rate). Measured on
+    // this GB10 at 8-bit: ~39 tok/s at a 6k prompt. 20 is the planning rate —
+    // about half of measured, slightly more generous than the old effective
+    // 22.5, and a number a person can check against reality.
+    llmTimeoutTokensPerSecond: 20,
+    llmTimeoutFloorMs: 60000
   },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
@@ -356,10 +372,16 @@ const DEFAULTS = {
     maxToolCallsPerJob: 40,
     maxWallClockMs: 900000,  // 15 minutes
     maxRoundsPerJob: 16,
+    // How many times a job may be STARTED, counting the first. 2 is one retry,
+    // which is what "exactly one retry, ever" meant while it was the literal
+    // `(j.attempts || 0) < 2` in sweepInterrupted. Safe to retry at all only
+    // because every job in this phase is read-only — the day one can write,
+    // this is the first line to revisit, and setting it above 2 then is a way
+    // to repeat a write.
+    maxAttempts: 2,
     // How long after a restart an interrupted run is still worth redoing. An
     // LLM call cannot be resumed, so the run is lost either way; the only
-    // question is whether repeating it is still useful. Safe to retry because
-    // every job in this phase is read-only. Exactly one retry, ever.
+    // question is whether repeating it is still useful.
     retryGraceMinutes: 30,
     // Terminal rows older than this are pruned. The run they describe stays in
     // the ops log; this table is a panel, not an archive.
@@ -407,6 +429,12 @@ const DEFAULTS = {
   // so background passes never starve chat or pile abandoned requests onto the
   // engine — over-saturation was a contributing cause of the brain wedge.
   agentPool: { concurrency: 3 },
+  // The mid-cycle circuit breaker's trip point, which was CIRCUIT_TIMEOUT_THRESHOLD
+  // in db/memory-manager.js. After this many consecutive callLLM timeouts every
+  // subsequent call fast-fails until something succeeds — so it is the limit that
+  // decides whether a wedged engine kills one run or all of them. It belongs
+  // beside the other numbers that can stop a run rather than inside a module.
+  brainCircuit: { consecutiveTimeoutsToOpen: 3 },
   // Lightweight periodic liveness probe: a tiny completion with a short timeout
   // that writes a daily-log warning when the brain stops answering, so a wedged
   // engine is caught in minutes instead of at the next heartbeat.
@@ -754,7 +782,12 @@ const DEFAULTS = {
     // from an API would move the thinking off the machine. Any `deep*` value
     // here is refused in code, not just discouraged in this comment.
     exa: { enabled: true, url: 'https://api.exa.ai/search', type: 'auto', numResults: 5, timeoutMs: 8000, textChars: 1000 },
-    searxng: { enabled: false, url: 'http://localhost:8888' },
+    searxng: { enabled: false, url: 'http://localhost:8888', timeoutMs: 8000 },
+    // web_fetch's own HTTP timeout, which was AbortSignal.timeout(10000) in
+    // mcp/tools/web-fetch.js. A job reading whole pages spends most of its wall
+    // clock here, and a page that hangs costs the run a tool call it cannot get
+    // back — so this is a per-run limit in everything but name.
+    webFetch: { timeoutMs: 10000 },
     // create_cron_job — the first action tool. PROPOSE ONLY: a call raises an
     // initiative for Ellie to approve or reject in the bell panel; nothing is
     // created without her decision, and nothing executes even once approved
@@ -1132,7 +1165,7 @@ function getSearchConfig(configOverride = null) {
       name: 'searxng',
       enabledInConfig: !!searxng.enabled,
       available: !!searxng.enabled && !!searxng.url,
-      config: { url: searxng.url, timeoutMs: 8000 },
+      config: { url: searxng.url, timeoutMs: Math.max(1000, searxng.timeoutMs ?? 8000) },
       why: !searxng.enabled ? 'switched off in settings' : (!searxng.url ? 'no instance URL is set' : null)
     })
   };

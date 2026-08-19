@@ -204,7 +204,9 @@ const SEARCH_PROVIDER_SPECS = [
     blurb: 'Your own instance. No account, no metering, and it keeps working when a hosted index does not.',
     toggle: 'tools.searxng.enabled',
     fields: [
-      { path: 'tools.searxng.url', label: 'Instance URL', type: 'text', placeholder: 'http://localhost:8888' }
+      { path: 'tools.searxng.url', label: 'Instance URL', type: 'text', placeholder: 'http://localhost:8888' },
+      { path: 'tools.searxng.timeoutMs', label: 'Timeout (ms)', type: 'number', min: 1000, max: 30000,
+        hint: 'How long to wait for your instance before giving up and moving down the chain. Too low and a slow-but-working instance reads as a failure.' }
     ]
   }
 ];

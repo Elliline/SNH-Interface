@@ -53,7 +53,17 @@ let isRunning = false;
 // 231-pair cross-link audit — drains in milliseconds instead of grinding every
 // remaining task against a dead engine), and runMaintenance aborts the cycle.
 // Any successful call or a successful liveness probe closes it again.
-const CIRCUIT_TIMEOUT_THRESHOLD = 3;
+/**
+ * Read per trip-check rather than captured at load, so raising it in Settings
+ * takes effect on a wedged engine without a restart — which is exactly when
+ * nobody wants to be restarting the server to change a number.
+ */
+function circuitThreshold() {
+  try {
+    const n = (getConfig().brainCircuit || {}).consecutiveTimeoutsToOpen;
+    return Number.isFinite(n) && n > 0 ? n : 3;
+  } catch { return 3; }
+}
 let consecutiveTimeouts = 0;
 let circuitOpen = false;
 
@@ -525,10 +535,15 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   // Sizing on the wire total can only ever LENGTHEN a timeout, so no existing
   // caller can start failing because of this.
   //
-  // 45 tok/s is the divisor and the measured rate is ~39 (2026-08-19, 8-bit
-  // weights, 6k-token prompt) — the 2x margin is what covers the gap, and it is
-  // the reason the constant has not been re-tuned.
-  const timeoutMs = Math.max(60000, Math.ceil(wireMaxTokens / 45 * 1000 * 2));
+  // The planning rate and the floor are config now (generation.llmTimeout*),
+  // because this is a hard kill: the request aborts, the run fails, and the
+  // bigger the answer budget the more likely it binds. A budget raised without
+  // this raised with it is a budget rise that kills jobs.
+  const rate = Number.isFinite(gen.llmTimeoutTokensPerSecond) && gen.llmTimeoutTokensPerSecond > 0
+    ? gen.llmTimeoutTokensPerSecond : 20;
+  const floorMs = Number.isFinite(gen.llmTimeoutFloorMs) && gen.llmTimeoutFloorMs > 0
+    ? gen.llmTimeoutFloorMs : 60000;
+  const timeoutMs = Math.max(floorMs, Math.ceil(wireMaxTokens / rate * 1000));
 
   let url, body, extract, extractFinishReason;
   if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
@@ -619,7 +634,7 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
       // count toward a wedge — reset the streak instead.
       if (isTimeoutError(err)) {
         consecutiveTimeouts++;
-        if (consecutiveTimeouts >= CIRCUIT_TIMEOUT_THRESHOLD && !circuitOpen) {
+        if (consecutiveTimeouts >= circuitThreshold() && !circuitOpen) {
           circuitOpen = true;
           console.warn(`[Heartbeat] Circuit opened after ${consecutiveTimeouts} consecutive timeouts — brain appears wedged; remaining calls will fast-fail`);
         }

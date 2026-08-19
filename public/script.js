@@ -1901,6 +1901,186 @@ async function loadSettingsBrainTab() {
         nullable: true,
         placeholder: 'Empty = 30000 (30 seconds)',
         desc: 'How long to wait for extraction before giving up on an exchange. Anything it does not finish in time is not remembered.'
+      },
+      {
+        key: 'generation.llmTimeoutTokensPerSecond',
+        label: 'Slowest generation speed to plan for (tokens/sec)',
+        type: 'number', step: '5', min: 1,
+        value: config.generation?.llmTimeoutTokensPerSecond,
+        desc: 'Sets how long to wait for one model call: the wait is the whole budget above, thinking plus answer, divided by this. It is a hard cut-off — when it runs out the call is abandoned and the run fails, mid-sentence, with nothing kept. Set it too high and you are claiming the machine is faster than it is, and the biggest jobs are the first to be killed. This machine measures around 39; 20 is deliberately pessimistic, and raising a budget without checking this is how a raised budget starts killing jobs.'
+      },
+      {
+        key: 'generation.llmTimeoutFloorMs',
+        label: 'Minimum wait for one model call (ms)',
+        type: 'number', step: '10000', min: 1000,
+        value: config.generation?.llmTimeoutFloorMs,
+        desc: 'The wait never drops below this, however small the budget. It exists for the many tiny background calls, where the calculated wait would be a second or two and any ordinary hiccup would fail them.'
+      }
+    ]));
+
+    // ONE RUN'S LIMITS, ALL OF THEM, ON ONE PAGE.
+    //
+    // Every number here could already stop a job; none of them were visible.
+    // They were picked from a menu on 2026-08-18, written into DEFAULTS, and
+    // then discovered one at a time by watching runs die — raise the output
+    // budget and rounds become binding, raise rounds and wall clock does. The
+    // point of listing them together is that the next binding limit is on the
+    // same screen as the one you just raised.
+    container.appendChild(createConfigSection('Agent Jobs — limits on one run', [
+      {
+        key: 'agentJobs.enabled',
+        label: 'Background jobs enabled',
+        type: 'checkbox',
+        value: config.agentJobs?.enabled !== false,
+        desc: 'Off means work cannot be handed off at all — the tool disappears from every turn, and anything that would have been delegated has to be answered on the spot instead.'
+      },
+      {
+        key: 'agentJobs.maxToolCallsPerJob',
+        label: 'Tool calls per job',
+        type: 'number', step: '5', min: 1,
+        value: config.agentJobs?.maxToolCallsPerJob,
+        desc: 'How much looking-up one job may do — roughly a dozen searches plus the fetches to read what they found. Too low and it stops mid-research and writes up whatever it had. Calls that fail or come back empty are billed at a fraction of a real one (see Background engine limits), so this counts work done rather than tries.'
+      },
+      {
+        key: 'agentJobs.maxRoundsPerJob',
+        label: 'Tool rounds per job',
+        type: 'number', step: '2', min: 1,
+        value: config.agentJobs?.maxRoundsPerJob,
+        desc: 'A round is one turn of the loop: it asks for some tools, gets the results, and thinks again. Two or three calls usually happen per round, so if this is small it runs out of turns long before it runs out of calls and the call budget above never binds. That is exactly what happened at 6 rounds against a 12-call budget.'
+      },
+      {
+        key: 'agentJobs.maxWallClockMs',
+        label: 'Time limit for one job (ms)',
+        type: 'number', step: '60000', min: 5000,
+        value: config.agentJobs?.maxWallClockMs,
+        desc: '900000 is 15 minutes. The clock starts when the job starts and does not stop for anything. Too low and deep research is cut off part way; too high and a stuck job sits in the panel looking alive. Live chat still takes priority over it either way.'
+      },
+      {
+        key: 'agentJobs.maxConcurrent',
+        label: 'Jobs running at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxConcurrent,
+        desc: 'Past this, a started job waits its turn. Kept low so jobs cannot fill every background slot and starve the memory repair and the heartbeat. Raising it makes jobs finish sooner and makes everything else on this machine slower while they do.'
+      },
+      {
+        key: 'agentJobs.maxQueued',
+        label: 'Jobs waiting in the queue',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxQueued,
+        desc: 'Past this a new job is refused out loud, in the reply, rather than queued for a time that never comes. Too low and a busy afternoon starts getting turned away.'
+      },
+      {
+        key: 'agentJobs.maxStartsPerHour',
+        label: 'Jobs started per hour',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxStartsPerHour,
+        desc: 'A trailing-hour cap counted from the database, so restarting the server does not hand out a fresh allowance. Too low and a genuinely busy hour gets refused; it is a runaway guard, not a rationing scheme.'
+      },
+      {
+        key: 'agentJobs.maxAttempts',
+        label: 'Starts allowed per job, including the first',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxAttempts,
+        desc: '2 means one retry. A restart kills whatever was running — a model call cannot be resumed — so the run is lost either way and the only question is whether repeating it is still worth it. Set to 1 to never retry. Only safe above 1 while jobs are read-only: the day one can write something, a retry is a repeated write.'
+      },
+      {
+        key: 'agentJobs.retryGraceMinutes',
+        label: 'Retry an interrupted job for up to (minutes)',
+        type: 'number', step: '5', min: 0,
+        value: config.agentJobs?.retryGraceMinutes,
+        desc: 'A job the server restart killed is redone only if it started less recently than this. Older than that and the answer would be stale anyway, so it stays interrupted with the reason written down. 0 means never redo one.'
+      },
+      {
+        key: 'agentJobs.retentionDays',
+        label: 'Keep finished jobs for (days)',
+        type: 'number', step: '10', min: 1,
+        value: config.agentJobs?.retentionDays,
+        desc: 'How long a finished job stays in the panel before it is pruned. The record of the run stays in the ops log either way — this table is a panel, not an archive. Too low and a result is gone before you get to it.'
+      }
+    ]));
+
+    container.appendChild(createConfigSection('Scheduled Jobs — limits on one run', [
+      {
+        key: 'scheduler.enabled',
+        label: 'Scheduled jobs enabled',
+        type: 'checkbox',
+        value: config.scheduler?.enabled !== false,
+        desc: 'Off stops every approved job from firing. They stay armed and simply never come due, so switching this back on resumes them rather than replaying what was missed.'
+      },
+      {
+        key: 'scheduler.maxToolCallsPerRun',
+        label: 'Tool calls per run',
+        type: 'number', step: '2', min: 1,
+        value: config.scheduler?.maxToolCallsPerRun,
+        desc: 'Sized for a summarising run — a handful of lookups, not a corpus sweep — which is why it is well below the agent-job budget. Too low and a digest stops before it has looked at everything it was asked about.'
+      },
+      {
+        key: 'scheduler.maxRoundsPerRun',
+        label: 'Tool rounds per run',
+        type: 'number', step: '1', min: 1,
+        value: config.scheduler?.maxRoundsPerRun,
+        desc: 'Same meaning as the agent-job version, and the same trap: at two or three calls a round, a small number here makes the call budget above unreachable.'
+      },
+      {
+        key: 'scheduler.maxWallClockMsPerRun',
+        label: 'Time limit for one run (ms)',
+        type: 'number', step: '30000', min: 5000,
+        value: config.scheduler?.maxWallClockMsPerRun,
+        desc: '180000 is 3 minutes. Shorter than an agent job on purpose: this fires on a schedule, possibly while you are asleep, and a scheduled run that grinds for a quarter of an hour is holding the background pool the whole time.'
+      },
+      {
+        key: 'scheduler.maxConsecutiveFailures',
+        label: 'Failures in a row before a job disables itself',
+        type: 'number', step: '1', min: 1,
+        value: config.scheduler?.maxConsecutiveFailures,
+        desc: 'A job that fails this many times running switches itself off, says so on the bell, and will not run again until you re-enable it. A run that was merely cut short does not count — that clears the streak, because a budget that is too small is not an engine that is broken. Too low and one bad night retires a job that was fine.'
+      },
+      {
+        key: 'scheduler.tickSeconds',
+        label: 'How often to look for due jobs (seconds)',
+        type: 'number', step: '10', min: 10,
+        value: config.scheduler?.tickSeconds,
+        desc: 'Nothing fires between ticks, so this is also the worst case for how late a job can be. Raising it does not save much — the check is cheap when nothing is due — and it makes every job fire later.'
+      },
+      {
+        key: 'scheduler.catchupGraceMinutes',
+        label: 'Still run a missed job if it is less than (minutes) late',
+        type: 'number', step: '15', min: 0,
+        value: config.scheduler?.catchupGraceMinutes,
+        desc: 'After a restart or a sleep, a firing that was missed is run once if it is inside this window and skipped if it is not. Too high and coming back from a long outage sets off a burst of stale jobs at once; 0 means a missed firing is always skipped.'
+      }
+    ]));
+
+    // Shared by both paths and by every background step, so a change here is
+    // felt everywhere rather than in one queue.
+    container.appendChild(createConfigSection('Background engine limits', [
+      {
+        key: 'agentPool.concurrency',
+        label: 'Background tasks at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.concurrency,
+        desc: 'The full width of the background queue that jobs, scheduled runs, memory repair and the heartbeat all share. While a chat message is being answered this drops to 1 automatically so the reply keeps the GPU. Raising it gets background work done sooner at the cost of everything else it is running beside.'
+      },
+      {
+        key: 'heartbeat.toolBudget.failedCallCost',
+        label: 'What a failed tool call costs against the budget',
+        type: 'number', step: '0.05', min: 0,
+        value: config.heartbeat?.toolBudget?.failedCallCost,
+        desc: 'Between 0 and 1, where a useful result costs 1. A search that errors or comes back empty is not progress, so charging it full price meant one broken provider could spend a whole job on nothing. At 0.25 a run gets four tries for the price of one result. Set it to 1 to go back to counting attempts.'
+      },
+      {
+        key: 'heartbeat.toolBudget.attemptCeilingMultiple',
+        label: 'Hard attempt ceiling, as a multiple of the call budget',
+        type: 'number', step: '1', min: 1,
+        value: config.heartbeat?.toolBudget?.attemptCeilingMultiple,
+        desc: 'The backstop under the discount above: at 2, a job with 40 calls stops after 80 tries no matter how cheap the failures were. This is the limit that actually binds when a provider is down. Too high and an everything-fails run keeps going until it hits the clock instead.'
+      },
+      {
+        key: 'brainCircuit.consecutiveTimeoutsToOpen',
+        label: 'Timeouts in a row before the engine is treated as down',
+        type: 'number', step: '1', min: 1,
+        value: config.brainCircuit?.consecutiveTimeoutsToOpen,
+        desc: 'After this many model calls time out back to back, everything else stops trying immediately instead of waiting out a full timeout each — so a pass with two hundred items left drains in milliseconds rather than grinding against a dead engine. Any success reopens it. Too low and one slow patch looks like an outage and cancels work that would have finished.'
       }
     ]));
 

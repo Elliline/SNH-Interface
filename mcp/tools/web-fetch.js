@@ -3,6 +3,19 @@
  * Fetches a URL and returns plain text content (HTML tags stripped)
  */
 
+/**
+ * How long one page fetch may hang. Config (tools.webFetch.timeoutMs) rather
+ * than a literal, because a job that reads whole pages spends most of its wall
+ * clock here and a page that never answers costs the run a tool call it cannot
+ * get back — a per-run limit in everything but name.
+ */
+function fetchTimeoutMs() {
+  try {
+    const n = ((require('../../db/config').getConfig().tools || {}).webFetch || {}).timeoutMs;
+    return Number.isFinite(n) && n > 0 ? n : 10000;
+  } catch { return 10000; }
+}
+
 class WebFetchTool {
   constructor() {
     this.name = 'web_fetch';
@@ -90,7 +103,7 @@ class WebFetchTool {
           'Accept': 'text/html,application/xhtml+xml,text/plain'
         },
         redirect: 'follow',
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(fetchTimeoutMs())
       });
 
       if (!response.ok) {

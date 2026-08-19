@@ -127,7 +127,11 @@ const TOOL_CATALOGUE = [
     gate: ({ registered }) => registered.has('web_search'),
     gateWhy: () => 'web search is off, and a page fetch is only useful for a URL a search produced',
     toggle: null,
-    toggleNote: 'Comes with web search.'
+    toggleNote: 'Comes with web search.',
+    fields: [
+      { path: 'tools.webFetch.timeoutMs', label: 'Page fetch timeout (ms)', type: 'number', min: 1000, max: 60000,
+        hint: 'How long one page may hang before it is given up on. A job reading whole pages spends most of its time here, and a page that never answers costs it a tool call it does not get back. Too low and slow-but-working sites read as broken.' }
+    ]
   },
   {
     id: 'create_cron_job',

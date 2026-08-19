@@ -155,6 +155,8 @@ function cfg() {
     // budget is null-means-send-nothing like every other field in that section.
     answerTokens: Math.max(64, gen.agentJobResponseTokens ?? 8192),
     thinkingTokens: Number.isFinite(gen.agentJobThinkingTokens) ? gen.agentJobThinkingTokens : null,
+    // Starts allowed per job, counting the first. Was the literal `< 2`.
+    maxAttempts: Math.max(1, c.maxAttempts ?? 2),
     retryGraceMinutes: Math.max(0, c.retryGraceMinutes ?? 30),
     retentionDays: Math.max(1, c.retentionDays ?? 90)
   };
@@ -698,7 +700,7 @@ function sweepInterrupted({ now = new Date() } = {}) {
   for (const j of open) {
     const startedMs = j.started_at ? new Date(j.started_at).getTime() : 0;
     const age = now.getTime() - startedMs;
-    const retryable = (j.attempts || 0) < 2 && startedMs > 0 && age <= graceMs;
+    const retryable = (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
 
     if (retryable) {
       db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL WHERE id = ?").run(j.id);
@@ -707,7 +709,7 @@ function sweepInterrupted({ now = new Date() } = {}) {
       console.warn(`[AgentJobs] ${line}`);
       opsLog(line);
     } else {
-      const why = (j.attempts || 0) >= 2
+      const why = (j.attempts || 0) >= c.maxAttempts
         ? 'interrupted by a restart, and it had already been retried once — it was not run again'
         : `interrupted by a restart, and by the time the server came back it was too old to be worth redoing (older than ${c.retryGraceMinutes} minutes) — it was not run again`;
       finish(j.id, { status: 'interrupted', error: why, toolCalls: j.tool_calls || 0 });
