@@ -29,6 +29,13 @@ const has = (name) => process.argv.includes(`--${name}`);
 
 database.initDatabase();
 
+/** Stored as UTC (toISOString); read by a person in their own timezone. */
+function localTime(iso) {
+  if (!iso) return '(no time)';
+  const d = new Date(String(iso).includes('T') ? iso : `${String(iso).replace(' ', 'T')}Z`);
+  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+}
+
 const hours = parseInt(arg('hours', '24'), 10) || 24;
 const limit = parseInt(arg('limit', '25'), 10) || 25;
 const onlyProvider = arg('provider', null);
@@ -59,7 +66,11 @@ if (!rows.length) {
   console.log('  Nothing matched.');
 } else {
   for (const r of rows) {
-    const when = String(r.created_at || '').replace('T', ' ').slice(0, 19);
+    // LOCAL time, not the stored ISO string. created_at is written with
+    // toISOString(), so printing it raw shows UTC with nothing saying so — and a
+    // row that says 00:31 for something that happened at 17:31 is a log that has
+    // to be mentally corrected before it can be read.
+    const when = localTime(r.created_at);
     const served = r.served ? ' *served*' : '';
     console.log(`  ${when}  ${String(r.provider).padEnd(8)} ${String(r.outcome).padEnd(8)} ${String(r.num_results).padStart(2)} result(s)` +
       `  [${r.caller || 'unknown'}]${served}`);

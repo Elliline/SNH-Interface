@@ -38,6 +38,9 @@ const config = require(path.join(ROOT, 'db/config'));
 const searchLog = require(path.join(ROOT, 'db/search-log'));
 const WebSearchTool = require(path.join(ROOT, 'mcp/tools/web-search'));
 const { resolveExaType } = require(path.join(ROOT, 'mcp/tools/search-providers'));
+// The cost rule lives with the budget; asserted here because "an unreachable
+// provider must not bill as an empty search" is a fact about this file's output.
+const mm = require(path.join(ROOT, 'db/memory-manager'));
 
 let pass = 0, fail = 0;
 function check(name, ok, detail) {
@@ -198,6 +201,33 @@ function rowsFor(query) {
   rows = rowsFor('nobody knows');
   check('both attempts are on the record', rows.length === 2 && rows.every(r => r.outcome === 'empty'));
   check('neither is marked as serving', rows.every(r => r.served === 0));
+
+  // ---------------------------------------------------------------------
+  console.log('\n5b. EVERY PROVIDER BROKEN is not "no results" — it is no search');
+  // Measured live on this code before it was fixed: with SearXNG on a dead port,
+  // a job told Ellie "the search tools returned no results for specific pricing".
+  // Nothing had been searched. The distinction this file keeps between providers
+  // was being lost in the aggregate return, which is the only part the model reads.
+  stubChain();
+  stubFetch({ exa: httpErr(500), searxng: boom('connect ECONNREFUSED 127.0.0.1:9') });
+  out = await tool.execute({ query: 'nothing ran' }, { caller: 'chat' });
+  check('it comes back as an ERROR, not as an empty result', !!out.error, JSON.stringify(out).slice(0, 200));
+  check('it says explicitly that this is not "no results found"',
+    /NOT "no results found"/.test(out.error), out.error);
+  check('and tells him nothing about the world follows from it',
+    /nothing about the world follows/.test(out.error), out.error);
+  check('both failures are still named', /exa/.test(out.error) && /searxng/.test(out.error));
+  check('an error bills as an error, not as an empty search',
+    mm.toolCallCost('web_search', out, 0.25).why === 'the call returned an error',
+    mm.toolCallCost('web_search', out, 0.25).why);
+
+  // One provider RAN and found nothing → that IS an answer about the world.
+  stubChain();
+  stubFetch({ exa: httpErr(500), searxng: SX_EMPTY });
+  out = await tool.execute({ query: 'one ran and found nothing' }, { caller: 'chat' });
+  check('a provider that ran and found nothing is still an empty RESULT, not an error',
+    !out.error && Array.isArray(out.results) && out.results.length === 0, JSON.stringify(out).slice(0, 200));
+  check('and it is reported as a real empty answer', /real empty answer/.test(out.message || ''), out.message);
 
   // ---------------------------------------------------------------------
   console.log('\n6. A provider with no prerequisite is SKIPPED, and says why');

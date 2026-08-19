@@ -166,14 +166,43 @@ class WebSearchTool {
       }
     }
 
-    // Nobody had anything. Say that, and say who was asked — never a bare empty
-    // array, which reads as "search is not working" or as nothing at all.
+    // NOBODY SERVED IT — AND THERE ARE TWO WAYS THAT HAPPENS.
+    //
+    // Measured 2026-08-18, on this very code: with SearXNG pointed at a dead port
+    // a job reported to Ellie that "the search tools returned no results for
+    // specific pricing or listings". Nothing had been searched. Both providers
+    // had FAILED, and the aggregate return said `results: []` with a message
+    // about finding nothing — so the same rule this file keeps between providers
+    // ("empty and broken are different facts") was being broken one level up, at
+    // the only place the model actually reads.
+    //
+    // So the two are split here too:
+    //   at least one provider RAN and found nothing → an empty answer about the
+    //     world, returned as a result, and he should report finding nothing.
+    //   every provider failed or was unavailable → NO SEARCH HAPPENED, returned
+    //     as an error, and he must say the search could not run. This also bills
+    //     as an error rather than as an empty search, which is the honest price.
     const summary = tried.map(t => `${t.provider} (${t.outcome}${t.detail ? `: ${t.detail}` : ''})`).join(', ');
+    const anyProviderRan = tried.some(t => t.outcome === 'empty');
+    const namesTried = tried.map(t => `${t.provider}:${t.outcome}`);
+
+    if (!anyProviderRan) {
+      opsLog(`Web search COULD NOT RUN for "${String(query).slice(0, 120)}" [${caller}]. Providers: ${summary}.`);
+      return {
+        error: `The search did not run: ${summary}. This is NOT "no results found" — nothing was searched, ` +
+          `so nothing about the world follows from it. Say that you could not search, and do not report this ` +
+          `as having found nothing.`,
+        results: [],
+        provider: null,
+        providers_tried: namesTried
+      };
+    }
+
     opsLog(`Web search found NOTHING for "${String(query).slice(0, 120)}" [${caller}]. Providers: ${summary}.`);
     return {
       results: [],
       provider: null,
-      providers_tried: tried.map(t => `${t.provider}:${t.outcome}`),
+      providers_tried: namesTried,
       message: `No results. Searched with: ${summary}. This is a real empty answer — report that you found nothing rather than filling it in from memory.`
     };
   }
