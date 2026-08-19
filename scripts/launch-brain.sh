@@ -60,15 +60,44 @@ NAME="sparky-brain"
 # thing prompt ordering in server.js is built to exploit — see the ordered
 # assembly there. If a future image ever defaults it off, this is where to add it.
 #
+# 8-BIT WEIGHTS AS OF 2026-08-18. Was nvidia/Gemma-4-26B-A4B-NVFP4 (4-bit).
+# Rollback: git checkout pre-fp8-swap-2026-08-18 -- scripts/launch-brain.sh
+# The 4-bit weights are NOT deleted (18G still in ~/.cache/huggingface/hub), so
+# rolling back is the checkout plus this script — no re-download.
+#
+# TWO FLAGS BELOW EXIST ONLY TO KEEP THE SWAP A ONE-VARIABLE EXPERIMENT:
+#
+# --served-model-name pins the wire name to the OLD id. data/config.json names
+#   the model in four places and data/ is off limits for this test, so the alias
+#   keeps every app-side string, the memory store and the request path byte-identical
+#   while the weights underneath change. The cost is that /v1/models now reports a
+#   name that does not describe what is loaded — this comment is the disambiguator,
+#   and the alias should be dropped (and data/config.json updated) if 8-bit stays.
+#
+# --kv-cache-dtype fp8_e4m3 restores what the checkpoint used to supply. The NVFP4
+#   checkpoint carries kv_cache_scheme {num_bits: 8, type: float}, so the engine has
+#   been running an fp8_e4m3 KV cache all along (at scaling factor 1.0 — it warns).
+#   The RedHatAI FP8 checkpoint has kv_cache_scheme: null, so without this flag the
+#   KV cache silently becomes bf16: 2x the bytes per token, and a SECOND variable
+#   changed in a test that is supposed to change only the weights. Setting it
+#   explicitly reproduces the 4-bit KV path exactly (also unscaled, same warning).
+#
+# UNCHANGED AND DELIBERATELY SO: cudagraph_mode PIECEWISE (the 7/23 wedge fix),
+# --max-num-seqs 128 (the 8/14 batch ceiling), --gpu-memory-utilization 0.80,
+# --max-model-len 131072, --tool-call-parser gemma4. None of them are quantization-
+# dependent, and the 128 pin only gets safer as each sequence costs more.
+#
 # The vLLM serve invocation. The compilation-config JSON is single-quoted so the
 # container's shell passes it to vllm intact.
-SERVE="vllm serve nvidia/Gemma-4-26B-A4B-NVFP4 \
+SERVE="vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic \
+--served-model-name nvidia/Gemma-4-26B-A4B-NVFP4 \
 --tensor-parallel-size 1 \
 --tool-call-parser gemma4 \
 --enable-auto-tool-choice \
 --max-model-len 131072 \
 --max-num-seqs 128 \
 --gpu-memory-utilization 0.80 \
+--kv-cache-dtype fp8_e4m3 \
 --compilation-config '{\"cudagraph_mode\": \"PIECEWISE\"}'"
 
 # The image needs a fastapi pin before serving (preserved from the original run).
