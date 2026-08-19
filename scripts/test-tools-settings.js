@@ -297,6 +297,90 @@ function callRoute(method, routePath, body) {
   check('Exa reads as unusable again, with the reason',
     /no API key/.test((config.getSearchConfig().allProviders.find(p => p.name === 'exa') || {}).why || ''));
 
+  // =======================================================================
+  console.log('\n── THE BROWSER HALF, RUN RATHER THAN ASSUMED ──');
+  // The render functions and the order collector are lifted VERBATIM out of
+  // public/script.js and run here against a stub DOM. Retyping them would test the
+  // copy; lifting them tests what ships. Two things are worth this trouble: the key
+  // field must render EMPTY every time, and switching a provider off must drop it
+  // from the order the form submits rather than reordering it.
+  const uiSrc = fs.readFileSync(path.join(ROOT, 'public/script.js'), 'utf8');
+
+  function liftFn(name) {
+    const at = uiSrc.indexOf(`function ${name}(`);
+    if (at === -1) throw new Error(`${name} is not in public/script.js`);
+    let depth = 0;
+    for (let j = uiSrc.indexOf('{', at); j < uiSrc.length; j++) {
+      if (uiSrc[j] === '{') depth++;
+      else if (uiSrc[j] === '}' && --depth === 0) return uiSrc.slice(at, j + 1);
+    }
+    throw new Error(`${name} never closes`);
+  }
+
+  const escapeHtml = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const ui = {};
+  new Function('escapeHtml', [
+    liftFn('renderToolRow'), liftFn('renderToolField'),
+    liftFn('renderSearchProviders'), liftFn('renderSecretField'),
+    'this.renderToolRow = renderToolRow; this.renderSearchProviders = renderSearchProviders;'
+  ].join('\n')).call(ui, escapeHtml);
+
+  // A key IS set for this stretch, which is the case that could leak one.
+  callRoute('put', '/secrets', { secrets: { EXA_API_KEY: 'render-check-key-zzz999' } });
+  const uiPayload = callRoute('get', '/').body;
+  const cardHtml = ui.renderSearchProviders(uiPayload.search);
+  const rowsHtml = uiPayload.tools.map(t => ui.renderToolRow(t)).join('\n');
+
+  check('every tool gets a row in the rendered markup',
+    (rowsHtml.match(/class="tool-row /g) || []).length === uiPayload.tools.length,
+    `${(rowsHtml.match(/class="tool-row /g) || []).length} of ${uiPayload.tools.length}`);
+  check('each switch is bound by dotted config path, the existing mechanism',
+    (rowsHtml.match(/data-config-key="/g) || []).length > 10);
+  check('both providers render, with a position select each',
+    (cardHtml.match(/class="provider-row /g) || []).length === 2
+    && (cardHtml.match(/data-search-order="/g) || []).length === 2);
+  check('the key field renders with an EMPTY value even though a key is set',
+    /data-secret="EXA_API_KEY"[\s\S]{0,200}?value=""/.test(cardHtml)
+    && !/data-secret="EXA_API_KEY"[\s\S]{0,200}?value="[^"]+"/.test(cardHtml));
+  check('and the key itself is nowhere in the markup', !cardHtml.includes('render-check-key-zzz999'));
+  check('what it shows instead is that one is saved', /secret-state-on/.test(cardHtml));
+  callRoute('put', '/secrets', { secrets: { EXA_API_KEY: null } });
+
+  // The order collector, verbatim, against a stub DOM.
+  const collectorStart = uiSrc.indexOf('  const orderSelects = Array.from(');
+  const collectorEnd = uiSrc.indexOf('  // Voice active selections');
+  check('the order collector is where it is expected to be',
+    collectorStart > -1 && collectorEnd > collectorStart);
+  const collector = uiSrc.slice(collectorStart, collectorEnd);
+
+  const collectOrder = (state) => {
+    const doc = {
+      querySelectorAll: (sel) => sel.includes('data-search-order')
+        ? state.map(p => ({ dataset: { searchOrder: p.id }, value: String(p.pos) })) : [],
+      querySelector: (sel) => {
+        const m = sel.match(/data-provider-toggle="([^"]+)"/);
+        const p = state.find(x => x.id === m[1]);
+        return p ? { checked: p.on } : null;
+      }
+    };
+    const partial = {};
+    new Function('document', 'partial', collector)(doc, partial);
+    return partial.tools.search.order.join(',');
+  };
+
+  check('both on, in the order shown',
+    collectOrder([{ id: 'exa', pos: 1, on: true }, { id: 'searxng', pos: 2, on: true }]) === 'exa,searxng');
+  check('positions swapped, order swapped',
+    collectOrder([{ id: 'exa', pos: 2, on: true }, { id: 'searxng', pos: 1, on: true }]) === 'searxng,exa');
+  check('a switched-off provider is LEFT OUT of the submitted order',
+    collectOrder([{ id: 'exa', pos: 1, on: true }, { id: 'searxng', pos: 2, on: false }]) === 'exa');
+  check('…including when it is the one that was first',
+    collectOrder([{ id: 'exa', pos: 1, on: false }, { id: 'searxng', pos: 2, on: true }]) === 'searxng');
+  check('both off submits an empty order', collectOrder([{ id: 'exa', pos: 1, on: false }, { id: 'searxng', pos: 1, on: false }]) === '');
+  check('tied positions keep the displayed order rather than dropping one',
+    collectOrder([{ id: 'exa', pos: 1, on: true }, { id: 'searxng', pos: 1, on: true }]) === 'exa,searxng');
+
   console.log(`\n=== ${pass} passed, ${fail} failed ===\n`);
   process.exit(fail ? 1 : 0);
 })().catch(err => {
