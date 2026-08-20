@@ -66,6 +66,18 @@ had shipped the day before).
      manifest exists to prevent. Derive the description from what the code does.
      Leave out disabled/aspirational features (e.g. web search stays out while
      `config.tools.searxng.enabled` defaults to false).
+   - **Never write a condition into the text, either.** If what the entry claims
+     depends on the box (`job-documents` and whether a chromium is installed),
+     make `oneLiner`/`description` a **function of config** and resolve it, the
+     way `when` resolves. An injected "a PDF, or text where no browser is
+     installed" is a question he cannot evaluate, so he hedges at Ellie instead
+     of answering — an over-claim and an under-claim stapled together.
+   - **Check it still fits.** The whole list is budgeted
+     (`memory.injection.manifestTokens`, 700). Over budget, the render keeps
+     every name and sheds one-liners **from the newest backwards** — i.e. from
+     the entry you just added. Boot warns and the heartbeat rings the bell when
+     that happens, but the fix is tighter one-liners, not a bigger budget.
+     `node scripts/test-injection-budget.js` asserts it fits with headroom.
    - Keep entries **dry and accurate** — facts about the code, not personality.
 2. **Introduce it to SNH** so it learns it (self-fact through reflection):
    `node scripts/introduce-capability.js <id>`. This stores a first-person

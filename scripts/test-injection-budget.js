@@ -209,6 +209,103 @@ const part = (kind, tokens) => ({ kind, label: kind, text: 'x'.repeat(tokens * 4
     check('…keeping the clauses that stop an over-claim',
       /she approves/.test(block.text) && /cannot delete/.test(block.text) && /read-only/.test(block.text),
       'a limit clause went missing from the compact list');
+
+    // The shipped budget must fit the shipped list with room to ship more. A
+    // render that only just fits is one entry away from going quiet, which is
+    // how job-documents reached him as a bare name for a day.
+    const headroom = block.budget - block.tokens;
+    check('…and it fits the shipped budget with headroom for what ships next',
+      block.compacted === 0 && headroom >= 15,
+      `${block.tokens}/${block.budget} tokens, ${block.count} entries, ${headroom} spare`);
+    console.log(`        (${block.count} capabilities, ${block.tokens}/${block.budget} tokens, ${headroom} spare)`);
+
+    // What he is told about a document depends on THIS machine, and it has to
+    // be an answer either way — the shipped wording was "PDF, or text where no
+    // browser is installed", a conditional nothing in the chat path resolves.
+    const docLine = block.text.split('\n').find(l => /^- Job results as files/.test(l));
+    if (docLine) {
+      const printer = require(path.join(ROOT, 'db/pdf-printer'));
+      const real = printer.probeSync({});
+      check('the documents line states what this box does, without hedging',
+        !/\bor text\b/i.test(docLine) && !/where no browser/i.test(docLine),
+        docLine);
+      check(real.ok ? '…and with a browser here, it says PDF' : '…and with no browser here, it says text file',
+        real.ok ? /\bPDF\b/.test(docLine) && !/text file/.test(docLine)
+                : /text file/.test(docLine) && /no browser/.test(docLine),
+        docLine);
+
+      // The other half of the same question, on a box with no chromium.
+      const realProbe = printer.probeSync;
+      printer.probeSync = () => ({ ok: false, reason: 'no chromium on this machine' });
+      try {
+        const dry = capabilityManifest.buildInjectionBlock();
+        const dryLine = dry.text.split('\n').find(l => /^- Job results as files/.test(l));
+        check('…and on a box with no browser it says text file, and why, still without hedging',
+          /text file/.test(dryLine) && /no browser/.test(dryLine) && !/\bor text\b/i.test(dryLine),
+          dryLine);
+        const full = capabilityManifest.getById('job-documents');
+        check('…the full description resolves the same way, for the answer on demand',
+          /No browser was found/.test(full.description) && !/where there is none installed/.test(full.description),
+          full.description.slice(0, 160));
+      } finally {
+        printer.probeSync = realProbe;
+      }
+    } else {
+      check('the documents entry is present to check', false, 'no "Job results as files" line');
+    }
+  }
+
+  console.log('\n5b. A manifest that sheds a one-liner says so, loudly and by name');
+  {
+    // Provoked with a budget too small for the list rather than by editing the
+    // live config. The failure being tested is not the shedding — that is the
+    // designed degradation — it is shedding SILENTLY: on 2026-08-19 the last
+    // three entries lost their descriptions and the only trace was a console
+    // line in the chat path, so nobody knew the entity had stopped knowing what
+    // its newest capability was.
+    const squeezed = capabilityManifest.buildInjectionBlock({ budget: 400 });
+    check('an over-budget render still lists every entry by name',
+      squeezed.text.split('\n').filter(l => /^- /.test(l)).length >= squeezed.count,
+      `${squeezed.count} entries`);
+    check('…it sheds one-liners rather than entries, and says how many',
+      squeezed.compacted > 0 && /listed by name only/.test(squeezed.text),
+      `compacted ${squeezed.compacted}`);
+    check('…and it names exactly the ones it took the description from',
+      squeezed.compactedNames.length === squeezed.compacted &&
+      squeezed.compactedIds.length === squeezed.compacted &&
+      squeezed.compactedNames.every(n => squeezed.text.includes(`- ${n}\n`) || squeezed.text.includes(`- ${n}(`) || squeezed.text.includes(`- ${n}`)),
+      JSON.stringify(squeezed.compactedNames));
+    check('…the newest capability is the one that goes first',
+      squeezed.compactedIds[0] === 'job-documents',
+      JSON.stringify(squeezed.compactedIds));
+
+    // The words themselves — one report, shared by the boot warning and the
+    // bell, so the two can never say different things about the same loss.
+    const report = capabilityManifest.truncationReport(squeezed);
+    check('…and it produces a warning that names them, not just a count',
+      !!report && squeezed.compactedNames.slice(0, 3).every(n => report.warning.includes(n)) &&
+      /NAME ONLY/.test(report.warning) && /db\/capability-manifest\.js/.test(report.warning),
+      report ? report.warning.slice(0, 200) : 'no report');
+    check('…and a bell message in his voice, naming them too',
+      !!report && report.message.includes(squeezed.compactedNames[0]) &&
+      /injected into every conversation/.test(report.message),
+      report ? report.message.slice(0, 200) : 'no report');
+    check('…and it says the size the list actually needed, not the size it was cut to',
+      !!report && report.detail.includes(String(squeezed.tokensFull)) && squeezed.tokensFull > squeezed.budget,
+      report ? report.detail : 'no report');
+    check('a render that fits produces no report at all',
+      capabilityManifest.truncationReport(capabilityManifest.buildInjectionBlock()) === null);
+
+    // And the two places that have to be loud about it.
+    const warnings = capabilityManifest.startupCheck().warnings;
+    const budgetWarning = warnings.find(w => /does not fit its budget/.test(w));
+    check('a fitting render raises no budget warning at startup',
+      !budgetWarning, budgetWarning || '');
+
+    const drift = await capabilityManifest.checkDrift();
+    const truncation = drift.mismatches.find(m => m.kind === 'manifest-truncated');
+    check('…and none through the bell either, while it fits',
+      !truncation, truncation ? truncation.message : '');
   }
 
   console.log('\n6. Long-term memory truncates at cluster boundaries, in a deliberate order');

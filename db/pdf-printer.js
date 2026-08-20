@@ -60,10 +60,37 @@ const EXTRA_PATHS = [
  * move. A NEGATIVE is cached for a minute and no longer, because the expected
  * way this box goes from "no chromium" to "chromium" is Ellie running one snap
  * command, and it would be absurd to make her restart the server to be believed.
+ *
+ * Keyed by the configured path, because the answer is only about the binary it
+ * was asked about. Unkeyed, changing Settings -> Job output left the old answer
+ * standing for the life of the process — invisible while only printToPdf read
+ * this, and no longer invisible now that the capability manifest reads it on
+ * every chat turn to decide what to tell him he produces.
  */
-let probeCache = null;
+let probeCache = null;      // the verified answer, from probe()
 let probeCacheAt = 0;
+let syncCache = null;       // the no-spawn answer, from probeSync()
+let syncCacheAt = 0;
+let cacheKey = null;        // the configured path both of the above are about
 const NEGATIVE_TTL_MS = 60_000;
+
+/**
+ * Said once, because two callers now report it: printToPdf puts it on the card,
+ * and probeSync hands it to the capability manifest. It is written for a person
+ * and names the one command that fixes it.
+ */
+const NO_BROWSER_REASON =
+  'no chromium on this machine, so the report was written as a text file instead. '
+  + 'Install one with "sudo snap install chromium" (Ubuntu has no apt package for it), '
+  + 'or set the path in Settings → Job output, and the next report will be a PDF.';
+
+/** Is a cached answer still good for the path we are being asked about? */
+function cacheHit(cache, at, key) {
+  // A different path invalidates both caches at once: neither of them is an
+  // answer about the binary being asked about now.
+  if (!cache || key !== cacheKey) return false;
+  return cache.ok || Date.now() - at < NEGATIVE_TTL_MS;
+}
 
 /** Run a command with a hard timeout. Never throws; reports instead. */
 function run(cmd, args, { timeoutMs = 60_000, cwd } = {}) {
@@ -136,16 +163,13 @@ function findBinary(configured) {
  */
 async function probe({ chromiumPath = '' } = {}) {
   const now = Date.now();
-  if (probeCache && (probeCache.ok || now - probeCacheAt < NEGATIVE_TTL_MS)) return probeCache;
+  const key = chromiumPath ? String(chromiumPath).trim() : '';
+  if (cacheHit(probeCache, probeCacheAt, key)) return probeCache;
+  cacheKey = key;
 
-  const found = findBinary(chromiumPath ? String(chromiumPath).trim() : '');
+  const found = findBinary(key);
   if (!found.path) {
-    probeCache = {
-      ok: false,
-      reason: 'no chromium on this machine, so the report was written as a text file instead. '
-        + 'Install one with "sudo snap install chromium" (Ubuntu has no apt package for it), '
-        + 'or set the path in Settings → Job output, and the next report will be a PDF.'
-    };
+    probeCache = { ok: false, verified: true, reason: NO_BROWSER_REASON };
     probeCacheAt = now;
     return probeCache;
   }
@@ -154,6 +178,7 @@ async function probe({ chromiumPath = '' } = {}) {
   if (!res.ok) {
     probeCache = {
       ok: false,
+      verified: true,
       path: found.path,
       reason: `chromium at ${found.path} would not run (${(res.stderr || res.stdout || 'no output').trim().slice(0, 200)}), `
         + 'so the report was written as a text file instead.'
@@ -162,13 +187,52 @@ async function probe({ chromiumPath = '' } = {}) {
     return probeCache;
   }
 
-  probeCache = { ok: true, path: found.path, version: res.stdout.trim() };
+  probeCache = { ok: true, verified: true, path: found.path, version: res.stdout.trim() };
   probeCacheAt = now;
   return probeCache;
 }
 
+/**
+ * The same question probe() answers, WITHOUT spawning anything.
+ *
+ * The capability manifest asks this on the chat injection path — which runs on
+ * every message and may not spawn a process or touch the network — so that the
+ * list he is handed can say what he actually produces on THIS box instead of
+ * hedging about what a browser would do if there were one. It stops at "is
+ * there a binary here we could execute", which is a handful of stat() calls,
+ * cached the same way as above.
+ *
+ * IT IS ONE NOTCH WEAKER THAN probe(), and deliberately so: a binary that is
+ * present but will not run reads as ok here, because verifying that means
+ * running it. That is the right way round for this caller — the alternative is
+ * spawning chromium on every chat turn — and the window is small: a VERIFIED
+ * answer always wins over this one, checkDrift() takes one on the heartbeat,
+ * and the first real print takes one too. Both write the shared cache below.
+ *
+ * @returns {{ok: boolean, path?: string, verified?: boolean, reason?: string}}
+ */
+function probeSync({ chromiumPath = '' } = {}) {
+  const now = Date.now();
+  const key = chromiumPath ? String(chromiumPath).trim() : '';
+  if (cacheHit(probeCache, probeCacheAt, key)) return probeCache;
+  if (cacheHit(syncCache, syncCacheAt, key)) return syncCache;
+
+  const found = findBinary(key);
+  // Kept in its own cache rather than written to probeCache: an unverified yes
+  // must not stand in for the version check the next real probe() would run.
+  syncCache = found.path
+    ? { ok: true, path: found.path, verified: false }
+    : { ok: false, verified: false, reason: NO_BROWSER_REASON };
+  syncCacheAt = now;
+  cacheKey = key;
+  return syncCache;
+}
+
 /** Forget what we learned — for tests, and for anyone who just installed one. */
-function resetProbe() { probeCache = null; probeCacheAt = 0; }
+function resetProbe() {
+  probeCache = null; probeCacheAt = 0; cacheKey = null;
+  syncCache = null; syncCacheAt = 0;
+}
 
 /**
  * Where the intermediate HTML goes.
@@ -338,4 +402,4 @@ async function printToPdf(html, outPath, opts = {}) {
   }
 }
 
-module.exports = { probe, resetProbe, printToPdf, findBinary };
+module.exports = { probe, probeSync, resetProbe, printToPdf, findBinary };

@@ -2355,8 +2355,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     try {
       const capBlock = capabilityManifest.buildInjectionBlock();
       manifestMessage = { role: 'system', content: capBlock.text };
-      console.log(`[Capabilities] Injected manifest: ${capBlock.count} capabilities, ~${capBlock.tokens} tokens` +
-                  `${capBlock.compacted ? `, ${capBlock.compacted} compacted to name-only` : ''}`);
+      console.log(`[Capabilities] Injected manifest: ${capBlock.count} capabilities, ~${capBlock.tokens} tokens`);
+      // A shed one-liner is a capability he is being shown the name of and
+      // nothing else — always the newest ones, since the list is in ship order.
+      // It was a clause on the line above until 2026-08-20, which is how
+      // job-documents spent a day in his context as four bare words.
+      if (capBlock.compacted) {
+        console.warn(`[Capabilities] ⚠ ${capBlock.compacted} listed by NAME ONLY — over budget ` +
+                     `(${capBlock.tokens}/${capBlock.budget} tokens): ${capBlock.compactedNames.join(', ')}`);
+      }
     } catch (capErr) {
       console.error('[Capabilities] Injection error:', capErr.message);
     }

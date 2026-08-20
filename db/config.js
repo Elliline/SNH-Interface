@@ -744,17 +744,25 @@ const DEFAULTS = {
       // The capability manifest block, which grows with every entry shipped.
       //
       // 700, not the 600 this was specified at, and the 100 is bought
-      // deliberately. Measured 2026-08-12 with the one-liners tightened as far
-      // as they go with their scope clauses intact: 23 entries render at 670
-      // tokens. At 600 the renderer compacts the last 8 to name-only, and those
-      // 8 are where the limits live — "she approves", "cannot delete",
-      // "read-only", "deletes nothing", "stops itself after 3 failures". A
-      // manifest that lists "Writing to memory on request" with no "cannot
+      // deliberately. At 600 the renderer compacts the tail to name-only, and
+      // the tail is where the limits live — "she approves", "cannot delete",
+      // "read-only", "deletes nothing", "a job stops itself after 3 failures".
+      // A manifest that lists "Writing to memory on request" with no "cannot
       // delete" is the over-claim this whole registry exists to prevent, so
       // buying the clauses back at 100 tokens is the cheap side of that trade.
-      // (1,064 → ~670 is still a 37% cut.) Lower it and the compaction is
-      // honest about what it did — it never drops an entry — but it will cost
-      // qualifiers, so lower it on purpose or not at all.
+      //
+      // AND IT STAYS AT 700. On 2026-08-19 the list reached 24 entries and did
+      // not fit: the last three lost their one-liners, job-documents among them,
+      // so what he was shown of the day-old capability was the four words of its
+      // name. This box was raised to 760 as a stopgap and is back here now — the
+      // one-liners were tightened instead (2026-08-20), which is the fix that
+      // does not charge every prompt for every future entry. 25 entries render
+      // at ~679 with a browser installed. When it next binds, tighten again:
+      // shedding is honest about what it did — it never drops an entry, it warns
+      // at boot and rings the bell — but it costs the newest entry its
+      // description, which is the one nobody has learned yet. Check with
+      // `node scripts/test-injection-budget.js` (it asserts the fit and the
+      // headroom).
       manifestTokens: 700,
       // Per self-fact, in the rendered identity block only. A single rambling
       // reflection should not be able to eat the block the way a 400-token
