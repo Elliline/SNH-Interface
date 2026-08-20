@@ -324,6 +324,18 @@ app.use(express.json({ limit: '10mb' })); // Limit payload size
 // SECURITY FIX: Serve only the public directory, not the entire project
 app.use(express.static(path.join(__dirname, 'public')));
 
+// The markdown renderer, served from db/ rather than copied into public/.
+//
+// The panel card and the printable report have to agree on what a document
+// looks like, and the only way to guarantee that is for both to run the same
+// bytes. A copy under public/ would be a second answer that drifts — so the one
+// file in db/ is served here, and there is nothing to keep in step.
+app.get('/markdown.js', (req, res) => {
+  res.type('application/javascript');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, 'db', 'markdown.js'));
+});
+
 // Apply rate limiting to API routes
 // TTS first — it has its own (much higher) budget and is excluded from the
 // shared /api/ bucket by apiLimiter's skip.

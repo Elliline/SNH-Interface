@@ -365,6 +365,74 @@ function finish(id, { status, resultText = null, error = null, toolCalls = 0, bu
   return { ...getJob(id) };
 }
 
+/**
+ * Give a finished job its file, if it should have one.
+ *
+ * SEPARATE FROM finish(), and after it, on purpose. finish() is the one write
+ * that ENDS a job and the module's invariant is that every exit through it
+ * writes exactly one terminal row; making a file is neither terminal nor
+ * required, and folding it in would put "chromium would not start" on the same
+ * line as "the job is over". So the status is settled first, and this is a
+ * follow-up write that can only ever add columns.
+ *
+ * ⚠ IT CANNOT FAIL THE JOB. produce() is written not to throw and this catches
+ * anyway: the result is already in the database, and a run that did real work
+ * must never be turned into a failed one because a disk was full. The worst
+ * outcome available here is a card with its text on it and a line saying why
+ * there is no file — which is exactly the card she had before any of this.
+ *
+ * @returns {Promise<Object|null>} the updated row
+ */
+async function attachArtifact(id, { note = null } = {}) {
+  const db = getSqliteDb();
+  if (!db) return null;
+  const job = getJob(id);
+  if (!job) return null;
+
+  let made;
+  try {
+    made = await require('./job-artifacts').produce(job, {
+      date: job.finished_at ? new Date(job.finished_at) : new Date(),
+      note: note || job.error || ''
+    });
+  } catch (err) {
+    // Belt and braces: produce() reports rather than throws, so reaching here
+    // means something below it broke in a way it did not anticipate.
+    const why = String(err && err.message || err).slice(0, 200);
+    console.error(`[AgentJobs] ${id.slice(0, 8)} artifact step threw:`, why);
+    opsLog(`Background job ${id.slice(0, 8)} produced a result but the file step threw: ${why}`);
+    db.prepare('UPDATE agent_jobs SET artifact_error = ? WHERE id = ?')
+      .run(`the file could not be written (${why}). The full result is above.`, id);
+    return getJob(id);
+  }
+
+  db.prepare(`
+    UPDATE agent_jobs
+    SET artifact_kind = ?, artifact_path = ?, artifact_name = ?, artifact_bytes = ?,
+        artifact_error = ?, summary_text = ?
+    WHERE id = ?
+  `).run(
+    made.kind || null,
+    made.path || null,
+    made.name || null,
+    Number.isFinite(made.bytes) ? made.bytes : null,
+    made.error || null,
+    // A summary only when there IS a file. For a result that stayed on the card
+    // the text is the summary, and storing a second shorter copy beside it would
+    // be two versions of one thing waiting to disagree.
+    made.kind ? (made.summary || null) : null,
+    id
+  );
+
+  if (made.kind) {
+    opsLog(`Background job ${id.slice(0, 8)} saved as ${made.kind}: ${made.name} (${made.reason}).`
+      + (made.error ? ` Note: ${made.error}` : ''));
+  } else if (made.error) {
+    opsLog(`Background job ${id.slice(0, 8)} produced no file: ${made.error}`);
+  }
+  return getJob(id);
+}
+
 // ---------------------------------------------------------------------------
 // The executor
 // ---------------------------------------------------------------------------
@@ -413,10 +481,31 @@ function systemPrompt(job, tools) {
     `found is genuinely empty.\n` +
     `If a tool result says it is capped, partial, or showing only the most recent few, say so rather than ` +
     `treating what you were given as all there is.\n\n` +
-    `WHAT TO WRITE. A few plain sentences to Ellie, in your own voice — what you found, and what it means ` +
-    `if it means anything. No headings, no preamble like "here is the result", no restating the task back ` +
-    `to her. If the honest answer is short, keep it short. If she asked for something built, the thing ` +
-    `itself IS the result: put the script or the draft in the answer.\n\n` +
+    `WHAT TO WRITE. Plain writing to Ellie, in your own voice — what you found, and what it means if it ` +
+    `means anything. No preamble like "here is the result", no restating the task back to her. If the ` +
+    `honest answer is short, keep it short. If she asked for something built, the thing itself IS the ` +
+    `result: put the script or the draft in the answer.\n\n` +
+    // WHAT HE WRITES NOW BECOMES A FILE, so he is told the rule that decides
+    // which one. The old prompt said "no headings" flatly — correct when every
+    // result was three sentences on a card, and wrong the moment a long one
+    // became a printed report, where the absence of headings is what makes it
+    // unreadable. The line is not "use headings"; it is that the SHAPE should
+    // follow the length, which is the same judgement the classifier makes.
+    `WHAT HAPPENS TO IT. A short answer stays on her card. A long one is turned into a document and saved ` +
+    `to her documents folder, and a single block of code becomes a source file with the right extension. ` +
+    `You do not choose this and you must not announce it — write the thing, and it is filed by what it is. ` +
+    `Two things follow. Keep a short answer free of headings and structure; it is a note, not a report. ` +
+    `But if what you are writing IS long, give it the structure a document needs — headings, tables where ` +
+    `the data is tabular, a short opening paragraph that says what you found, since that opening is what ` +
+    `she reads on the card before deciding to open it.\n\n` +
+    `CHARTS, when numbers are the point. A fenced block marked \`chart\` becomes a real figure in the ` +
+    `document — a pie, a bar chart or a line chart drawn from the data you put in it:\n` +
+    '```chart\n{"type":"pie","title":"Tickets by client","data":[{"label":"Acme","value":42},' +
+    '{"label":"Beta","value":17}]}\n```\n' +
+    `Use "pie" for shares of a whole, "bar" to compare amounts, "line" for change over time (that one takes ` +
+    `"series":[{"name":…,"data":[…]}]). Only ever chart numbers you actually read from a tool result — a ` +
+    `chart of invented figures is the most convincing way to be wrong. One or two per document; if there is ` +
+    `nothing to compare, a sentence is better than a figure.\n\n` +
     // The empty-card rule, said to him as well as enforced in code below.
     `YOU MUST WRITE SOMETHING. Whatever state you are in when you stop — out of tool calls, out of time, ` +
     `every lookup failing — write up what you have and say where it stops and why. An empty result is the ` +
@@ -675,6 +764,8 @@ async function runJob(id) {
   }
 
   const done = finish(id, { status, resultText: output || null, error, toolCalls, budget });
+  // The file comes after the status is settled — see attachArtifact.
+  const withFile = done ? await attachArtifact(id, { note: error }) : null;
   const secs = done ? (done.duration_ms / 1000).toFixed(1) : '?';
   const line = status === 'ok'
     ? `Background job finished: "${job.title}" (${id.slice(0, 8)}) — ok in ${secs}s, ${toolCalls} tool call(s).`
@@ -683,7 +774,7 @@ async function runJob(id) {
       : `Background job FAILED: "${job.title}" (${id.slice(0, 8)}) — ${error}`;
   console.log(`[AgentJobs] ${line}`);
   opsLog(line);
-  return done;
+  return withFile || done;
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +961,18 @@ function feed({ limit = 50 } = {}) {
     attempts: j.attempts,
     seen_at: j.seen_at,
     conversation_id: j.conversation_id,
-    cancellable: j.status === 'queued'
+    cancellable: j.status === 'queued',
+    // What it produced as a file. `artifact_path` is deliberately NOT here: the
+    // panel has no use for a server path it cannot open, and the download route
+    // looks it up by job id rather than being handed one. `artifact_location` is
+    // the folder, which IS worth showing — it is where the file will still be
+    // when this row has been pruned.
+    artifact_kind: j.artifact_kind,
+    artifact_name: j.artifact_name,
+    artifact_bytes: j.artifact_bytes,
+    artifact_error: j.artifact_error,
+    artifact_location: j.artifact_path ? path.dirname(j.artifact_path) : null,
+    summary_text: j.summary_text
   }));
 
   const RS = runResultStatuses();
@@ -896,7 +998,17 @@ function feed({ limit = 50 } = {}) {
     attempts: null,
     seen_at: r.seen_at,
     conversation_id: null,
-    cancellable: false
+    cancellable: false,
+    // A scheduled run produces no file. It is a digest that arrives on a
+    // cadence, and one PDF per firing would silt up the documents folder with a
+    // hundred near-identical reports nobody asked for. Named explicitly rather
+    // than left undefined, so the card renders one way for both kinds.
+    artifact_kind: null,
+    artifact_name: null,
+    artifact_bytes: null,
+    artifact_error: null,
+    artifact_location: null,
+    summary_text: null
   }));
 
   return [...jobs, ...runs]
@@ -938,13 +1050,15 @@ function pendingAnnouncements({ limit = 3 } = {}) {
   const lim = Math.min(Math.max(1, limit), 10);
 
   const jobs = db.prepare(`
-    SELECT id, title, status, finished_at, result_text, error, duration_ms
+    SELECT id, title, status, finished_at, result_text, error, duration_ms,
+           artifact_kind, artifact_name, summary_text
     FROM agent_jobs
     WHERE announced_at IS NULL AND status IN (${TERMINAL.map(() => '?').join(',')})
     ORDER BY datetime(finished_at) DESC LIMIT ?
   `).all(...TERMINAL, lim).map(j => ({
     kind: 'handoff', id: j.id, title: j.title, status: j.status,
-    finished_at: j.finished_at, text: j.result_text, error: j.error, duration_ms: j.duration_ms
+    finished_at: j.finished_at, text: j.result_text, error: j.error, duration_ms: j.duration_ms,
+    artifact_kind: j.artifact_kind, artifact_name: j.artifact_name
   }));
 
   const RS2 = runResultStatuses();
@@ -1083,7 +1197,14 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
         ? `${text}\n  (This one stopped short of finishing: ${it.error || 'reason unrecorded'}. What is above is what it had.)`
         : `It did not produce a result. What went wrong: ${it.error || 'unrecorded'}.`);
     const label = it.kind === 'scheduled' ? 'scheduled job' : 'job you started';
-    const line = `- (${label}) "${it.title}" — finished ${when}: ${body}`;
+    // A result that became a file is announced AS a file. Without this he would
+    // be told the text and, asked where it went, would have to guess — and the
+    // guess would be wrong, because until this shipped there was nowhere for it
+    // to go.
+    const filed = it.artifact_name
+      ? ` (saved as ${it.artifact_name}${it.artifact_kind === 'pdf' ? ', a PDF' : ''}; she has a link to it on the card, which does not mean she has opened it)`
+      : '';
+    const line = `- (${label}) "${it.title}" — finished ${when}${filed}: ${body}`;
     const t = estTokens(line);
     // Always deliver at least one, however long: a result too big for the batch
     // would otherwise never be delivered at all. The rest wait for the next turn
@@ -1107,6 +1228,7 @@ module.exports = {
   mechanicalAccount,
   enqueue,
   runJob,
+  attachArtifact,
   drain,
   startup,
   sweepInterrupted,

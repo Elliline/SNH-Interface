@@ -407,6 +407,57 @@ const DEFAULTS = {
     // the ops log; this table is a panel, not an archive.
     retentionDays: 90
   },
+  // ============ Job output as FILES ============
+  //
+  // A job result was one column of text on a card, and the card was the only
+  // place it existed. That is fine for three sentences and wrong for everything
+  // else: a research report arrived as raw markdown in a narrow panel, and a
+  // Python module arrived as a code block she had to select and copy out of a
+  // scrolling box. Neither is a thing you can keep, send, or open later.
+  //
+  // So a job now picks a FORM from what it actually made — source file, PDF, or
+  // a card — and anything that becomes a file lands in a real folder AND gets a
+  // download link on the card. Both, deliberately: the folder is on the server
+  // and she is usually on her laptop, so a path alone is no use to her, and a
+  // download alone would mean the machine that did the work does not keep it.
+  documents: {
+    enabled: true,
+    // WHERE FILES GO. A bare name (the default) is resolved under the home
+    // directory of the user the server runs as — ~/SNH_Documents. An absolute
+    // path is used as given, which is how this points at a synced folder or a
+    // NAS mount. The directory is created if it is missing.
+    //
+    // NOT under data/: this is the one thing SNH produces that is FOR HER
+    // rather than for itself, and burying it beside the vector store would make
+    // it something to go digging for. It is deliberately not moved by
+    // SNH_DATA_DIR either — a throwaway test instance writing into her real
+    // documents folder is exactly the accident that redirect exists to prevent,
+    // so a redirected process gets a documents folder inside its own data dir.
+    outputDir: 'SNH_Documents',
+    // THE LINE BETWEEN A CARD AND A DOCUMENT, in characters of readable prose —
+    // code fences are measured as one token, not as their own length, so a short
+    // note wrapped around a long script counts as short and the script becomes
+    // the file. Roughly 1,200 characters is four or five paragraphs: past that a
+    // card is a scrolling box and a document is a document.
+    inlineMaxChars: 1200,
+    // Which chromium to print with. Empty means look for the usual names on
+    // PATH (chromium, chromium-browser, google-chrome, …). Set this when it is
+    // installed somewhere unusual — a snap wrapper, a flatpak, a vendored
+    // headless shell.
+    //
+    // NOTHING FAILS IF IT IS ABSENT. A box with no chromium writes the report as
+    // a formatted text file instead and the card says why, in one line. A
+    // missing browser is a downgrade in what the file looks like; it is never a
+    // job that produced nothing.
+    chromiumPath: '',
+    // Page setup for the printed report. Letter or A4 — the two the CSS knows.
+    pageSize: 'Letter',
+    // Keep the intermediate HTML beside the PDF. Off; it is a build artifact and
+    // she did not ask for two files. Worth turning on when a PDF comes out
+    // looking wrong and the question is whether the fault is in the HTML or in
+    // the printing.
+    keepHtml: false
+  },
   // The corrector (Phase 2c) — the heartbeat step that repairs the corpus.
   //
   // Its own cadence, deliberately slower than the heartbeat: a pass is expensive

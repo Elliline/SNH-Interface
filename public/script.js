@@ -1993,6 +1993,59 @@ async function loadSettingsBrainTab() {
       }
     ]));
 
+    // WHERE A RESULT GOES WHEN IT IS TOO BIG TO BE A CARD.
+    //
+    // Every one of these decides something she would otherwise only discover by
+    // looking in a folder and not finding a file — so the folder, the line
+    // between a card and a document, and the browser that prints the PDF are all
+    // on one screen, next to each other, with what happens when the browser is
+    // missing said plainly rather than left to be inferred from an empty folder.
+    container.appendChild(createConfigSection('Job Output — files, folders and PDFs', [
+      {
+        key: 'documents.enabled',
+        label: 'Save long results as files',
+        type: 'checkbox',
+        value: config.documents?.enabled !== false,
+        desc: 'Off means every result stays on its card, however long — which is how it worked before, and it is fine if you only ever ask short questions. On, a long result becomes a document and a block of code becomes a source file, saved to the folder below and downloadable from the card.'
+      },
+      {
+        key: 'documents.outputDir',
+        label: 'Documents folder',
+        type: 'text',
+        value: config.documents?.outputDir,
+        desc: 'A bare name lands in your home directory — SNH_Documents means ~/SNH_Documents. A full path starting with / is used exactly as written, which is how you point this at a synced folder or a network drive. The folder is created if it does not exist. A test instance never writes here; it gets a folder inside its own throwaway data directory.'
+      },
+      {
+        key: 'documents.inlineMaxChars',
+        label: 'Keep a result on the card up to (characters)',
+        type: 'number', step: '200', min: 200,
+        value: config.documents?.inlineMaxChars,
+        desc: 'Roughly four or five paragraphs at 1200. Past this the result becomes a document and the card shows the opening of it plus a link. Code is counted separately and always becomes a file, so this is about how much WRITING you want to read in the panel rather than about total size.'
+      },
+      {
+        key: 'documents.pageSize',
+        label: 'Paper size',
+        type: 'select',
+        options: [{ value: 'Letter', label: 'Letter' }, { value: 'A4', label: 'A4' }],
+        value: config.documents?.pageSize,
+        desc: 'The page the PDF is laid out for. Nothing else changes with it.'
+      },
+      {
+        key: 'documents.chromiumPath',
+        label: 'Chromium (leave empty to search for it)',
+        type: 'text',
+        value: config.documents?.chromiumPath,
+        desc: 'PDFs are printed by a headless Chromium — there is no PDF library, the browser does the typesetting. Empty means look for one in the usual places. If there is none on this machine, reports are written as formatted text files instead and the card says so; nothing fails and no result is lost. On Ubuntu there is no apt package: install it with "sudo snap install chromium". Set a full path here only if yours lives somewhere unusual.'
+      },
+      {
+        key: 'documents.keepHtml',
+        label: 'Keep the HTML a PDF was printed from',
+        type: 'checkbox',
+        value: !!config.documents?.keepHtml,
+        desc: 'Off. It is a build step, not a second copy of the report. Turn it on when a PDF comes out looking wrong and the question is whether the fault is in the page or in the printing.'
+      }
+    ]));
+
     container.appendChild(createConfigSection('Scheduled Jobs — limits on one run', [
       {
         key: 'scheduler.enabled',
@@ -3854,6 +3907,77 @@ const JOB_STATUS_NOTE = {
   cancelled: 'You cancelled this before it started.'
 };
 
+/**
+ * A job result, rendered as the markdown it has always been.
+ *
+ * It used to go through escapeHtml() and nothing else, so a research report
+ * arrived in the panel as one long thin column of pipes and asterisks: the
+ * SOURCE of a table, in a narrow card, with the table nowhere. The text was
+ * never the problem — the card was printing a document as if it were a string.
+ *
+ * FALLS BACK RATHER THAN FAILING. If /markdown.js did not load, the card shows
+ * escaped text exactly as it did before. A missing renderer must degrade to the
+ * old behaviour, never to a blank card — the whole point of this panel is that a
+ * result cannot vanish.
+ */
+function renderResultMarkdown(text) {
+  const md = window.SNHMarkdown;
+  if (!md || typeof md.renderMarkdown !== 'function') {
+    return escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+  }
+  try {
+    return md.renderMarkdown(text);
+  } catch (e) {
+    console.error('[Jobs] markdown render failed, showing plain text:', e);
+    return escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+  }
+}
+
+/** A file size a person would say out loud. */
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const JOB_FILE_LABEL = { pdf: 'PDF', code: 'FILE', text: 'TXT' };
+
+/**
+ * The file a job produced: a download link, its size, and where it also lives.
+ *
+ * BOTH HALVES ARE SHOWN, and that is the point of the feature rather than a
+ * detail of it. The link works from whatever machine is reading the panel — the
+ * usual case, since the server is not the laptop. The folder is named underneath
+ * because the file is genuinely there, and will still be there when this row has
+ * been pruned out of the panel.
+ *
+ * A DOWNGRADE IS ALSO SHOWN. If the report came out as text because there is no
+ * chromium on the box, that sentence goes here, next to the file it explains —
+ * not swallowed, and not dressed up as an error, because the file is fine and
+ * the only thing that went differently is its format.
+ */
+function renderJobFile(it) {
+  if (!it.artifact_kind && !it.artifact_error) return '';
+
+  // No file, but a reason there is none — worth one muted line. Anything else
+  // would be a result that quietly failed to become the file it should have.
+  if (!it.artifact_kind) {
+    return `<div class="job-file-note">${escapeHtml(it.artifact_error)}</div>`;
+  }
+
+  const size = formatFileSize(it.artifact_bytes);
+  const label = JOB_FILE_LABEL[it.artifact_kind] || 'FILE';
+  return `
+    <a class="job-file" href="/api/jobs/${encodeURIComponent(it.id)}/file" download>
+      <span class="job-file-kind job-file-kind-${escapeHtml(it.artifact_kind)}">${escapeHtml(label)}</span>
+      <span class="job-file-name">${escapeHtml(it.artifact_name || 'download')}</span>
+      ${size ? `<span class="job-file-size">${escapeHtml(size)}</span>` : ''}
+    </a>
+    ${it.artifact_location ? `<div class="job-file-where">Also saved in <code>${escapeHtml(it.artifact_location)}</code></div>` : ''}
+    ${it.artifact_error ? `<div class="job-file-note">${escapeHtml(it.artifact_error)}</div>` : ''}`;
+}
+
 async function loadJobsList() {
   const container = document.getElementById('jobsList');
   if (!container) return;
@@ -3899,12 +4023,20 @@ async function loadJobsList() {
       // which is the same class of bug as the retired fact that redrew as live.
       // If there is text, she reads the text; the reason it stopped goes
       // underneath it, where it explains the result rather than replacing it.
-      const partialText = (it.status !== 'ok' && it.result_text) ? escapeHtml(it.result_text) : '';
+      // WHAT GOES ON THE CARD DEPENDS ON WHETHER THERE IS A FILE.
+      //
+      // With one, the card is an ANNOUNCEMENT: a few lines and a link. Pasting a
+      // 4,000-word report onto a card that also links to the PDF of it would be
+      // the original problem with a download button bolted to the side.
+      // Without one, the result IS the card and is shown whole, as before.
+      const shown = it.artifact_kind && it.summary_text ? it.summary_text : it.result_text;
+      const rendered = shown ? renderResultMarkdown(shown) : '';
       const body = it.status === 'ok'
-        ? escapeHtml(it.result_text || '')
-        : (partialText
-          ? `${partialText}<div class="job-error job-cutshort">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</div>`
+        ? rendered
+        : (rendered
+          ? `${rendered}<div class="job-error job-cutshort">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</div>`
           : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`);
+      const file = renderJobFile(it);
       // Elapsed, for the ones still going — "running" with no clock on it tells
       // her nothing about whether to keep waiting.
       const elapsed = (it.status === 'running' && it.started_at)
@@ -3930,6 +4062,7 @@ async function loadJobsList() {
         ${it.status === 'queued' || it.status === 'running'
           ? `<div class="initiative-note">${escapeHtml(note)} The result will appear here — it will not message you.</div>`
           : `<div class="initiative-content">${body}</div>`}
+        ${file}
         ${meta ? `<div class="job-meta">${meta}</div>` : ''}
         ${actions.length ? `<div class="initiative-actions">${actions.join('')}</div>` : ''}
       </div>`;

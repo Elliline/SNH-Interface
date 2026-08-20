@@ -926,6 +926,52 @@ function initDatabase() {
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at)');
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_finished ON agent_jobs(finished_at)');
 
+    // ============ What the run PRODUCED, as a file ============
+    //
+    // A result used to be one column: result_text, shown whole on the card. A
+    // report and a Python module were the same shape as "nothing new since
+    // Monday", which is how a 4,000-word report came to be rendered as raw
+    // markdown in a narrow panel.
+    //
+    // These five columns say what form the result took. They are NOT a second
+    // copy of the result — result_text stays the truth and the file is made
+    // from it, so a lost or deleted file costs the formatting and never the
+    // work.
+    //
+    //   artifact_kind  - pdf | code | text | null. Null means it stayed on the
+    //                    card, which is the right answer for a short result and
+    //                    is not a failure.
+    //   artifact_path  - absolute path on the server. The download route reads
+    //                    the file by JOB ID and gets the path from here, so no
+    //                    client-supplied path is ever opened.
+    //   artifact_name  - the basename, which is what the card shows and what the
+    //                    browser saves it as.
+    //   artifact_bytes - size on disk, for the card. A 0-byte file that reads as
+    //                    finished is the failure this makes visible.
+    //   artifact_error - why there is no file, or why it is a text file and not
+    //                    a PDF. Written even on success paths that DOWNGRADED,
+    //                    because "chromium is not installed" must reach her as a
+    //                    sentence on the card rather than as a missing feature
+    //                    she is left to notice.
+    //
+    //   summary_text   - a few lines for the card, so a document is announced
+    //                    rather than pasted. Null for a result that stayed
+    //                    inline, where the text IS the summary.
+    const jobCols = sqliteDb.prepare('PRAGMA table_info(agent_jobs)').all();
+    for (const [col, type, note] of [
+      ['artifact_kind', 'TEXT', 'pdf | code | text, or null when it stayed on the card'],
+      ['artifact_path', 'TEXT', 'absolute path to the file this run produced'],
+      ['artifact_name', 'TEXT', 'basename, for the card and the download'],
+      ['artifact_bytes', 'INTEGER', 'size on disk'],
+      ['artifact_error', 'TEXT', 'why there is no file, or why it was downgraded'],
+      ['summary_text', 'TEXT', 'the few lines the card shows instead of the document']
+    ]) {
+      if (!jobCols.some(c => c.name === col)) {
+        sqliteDb.exec(`ALTER TABLE agent_jobs ADD COLUMN ${col} ${type}`);
+        console.log(`Migration: added ${col} to agent_jobs (${note})`);
+      }
+    }
+
     // Every tool call the entity makes and what came of it. Operational telemetry
     // → surfaced in the Thinking tab, never injected into chat. Rejected/capped
     // calls are logged too: a tool call that was refused is exactly the thing

@@ -425,6 +425,33 @@ const CONDITIONAL_CAPABILITIES = [
     // service on every boot, and a check that cries wolf is a check that gets
     // ignored.
     coversConfig: ['agentJobs', 'tools.agentJobs']
+  },
+  {
+    id: 'job-documents',
+    name: 'Job results as files',
+    // WHAT THIS MAY NOT CLAIM, since over-claiming is the exact failure the
+    // manifest exists to prevent:
+    //   - not "it makes PDFs", flatly. A PDF needs a headless chromium on the
+    //     machine, and on this one there is none. The description says where the
+    //     PDF comes from and what happens when it is missing, because the entity
+    //     telling her he will produce a PDF on a box that cannot is precisely
+    //     the kind of confident wrongness this registry is here to stop.
+    //   - not "he chooses the format". He does not; the form is derived from
+    //     what the text turns out to be, after the run is over.
+    //   - not "it writes files" in general. It writes ONE file, for the result
+    //     of one job, into one configured folder. A job still cannot run
+    //     commands or touch anything else on disk.
+    description: "A result that is too long to read on a card becomes a document instead: it is saved to a documents folder on the machine (SNH_Documents by default, changeable in Settings) and the card shows a few lines of it plus a link that downloads it from whatever device is reading the panel. A result that is mostly one block of code becomes a source file with the right extension. A short result stays on the card, rendered properly rather than as raw markdown. You do not pick which of the three happens — it follows from what you actually wrote, so writing well is the whole of your part in it. A document is laid out as a PDF by a headless browser on the machine; where there is none installed, the same report is written as a formatted text file and the card says so plainly. In a document, a fenced block marked `chart` becomes a real pie, bar or line chart drawn from the numbers you put in it. The file is made FROM the result and never replaces it — the full text stays in the panel's record either way, so a deleted or unwritable file costs the formatting and never the work.",
+    oneLiner: "long results become a saved document (PDF, or text where no browser is installed), code becomes a source file",
+    intro: 'When a job of mine produces something too long to read on a card, it now becomes a file: a document saved to her documents folder with a download link on the card, or a source file with the right extension when what I wrote is code. Short results still stay on the card. I do not choose which — it follows from what I actually wrote. Documents are laid out as PDFs by a headless browser where one is installed, and as formatted text where there is not, and either way the full result stays in the panel, so losing the file never loses the work',
+    schedule: 'Whenever a background job finishes with something long enough to be a document',
+    dateAdded: '2026-08-19',
+    // Honesty gate: off means every result stays on its card, which is exactly
+    // how it behaved before this shipped, so the capability is genuinely absent
+    // and must not be claimed.
+    when: (cfg) => !!(cfg && cfg.documents && cfg.documents.enabled !== false
+      && cfg.agentJobs && cfg.agentJobs.enabled !== false),
+    coversConfig: ['documents']
   }
 ];
 

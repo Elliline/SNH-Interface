@@ -18,6 +18,8 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 
+const fs = require('fs');
+const path = require('path');
 const agentJobs = require('../db/agent-jobs');
 
 /** Deliberate human actions: cheap, but not something to script in bulk. */
@@ -80,6 +82,88 @@ router.post('/:id/seen', actionLimiter, (req, res) => {
   } catch (error) {
     console.error('[JobsAPI] Error marking job seen:', error.message);
     res.status(500).json({ error: 'Failed to mark job seen' });
+  }
+});
+
+/**
+ * GET /api/jobs/:id/file
+ * Download what the run produced.
+ *
+ * ⚠ BY JOB ID, NEVER BY PATH. The route takes a UUID and looks the location up
+ * in the row; there is no parameter that names a file and therefore nothing to
+ * traverse out of. A `?path=` version of this endpoint would be a directory
+ * traversal with a rate limit on it, and the temptation to add one — "so the
+ * panel can link to older files too" — is exactly why the reason is written
+ * down here rather than left as an obvious choice.
+ *
+ * The stored path is ours: it is written by db/job-artifacts.js and reaches the
+ * database no other way. Nothing a browser sends is ever joined onto it.
+ *
+ * WHY THIS EXISTS AT ALL, when the file is already saved to a folder: the folder
+ * is on the server and Ellie is usually not. A path in a card is a fact about a
+ * machine she is not sitting at. Both halves are the feature — the file lands in
+ * her documents folder AND the card downloads it.
+ */
+const MIME = {
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
+  '.json': 'application/json',
+  '.html': 'text/html; charset=utf-8'
+};
+
+router.get('/:id/file', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid job ID' });
+
+    const job = agentJobs.getJob(id);
+    if (!job) return res.status(404).json({ error: 'No such job' });
+    if (!job.artifact_path) {
+      // The distinction matters to whoever is looking at this: a job with no
+      // file is usually a short result that correctly stayed on the card, not a
+      // missing file.
+      return res.status(404).json({ error: job.artifact_error || 'This job did not produce a file — its result is on the card.' });
+    }
+
+    let stat;
+    try {
+      stat = fs.statSync(job.artifact_path);
+    } catch {
+      // Deleted, moved, or on a drive that is not mounted. Said plainly, and
+      // NOT treated as data loss: the result itself is still in the row.
+      return res.status(410).json({
+        error: 'The file is no longer where it was saved. The result itself is still on the card.'
+      });
+    }
+    if (!stat.isFile()) return res.status(410).json({ error: 'That is not a file any more.' });
+
+    const name = job.artifact_name || path.basename(job.artifact_path);
+    const type = MIME[path.extname(name).toLowerCase()] || 'application/octet-stream';
+    res.setHeader('Content-Type', type);
+    res.setHeader('Content-Length', stat.size);
+    // `attachment` rather than `inline`: this is a download link and it should
+    // download, on every browser, rather than opening a PDF viewer on some and
+    // a save dialog on others. The filename is quoted and stripped of quotes and
+    // control characters — it comes from a job title the model wrote.
+    const safeName = name.replace(/["\\\r\n]/g, '');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    // It is a generated document, not a page: nothing here should be sniffed,
+    // framed, or cached by anything in between.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-store');
+
+    fs.createReadStream(job.artifact_path)
+      .on('error', (err) => {
+        console.error('[JobsAPI] Error streaming job file:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to read the file' });
+        else res.destroy();
+      })
+      .pipe(res);
+  } catch (error) {
+    console.error('[JobsAPI] Error serving job file:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to serve the file' });
   }
 });
 

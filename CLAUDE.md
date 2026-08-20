@@ -483,6 +483,137 @@ Four more things that are load-bearing if you touch this:
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
 
+## ⚠ A result has a FORM, and the form is derived, not chosen
+
+A job result was one column of text on a card and that was the whole of it. Fine
+for three sentences; wrong for everything else. A research report arrived as raw
+markdown in a narrow panel — pipes and asterisks, the source of a table with the
+table nowhere — and a Python module arrived as a code block to be selected out of
+a scrolling box. Neither is a thing you can keep, open later, or send to anyone.
+
+`db/job-artifacts.js` reads what the run actually produced and picks one of three
+forms. **Derived from the output, never asked for and never chosen by the model**
+— which is why the run prompt tells him the rule exists and forbids him to
+announce it: a model that could pick would pick "PDF" for a two-line answer.
+
+- **code** — one fenced block that IS the result → a source file with the right
+  extension. Two or more substantial blocks is a document ABOUT code, not one
+  file, and flattening it would throw the others away.
+- **document** — long prose → a PDF, or a formatted text file where there is no
+  browser. `documents.inlineMaxChars` is the line.
+- **inline** — short → the card, rendered as markdown.
+
+Load-bearing pieces, in the order they bite:
+
+- **Length is measured with code discounted, and that is not sufficient on its
+  own.** `toPlainText` counts a fence as the token `[code]`, which is right for
+  "is the WRITING long" — a short note wrapped around a long script is a short
+  note. It is wrong as the only test: a run returning two scripts under sixty
+  words measured as 60 characters and stayed on a card, 140 lines of code in a
+  panel the width of a phone. Substantial code is a file whatever the prose does.
+- **ONE renderer, served from `db/`.** `db/markdown.js` runs under Node and in the
+  browser, and `server.js` serves it at `/markdown.js` rather than a copy living
+  in `public/`. The card and the printed report have to agree on what a document
+  looks like; two renderers would be two answers that drift.
+- **Escaping is structural, and the ordering IS the security property.** Every
+  construct that produces markup is stashed behind a NUL placeholder as it is
+  recognised, and only plain text is ever handed to `esc()`. The first version
+  built `<a>`/`<img>` in place and split on a tag-shaped regex to decide what to
+  escape — which cannot tell our markup from the author's. A literal
+  `<img src=x onerror=…>` in a result matched the split and reached the browser
+  unescaped. **Job text is written by a model that has just been reading
+  arbitrary web pages; it is untrusted input.**
+- **No PDF library, and the DevTools socket is deliberately not opened.**
+  `chromium --headless --print-to-pdf` IS `Page.printToPDF` behind a flag — the
+  same code inside the browser. Driving the socket would mean hand-writing a
+  WebSocket client (no `ws` here, and no dependency is being added for this) and
+  would buy exactly one thing: page numbers via `headerTemplate`. Everything else
+  — paper, margins, backgrounds, page-break control — is CSS, which is where
+  paged media puts it. **So there are no page numbers, and there is no way to add
+  them without that socket.** Chrome does not implement the `@page` margin boxes
+  that would generate them.
+- **A missing chromium is a DOWNGRADE, never a failure.** On this box there is
+  none, and Ubuntu 24.04 has no apt package — `chromium-browser` is a
+  transitional stub and the real install is `sudo snap install chromium`. So the
+  text-fallback path is the ordinary path here, not an edge case, and it has to
+  produce something worth opening: structure kept, prose wrapped to 78 columns,
+  **tables aligned into columns**, because an unaligned table is the exact
+  unreadable thing this work started from.
+- **Snap confinement shapes two things**, and both are invisible until they
+  break: a snap gets a PRIVATE `/tmp`, so the intermediate HTML goes under the
+  data directory instead; and the snap `home` interface does not cross HIDDEN
+  directories, so nothing this writes may live in a dot-directory (`print-work`,
+  not `.print-work`).
+- **A confined chromium given a page it cannot read EXITS 0 AND WRITES NOTHING.**
+  Measured on Chromium 151 snap: exit code 0, empty stderr, no output file. It
+  does not fail, so only the empty-output guard notices — and on its own that
+  guard reports "produced an empty PDF", which sends you to inspect the HTML, the
+  one place the fault is not. `confinementProblem()` therefore checks the path
+  BEFORE spawning and names the cause. The practical consequence:
+  **any instance whose data directory is outside `$HOME` cannot print PDFs**,
+  which is every test instance, and is why `scripts/test-job-artifacts.js` asserts
+  the fallback rather than the PDF when the browser is a snap.
+- **There is NO running header or footer, and adding one is a trap.** The
+  `position: fixed` trick that every search result recommends does repeat on
+  every printed page and does NOT stay in the margin: on a real three-page print
+  it painted at a fixed offset over a table row on page 2 and over a blockquote
+  on page 3. **Page one was perfect**, which is the whole problem — nothing short
+  of printing past one page and looking at it would catch it. The test suite
+  asserts the absence of `position: fixed` for that reason. A real running footer
+  needs `footerTemplate`, which needs the DevTools socket, which this path does
+  not open.
+- **Axes are snapped to round numbers** (`niceScale`). Dividing a data range into
+  four equal parts is arithmetically right and reads as noise — a real print came
+  out labelled 2.61 / 4.38 / 6.15 / 7.92 / 9.69. Gridlines are a ruler, and a
+  ruler is marked in round units. Related: a line chart gets a **padded** range,
+  not a forced zero. Zero-anchoring is a BAR rule, because a bar's length IS the
+  value; forcing it onto lead times that never approach zero spent a quarter of
+  the figure on empty space and flattened the crossing the chart existed to show.
+- **A pie labels only slices at or above 8%.** At 4% the labels on a 5.2% and a
+  6.3% slice collided against the edge. Every slice's exact value and share is in
+  the key beside the figure, so a label on a thin slice costs legibility and buys
+  nothing.
+- **The report must be self-contained.** The printer opens a `file://` URL with
+  no network. A stylesheet link, a webfont or a CDN script would fail silently
+  and the PDF would print unstyled — **a failure that still produces a file**, so
+  nothing errors and nobody finds out until she opens it. Fonts are named
+  explicitly (Liberation, DejaVu, Nimbus) rather than left to `system-ui`, which
+  under a headless browser with no desktop resolves to whatever fontconfig
+  fancies.
+- **Charts are our own SVG** (`db/charts.js`), for the same reason: a charting
+  library behind a `file://` URL is a blank rectangle. The categorical palette is
+  a fixed eight-slot order validated for colour-vision deficiency **in that
+  order**; slots are assigned by position and never cycled, and a seventh
+  category folds into "Other" rather than getting a colour nobody can tell from
+  another. Every mark carries a visible label, which is what makes three of the
+  slots legal below 3:1 against white. A chart that cannot be drawn falls back to
+  a table of its own numbers — never to a hole where a figure was promised.
+- **The file is never the only copy, and never the only way to reach it.**
+  `result_text` stays in the row and the file is made from it, so a full disk or
+  a deleted file costs the formatting and never the work. And the card carries a
+  **download link** as well as the folder: the folder is on the server and she is
+  usually on a laptop, so a path alone is a fact about a machine she is not
+  sitting at. Both halves are the feature.
+- **The download route takes a JOB ID and never a path.** `GET /api/jobs/:id/file`
+  looks the location up in the row; there is no parameter that names a file and
+  therefore nothing to traverse out of. A `?path=` version — "so it can link to
+  older files too" — would be a directory traversal with a rate limit on it.
+- **`attachArtifact` runs after `finish()`, and cannot fail the job.** `finish()`
+  is the one write that ENDS a job and the invariant is that every exit through
+  it writes exactly one terminal row. Making a file is neither terminal nor
+  required, so the status is settled first and the file is a follow-up write that
+  only adds columns. Same doctrine as the empty-card guard, applied to a new way
+  of losing something.
+- **A redirected process gets its own documents folder.** `SNH_DATA_DIR` does not
+  move `data/config.json`, so a throwaway instance reads the real `outputDir` —
+  and would write into her real documents folder. `outputDir()` therefore puts
+  the folder inside the data directory whenever the redirect is set. A file on
+  disk is live state, and that redirect exists so a disposable process cannot
+  touch live state.
+- **Scheduled runs produce no file, deliberately.** They share the panel with
+  handed-off jobs, but a digest arrives on a cadence and one PDF per firing would
+  silt the folder up with a hundred near-identical reports nobody asked for.
+
 ## ⚠️ One search tool, a provider chain, and every call on the record
 
 `web_search` is one tool with two providers behind it (2026-08-18). **Exa's
