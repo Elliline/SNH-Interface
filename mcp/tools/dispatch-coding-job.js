@@ -1,22 +1,27 @@
 /**
- * dispatch_coding_job — handing coding work to squatch-code.
+ * dispatch_coding_job — sending coding work to squatch-code.
  *
- * PROPOSE ONLY, like create_cron_job and unlike start_background_job, and the
- * difference is the whole reason this tool is separate from that one.
- * start_background_job argues its own case for skipping approval: "starting a
- * read-only background lookup is not a decision that needs Ellie's approval —
- * it changes nothing". This one changes files on her machine, unattended, with
- * nobody at squatch-code's approval prompt. So it asks first.
+ * THE INTERFACE IS THE CONVERSATION. Ellie and the entity talk a problem
+ * through; he writes the brief in his reply where she can read it; she
+ * says send it; this fires. No panel, no button, nothing to leave the
+ * chat for.
  *
- * ONE COARSE TOOL, NOT FILE OPERATIONS. squatch-code has its own agentic loop,
- * its own model and its own tools; what it wants is a brief, not a driver.
- * There is deliberately no read_file/write_file surface here — a tool layer
- * that drove it step by step would be a worse copy of the thing it is calling.
+ * This shipped as a bell proposal with an approve button and that was a
+ * mechanism failure, not a matter of taste. Of 390 bell items ever
+ * raised on this instance, 223 expired unactioned; exactly one proposal
+ * has ever been raised there and it was dismissed. Briefs would have sat
+ * until they aged out. The rule Ellie drew from it is general and lives
+ * in CLAUDE.md: nothing that has to be ACTED ON goes on the bell.
  *
- * THE BRIEF IS PROSE. No schema, no fields to fill in. She and the entity have
- * just talked the problem through in chat; the brief is him writing down what
- * they settled on, the way one person briefs another. A form would lose exactly
- * the context that makes the handoff worth anything.
+ * SO THIS TOOL IS NOT PROPOSE-ONLY, and it is not direct-execute either.
+ * Her go-ahead already happened, in words, in the conversation - the
+ * call is what carries it out. What makes that safe is not a gate in
+ * the UI but a check on the brief itself: db/brief-shown.js refuses
+ * anything she has not already been shown, which is what stops this
+ * firing on the turn where the brief is still being written.
+ *
+ * ONE COARSE TOOL, NOT FILE OPERATIONS. squatch-code has its own agentic
+ * loop, its own model and its own tools; it wants a brief, not a driver.
  */
 
 const codingJobs = require('../../db/coding-jobs');
@@ -25,19 +30,23 @@ class DispatchCodingJobTool {
   constructor() {
     this.name = 'dispatch_coding_job';
     this.description =
-      'Send a piece of coding work to squatch-code, the local coding agent, to do ' +
-      'on its own in one of the projects under Projects/. This does NOT start ' +
-      'anything: it writes a brief and shows it to Ellie, and she approves, edits ' +
-      'or rejects it. If she approves, squatch-code works unattended for a few ' +
-      'minutes — it can edit files in that project and run test commands there — ' +
-      'and the write-up lands in her jobs panel, not in this conversation. ' +
-      'Use it when the two of you have settled on a concrete change to a project ' +
-      'and she says to send it, hand it over, or get squatch-code to do it. ' +
-      'Write the brief as prose, the way you would explain the job to a person: ' +
-      'what needs doing and what it is for. It is the only instruction the run ' +
-      'gets, so include what you both worked out, not just the last sentence she ' +
-      'said. Do not use it to ask questions about code, and do not use it for ' +
-      'work outside a project directory.';
+      'Send coding work to squatch-code, the local coding agent, to carry out ' +
+      'on its own in one of the projects under Projects/. ' +
+      'USE THIS ONLY WHEN ELLIE HAS TOLD YOU TO SEND IT — "send that to the ' +
+      'coder", "go ahead", "ship it". It is not for proposing work and not for ' +
+      'starting something you think would be useful. ' +
+      'Before it can be used she must have READ the brief: write the brief out ' +
+      'in an ordinary reply first, in full, and wait for her to say go. A brief ' +
+      'she has not seen is refused, so a call on the same turn you first write ' +
+      'one will fail and nothing will run. ' +
+      'When she does say go, send the SAME brief she read, word for word — do ' +
+      'not rewrite, tidy or re-summarise it on the way out. If she asked for a ' +
+      'change, write the revised brief out in your reply and wait for her to ' +
+      'approve that one. ' +
+      'The job runs unattended for a few minutes; it can edit files in that ' +
+      'project and run test commands there. A restore point is committed first, ' +
+      'so the whole job can be undone. The write-up arrives in her jobs panel, ' +
+      'not in this conversation, so do not describe a result you do not have.';
 
     this.parameters = {
       type: 'object',
@@ -50,21 +59,21 @@ class DispatchCodingJobTool {
         brief: {
           type: 'string',
           description:
-            'What needs doing, as prose. Everything the run will know — it cannot ' +
-            'see this conversation. Say what to change, where, and why, and name ' +
-            'anything you already worked out together about how.'
+            'The brief, exactly as Ellie read it. Everything the run will know — ' +
+            'it cannot see this conversation. Copy the text you already showed ' +
+            'her rather than composing a fresh version of it.'
         }
       },
       required: ['project', 'brief']
     };
 
-    // Tier metadata, declared the way create_cron_job declares its own.
     this.tier = 'action';
-    // Reversible in the sense that matters: a git restore point is committed
-    // inside the project before the run starts, and the report carries the
-    // command that undoes the whole job. Not reversible if the project is not
-    // a repository, which is why every project under Projects/ was made one.
+    // A git restore point is committed inside the project before the run
+    // starts, and the report carries the command that undoes the job.
     this.reversible = true;
+    // Her approval is real but conversational: it happened in words
+    // before this was called, and the brief-shown check is what ties the
+    // call to it. There is no pending-approval state anywhere.
     this.requiresApproval = true;
     this.destructive = false;
     this.rateCaps = null;
@@ -84,33 +93,44 @@ class DispatchCodingJobTool {
   async execute(args = {}, context = {}) {
     const { project, brief } = args;
 
-    const result = await codingJobs.propose({
+    const result = codingJobs.dispatch({
       project,
       brief,
       conversationId: context.conversationId || null,
-      messageId: context.messageId || null
+      messageId: context.messageId || null,
+      userMessage: context.userMessage || null,
     });
 
     if (!result.ok) {
+      const unseen = result.unseen
+        ? ' Write the brief out in this reply so she can read it, and send it ' +
+          'once she says to. Do not claim anything has been sent.'
+        : ' Tell her plainly that you did not send it, and why.';
       return {
         success: false,
         error: result.error,
-        message:
-          `Nothing was sent. ${result.error} Tell her plainly that you did not ` +
-          `dispatch it, and why — do not describe work that is not happening.`
+        message: 'Nothing was sent. ' + result.error + unseen,
       };
     }
 
+    // A paraphrase is dispatched but never passes silently: both texts
+    // are in the scrollback, so a divergence is hers to see.
+    const fidelity = result.exact
+      ? 'The brief you sent is word for word what she read.'
+      : 'NOTE: what you sent is not word for word what she read (' +
+        Math.round(result.ratio * 100) + '% match). Quote the brief you ' +
+        'actually sent in your reply so she can see the difference.';
+
     return {
       success: true,
-      proposal_id: result.id,
-      status: 'awaiting-approval',
+      dispatch_id: result.id,
+      job_id: result.agentJobId,
+      status: 'running',
       message:
-        'The brief is written and waiting for her approval — nothing has been ' +
-        'sent to squatch-code yet and no file has been touched. Show her the ' +
-        'brief in your reply so she can approve or correct it without leaving ' +
-        'the conversation. You do NOT have a result and must not describe one; ' +
-        'when the job finishes, the write-up appears in her jobs panel.'
+        'Sent to squatch-code and it is running now. ' + fidelity +
+        ' Tell her it has gone and quote the brief that was sent. You do NOT ' +
+        'have a result and must not describe one — the write-up will appear ' +
+        'in her jobs panel when the job finishes.',
     };
   }
 

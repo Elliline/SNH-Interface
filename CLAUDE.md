@@ -502,55 +502,124 @@ Four more things that are load-bearing if you touch this:
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
 
-## ⚠️ Coding work goes to squatch-code, and she approves the BRIEF
+## ⛔ Nothing that has to be ACTED ON goes on the bell
 
-`db/coding-jobs.js` + `mcp/tools/dispatch-coding-job.js`, shipped 2026-08-20,
-OFF by default (`tools.codingJobs.enabled`). Ellie and the entity settle a change
-in chat; he writes a brief; she approves or edits it; it runs unattended in
-`Projects/<name>` and the write-up lands in the jobs panel. It removes a
-clipboard from a loop she already ran by hand.
+The bell is where the entity says things. It is not a queue of work for
+Ellie, and anything put there that REQUIRES her to do something in order
+to proceed will not proceed.
 
-- **It combines two patterns that were always separate here, and each existing
-  tool argues the opposite case for itself.** `create_cron_job` is propose-only
-  because a cron job recurs forever. `start_background_job` is direct-execute
-  and says why in its own header: "starting a read-only background lookup is not
-  a decision that needs Ellie's approval — it changes nothing". That clause is
-  exactly what fails here, so this tool takes the cron gate AND the job handoff.
-- **What she approves is the BRIEF, not the actions.** There is no approval
-  prompt in a dispatched run — squatch-code's gate fails closed and would deny
-  every write — so approval is pre-granted at dispatch. Everything downstream
-  depends on that being understood, which is why the bell item shows her the
-  brief verbatim and why her edit, not his draft, is what runs. Both are kept on
-  the row.
-- **A git restore point is the safety property, and the allowlist is not.**
-  squatch-code commits any dirty work first (so hers stays separable), then
-  commits a baseline, and the report carries `git reset --hard <sha>`. Ellie
-  chose this knowing the command allowlist is a speed bump: an allowed
-  interpreter can run anything, and a test in squatch-code asserts that gap out
-  loud rather than letting it read as a boundary. Every project under
-  `Projects/` was made a git repository as part of shipping this, because
-  without one the tool's `reversible: true` would be a lie.
-- **ONE COARSE TOOL.** No read_file/write_file surface here — squatch-code has
-  its own agentic loop and its own model; a tool layer that drove it step by step
-  would be a worse copy of the thing it is calling.
-- **The result reuses `agent_jobs` with `source = 'squatch-code'`**, so it
-  inherits the panel, the unread badge, the announcement block and the
-  ok/partial/failed vocabulary. squatch-code's own exit statuses were made to
-  match this vocabulary rather than the other way round. `runJob` branches on
-  source before any tool machinery is built: a dispatched job is not an agent
-  run and has no JOB_TOOLS, no model call in this process.
-- **The proposal is a BELL; the result is a ROBOT.** Asking is something he wants
-  to say. A finished job is not, and does not open a conversation — the same rule
-  as every other job, and the test asserts exactly one `addInitiative` call in
-  the module.
-- **The report is squatch-code's, and it is bound to its own record.** The far
-  side writes the prose and appends what the tools actually did — files written,
-  commands run with exit codes, `git diff --stat` — because on the first live
-  run the model reported "I identified and corrected logic errors in
-  math_utils.py… I updated these functions" having written nothing at all: file
-  untouched, git clean, all three commands failed. Nothing here paraphrases that
-  report or re-derives it; a second account could only disagree with the first.
-- Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-coding-jobs.js`.
+This is measured, not a preference. On the live corpus, of 390 bell items
+ever raised:
+
+    expired     223  57%      <- nobody acted; they aged out
+    delivered   134  34%
+    dismissed    15   4%
+    pending      10   3%
+    relocated     8   2%
+
+Expiry is the single most common end state. And for the category that
+actually needs an action - `type = 'proposal'` - the record is starker:
+**exactly one proposal has ever been raised on the bell, and it was
+dismissed.** There is no instance, in the whole history of this
+instance, of the bell-approval path producing an approved thing.
+
+Ellie put it plainly when the coding-job tool shipped with a bell
+proposal and an approve button: *"the bell is always full and I don't
+work it. I engage with initiatives in conversation, almost exclusively.
+Routing an approval through the bell means briefs sit there unapproved
+and jobs never run."*
+
+So:
+
+- **A decision she must make happens in the CONVERSATION.** He writes
+  the thing in his reply where she reads it; she answers in words; the
+  next turn acts on her answer. No panel, no button, no leaving the chat.
+- **The bell is for things worth SAYING** - an observation, a question,
+  a self-fact he could not resolve. Ignoring one of those costs nothing;
+  it expires and that is a legitimate end.
+- **The jobs panel is for RESULTS**, which is why it is safe: nothing
+  there has to be acted on, so nothing rots by being ignored. The
+  ROBOT/BELL split is unchanged, and this adds a third rule to it - not
+  every non-result belongs on the bell either.
+- **A refusal or a block must be LOUD in the turn**, for the same reason.
+  A guard that silently declines reproduces the failure exactly: work
+  that never happens, and nothing saying so. `dispatch_coding_job`
+  returns its refusal in words the model can act on immediately, and
+  writes an ops line.
+
+**`create_cron_job` still has this defect.** It proposes to the bell and
+waits for an approve button, and it is the one proposal in the record
+above - raised once, dismissed. It has not been changed yet; Ellie wants
+to look at what is on the bell before deciding what moves. Do not copy
+its approval mechanism into anything new, which is exactly how the
+coding-job tool acquired it.
+
+## ⚠️ Coding work goes to squatch-code, and the approval is a SENTENCE
+
+`db/coding-jobs.js` + `db/brief-shown.js` + `mcp/tools/dispatch-coding-job.js`,
+shipped 2026-08-21, OFF by default (`tools.codingJobs.enabled`). Ellie and
+the entity talk a change through; he writes the brief IN HIS REPLY; she
+says send it; it dispatches. The write-up lands in the jobs panel. It
+removes a clipboard from a loop she already ran by hand.
+
+- **It shipped through the bell first, and that was wrong.** See the
+  doctrine above. The approval is conversational: her "send it" IS the
+  approval and the tool call is what carries it out. There is no
+  proposal row, no pending state and nothing to approve later, because
+  by the time the tool is called the decision is made.
+- **The guard is that she must have SEEN the brief**, not that she used
+  approving words. `db/brief-shown.js` refuses any brief that does not
+  already appear in an earlier assistant message in this conversation,
+  or in her own message. The timing is what makes it work: `server.js`
+  stores her message BEFORE tools run and the reply AFTER, so a brief
+  the model is composing this turn has nothing to match, and a dispatch
+  on the drafting turn fails structurally.
+- **Deliberately NOT a phrase classifier.** The rule for triggers is
+  that they are built from her messages, measured - and there are zero
+  measured instances of her saying "send it to the coder", because the
+  feature did not exist. A phrase list written now would be invention,
+  and would fail the first time she said it differently.
+- **The same check does the fidelity job.** The comparison that proves
+  the brief was shown also measures how closely it matches, so a
+  paraphrase is dispatched but MARKED - `match_ratio` and `match_exact`
+  on the row, and the tool tells him to quote what was actually sent.
+  Both texts then sit in the scrollback and a divergence is hers to see.
+  One mechanism, both jobs.
+- **"Change X and send it" in one message is refused, on purpose.** The
+  revised brief was never shown, so he must write it out and wait for
+  another go-ahead. That is one extra round trip on a natural phrasing,
+  and it is the point: she sees the change she asked for before it runs.
+- **CROSS-CONVERSATION IS NOT SUPPORTED, and does not need to be.**
+  Conversations here are per-session - 203 of 229 last under an hour and
+  none spans more than 2.1 days - so "send that one from yesterday" is a
+  new conversation with nothing to match. Checked before scoping: of 621
+  real user messages, exactly ONE contains a back-reference of the "we
+  talked about" form, and that one is text she pasted FROM Claude. The
+  pattern does not occur. If it ever does the cost is one turn - he
+  writes the brief out again and she says go - which is the ordinary
+  flow, not a dead end.
+- **A git restore point is the safety property, and the allowlist is
+  not.** squatch-code commits any dirty work first so hers stays
+  separable, commits a baseline, and the report carries
+  `git reset --hard <sha>`. Ellie chose the command allowlist knowing it
+  is a speed bump: an allowed interpreter can run anything. Every
+  project under `Projects/` was made a git repository as part of
+  shipping this, because without one `reversible: true` would be a lie.
+- **ONE COARSE TOOL.** No read_file/write_file surface here -
+  squatch-code has its own agentic loop and model; a tool layer driving
+  it step by step would be a worse copy of the thing it calls.
+- **The result reuses `agent_jobs` with `source = 'squatch-code'`**, so
+  it inherits the panel, badge, announcement block and ok/partial/failed
+  vocabulary. `runJob` branches on source before any tool machinery is
+  built: a dispatched job is not an agent run and has no JOB_TOOLS.
+- **The report is squatch-code's, bound to its own record.** The far
+  side appends what the tools actually did - files written, commands and
+  exit codes, `git diff --stat` - because on the first live run the
+  model reported "I updated these functions" having written nothing:
+  file untouched, git clean, all three commands failed. Nothing here
+  paraphrases that report; a second account could only disagree.
+- Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-coding-jobs.js`
+  and `scripts/test-brief-shown.js`.
 
 ## ⚠ A result has a FORM, and the form is derived, not chosen
 

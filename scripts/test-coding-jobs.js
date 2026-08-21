@@ -45,91 +45,164 @@ cfgMod.getConfig = () => {
 };
 
 function db() { return getSqliteDb(); }
+
+/** A real conversation with a real assistant message in it.
+
+    Uses the same API the chat route uses rather than raw SQL: a test
+    that inserts rows by hand is testing its own SQL, not the shape the
+    guard will actually see. */
+function conversationShowing(text) {
+  const id = database.createConversation('test', 'test-model');
+  database.addMessage(id, 'assistant', text, 'test-model');
+  return id;
+}
 function clean() {
   db().prepare('DELETE FROM coding_jobs').run();
   db().prepare('DELETE FROM agent_jobs').run();
 }
 
 (async () => {
-  console.log('\ncoding jobs: proposing\n');
+  const SHOWN = 'Refactor the auth module in src/auth.py to use signed tokens '
+    + 'instead of session cookies, keep the existing tests passing, and add a '
+    + 'test for token expiry.';
 
-  await test('a valid brief is proposed, not started', async () => {
+  function asShown(extra = {}) {
+    // She read it in her own message: the simplest way to satisfy the
+    // guard without a stored conversation.
+    return { project: 'demo', brief: SHOWN, userMessage: SHOWN, ...extra };
+  }
+
+  console.log('\ndispatching: the guard\n');
+
+  await test('a brief she has read is dispatched', async () => {
     clean();
-    const r = await codingJobs.propose({ project: 'demo', brief: 'Fix the failing tests.' });
+    const r = codingJobs.dispatch(asShown());
     assert.ok(r.ok, r.error);
-    assert.strictEqual(codingJobs.get(r.id).status, 'proposed');
-    const queued = db().prepare('SELECT COUNT(*) AS n FROM agent_jobs').get().n;
-    assert.strictEqual(queued, 0, 'proposing must not enqueue anything');
+    assert.strictEqual(agentJobs.getJob(r.agentJobId).source, codingJobs.SOURCE);
+    assert.strictEqual(agentJobs.getJob(r.agentJobId).task, SHOWN);
   });
 
-  await test('an unknown project is refused, and says what exists', async () => {
+  await test('a brief she has NOT seen is refused, and nothing is queued', async () => {
     clean();
-    const r = await codingJobs.propose({ project: 'nosuch', brief: 'x' });
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: SHOWN,
+      userMessage: 'thanks, that all sounds sensible to me',
+    });
+    assert.ok(!r.ok, 'dispatched a brief she never read');
+    assert.ok(r.unseen);
+    assert.match(r.error, /has not seen this brief/i);
+    assert.strictEqual(db().prepare('SELECT COUNT(*) AS n FROM agent_jobs').get().n, 0);
+  });
+
+  await test('the refusal tells the model what to do instead', async () => {
+    clean();
+    const r = codingJobs.dispatch({ project: 'demo', brief: SHOWN, userMessage: 'go' });
+    assert.match(r.error, /write the brief out/i);
+    assert.match(r.error, /once she says to/i);
+  });
+
+  await test('a brief shown in an earlier reply is dispatched', async () => {
+    clean();
+    const convo = conversationShowing('Here is what I would send:\n\n' + SHOWN);
+
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: SHOWN, conversationId: convo,
+      userMessage: 'yep, send that to the coder',
+    });
+    assert.ok(r.ok, r.error);
+    assert.match(String(r.matchedIn), /earlier reply/);
+  });
+
+  await test('a DIFFERENT brief in the same conversation is still refused', async () => {
+    clean();
+    const convo = conversationShowing(SHOWN);
+
+    const r = codingJobs.dispatch({
+      project: 'demo', conversationId: convo, userMessage: 'send it',
+      brief: 'Rewrite the billing exporter to emit CSV and delete the old XML path.',
+    });
+    assert.ok(!r.ok, 'a swapped brief passed the guard');
+  });
+
+  await test('"change X and send it" in one message is refused, as designed', async () => {
+    clean();
+    const convo = conversationShowing(SHOWN);
+
+    const revised = SHOWN.replace('signed tokens', 'refresh tokens with rotation')
+      + ' Also migrate the existing sessions table and drop the cookie helper.';
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: revised, conversationId: convo,
+      userMessage: 'use refresh tokens instead and send it',
+    });
+    assert.ok(!r.ok, 'dispatched a revision she had not been shown');
+  });
+
+  await test('a brief with no conversation context at all is refused', async () => {
+    clean();
+    const r = codingJobs.dispatch({ project: 'demo', brief: SHOWN });
+    assert.ok(!r.ok, 'failed open with no context');
+    assert.match(r.error, /no way to tell/i);
+  });
+
+  await test('a trivially short brief is refused', async () => {
+    clean();
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: 'fix it', userMessage: 'fix it',
+    });
+    assert.ok(!r.ok);
+    assert.match(r.error, /too short/i);
+  });
+
+  console.log('\ndispatching: fidelity\n');
+
+  await test('an exact send is recorded as exact', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown());
+    assert.ok(r.exact, 'word-for-word send was not marked exact');
+    assert.strictEqual(codingJobs.get(r.id).match_exact, 1);
+  });
+
+  await test('a paraphrase is dispatched but marked', async () => {
+    clean();
+    const paraphrased = SHOWN.replace('Refactor', 'Please refactor')
+      .replace('add a test for token expiry', 'add a test covering token expiry');
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: paraphrased, userMessage: SHOWN,
+    });
+    assert.ok(r.ok, r.error);
+    assert.ok(!r.exact, 'a reworded brief was reported as word-for-word');
+    assert.ok(r.ratio >= 0.8 && r.ratio < 1);
+    assert.strictEqual(codingJobs.get(r.id).match_exact, 0);
+  });
+
+  await test('what was actually sent is what is stored and queued', async () => {
+    clean();
+    const paraphrased = 'Please ' + SHOWN.toLowerCase();
+    const r = codingJobs.dispatch({
+      project: 'demo', brief: paraphrased, userMessage: SHOWN,
+    });
+    assert.strictEqual(codingJobs.get(r.id).brief, paraphrased);
+    assert.strictEqual(agentJobs.getJob(r.agentJobId).task, paraphrased);
+  });
+
+  console.log('\ndispatching: the ordinary refusals\n');
+
+  await test('an unknown project is refused before the guard', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown({ project: 'nosuch' }));
     assert.ok(!r.ok);
     assert.match(r.error, /no project called/i);
-    assert.match(r.error, /demo/, 'should list what is available');
+    assert.match(r.error, /demo/);
   });
 
-  await test('a path is refused rather than normalised', async () => {
+  await test('a path instead of a name is refused', async () => {
     for (const name of ['../etc', '/etc', './demo', 'a/b']) {
-      const r = await codingJobs.propose({ project: name, brief: 'x' });
-      assert.ok(!r.ok, `${name} should be refused`);
+      assert.ok(!codingJobs.dispatch(asShown({ project: name })).ok, name);
     }
   });
 
   await test('an empty brief is refused', async () => {
-    const r = await codingJobs.propose({ project: 'demo', brief: '   ' });
-    assert.ok(!r.ok);
-  });
-
-  await test('pending proposals are capped', async () => {
-    clean();
-    for (let i = 0; i < 3; i++) {
-      const r = await codingJobs.propose({ project: 'demo', brief: `job ${i}` });
-      assert.ok(r.ok, r.error);
-    }
-    const r = await codingJobs.propose({ project: 'demo', brief: 'one too many' });
-    assert.ok(!r.ok);
-    assert.match(r.error, /limit/i);
-  });
-
-  console.log('\ncoding jobs: approving\n');
-
-  await test('approving enqueues an agent job with the squatch-code source', async () => {
-    clean();
-    const p = await codingJobs.propose({ project: 'demo', brief: 'Fix the tests.' });
-    const a = codingJobs.approve(p.id);
-    assert.ok(a.ok, a.error);
-    const job = agentJobs.getJob(a.agentJobId);
-    assert.strictEqual(job.source, codingJobs.SOURCE);
-    assert.strictEqual(job.task, 'Fix the tests.');
-    assert.strictEqual(job.status, 'queued');
-  });
-
-  await test('her edit is what runs, and both are kept', async () => {
-    clean();
-    const p = await codingJobs.propose({ project: 'demo', brief: 'his version' });
-    const a = codingJobs.approve(p.id, { editedBrief: 'her version' });
-    assert.ok(a.editedByHer);
-    assert.strictEqual(agentJobs.getJob(a.agentJobId).task, 'her version');
-    const row = codingJobs.get(p.id);
-    assert.strictEqual(row.brief, 'his version', 'the original ask must survive');
-    assert.strictEqual(row.final_brief, 'her version');
-  });
-
-  await test('a proposal cannot be approved twice', async () => {
-    clean();
-    const p = await codingJobs.propose({ project: 'demo', brief: 'x' });
-    assert.ok(codingJobs.approve(p.id).ok);
-    assert.ok(!codingJobs.approve(p.id).ok);
-  });
-
-  await test('rejecting starts nothing', async () => {
-    clean();
-    const p = await codingJobs.propose({ project: 'demo', brief: 'x' });
-    assert.ok(codingJobs.reject(p.id, { note: 'not now' }).ok);
-    assert.strictEqual(codingJobs.get(p.id).status, 'rejected');
-    assert.strictEqual(db().prepare('SELECT COUNT(*) AS n FROM agent_jobs').get().n, 0);
+    assert.ok(!codingJobs.dispatch(asShown({ brief: '   ' })).ok);
   });
 
   console.log('\na job that writes is never retried\n');
@@ -218,32 +291,58 @@ function clean() {
       'a job result must never be able to open a conversation');
   });
 
-  await test('the proposal is a bell item, and only the proposal', () => {
+  await test('NOTHING about coding jobs touches the bell', () => {
+    // The rule Ellie drew from 223 expired bell items: nothing that has
+    // to be acted on goes there. A brief on the bell is a job that never
+    // runs.
     const src = fs.readFileSync(path.join(__dirname, '../db/coding-jobs.js'), 'utf8');
-    const initiativeUses = (src.match(/addInitiative/g) || []).length;
-    assert.strictEqual(initiativeUses, 1,
-      'exactly one bell item: the ask. The result goes to the panel.');
-    assert.ok(/sourceKind: 'coding-job-proposal'/.test(src));
+    assert.ok(!/addInitiative/.test(src), 'a bell item crept back in');
+    assert.ok(!/initiatives/.test(src), 'coding-jobs reached for the bell');
+    const tool = fs.readFileSync(
+      path.join(__dirname, '../mcp/tools/dispatch-coding-job.js'), 'utf8');
+    assert.ok(!/addInitiative|initiatives/.test(tool), 'the tool reached for the bell');
   });
 
   console.log('\nthe tool\n');
 
-  await test('the tool proposes and never claims a result', async () => {
+  await test('the tool dispatches and never claims a result', async () => {
     clean();
+    const SHOWN2 = 'Refactor the auth module in src/auth.py to use signed tokens '
+      + 'instead of session cookies and keep the existing tests passing.';
     const Tool = require('../mcp/tools/dispatch-coding-job');
-    const t = new Tool();
-    const r = await t.execute({ project: 'demo', brief: 'do the thing' }, {});
-    assert.ok(r.success);
-    assert.strictEqual(r.status, 'awaiting-approval');
-    assert.match(r.message, /not have a result/i);
-    assert.match(r.message, /no file has been touched/i);
+    const r = await new Tool().execute(
+      { project: 'demo', brief: SHOWN2 }, { userMessage: SHOWN2 });
+    assert.ok(r.success, r.error);
+    assert.strictEqual(r.status, 'running');
+    assert.match(r.message, /not\s+have a result/i);
+    assert.match(r.message, /jobs panel/i);
   });
 
-  await test('a refusal tells him to say so rather than imply work', async () => {
+  await test('an unseen brief tells him to write it out, not to claim a send', async () => {
+    clean();
     const Tool = require('../mcp/tools/dispatch-coding-job');
-    const r = await new Tool().execute({ project: 'nosuch', brief: 'x' }, {});
+    const r = await new Tool().execute(
+      { project: 'demo',
+        brief: 'Refactor the auth module in src/auth.py to use signed tokens '
+             + 'instead of session cookies and keep the tests passing.' },
+      { userMessage: 'sounds good' });
     assert.ok(!r.success);
     assert.match(r.message, /Nothing was sent/);
+    assert.match(r.message, /write the brief out/i);
+    assert.match(r.message, /must not claim|do not claim/i);
+  });
+
+  await test('a paraphrase is flagged back to him', async () => {
+    clean();
+    const SHOWN3 = 'Refactor the auth module in src/auth.py to use signed tokens '
+      + 'instead of session cookies and keep the existing tests passing.';
+    const Tool = require('../mcp/tools/dispatch-coding-job');
+    const r = await new Tool().execute(
+      { project: 'demo', brief: 'Please ' + SHOWN3.toLowerCase() },
+      { userMessage: SHOWN3 });
+    assert.ok(r.success, r.error);
+    assert.match(r.message, /not word for word/i);
+    assert.match(r.message, /quote the brief/i);
   });
 
   await test('it is registered in the catalogue and off by default', () => {

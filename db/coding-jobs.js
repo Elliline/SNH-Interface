@@ -1,49 +1,42 @@
 /**
- * coding-jobs — handing work to squatch-code.
+ * coding-jobs — handing coding work to squatch-code.
  *
- * Ellie and the entity settle on what to do in chat; she says "send it to
- * squatch-code"; he writes the brief, she approves it, and it goes. The
- * point is removing the clipboard from a loop she already runs by hand.
+ * Ellie and the entity talk a problem through in chat. He writes the
+ * brief IN HIS REPLY, where she reads it. She says send it. It
+ * dispatches. That is the whole interface.
  *
- * THIS TOOL COMBINES TWO PATTERNS THAT HAVE ALWAYS BEEN SEPARATE HERE, and
- * the reason is worth stating because each existing tool argues the opposite
- * case for itself:
+ * NOTHING GOES THROUGH THE BELL. This shipped as a bell proposal with an
+ * approve button, and that was wrong - not as a preference, as a
+ * mechanism that does not work here. Measured on the live corpus: of 390
+ * bell items ever raised, 223 EXPIRED (57%), and of proposals - the ones
+ * that actually require an action - exactly one has ever been raised and
+ * it was DISMISSED. There is no instance of the bell-approval path
+ * producing an approved thing. A brief routed there would have sat until
+ * it aged out, and the job would never have run.
  *
- *   - create_cron_job is PROPOSE-ONLY. She decides, because a cron job
- *     recurs forever.
- *   - start_background_job is DIRECT-EXECUTE, and says so in its own header:
- *     "starting a read-only background lookup is not a decision that needs
- *     Ellie's approval — it changes nothing".
+ * So the approval is conversational. Her "send it" IS the approval, and
+ * the tool call is what it authorises. There is no proposal row waiting
+ * on a decision, because by the time this is called the decision is made.
  *
- * That last clause is exactly what fails here. A coding job WRITES FILES on
- * her machine, unattended, with nobody at squatch-code's approval prompt. So
- * it takes the cron tool's gate and the job tool's handoff: proposed, shown
- * to her, approved, and only then dispatched — and once dispatched it runs
- * without further consent, because there is nobody to ask. WHAT SHE APPROVES
- * IS THE BRIEF, NOT THE ACTIONS. Everything downstream depends on that being
- * understood, so the proposal shows her the brief verbatim.
+ * THE GUARD IS THAT SHE MUST HAVE SEEN IT. db/brief-shown.js refuses any
+ * brief that does not already appear in this conversation - in an earlier
+ * reply, or in her own message. That is what stops a dispatch on the
+ * drafting turn, structurally rather than by guessing at how she phrases
+ * a go-ahead. See that file for why not a phrase classifier.
  *
  * WHAT KEEPS A BAD JOB SURVIVABLE, in the order it matters:
  *
- *   1. A git restore point, committed inside the project before the run
- *      starts. Ellie named this as the thing she actually cares about: a
- *      dispatched job with no way back is the risk. squatch-code takes it and
- *      reports the command that undoes the whole job.
- *   2. Path containment inside squatch-code, confining every file tool to
- *      Projects/<name>.
- *   3. A command allowlist. A speed bump on top of the restore point, and
- *      she accepted it as one — an allowed interpreter can run anything.
+ *   1. A git restore point committed inside the project before the run
+ *      starts. Ellie named this as the risk she actually cares about.
+ *   2. Path containment inside squatch-code, confining every file tool
+ *      to Projects/<name>.
+ *   3. A command allowlist - a speed bump on the restore point, and she
+ *      accepted it as one.
  *
- * THE RESULT REUSES agent_jobs ON PURPOSE. A dispatched job is enqueued with
- * source 'squatch-code', so it inherits the jobs panel, the unread badge, the
- * announcement block, the seen/announced stamps and the ok/partial/failed
- * vocabulary without a second panel that could disagree with the first.
- * squatch-code's own exit statuses were made to match this vocabulary rather
- * than the other way round.
- *
- * AND THE RESULT IS STILL A ROBOT, NEVER A BELL. A finished coding job lands
- * in the panel and does not open a conversation. The PROPOSAL is a bell item,
- * because asking is something he wants to say; the RESULT is not.
+ * THE RESULT REUSES agent_jobs, so it inherits the jobs panel, the badge,
+ * the announcement block and the ok/partial/failed vocabulary. The panel
+ * is the right home for a RESULT: nothing there has to be acted on, so
+ * nothing rots by being ignored.
  */
 
 const { randomUUID } = require('crypto');
@@ -53,6 +46,7 @@ const os = require('os');
 const path = require('path');
 
 const { getSqliteDb } = require('./database');
+const briefShown = require('./brief-shown');
 
 function cfg() {
   const c = require('./config').getConfig();
@@ -108,10 +102,16 @@ function listProjects() {
   }
 }
 
+
 /**
- * Record a proposal and raise it for Ellie. Creates NOTHING that runs.
+ * Send a brief to squatch-code. Her go-ahead already happened, in chat.
+ *
+ * Refuses unless the brief is already on her screen. A refusal comes back
+ * in words the model can act on in the same turn - write the brief out,
+ * ask - rather than as silence.
  */
-async function propose({ project, brief, conversationId = null, messageId = null }) {
+function dispatch({ project, brief, conversationId = null, messageId = null,
+                    userMessage = null }) {
   const c = cfg();
   if (c.enabled === false) {
     return { ok: false, error: 'Dispatching coding jobs is switched off in configuration.' };
@@ -121,114 +121,60 @@ async function propose({ project, brief, conversationId = null, messageId = null
   if (!v.ok) return { ok: false, error: v.error };
 
   const text = String(brief || '').trim();
-  if (!text) return { ok: false, error: 'A brief is required — say what needs doing.' };
+  if (!text) return { ok: false, error: 'A brief is required - say what needs doing.' };
   if (text.length > 4000) {
     return { ok: false, error: 'That brief is too long to dispatch (4000 characters max).' };
   }
 
-  const db = getSqliteDb();
-  if (!db) return { ok: false, error: 'The database is unavailable, so nothing was proposed.' };
-
-  const pending = db.prepare(
-    "SELECT COUNT(*) AS n FROM coding_jobs WHERE status = 'proposed'"
-  ).get().n;
-  const maxPending = c.maxPendingProposals ?? 3;
-  if (pending >= maxPending) {
-    return {
-      ok: false,
-      error: `There are already ${pending} coding jobs waiting for her approval, which is the limit (${maxPending}). Nothing was proposed — say so rather than proposing another.`
-    };
+  // THE GUARD.
+  const seen = briefShown.check(text, { conversationId, userMessage });
+  if (!seen.ok) {
+    // Loud, never silent. A guard that quietly declines reproduces the
+    // failure the bell had: work that never happens and nothing says so.
+    opsLog('dispatch_coding_job REFUSED for ' + project + ': ' + seen.reason +
+           ' (best match ' + (seen.ratio * 100).toFixed(0) + '%)');
+    return { ok: false, error: seen.reason, unseen: true, ratio: seen.ratio };
   }
+
+  const db = getSqliteDb();
+  if (!db) return { ok: false, error: 'The database is unavailable, so nothing was sent.' };
+
+  const agentJobs = require('./agent-jobs');
+  const queued = agentJobs.enqueue({
+    title: 'squatch-code: ' + project.trim(),
+    task: text,
+    why: 'Sent to squatch-code after Ellie gave the go-ahead in conversation.',
+    conversationId,
+    messageId,
+    source: SOURCE,
+  });
+  if (!queued.ok) return queued;
 
   const id = randomUUID();
-  db.prepare(`
-    INSERT INTO coding_jobs (id, project, brief, status, conversation_id, message_id, created_at)
-    VALUES (?, ?, ?, 'proposed', ?, ?, ?)
-  `).run(id, v.dir && project.trim(), text, conversationId, messageId, new Date().toISOString());
+  db.prepare(
+    'INSERT INTO coding_jobs (id, project, brief, status, conversation_id, ' +
+    'message_id, agent_job_id, match_ratio, match_exact, created_at) ' +
+    "VALUES (?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?)"
+  ).run(id, project.trim(), text, conversationId, messageId, queued.id,
+        seen.ratio, seen.exact ? 1 : 0, new Date().toISOString());
 
-  // The bell carries the ASK. She sees the brief verbatim, because the brief
-  // is the thing she is approving.
-  let initiativeId = null;
-  try {
-    const initiatives = require('./initiatives');
-    initiativeId = await initiatives.addInitiative({
-      type: 'proposal',
-      content: `I'd like to send this to squatch-code, working in Projects/${project.trim()}:\n\n${text}\n\nApprove it and it runs unattended — it can edit files in that project and run test commands there. A restore point is committed first, so the whole job can be undone. Reject it and nothing happens.`,
-      sourceKind: 'coding-job-proposal',
-      sourceRef: id,
-      priority: 7
-    });
-    if (initiativeId) {
-      db.prepare('UPDATE coding_jobs SET initiative_id = ? WHERE id = ?').run(initiativeId, id);
-    }
-  } catch (err) {
-    console.error('[CodingJobs] could not raise initiative:', err.message);
-  }
+  opsLog('dispatch_coding_job sent to ' + project + ': "' + text.slice(0, 80) +
+         '" (job ' + queued.id.slice(0, 8) + (seen.exact ? '' : ', paraphrased') + ')');
 
-  opsLog(`dispatch_coding_job proposed for ${project}: "${text.slice(0, 80)}" (${id.slice(0, 8)}, awaiting approval)`);
-  return { ok: true, id, status: 'proposed' };
+  return {
+    ok: true, id, agentJobId: queued.id,
+    exact: seen.exact, ratio: seen.ratio, matchedIn: seen.source,
+  };
 }
 
+
+/** Fetch one dispatch record. */
 function get(id) {
   const db = getSqliteDb();
   if (!db) return null;
   return db.prepare('SELECT * FROM coding_jobs WHERE id = ?').get(id) || null;
 }
 
-/**
- * Approve a proposal: enqueue it as an agent job with source 'squatch-code'.
- *
- * `editedBrief` is the point of showing it to her. She approves or CORRECTS —
- * a brief she rewrote is the one that runs, and the row keeps both so the
- * record shows what he asked for and what she actually sent.
- */
-function approve(id, { editedBrief = null } = {}) {
-  const db = getSqliteDb();
-  if (!db) return { ok: false, error: 'Database unavailable.' };
-  const row = get(id);
-  if (!row) return { ok: false, error: 'No such proposal.' };
-  if (row.status !== 'proposed') {
-    return { ok: false, error: `That proposal is already "${row.status}".` };
-  }
-
-  const finalBrief = (editedBrief && String(editedBrief).trim()) || row.brief;
-  const v = validateProject(row.project);
-  if (!v.ok) return { ok: false, error: v.error };
-
-  const agentJobs = require('./agent-jobs');
-  const queued = agentJobs.enqueue({
-    title: `squatch-code: ${row.project}`,
-    task: finalBrief,
-    why: 'Dispatched to squatch-code after Ellie approved the brief.',
-    conversationId: row.conversation_id,
-    messageId: row.message_id,
-    source: SOURCE
-  });
-  if (!queued.ok) return queued;
-
-  db.prepare(`
-    UPDATE coding_jobs
-    SET status = 'approved', decided_at = ?, final_brief = ?, agent_job_id = ?
-    WHERE id = ?
-  `).run(new Date().toISOString(), finalBrief, queued.id, id);
-
-  opsLog(`coding job ${id.slice(0, 8)} approved -> agent job ${queued.id.slice(0, 8)} (${row.project})`);
-  return { ok: true, id, agentJobId: queued.id, editedByHer: finalBrief !== row.brief };
-}
-
-function reject(id, { note = null } = {}) {
-  const db = getSqliteDb();
-  if (!db) return { ok: false, error: 'Database unavailable.' };
-  const row = get(id);
-  if (!row) return { ok: false, error: 'No such proposal.' };
-  if (row.status !== 'proposed') {
-    return { ok: false, error: `That proposal is already "${row.status}".` };
-  }
-  db.prepare("UPDATE coding_jobs SET status = 'rejected', decided_at = ?, decided_note = ? WHERE id = ?")
-    .run(new Date().toISOString(), note, id);
-  opsLog(`coding job ${id.slice(0, 8)} rejected (${row.project})`);
-  return { ok: true, id };
-}
 
 /**
  * Run a dispatched job by shelling out to squatch-job.
@@ -352,9 +298,7 @@ function readReport(reportPath, fallback) {
 module.exports = {
   SOURCE,
   DEFAULT_ALLOWED_COMMANDS,
-  propose,
-  approve,
-  reject,
+  dispatch,
   get,
   runDispatched,
   readReport,
