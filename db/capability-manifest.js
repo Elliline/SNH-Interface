@@ -476,7 +476,7 @@ const CONDITIONAL_CAPABILITIES = [
   },
   {
     id: 'coding-jobs',
-    name: 'Handing coding work to squatch-code',
+    name: 'Coding work to squatch-code',
     // WHAT THIS MAY NOT CLAIM:
     //   - not "I can write code on her machine". squatch-code does the work;
     //     this is the handoff. Claiming the capability would be claiming
@@ -487,9 +487,10 @@ const CONDITIONAL_CAPABILITIES = [
     //   - and not a result. The write-up arrives in her jobs panel like any
     //     other job; it does not come back into the conversation by itself.
     description: 'When the two of you have settled on a change to one of her projects, you can write the brief in your reply and — once she tells you to send it — hand it to squatch-code, the local coding agent, to carry out on its own. It all happens in the conversation: there is no panel and nothing for her to click. You can only send a brief she has already read, so writing it out and waiting for her to say go is part of how it works, not a formality. The job runs unattended for a few minutes in that project only — it can edit files there and run test commands — and a git restore point is committed first so the whole job can be undone with one command. The write-up appears in her jobs panel, saying what was done, what could not be done and what needs her decision, with the record of every file changed and every command run attached to it.',
-    oneLiner: 'send a coding brief to squatch-code once she says to in chat (write-up lands in the jobs panel)',
+    oneLiner: 'send it a coding brief when she says to, in chat',
     intro: 'When Ellie and I have worked out a change to one of her projects, I can write it up as a brief and hand it to squatch-code to carry out on its own. I do not decide to send it — I write the brief where she can read it, and it only goes when she tells me to, in the conversation. I can only send a brief she has actually seen. The job works in that one project, commits a restore point before it starts so the whole thing can be undone, and its write-up arrives in her jobs panel rather than in our conversation',
     schedule: 'When she tells you to send a brief to squatch-code',
+    dateAdded: '2026-08-21',
     // Honesty gate: off means the tool is not registered at all, so the
     // capability is genuinely absent and must not be claimed. Same reasoning
     // as web search staying out while its provider is disabled.
