@@ -56,8 +56,35 @@ function cosine(a, b) {
     .filter(f => !f.locked)
     .sort((a, b) => (b.salience - a.salience) || (new Date(a.created_at) - new Date(b.created_at)));
 
+  // READ the stored vectors rather than regenerating them. This loop had
+  // the same defect as the one in processSelfFacts: one embedding round
+  // trip per active self-fact, ~950ms each, to reproduce vectors already
+  // sitting in cluster_embeddings (verified identical, cosine 1.000000).
+  // At 402 facts that is over six minutes before this script decides
+  // anything; it grows with the corpus and this script exists to be run
+  // on a corpus that has grown.
+  const storedEmbs = await mc.getStoredEmbeddings(facts.map(f => f.id));
   const embs = [];
-  for (const f of facts) { const e = await mc.generateEmbedding(f.content); embs.push(e ? Array.from(e) : null); }
+  let embeddedOnDemand = 0;
+  for (const f of facts) {
+    let e = storedEmbs.get(f.id);
+    if (!e) { e = await mc.generateEmbedding(f.content); embeddedOnDemand++; }
+    embs.push(e ? Array.from(e) : null);
+  }
+  const missingVectors = embs.filter(e => !e).length;
+  if (embeddedOnDemand) {
+    console.log(`${embeddedOnDemand}/${facts.length} fact(s) had no stored vector and were embedded on demand.`);
+  }
+  // A dedup run that cannot see part of the corpus is not a dedup run.
+  // Refusing is the only safe answer here: this script SUPERSEDES facts,
+  // and deciding which of two is a duplicate while blind to some of them
+  // is how the July near-miss on his name happened.
+  if (missingVectors) {
+    console.error(`\nREFUSING TO RUN: ${missingVectors} of ${facts.length} self-facts have no usable embedding.`);
+    console.error('Deduplicating while blind to part of the corpus can supersede a fact whose');
+    console.error('near-duplicate was never compared. Fix the embedding provider and re-run.');
+    process.exit(2);
+  }
 
   const kept = []; // { id, content, emb }
   const supersessions = []; // { dupId, dupContent, keepId, keepContent, sim }

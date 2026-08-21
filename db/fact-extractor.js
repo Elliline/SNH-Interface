@@ -2305,6 +2305,62 @@ async function applySelfFactRaises(raises, { source = 'reflection', dailyDir = n
  * @param {string} [opts.memoryDir=MEMORY_DIR]
  * @returns {Promise<{stored:number, superseded:number, facts:Array}>}
  */
+/**
+ * Tell her, at most once a window, that the self-fact dedup did not run.
+ *
+ * ON THE BELL DELIBERATELY, and consistent with the rule that nothing
+ * requiring an ACTION goes there: this needs no action from her. It is
+ * him reporting that a guard over his own memory was not applied, which
+ * is his voice about his own identity - exactly what that channel is for,
+ * and the same reasoning as the self-fact raise alert.
+ *
+ * The window is hard for the same reason: an embedding provider that is
+ * down fails on every pass, and the failure to avoid is one alert per
+ * pass. One alert saying it has happened repeatedly is quieter and more
+ * useful.
+ */
+async function alertDedupSkipped(err, factCount) {
+  try {
+    const db = require('./database').getSqliteDb();
+    if (!db) return;
+
+    const hours = Number.isFinite(cfgIdentity().selfFactRaiseAlertHours)
+      ? cfgIdentity().selfFactRaiseAlertHours : 24;
+    const since = new Date(Date.now() - hours * 3600_000).toISOString();
+
+    // ANY status: pending, delivered, dismissed and expired all mean he
+    // has already said this recently.
+    const recent = db.prepare(`
+      SELECT id FROM initiatives
+      WHERE source_kind = 'self-fact-dedup-skipped' AND datetime(created_at) > datetime(?)
+      ORDER BY datetime(created_at) DESC LIMIT 1
+    `).get(since);
+    if (recent) {
+      console.log(`[SelfFacts] dedup-skipped alert suppressed — one already stands (window ${hours}h)`);
+      return;
+    }
+
+    const initiatives = require('./initiatives');
+    await initiatives.addInitiative({
+      type: 'alert',
+      content:
+        `Something I should tell you about my own memory: the check that stops me ` +
+        `recording the same thing about myself twice did not run just now, and I ` +
+        `stored ${factCount === 1 ? 'an observation' : `${factCount} observations`} ` +
+        `without it. Nothing was lost and nothing was overwritten — but if you see ` +
+        `me repeating myself in my self-facts, this is why. It could not compare ` +
+        `against what I already hold (${err.message}).`,
+      sourceKind: 'self-fact-dedup-skipped',
+      sourceRef: `dedup-skipped-${new Date().toISOString()}`,
+      priority: 7,
+      dedupe: false   // the window above IS the dedup
+    });
+  } catch (alertErr) {
+    console.error('[SelfFacts] could not raise dedup-skipped alert:', alertErr.message);
+  }
+}
+
+
 async function processSelfFacts(rawSelfFacts, opts = {}) {
   const source = opts.source || 'reflection';
   const memoryDir = opts.memoryDir || MEMORY_DIR;
@@ -2384,9 +2440,32 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       const threshold = Number.isFinite(cfg.identity?.selfFactDedupThreshold)
         ? cfg.identity.selfFactDedupThreshold : 0.88;
       const activeExisting = memoryClusters.getSelfFacts({ status: 'active' });
+
+      // READ the vectors, do not regenerate them. Every active self-fact
+      // already has its embedding in cluster_embeddings, written when the
+      // fact was stored. This loop used to call generateEmbedding() for
+      // each one on every pass: 402 sequential round trips at ~950ms,
+      // 6.3 MINUTES measured, to reproduce what was already on disk
+      // (cosine 1.000000 between stored and fresh, every sample). And it
+      // is O(n) in a corpus that only grows - 20 minutes at 1,300 facts,
+      // 35 at 2,200 - paid by reflection on most days.
+      //
+      // Only what has no stored vector is embedded, which in practice is
+      // nothing, and after a rebuild is a handful.
+      const storedEmbs = await memoryClusters.getStoredEmbeddings(
+        activeExisting.map(ef => ef.id));
       const existingEmbs = [];
+      let embeddedOnDemand = 0;
       for (const ef of activeExisting) {
-        existingEmbs.push({ content: ef.content, emb: await memoryClusters.generateEmbedding(ef.content) });
+        let emb = storedEmbs.get(ef.id);
+        if (!emb) {
+          emb = await memoryClusters.generateEmbedding(ef.content);
+          embeddedOnDemand++;
+        }
+        existingEmbs.push({ content: ef.content, emb });
+      }
+      if (embeddedOnDemand) {
+        console.log(`[SelfFacts] ${embeddedOnDemand}/${activeExisting.length} active self-facts had no stored vector and were embedded on demand`);
       }
       const acceptedEmbs = [];
       const deduped = [];
@@ -2410,7 +2489,30 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       facts.length = 0;
       facts.push(...deduped);
     } catch (dedupErr) {
+      // A DEDUP THAT COULD NOT RUN IS THE WORST OUTCOME HERE, and it used
+      // to be one console.error. It does not fail - it just stops
+      // defending, and the observation is stored undeduped as though it
+      // had been checked. This module exists to keep reworded restamps out
+      // of his identity; silently not doing that is indistinguishable from
+      // doing it, right up until the corpus is full of near-duplicates.
+      //
+      // Found while instrumenting this path: a wrapper accidentally made
+      // getSelfFacts return a Promise, the block threw "activeExisting is
+      // not iterable", and the run completed reporting success with the
+      // dedup skipped entirely. Nothing said so louder than a log line.
+      //
+      // Three tiers, the same shape as a self-fact raise: the result, the
+      // ops log, and the bell - because this is him saying something about
+      // his own memory, not a job result, and the bell is what she reads.
+      result.dedupSkipped = { reason: dedupErr.message };
       console.error('[SelfFacts] Semantic dedup skipped (continuing):', dedupErr.message);
+      try {
+        appendToOpsLog(
+          `Self-fact dedup did NOT run (${dedupErr.message}) — ${facts.length} observation(s) were stored without being checked against existing self-facts.`,
+          path.join(memoryDir, 'ops')
+        );
+      } catch (_) { /* best-effort */ }
+      await alertDedupSkipped(dedupErr, facts.length);
     }
     if (facts.length === 0) return result;
 

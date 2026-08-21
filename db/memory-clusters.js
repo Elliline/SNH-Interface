@@ -1303,6 +1303,48 @@ function renderLongTermMemory({ subject = 'user', budgetTokens = null } = {}) {
  *   (identity injection uses 'dissonance' to keep audit records out of chat).
  * @returns {Array} cluster_member rows with cluster_name + claim_type attached
  */
+/**
+ * Stored embeddings for a set of cluster members, keyed by member id.
+ *
+ * WHY THIS EXISTS. The self-fact dedup sweep called generateEmbedding()
+ * for every active self-fact on every pass - 402 sequential round trips
+ * to the embedding model at ~950ms each, 6.3 MINUTES per call, measured -
+ * to reproduce vectors that were already sitting in cluster_embeddings.
+ * Verified identical: cosine 1.000000 between a stored vector and a
+ * freshly generated one, on every sample.
+ *
+ * It is O(n) in a corpus that only grows: 6.4 min at 402 facts, 20.6 at
+ * 1,300, 35 at 2,200. Reflection pays it on every pass that concludes
+ * anything about him, which is most days.
+ *
+ * Returns a Map(member_id -> Float32Array|number[]). A member with no
+ * stored vector is simply absent, and the caller embeds that one.
+ */
+async function getStoredEmbeddings(memberIds = []) {
+  const wanted = new Set((memberIds || []).filter(Boolean));
+  const found = new Map();
+  if (!wanted.size) return found;
+
+  try {
+    const table = getClusterEmbeddingsTable();
+    if (!table) return found;
+
+    // One scan, filtered in memory. The alternative - a filter string per
+    // id - is n queries, which is the shape being removed.
+    const rows = await table.filter('true').limit(100000).execute();
+    for (const row of rows) {
+      if (row && row.member_id && wanted.has(row.member_id) && row.vector) {
+        found.set(row.member_id, row.vector);
+      }
+    }
+  } catch (err) {
+    // No vectors is a reason to embed, never a reason to fail.
+    console.error('[Clusters] could not read stored embeddings:', err.message);
+  }
+  return found;
+}
+
+
 function getSelfFacts({ status = 'active', limit = null, claimType = null, excludeClaimType = null } = {}) {
   try {
     const db = getSqliteDb();
@@ -1760,6 +1802,7 @@ module.exports = {
   getClusters,
   getCluster,
   getSelfFacts,
+  getStoredEmbeddings,
   generateEmbedding,
   cosineSimilarity,
   generateClusterNameFromMembers,

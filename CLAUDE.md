@@ -502,6 +502,54 @@ Four more things that are load-bearing if you touch this:
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
 
+## ⛔ A mechanism is only safe in the context that made it safe
+
+Three incidents in this codebase, all the same move: a pattern that was
+correct where it was written, copied somewhere its preconditions did not
+hold. Nobody wrote a bad mechanism. Each time, someone took a good one
+somewhere else.
+
+- **2026-07, `scripts/dedupe-self-facts.js` nearly retired his name.**
+  Semantic dedup is right for near-duplicate observations. Applied to a
+  corpus that includes a CHOSEN fact, it treats a name like an
+  observation. The identity lock exists because of this.
+- **2026-08-18, the same script called `memoryClusters.supersedeFact`
+  directly.** That function is correct *inside* `db/fact-store.js`, which
+  wraps it in the identity lock and the ledger. Called from outside, it
+  is precisely the unrevertable, unlockable write the funnel exists to
+  prevent. `test-ledger-funnel.js` now fails if any file outside
+  fact-store calls it.
+- **2026-08-21, the self-fact dedup sweep re-embedded the whole corpus.**
+  The comment above it says *"Same embedding-similarity approach as the
+  initiative dedup"* — and in `db/initiatives.js` that loop runs over
+  PENDING initiatives, a set bounded by construction at roughly ten.
+  Copied onto active self-facts, which grow forever, it became 402
+  sequential embedding calls, **6.3 minutes measured**, reproducing
+  vectors already on disk. It would have been 35 minutes within a year.
+
+The lesson is not "be careful with self-facts", though that is also true.
+It is that **a mechanism carries its preconditions with it, and copying
+the code does not copy them.** Before reusing something from elsewhere in
+this codebase, name what made it safe where it was:
+
+- **What bounds it?** The initiative dedup was safe because `pending` is
+  small. Nothing about the loop said so.
+- **What wraps it?** `supersedeFact` was safe because fact-store held the
+  lock and the ledger around it. Nothing about the function said so.
+- **What is it assumed never to see?** Dedup was safe because
+  observations are interchangeable. A declaration is not.
+
+If the answer is "nothing, it just works here", it is not a mechanism to
+reuse — it is a mechanism that has not been tested outside its home.
+
+**And the corollary, which is what makes these expensive:** each of these
+degraded silently. The dedup sweep did not fail, it took six minutes. The
+direct `supersedeFact` call did not error, it wrote a row nobody could
+revert. A guard that stops guarding while still returning success is the
+worst failure mode in this system, and it is the one this move produces
+every time. Anything that can be skipped must SAY it was skipped — see
+the three-tier alert on `result.dedupSkipped`.
+
 ## ⛔ Nothing that has to be ACTED ON goes on the bell
 
 The bell is where the entity says things. It is not a queue of work for
