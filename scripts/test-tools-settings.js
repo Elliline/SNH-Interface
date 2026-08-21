@@ -123,13 +123,19 @@ function callRoute(method, routePath, body) {
 
   const registered = client.getToolNames();
   let rows = client.describeCatalogue();
+  const CATALOGUE_SIZE = rows.length;
   check('every registered tool has a row on the page',
     registered.every(n => rows.some(r => r.id === n)),
     registered.filter(n => !rows.some(r => r.id === n)).join(', '));
   check('and every row is a real registered tool name (no invented rows)',
     rows.filter(r => r.registered).every(r => registered.includes(r.id)));
-  check('fourteen tools, fourteen rows — the count the old page got wrong',
-    registered.length === 14 && rows.length === 14, `${registered.length} registered, ${rows.length} rows`);
+  // The NUMBER is not the invariant — tools get added, and dispatch_coding_job
+  // was the fifteenth (2026-08-20). What must hold is that the page has a row
+  // for every tool in the catalogue, registered or not, which is the defect
+  // this test was written for: fourteen registered and three on the page.
+  check('every catalogued tool has a row, registered or not',
+    rows.length === CATALOGUE_SIZE && registered.every(id => rows.some(r => r.id === id)),
+    `${registered.length} registered, ${rows.length} rows, catalogue ${CATALOGUE_SIZE}`);
   check('each row carries the tool\'s OWN description, not a second copy',
     rows.every(r => r.description && r.description.length > 20));
   check('every row can be turned on or off by something — a switch or a stated reason',
@@ -149,18 +155,19 @@ function callRoute(method, routePath, body) {
   });
   client.loadConfig();
   rows = client.describeCatalogue();
-  check('adding a tool to the registry adds a FIFTEENTH row, with no page change',
-    rows.length === 15 && rows.some(r => r.id === 'dummy_probe'), `${rows.length} rows`);
+  check('adding a tool to the registry adds one more row, with no page change',
+    rows.length === CATALOGUE_SIZE + 1 && rows.some(r => r.id === 'dummy_probe'), `${rows.length} rows`);
   check('and it is registered too — one table decided both',
     client.getToolNames().includes('dummy_probe'));
 
   const payloadWithDummy = callRoute('get', '/').body;
   check('the API the page fetches shows it as well',
-    payloadWithDummy.tools.some(t => t.id === 'dummy_probe') && payloadWithDummy.catalogueCount === 15);
+    payloadWithDummy.tools.some(t => t.id === 'dummy_probe') && payloadWithDummy.catalogueCount === CATALOGUE_SIZE + 1);
 
   MCPClient.TOOL_CATALOGUE.pop();
   client.loadConfig();
-  check('removing it again leaves fourteen', client.describeCatalogue().length === 14);
+  check('removing it again leaves the catalogue as it was',
+    client.describeCatalogue().length === CATALOGUE_SIZE);
 
   // =======================================================================
   console.log('\n── A ROW STAYS WHEN YOU TURN IT OFF ──');

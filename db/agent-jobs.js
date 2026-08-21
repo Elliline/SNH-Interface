@@ -658,6 +658,32 @@ async function runJob(id) {
     "UPDATE agent_jobs SET status = 'running', started_at = ?, attempts = COALESCE(attempts, 0) + 1 WHERE id = ?"
   ).run(startedAt.toISOString(), id);
 
+  // A dispatched coding job is not an agent run. It has no tool loop here,
+  // no JOB_TOOLS, and no model call in this process: squatch-code has its
+  // own agentic loop and its own model, and this hands it a brief rather
+  // than driving it step by step. The row, the panel, the badge and the
+  // announcement are shared; the execution is not.
+  if (job.source === require('./coding-jobs').SOURCE) {
+    let outcome;
+    try {
+      outcome = await require('./coding-jobs').runDispatched(job);
+    } catch (err) {
+      // runDispatched is written not to throw. If it ever does, the row
+      // must still close with something readable rather than hanging.
+      outcome = {
+        status: 'failed',
+        resultText: `The dispatch itself failed: ${err.message}. Check git status in the project before assuming nothing changed.`,
+        error: err.message
+      };
+    }
+    return finish(id, {
+      status: outcome.status,
+      resultText: outcome.resultText,
+      error: outcome.error || null,
+      toolCalls: outcome.toolCalls || 0
+    });
+  }
+
   const mm = memoryManager();
   const MCPClient = require('../mcp/mcp-client');
   const allowed = MCPClient.shared().backgroundToolsAmong(JOB_TOOLS);
@@ -809,7 +835,14 @@ function sweepInterrupted({ now = new Date() } = {}) {
   for (const j of open) {
     const startedMs = j.started_at ? new Date(j.started_at).getTime() : 0;
     const age = now.getTime() - startedMs;
-    const retryable = (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
+    // NEVER re-run a job that writes to disk. CLAUDE.md called this line out
+    // in advance - "the retry is only safe because jobs are read-only, the day
+    // one can write, that is the first line to revisit" - and a dispatched
+    // coding job is that day. A killed run may have already edited files and
+    // committed a restore point; running the brief again would apply it on top
+    // of its own half-finished work.
+    const writesToDisk = j.source === require('./coding-jobs').SOURCE;
+    const retryable = !writesToDisk && (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
 
     if (retryable) {
       db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL WHERE id = ?").run(j.id);
@@ -818,7 +851,9 @@ function sweepInterrupted({ now = new Date() } = {}) {
       console.warn(`[AgentJobs] ${line}`);
       opsLog(line);
     } else {
-      const why = (j.attempts || 0) >= c.maxAttempts
+      const why = writesToDisk
+        ? 'interrupted by a restart. It was NOT run again, because it can write files and re-running the brief could apply it twice. Anything it had already changed is still changed - check git status in the project; it commits a restore point before it starts'
+        : (j.attempts || 0) >= c.maxAttempts
         ? 'interrupted by a restart, and it had already been retried once — it was not run again'
         : `interrupted by a restart, and by the time the server came back it was too old to be worth redoing (older than ${c.retryGraceMinutes} minutes) — it was not run again`;
       finish(j.id, { status: 'interrupted', error: why, toolCalls: j.tool_calls || 0 });

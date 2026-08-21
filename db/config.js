@@ -953,6 +953,19 @@ const DEFAULTS = {
       // what it writes. The patterns are built and tested (HANDOFF_BUILD in
       // db/tool-routing.js) so that day is a flag flip, not a rewrite.
       dispatchBuildRequests: false
+    },
+    // Handing coding work to squatch-code. OFF by default: an approved brief
+    // runs unattended and can edit files, so switching it on is a decision.
+    codingJobs: {
+      enabled: false,
+      projectsRoot: require('path').join(require('os').homedir(), 'Projects'),
+      timeoutMinutes: 20,
+      maxPendingProposals: 3,
+      binary: 'squatch-job',
+      // A speed bump on top of the git restore point, not a security
+      // boundary - an allowed interpreter can run anything. Ellie chose it
+      // on that understanding.
+      allowedCommands: ['pytest', 'python', 'python3', 'node', 'npm', 'go', 'cargo', 'make', 'git', 'ls', 'cat']
     }
   },
   voice: {

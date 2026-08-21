@@ -482,8 +482,15 @@ Four more things that are load-bearing if you touch this:
 - **A restart kills a run, so the loss is made loud.** The row is written before
   the work starts; `sweepInterrupted()` closes every `running` row as
   `interrupted` WITH THE REASON, and re-queues it once if it is inside
-  `agentJobs.retryGraceMinutes`. The retry is only safe because jobs are
-  read-only — the day one can write, that is the first line to revisit.
+  `agentJobs.retryGraceMinutes`. The retry was only safe because jobs were
+  read-only, and this said the day one could write was the day to revisit it.
+  **That day was 2026-08-20** — see *Coding work goes to squatch-code* below.
+  A job whose `source` is `squatch-code` is NEVER re-queued: it may already
+  have edited files and committed a restore point, and running the brief again
+  would apply it on top of its own half-finished work. Its interrupted reason
+  says so, and tells her to check git status in the project rather than assume
+  nothing changed. Read-only jobs are unaffected, and
+  `scripts/test-coding-jobs.js` asserts both halves.
 - **Announce, then stamp — never the other way round.** `renderAnnouncementBlock`
   returns items and does NOT mark them; the chat route calls `markAnnounced`
   only after the ceiling pass, and only if the block is really in the message
@@ -494,6 +501,56 @@ Four more things that are load-bearing if you touch this:
 - **The badge counts unread RESULTS, not work in progress.** Running jobs show as
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
+
+## ⚠️ Coding work goes to squatch-code, and she approves the BRIEF
+
+`db/coding-jobs.js` + `mcp/tools/dispatch-coding-job.js`, shipped 2026-08-20,
+OFF by default (`tools.codingJobs.enabled`). Ellie and the entity settle a change
+in chat; he writes a brief; she approves or edits it; it runs unattended in
+`Projects/<name>` and the write-up lands in the jobs panel. It removes a
+clipboard from a loop she already ran by hand.
+
+- **It combines two patterns that were always separate here, and each existing
+  tool argues the opposite case for itself.** `create_cron_job` is propose-only
+  because a cron job recurs forever. `start_background_job` is direct-execute
+  and says why in its own header: "starting a read-only background lookup is not
+  a decision that needs Ellie's approval — it changes nothing". That clause is
+  exactly what fails here, so this tool takes the cron gate AND the job handoff.
+- **What she approves is the BRIEF, not the actions.** There is no approval
+  prompt in a dispatched run — squatch-code's gate fails closed and would deny
+  every write — so approval is pre-granted at dispatch. Everything downstream
+  depends on that being understood, which is why the bell item shows her the
+  brief verbatim and why her edit, not his draft, is what runs. Both are kept on
+  the row.
+- **A git restore point is the safety property, and the allowlist is not.**
+  squatch-code commits any dirty work first (so hers stays separable), then
+  commits a baseline, and the report carries `git reset --hard <sha>`. Ellie
+  chose this knowing the command allowlist is a speed bump: an allowed
+  interpreter can run anything, and a test in squatch-code asserts that gap out
+  loud rather than letting it read as a boundary. Every project under
+  `Projects/` was made a git repository as part of shipping this, because
+  without one the tool's `reversible: true` would be a lie.
+- **ONE COARSE TOOL.** No read_file/write_file surface here — squatch-code has
+  its own agentic loop and its own model; a tool layer that drove it step by step
+  would be a worse copy of the thing it is calling.
+- **The result reuses `agent_jobs` with `source = 'squatch-code'`**, so it
+  inherits the panel, the unread badge, the announcement block and the
+  ok/partial/failed vocabulary. squatch-code's own exit statuses were made to
+  match this vocabulary rather than the other way round. `runJob` branches on
+  source before any tool machinery is built: a dispatched job is not an agent
+  run and has no JOB_TOOLS, no model call in this process.
+- **The proposal is a BELL; the result is a ROBOT.** Asking is something he wants
+  to say. A finished job is not, and does not open a conversation — the same rule
+  as every other job, and the test asserts exactly one `addInitiative` call in
+  the module.
+- **The report is squatch-code's, and it is bound to its own record.** The far
+  side writes the prose and appends what the tools actually did — files written,
+  commands run with exit codes, `git diff --stat` — because on the first live
+  run the model reported "I identified and corrected logic errors in
+  math_utils.py… I updated these functions" having written nothing at all: file
+  untouched, git clean, all three commands failed. Nothing here paraphrases that
+  report or re-derives it; a second account could only disagree with the first.
+- Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-coding-jobs.js`.
 
 ## ⚠ A result has a FORM, and the form is derived, not chosen
 

@@ -926,6 +926,29 @@ function initDatabase() {
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at)');
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_agent_jobs_finished ON agent_jobs(finished_at)');
 
+    // Proposals to hand work to squatch-code. A row here runs NOTHING: it is
+    // the ask, waiting for Ellie. Approving it enqueues an agent_jobs row with
+    // source 'squatch-code', which is what actually runs — so the result lands
+    // in the same panel as every other job rather than in a second one that
+    // could disagree with the first.
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS coding_jobs (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,             -- name under Projects/
+        brief TEXT NOT NULL,               -- what he proposed, verbatim
+        final_brief TEXT,                  -- what she actually sent, if she edited it
+        status TEXT NOT NULL DEFAULT 'proposed',
+        initiative_id TEXT,                -- the bell item carrying the ask
+        agent_job_id TEXT,                 -- the run, once approved
+        conversation_id TEXT,
+        message_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decided_at DATETIME,
+        decided_note TEXT
+      )
+    `);
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_coding_jobs_status ON coding_jobs(status)');
+
     // ============ What the run PRODUCED, as a file ============
     //
     // A result used to be one column: result_text, shown whole on the card. A

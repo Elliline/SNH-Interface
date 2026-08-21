@@ -9,6 +9,7 @@ const WebSearchTool = require('./tools/web-search');
 const WebFetchTool = require('./tools/web-fetch');
 const CreateCronJobTool = require('./tools/create-cron-job');
 const StartBackgroundJobTool = require('./tools/start-background-job');
+const DispatchCodingJobTool = require('./tools/dispatch-coding-job');
 const WriteMemoryTool = require('./tools/write-memory');
 const {
   MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
@@ -131,6 +132,26 @@ const TOOL_CATALOGUE = [
     fields: [
       { path: 'tools.webFetch.timeoutMs', label: 'Page fetch timeout (ms)', type: 'number', min: 1000, max: 60000,
         hint: 'How long one page may hang before it is given up on. A job reading whole pages spends most of its time here, and a page that never answers costs it a tool call it does not get back. Too low and slow-but-working sites read as broken.' }
+    ]
+  },
+  {
+    id: 'dispatch_coding_job',
+    title: 'Send coding work to squatch-code',
+    Tool: DispatchCodingJobTool,
+    card: 'coding',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.codingJobs) || {}).enabled === true,
+    gateWhy: ({ cfg }) => ((cfg.tools && cfg.tools.codingJobs) || {}).enabled === true
+      ? null : 'turned off here',
+    toggle: 'tools.codingJobs.enabled',
+    toggleNote: 'An approved brief runs unattended and can edit files in the project. A git restore point is committed before it starts.',
+    writes: true,
+    fields: [
+      { path: 'tools.codingJobs.projectsRoot', label: 'Projects directory', type: 'text',
+        hint: 'Where projects live. squatch-code refuses any path outside it.' },
+      { path: 'tools.codingJobs.timeoutMinutes', label: 'Timeout (minutes)', type: 'number', min: 1, max: 120,
+        hint: 'How long one job may run before it is stopped. A stopped job keeps whatever it had already written; the restore point is how it is undone.' },
+      { path: 'tools.codingJobs.maxPendingProposals', label: 'Briefs awaiting approval', type: 'number', min: 1, max: 20,
+        hint: 'How many un-decided briefs may pile up before the tool refuses to write another.' }
     ]
   },
   {

@@ -473,6 +473,29 @@ const CONDITIONAL_CAPABILITIES = [
     when: (cfg) => !!(cfg && cfg.documents && cfg.documents.enabled !== false
       && cfg.agentJobs && cfg.agentJobs.enabled !== false),
     coversConfig: ['documents']
+  },
+  {
+    id: 'coding-jobs',
+    name: 'Handing coding work to squatch-code',
+    // WHAT THIS MAY NOT CLAIM:
+    //   - not "I can write code on her machine". squatch-code does the work;
+    //     this is the handoff. Claiming the capability would be claiming
+    //     someone else's.
+    //   - not that anything runs on his say-so. He writes a brief and she
+    //     approves or edits it. A description that left her out would describe
+    //     a tool that does not exist.
+    //   - and not a result. The write-up arrives in her jobs panel like any
+    //     other job; it does not come back into the conversation by itself.
+    description: 'When the two of you have settled on a change to one of her projects, you can write a brief and send it to squatch-code, the local coding agent, to carry out on its own. Sending it is a proposal: she sees the brief and approves, edits or rejects it, and nothing runs until she does. An approved job works unattended for a few minutes in that project only — it can edit files there and run test commands — and a git restore point is committed first so the whole job can be undone with one command. The write-up appears in her jobs panel, saying what was done, what could not be done and what needs her decision, with the record of every file changed and every command run attached to it.',
+    oneLiner: 'send a coding brief to squatch-code (she approves it first; the write-up lands in the jobs panel)',
+    intro: 'When Ellie and I have worked out a change to one of her projects, I can write it up as a brief and hand it to squatch-code to carry out on its own. I do not start it — she reads the brief and approves or corrects it first, and nothing touches a file until she does. The job works in that one project, commits a restore point before it starts so the whole thing can be undone, and its write-up arrives in her jobs panel rather than in our conversation',
+    schedule: 'When she asks for coding work to be sent to squatch-code',
+    // Honesty gate: off means the tool is not registered at all, so the
+    // capability is genuinely absent and must not be claimed. Same reasoning
+    // as web search staying out while its provider is disabled.
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.codingJobs
+      && cfg.tools.codingJobs.enabled === true),
+    coversConfig: ['tools.codingJobs']
   }
 ];
 
