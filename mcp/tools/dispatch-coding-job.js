@@ -31,7 +31,9 @@ class DispatchCodingJobTool {
     this.name = 'dispatch_coding_job';
     this.description =
       'Send coding work to squatch-code, the local coding agent, to carry out ' +
-      'on its own in one of the projects under Projects/. ' +
+      'on its own in one of the projects under Projects/. If the project does ' +
+      'not exist yet it is created — starting something new is an ordinary ' +
+      'request, not an error. ' +
       'USE THIS ONLY WHEN ELLIE HAS TOLD YOU TO SEND IT — "send that to the ' +
       'coder", "go ahead", "ship it". It is not for proposing work and not for ' +
       'starting something you think would be useful. ' +
@@ -121,13 +123,30 @@ class DispatchCodingJobTool {
         Math.round(result.ratio * 100) + '% match). Quote the brief you ' +
         'actually sent in your reply so she can see the difference.';
 
+    // A project that did not exist a moment ago is something she should
+    // hear in this reply, not discover later. And if the name is close to
+    // one she already has, that is where a typo gets caught.
+    let newProject = '';
+    if (result.isNewProject) {
+      newProject = ` This project did not exist, so a new one was created at Projects/${project.trim()}.`;
+      if (result.nearMatches && result.nearMatches.length) {
+        newProject += ` Say so plainly, and mention that she already has ` +
+          `Projects/${result.nearMatches.join(' and Projects/')} — if that is ` +
+          `what was meant, this one can be deleted.`;
+      } else {
+        newProject += ' Say so in your reply.';
+      }
+    }
+
     return {
       success: true,
       dispatch_id: result.id,
       job_id: result.agentJobId,
       status: 'running',
+      new_project: !!result.isNewProject,
+      near_matches: result.nearMatches || [],
       message:
-        'Sent to squatch-code and it is running now. ' + fidelity +
+        'Sent to squatch-code and it is running now. ' + fidelity + newProject +
         ' Tell her it has gone and quote the brief that was sent. You do NOT ' +
         'have a result and must not describe one — the write-up will appear ' +
         'in her jobs panel when the job finishes.',

@@ -80,16 +80,37 @@ function validateProject(name) {
     return { ok: false, error: `Give the project NAME, not a path: got ${JSON.stringify(n)}.` };
   }
   const dir = path.join(projectsRoot(), n);
-  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
-    const available = listProjects();
-    return {
-      ok: false,
-      error: `There is no project called "${n}" in ${projectsRoot()}.` +
-        (available.length ? ` Available: ${available.join(', ')}.` : '')
-    };
-  }
-  return { ok: true, dir };
+  // A project that does not exist yet is NOT an error. A new build is an
+  // ordinary thing to ask for, and squatch-code creates the directory,
+  // git-inits it and commits an empty baseline so the first job is as
+  // undoable as any other. It also reports what it created, and names a
+  // near-miss if the name is close to an existing project - which is
+  // where a typo gets caught, without blocking a legitimate new project
+  // whose name happens to resemble an old one.
+  const exists = fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+  return { ok: true, dir, isNew: !exists };
 }
+
+/**
+ * Existing projects whose names are close to this one.
+ *
+ * Auto-creating a project turns a typo into a new empty directory and a
+ * job that builds in the wrong place. This does not block - a new
+ * project may legitimately resemble an old one - it gives him something
+ * to say at the moment she is reading the reply.
+ */
+function nearMatches(name) {
+  const existing = listProjects().filter(p => p !== name);
+  const a = String(name).toLowerCase();
+  return existing.filter(p => {
+    const b = p.toLowerCase();
+    if (Math.abs(a.length - b.length) > 3) return false;
+    // Cheap containment/prefix test: a typo is nearly always one of these.
+    return a.startsWith(b.slice(0, Math.max(3, b.length - 2)))
+        || b.startsWith(a.slice(0, Math.max(3, a.length - 2)));
+  }).slice(0, 2);
+}
+
 
 function listProjects() {
   try {
@@ -164,6 +185,8 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   return {
     ok: true, id, agentJobId: queued.id,
     exact: seen.exact, ratio: seen.ratio, matchedIn: seen.source,
+    isNewProject: !!v.isNew,
+    nearMatches: v.isNew ? nearMatches(project.trim()) : [],
   };
 }
 

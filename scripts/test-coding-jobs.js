@@ -153,6 +153,69 @@ function clean() {
     assert.match(r.error, /too short/i);
   });
 
+  console.log('\nnew projects\n');
+
+  await test('a project that does not exist is dispatched, not refused', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown({ project: 'brand-new-build' }));
+    assert.ok(r.ok, r.error);
+    assert.ok(r.isNewProject, 'it did not report the project as new');
+  });
+
+  await test('an existing project is not reported as new', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown());
+    assert.ok(r.ok, r.error);
+    assert.ok(!r.isNewProject);
+  });
+
+  await test('a near-miss names the project it resembles', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown({ project: 'dem' }));
+    assert.ok(r.ok, r.error);
+    assert.deepStrictEqual(r.nearMatches, ['demo'],
+      'a typo of an existing project was not flagged');
+  });
+
+  await test('a genuinely new name flags nothing', async () => {
+    clean();
+    const r = codingJobs.dispatch(asShown({ project: 'invoice-parser' }));
+    assert.ok(r.ok, r.error);
+    assert.deepStrictEqual(r.nearMatches, []);
+  });
+
+  await test('a path is still refused, new or not', async () => {
+    for (const n of ['../etc', '/etc', 'a/b', '.hidden']) {
+      assert.ok(!codingJobs.dispatch(asShown({ project: n })).ok, n);
+    }
+  });
+
+  await test('the tool tells him to say a new project was created', async () => {
+    clean();
+    const Tool = require('../mcp/tools/dispatch-coding-job');
+    const SH = 'Build a small CSV to JSON converter with a convert(path) function '
+      + 'and a test that round-trips one row.';
+    const r = await new Tool().execute(
+      { project: 'csvtool', brief: SH }, { userMessage: SH });
+    assert.ok(r.success, r.error);
+    assert.ok(r.new_project);
+    assert.match(r.message, /did not exist/i);
+    assert.match(r.message, /Projects\/csvtool/);
+  });
+
+  await test('...and names the near match in the same message', async () => {
+    clean();
+    const Tool = require('../mcp/tools/dispatch-coding-job');
+    const SH = 'Build a small CSV to JSON converter with a convert(path) function '
+      + 'and a test that round-trips one row.';
+    const r = await new Tool().execute(
+      { project: 'dem', brief: SH }, { userMessage: SH });
+    assert.ok(r.success, r.error);
+    assert.deepStrictEqual(r.near_matches, ['demo']);
+    assert.match(r.message, /already has/i);
+    assert.match(r.message, /can be deleted/i);
+  });
+
   console.log('\ndispatching: fidelity\n');
 
   await test('an exact send is recorded as exact', async () => {
@@ -187,12 +250,13 @@ function clean() {
 
   console.log('\ndispatching: the ordinary refusals\n');
 
-  await test('an unknown project is refused before the guard', async () => {
+  await test('an unknown project is CREATED, not refused', async () => {
+    // Was: refused with "there is no project called...". A new build is
+    // an ordinary request, so the refusal was the defect.
     clean();
     const r = codingJobs.dispatch(asShown({ project: 'nosuch' }));
-    assert.ok(!r.ok);
-    assert.match(r.error, /no project called/i);
-    assert.match(r.error, /demo/);
+    assert.ok(r.ok, r.error);
+    assert.ok(r.isNewProject);
   });
 
   await test('a path instead of a name is refused', async () => {
