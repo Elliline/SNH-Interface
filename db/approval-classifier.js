@@ -49,7 +49,7 @@ const BRIEF_EXCERPT_CHARS = 700;
  * Structural, not verbal — it is about the state of the conversation, not about
  * anything either of them said.
  */
-function pendingBrief({ conversationId }) {
+function actionableBrief({ conversationId }) {
   const db = getSqliteDb();
   if (!db || !conversationId) return null;
 
@@ -69,17 +69,46 @@ function pendingBrief({ conversationId }) {
     // that can be dispatched as-is, and pinning on it would force a refusal.
     if (!validateBrief(text).ok) continue;
 
-    // Already sent? A coding job created after this reply means this brief has
-    // had its answer, whatever was said since.
-    const since = db.prepare(
-      `SELECT COUNT(*) n FROM coding_jobs
-       WHERE conversation_id = ? AND created_at > ?`
+    // Has it been sent? A coding job created after this reply is this brief's
+    // answer. That USED TO END THE STORY — the function returned null and the
+    // conversation had no trigger left. See the note on rerun below.
+    const job = db.prepare(
+      `SELECT id, project, created_at, agent_job_id FROM coding_jobs
+       WHERE conversation_id = ? AND created_at > ?
+       ORDER BY created_at DESC LIMIT 1`
     ).get(conversationId, row.timestamp);
-    if (since && since.n > 0) return null;
 
-    return { text, timestamp: row.timestamp };
+    if (!job) return { text, timestamp: row.timestamp, dispatched: false, project: null, lastJob: null };
+
+    const outcome = db.prepare(
+      'SELECT status, error, duration_ms FROM agent_jobs WHERE id = ?'
+    ).get(job.agent_job_id) || {};
+    return {
+      text,
+      timestamp: row.timestamp,
+      dispatched: true,
+      project: job.project,
+      lastJob: {
+        id: job.id, agentJobId: job.agent_job_id, createdAt: job.created_at,
+        status: outcome.status || null, error: outcome.error || null,
+      },
+    };
   }
   return null;
+}
+
+/**
+ * The un-dispatched case, kept under its old name and old contract.
+ *
+ * The claim-keyed backstop scopes itself with this, and its skip behaviour for
+ * an ALREADY-DISPATCHED brief is deliberate: a repeat claim there is a phantom
+ * with nothing left to send, and loosening it would let a false claim re-run
+ * real work. That guard is unchanged; the re-run case is handled BEFORE
+ * generation by a classifier, not after it by a claim.
+ */
+function pendingBrief({ conversationId }) {
+  const b = actionableBrief({ conversationId });
+  return b && !b.dispatched ? { text: b.text, timestamp: b.timestamp } : null;
 }
 
 const SYSTEM = [
@@ -166,4 +195,100 @@ async function isApproval({ brief, message, callLLM }) {
   }
 }
 
-module.exports = { pendingBrief, isApproval, parseVerdict, buildUserPrompt, SYSTEM, BRIEF_EXCERPT_CHARS };
+/**
+ * "Is she asking me to RUN IT AGAIN?" — a separate and deliberately harder
+ * question than "is she approving this?".
+ *
+ * WHY IT IS ITS OWN CLASSIFIER. Once a brief has been dispatched the same words
+ * mean different things. "Go ahead" before a dispatch is an approval; after one
+ * it is more likely a reply to something else entirely. And the conversation
+ * after a job is FULL of talk about that job — how it went, what it produced,
+ * what is wrong with it — which is exactly the material a first-dispatch
+ * classifier would misread as enthusiasm for sending.
+ *
+ * WHY IT IS BIASED TOWARD NO. The two mistakes are not the same size. A false
+ * YES on first dispatch costs a round trip: the tool refuses, or a job runs
+ * that she was about to ask for anyway. A false YES here BURNS A REAL RUN —
+ * squatch-code edits files, commits a restore point, and does it on top of
+ * whatever the last run left. She has to notice and undo it. So anything
+ * ambiguous is NO, and the prompt says so in those words.
+ *
+ * THE GAP THIS FILLS. Before this, a genuine re-run request hit nothing at all.
+ * The brief was no longer pending, so the approval classifier never ran; the
+ * claim-keyed backstop skips already-dispatched briefs on purpose. A job could
+ * fail in 32ms with a spawn error, she could say "try that again", and the
+ * system had no path — not a refusal, not a correction, silence. The 2026-08-22
+ * resend only worked because the first dispatch had been FAKE, which left the
+ * brief pending.
+ */
+const RERUN_SYSTEM = [
+  'A coding brief has ALREADY been sent to the coding agent and a job has already run.',
+  'You decide ONE THING: is the person now asking for that same brief to be RUN AGAIN?',
+  '',
+  'Answer with exactly one word: YES or NO.',
+  '',
+  'YES only when she is asking for another run — retry it, run it again, try that once',
+  'more, send it again, have another go, do it over. She may be brief or casual and may',
+  'misspell things; judge intent, not wording.',
+  '',
+  'NO for everything else, and MOST things are NO:',
+  '- asking how the job went, or what it did, or whether it finished',
+  '- discussing, praising or complaining about the result',
+  '- reporting a bug or describing what is wrong with the output',
+  '- asking for a CHANGE to the brief, or for a new brief (that is not a re-run)',
+  '- talking about anything else',
+  '',
+  'Complaining about a result is not a request to repeat it. Describing a problem is not',
+  'a request to repeat it. Only an explicit ask for another run of the SAME work is YES.',
+  '',
+  'When in doubt, answer NO. Running again edits real files, so a wrong YES costs her',
+  'work; a wrong NO costs one sentence.',
+  '',
+  'Answer YES or NO with no punctuation and no explanation.',
+].join('\n');
+
+function buildRerunPrompt(brief, message, lastJob) {
+  const excerpt = String(brief || '').slice(0, BRIEF_EXCERPT_CHARS);
+  const outcome = lastJob && lastJob.status
+    ? `The last run of it ended: ${lastJob.status}${lastJob.error ? ` (${String(lastJob.error).slice(0, 120)})` : ''}.`
+    : 'The last run of it has already happened.';
+  return [
+    'THE BRIEF THAT WAS ALREADY SENT (for context only):',
+    '"""', excerpt, '"""',
+    '',
+    outcome,
+    '',
+    'HER MESSAGE:',
+    '"""', String(message || '').trim(), '"""',
+    '',
+    'Is she asking for that same brief to be run again? YES or NO.',
+  ].join('\n');
+}
+
+async function isRerunRequest({ brief, message, lastJob = null, callLLM }) {
+  if (!brief || !String(message || '').trim()) return { rerun: false, reason: 'nothing to decide' };
+  try {
+    const answer = await callLLM(RERUN_SYSTEM, buildRerunPrompt(brief, message, lastJob), {
+      maxTokens: 4,
+      temperature: 0,
+      thinkingTokens: 0,
+    });
+    const raw = (answer && typeof answer === 'object') ? answer.content : answer;
+    const verdict = parseVerdict(raw);
+    if (verdict === null) {
+      console.warn(`[Rerun] unparseable verdict ${JSON.stringify(String(raw).slice(0, 60))} — treating as NO`);
+      return { rerun: false, reason: 'unparseable', raw };
+    }
+    return { rerun: verdict, reason: verdict ? 'rerun classifier YES' : 'rerun classifier NO', raw };
+  } catch (err) {
+    console.warn('[Rerun] classifier call failed — treating as NO:', err.message);
+    return { rerun: false, reason: `classifier unavailable: ${err.message}` };
+  }
+}
+
+module.exports = {
+  pendingBrief, actionableBrief,
+  isApproval, isRerunRequest,
+  parseVerdict, buildUserPrompt, buildRerunPrompt,
+  SYSTEM, RERUN_SYSTEM, BRIEF_EXCERPT_CHARS,
+};

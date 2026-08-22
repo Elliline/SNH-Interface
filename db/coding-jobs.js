@@ -800,6 +800,29 @@ function dispatchedInTurn(conversationId, sinceIso) {
   return (row && row.n) || 0;
 }
 
+/**
+ * Jobs still in flight for a project — the same-project concurrency hazard.
+ *
+ * Two runs in one project is a KNOWN open hazard, not a theoretical one: each
+ * takes its own restore point, and a second run started while the first is
+ * working takes its baseline from a half-finished tree, so the two undo
+ * commands no longer describe recoverable states. squatch-code serialises
+ * within a run; nothing serialises across dispatches.
+ *
+ * This is why a re-run is refused rather than queued. Queueing would look
+ * helpful and would silently produce the same tangle a few minutes later.
+ */
+function activeForProject(project) {
+  const db = getSqliteDb();
+  if (!db || !project) return [];
+  return db.prepare(`
+    SELECT c.id, c.created_at, j.status, j.id AS agent_job_id
+    FROM coding_jobs c JOIN agent_jobs j ON j.id = c.agent_job_id
+    WHERE c.project = ? AND j.status IN ('queued', 'running')
+    ORDER BY c.created_at DESC
+  `).all(project);
+}
+
 module.exports = {
   SOURCE,
   validateBrief,
@@ -811,6 +834,7 @@ module.exports = {
   logAttempt,
   logRefusal,
   dispatchedInTurn,
+  activeForProject,
   resolveBinary,
   binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,

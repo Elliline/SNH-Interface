@@ -189,6 +189,110 @@ const REAL_NEGATIVES = [
     { conversationId: 'c-pending' });
   check('but an invented brief is still refused', invented.ok === false);
 
+  // ── The re-run path ─────────────────────────────────────────────────────
+  //
+  // THE GAP THIS CLOSES: a brief dispatches for real, the job fails, and she
+  // says "try that again". Before this the brief was no longer pending so the
+  // approval classifier never ran, and the claim-keyed backstop skips
+  // dispatched briefs on purpose. The request hit nothing at all — not a
+  // refusal, not a correction, silence. The 2026-08-22 resend only worked
+  // through the new path because that first dispatch had been FAKE, which left
+  // the brief pending.
+  console.log('\n── After a dispatch, the brief is still ACTIONABLE ──');
+
+  function seedDispatched(cid, { jobStatus = 'failed', jobError = 'spawn squatch-job ENOENT' } = {}) {
+    seedConversation(cid, BRIEF, '2026-08-22T19:00:00.000Z');
+    const aj = `${cid}-aj`;
+    sql.prepare(`INSERT INTO agent_jobs (id, title, task, status, source, created_at, error)
+                 VALUES (?,?,?,?,'squatch-code','2026-08-22T19:01:00.000Z',?)`)
+      .run(aj, 'squatch-code: squatch_crawler', BRIEF, jobStatus, jobError);
+    sql.prepare(`INSERT INTO coding_jobs (id, project, brief, status, conversation_id, created_at, agent_job_id)
+                 VALUES (?,?,?,'dispatched',?, '2026-08-22T19:01:00.000Z', ?)`)
+      .run(`${cid}-cj`, 'squatch_crawler', BRIEF, cid, aj);
+    return aj;
+  }
+
+  seedDispatched('c-ran');
+  const after = approval.actionableBrief({ conversationId: 'c-ran' });
+  check('a dispatched brief is still actionable', !!after);
+  check('  and is marked dispatched', after && after.dispatched === true);
+  check('  carrying the project', after && after.project === 'squatch_crawler');
+  check('  and how the last run ended', after && after.lastJob && after.lastJob.status === 'failed');
+  check('pendingBrief still returns null for it (the backstop skip is unchanged)',
+    approval.pendingBrief({ conversationId: 'c-ran' }) === null,
+    'loosening this would let a false claim re-run real work');
+
+  console.log('\n── The re-run question is stricter than the approval one ──');
+  const rerunAnswers = {
+    'Try that again': 'YES',
+    'run it one more time': 'YES',
+    'Please try sending the brief again. Something did not work the last time and it should be fixed.': 'YES',
+    'resend it': 'YES',
+    'How did the job go?': 'NO',
+    'that result looks wrong': 'NO',
+    'the fog still re-darkens when I walk away': 'NO',
+    'can you change the scoring and then send it': 'NO',
+  };
+  const rerunLLM = stubEngine(rerunAnswers);
+  for (const [msg, want] of Object.entries(rerunAnswers)) {
+    const v = await approval.isRerunRequest({
+      brief: BRIEF, message: msg, lastJob: after.lastJob, callLLM: rerunLLM,
+    });
+    check(`${want === 'YES' ? 'RE-RUN' : 'no    '}: ${JSON.stringify(msg.slice(0, 48))}`,
+      v.rerun === (want === 'YES'));
+  }
+
+  console.log('\n── The re-run classifier fails closed too ──');
+  check('an engine error is NO', (await approval.isRerunRequest({
+    brief: BRIEF, message: 'try again', lastJob: null,
+    callLLM: async () => { throw new Error('brain circuit open'); } })).rerun === false);
+  check('waffle is NO', (await approval.isRerunRequest({
+    brief: BRIEF, message: 'try again', lastJob: null,
+    callLLM: async () => ({ content: 'probably, if she meant that' }) })).rerun === false);
+  let rerunOpts = null;
+  await approval.isRerunRequest({ brief: BRIEF, message: 'try again', lastJob: null,
+    callLLM: async (_s, _u, o) => { rerunOpts = o; return { content: 'YES' }; } });
+  check('temperature 0 and a tiny budget',
+    rerunOpts && rerunOpts.temperature === 0 && rerunOpts.maxTokens <= 8);
+  check('the prompt states the bias toward NO', /When in doubt, answer NO/.test(approval.RERUN_SYSTEM));
+  check('and names complaining as NOT a re-run',
+    /Complaining about a result is not a request to repeat it/.test(approval.RERUN_SYSTEM));
+
+  console.log('\n── Same-project concurrency is refused, not queued ──');
+  seedDispatched('c-busy', { jobStatus: 'running', jobError: null });
+  const busy = codingJobs.activeForProject('squatch_crawler');
+  check('an in-flight job for the project is visible', busy.length >= 1);
+  check('  and only queued/running count',
+    busy.every(j => ['queued', 'running'].includes(j.status)));
+  const refusalsBefore = sql.prepare("SELECT COUNT(*) n FROM tool_call_log WHERE outcome='rejected-busy'").get().n;
+  codingJobs.logRefusal({
+    reason: 're-run refused: 1 job(s) still in flight for squatch_crawler',
+    project: 'squatch_crawler', brief: BRIEF, conversationId: 'c-busy', kind: 'rejected-busy',
+  });
+  const refusalsAfter = sql.prepare("SELECT COUNT(*) n FROM tool_call_log WHERE outcome='rejected-busy'").get().n;
+  check('  a busy refusal is recorded like every other refusal', refusalsAfter === refusalsBefore + 1);
+  const busyRow = sql.prepare("SELECT detail, args_json FROM tool_call_log WHERE outcome='rejected-busy' ORDER BY created_at DESC LIMIT 1").get();
+  check('  with the reason and the brief', /still in flight/.test(busyRow.detail)
+    && JSON.parse(busyRow.args_json).brief_sha256.length === 16);
+
+  console.log('\n── A re-run makes NEW rows, never reuses old ones ──');
+  // Reusing a row would destroy the first run's restore-point reference, which
+  // is the only thing that makes `reversible: true` true.
+  const shaOf = t => require('crypto').createHash('sha256').update(t).digest('hex').slice(0, 16);
+  // Only real dispatches: an earlier case in this suite hand-seeds a row with
+  // no agent_job_id to test "already dispatched", and that is not a run.
+  const jobRows = sql.prepare(
+    "SELECT c.id, c.agent_job_id, c.brief FROM coding_jobs c "
+    + "WHERE c.project = 'squatch_crawler' AND c.agent_job_id IS NOT NULL"
+  ).all();
+  check('two coding_jobs rows exist for the same brief',
+    jobRows.length >= 2 && new Set(jobRows.map(r => shaOf(r.brief))).size === 1,
+    `${jobRows.length} rows, ${new Set(jobRows.map(r => shaOf(r.brief))).size} distinct briefs`);
+  check('  with distinct ids', new Set(jobRows.map(r => r.id)).size === jobRows.length);
+  check('  each joined to its own agent_jobs row',
+    new Set(jobRows.map(r => r.agent_job_id)).size === jobRows.length
+      && jobRows.every(r => sql.prepare('SELECT 1 FROM agent_jobs WHERE id = ?').get(r.agent_job_id)));
+
   // ── The wiring, asserted against the source ─────────────────────────────
   console.log('\n── The pin is set BEFORE generation, and by the classifier ──');
   const fs = require('fs');

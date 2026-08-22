@@ -352,6 +352,46 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+### The same words mean different things before and after a dispatch
+
+`actionableBrief()` returns the most recent validator-acceptable brief in a
+conversation **whether or not it has been dispatched**, and the two states ask
+different questions. Scoping it to un-dispatched briefs left a real case with no
+path at all: a brief dispatches, the job fails (the 32ms `spawn squatch-job
+ENOENT` is the live example), she says "try that again" — and nothing happened.
+Not a refusal, not a correction. Silence. The approval classifier never ran
+because the brief was no longer pending, and the claim-keyed backstop skips
+dispatched briefs on purpose. **The 2026-08-22 resend only worked through the
+new path because that first dispatch had been FAKE, which left the brief
+pending.** A genuine re-run request had nowhere to land.
+
+- **Two classifiers, and the re-run one is stricter.** "Go ahead" before a
+  dispatch is approval; after one it is probably about something else. And the
+  conversation after a job is mostly ABOUT that job — how it went, what it
+  produced, what is wrong with it — which is exactly what a first-dispatch
+  classifier would misread as enthusiasm.
+- **It is biased toward NO, in the prompt, in those words.** The mistakes are
+  different sizes: a false YES on first dispatch costs a round trip; a false YES
+  on a re-run burns a real run that edits files on top of the last one's
+  changes. Asking about a result, complaining about it, or describing a bug is
+  never a re-run request.
+- **A re-run makes NEW rows.** Never mutate or reuse the old `coding_jobs` /
+  `agent_jobs` rows — the old row holds the restore point that makes
+  `reversible: true` true, and overwriting it destroys the only way back.
+- **Same-project concurrency is REFUSED, not queued.** Two runs in one project
+  take two restore points, the second from a half-finished tree, so the undo
+  commands stop describing recoverable states. Queueing would look helpful and
+  produce the same tangle later. The refusal is logged like every other and
+  reaches her as chrome.
+- **The claim-keyed backstop's skip is unchanged.** This path replaces silence
+  with a classifier BEFORE generation, not with looser claim handling after it.
+  Loosening the backstop would let a false claim re-run real work.
+- **A stub must read the part of the request the real dependency reads.** The
+  e2e stub matched phrases against the whole HTTP body, and `RERUN_SYSTEM` lists
+  "run it again" as an example of a YES — so every classifier call came back YES,
+  including for "How did the job go?". It parses the body and reads her message
+  now. Second time in two commits that a stub's shape hid a real result.
+
 ## ⛔ She must be able to talk like a person — no phrase list may gate an action
 
 Coding dispatch ran at **2 real out of 7 claimed**. Every fix built for it —

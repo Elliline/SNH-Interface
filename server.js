@@ -1944,22 +1944,61 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // disagree the classifier wins, because the list is the thing that failed.
     let forceCodingCall = false;
     let codingPinReason = null;
+    // Set when a re-run was asked for and refused because the project is busy.
+    // Carried to the end of the turn so the refusal reaches her as chrome
+    // alongside the reply, rather than as a silence she has to notice.
+    let rerunBlocked = null;
     if (mcpClient.hasTool('dispatch_coding_job')) {
-      const pending = approvalClassifier.pendingBrief({ conversationId: convoId });
-      if (pending) {
+      // ACTIONABLE, NOT MERELY PENDING. A brief that has already been sent is
+      // still the subject of the conversation, and "try that again" after a job
+      // failed used to hit NOTHING: the brief was not pending so the approval
+      // classifier never ran, and the claim-keyed backstop skips dispatched
+      // briefs on purpose. A 32ms spawn failure followed by "run it once more"
+      // produced silence. The two states ask DIFFERENT questions.
+      const actionable = approvalClassifier.actionableBrief({ conversationId: convoId });
+      if (actionable && !actionable.dispatched) {
         const phrase = dispatchClaims.classifyCodingGoAhead(userMessage.content);
         const verdict = await approvalClassifier.isApproval({
-          brief: pending.text,
+          brief: actionable.text,
           message: userMessage.content,
           callLLM: memoryManager.callLLM,
         });
         forceCodingCall = verdict.approved;
         codingPinReason = verdict.reason;
         if (phrase.goAhead !== verdict.approved) {
-          // Worth a line: this is the disagreement the rebuild exists for, and
-          // it is how anyone learns the list is still drifting.
           console.log(`Tool routing: phrase list said ${phrase.goAhead ? 'YES' : 'NO'}, `
             + `classifier said ${verdict.approved ? 'YES' : 'NO'} — classifier wins`);
+        }
+      } else if (actionable && actionable.dispatched) {
+        // A SEPARATE, STRICTER QUESTION. Most talk after a dispatch is about the
+        // job, not a request to repeat it, and a false YES here burns a real run
+        // on top of the last one's changes rather than costing a round trip.
+        const verdict = await approvalClassifier.isRerunRequest({
+          brief: actionable.text,
+          message: userMessage.content,
+          lastJob: actionable.lastJob,
+          callLLM: memoryManager.callLLM,
+        });
+        if (verdict.rerun) {
+          // SAME-PROJECT CONCURRENCY IS REFUSED, NOT QUEUED. Two runs in one
+          // project take two restore points, the second from a half-finished
+          // tree, and the undo commands stop describing recoverable states.
+          // Queueing would look helpful and produce the same tangle later.
+          const busy = codingJobs.activeForProject(actionable.project);
+          if (busy.length) {
+            rerunBlocked = { project: actionable.project, count: busy.length };
+            codingJobs.logRefusal({
+              reason: `re-run refused: ${busy.length} job(s) still in flight for ${actionable.project}`,
+              project: actionable.project,
+              brief: actionable.text,
+              conversationId: convoId,
+              kind: 'rejected-busy',
+            });
+            console.warn(`Tool routing: re-run of ${actionable.project} REFUSED — ${busy.length} job(s) still in flight`);
+          } else {
+            forceCodingCall = true;
+            codingPinReason = `${verdict.reason} (re-run of ${actionable.project})`;
+          }
         }
       }
     }
@@ -3645,6 +3684,18 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             ? `data: ${JSON.stringify(frame)}\n\n`
             : `${JSON.stringify(frame)}\n`);
         };
+
+        // A RE-RUN SHE ASKED FOR AND DID NOT GET. Decided before generation
+        // (the project is busy), reported here so it arrives with the reply she
+        // is reading. Silence was the old behaviour for this whole case, and
+        // silence is the thing being removed.
+        if (rerunBlocked) {
+          notice('rerun-blocked',
+            `**That was not run again.** A coding job for **${rerunBlocked.project}** is still in `
+            + `flight, and starting a second one in the same project would take its restore point `
+            + `from a half-finished tree — the two undos would stop lining up. Wait for the one in `
+            + `the strip to finish, then ask again.`);
+        }
 
         if (created.length === 0 && forceHandoffCall) {
           // Her message IS the task: it is what she asked for, in her words, and
