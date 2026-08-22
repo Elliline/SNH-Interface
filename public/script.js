@@ -485,6 +485,45 @@ function handleModelChange() {
 // when sendAudioToWhisper hands over a transcription. It rides with the request
 // so the fact extractor can record whether a fact was spoken or typed; a
 // transcription is weaker evidence and the corrector needs to know.
+/**
+ * A system notice: shown to Ellie, attached to the turn she is reading, and
+ * never part of the message.
+ *
+ * Visually distinct on purpose. The whole reason this exists is that she could
+ * not tell a real status line from one the model typed, so a notice must not
+ * look like anything the model can produce inside its own text.
+ */
+function renderSystemNotice(n) {
+  try {
+    const messages = document.getElementById('messages');
+    if (!messages) return;
+    const el = document.createElement('div');
+    el.className = `system-notice notice-${String(n.kind || 'info').replace(/[^a-z-]/gi, '')}`;
+    const label = document.createElement('span');
+    label.className = 'system-notice-label';
+    label.textContent = 'from the system, not the model';
+    const body = document.createElement('div');
+    body.className = 'system-notice-body';
+    // The shared renderer (db/markdown.js, served at /markdown.js) so bold and
+    // code look the same here as in a message. Falls back to escaped text if it
+    // did not load — a notice must never fail to appear, since the cases it
+    // reports are exactly the ones she cannot otherwise detect.
+    const md = window.SNHMarkdown;
+    if (md && typeof md.renderMarkdown === 'function') {
+      try { body.innerHTML = md.renderMarkdown(String(n.text || '')); }
+      catch { body.textContent = String(n.text || ''); }
+    } else {
+      body.textContent = String(n.text || '');
+    }
+    el.appendChild(label);
+    el.appendChild(body);
+    messages.appendChild(el);
+    messages.scrollTop = messages.scrollHeight;
+  } catch (err) {
+    console.error('[Notice] could not render:', err);
+  }
+}
+
 async function sendMessage(inputModality = 'typed') {
   const message = messageInput.value.trim();
   // Cancel any pending TTS from previous message
@@ -919,6 +958,20 @@ async function processGrokStream(response) {
 
         try {
           const parsed = JSON.parse(jsonStr);
+
+          // SYSTEM NOTICES — chrome, never the transcript.
+          //
+          // The server sends these when it has something to say ABOUT the
+          // reply: no job was started, a progress line was fabricated, the
+          // brief was actually sent after the fact. They used to be appended
+          // to the message text, which stored them as the model's own words
+          // and taught it to write them (that is how the forged status line
+          // happened). This channel is one-way: the model cannot emit a frame,
+          // only content, so anything rendered here came from the server.
+          if (parsed.snh_notice) {
+            renderSystemNotice(parsed.snh_notice);
+            continue;
+          }
 
           // THINKING — its own channel, never the answer.
           const reasoned = extractReasoningDelta(parsed);

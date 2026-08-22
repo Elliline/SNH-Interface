@@ -44,8 +44,9 @@ const TARGET = '(?:squatch-?code|the coder|the coding agent|an? agent|the agent'
 // Verbs that mean "it has gone somewhere to be done". Deliberately not
 // "written", "created", "prepared" — those describe making the thing, not
 // sending it.
-const SENT = '(?:sent|dispatched|delivered|submitted|queued|launched|transmitted'
-  + '|handed (?:off|over)|passed (?:on|over)|kicked off|fired off|shipped)';
+const SENT = '(?:sent|re-?sent|dispatched|re-?dispatched|delivered|submitted|queued|re-?queued'
+  + '|launched|transmitted|handed (?:off|over)|passed (?:on|over)|kicked off|fired off|shipped'
+  + '|back in the queue|in the queue)';
 
 // The passive family may also use a bare "handed to" / "passed to", which the
 // list above deliberately excludes: those words are only unambiguous when
@@ -71,8 +72,9 @@ const PASSIVE = new RegExp(
   // "has been sent to the coder" with the target trailing instead
   + '|\\b(?:has|have|had) been\\s+(?:now |already |successfully |just )?' + SENT_PASSIVE
   + '\\b[^.!?\\n]{0,40}\\b(?:to|with)\\b[^.!?\\n]{0,30}\\b' + TARGET + '\\b'
-  // "<target> is on its way / is with the coder / is in the queue"
-  + '|\\b' + TARGET + '\\b\\s*(?:is|\'s)\\s+(?:on its way|in the queue|with (?:the )?(?:coder|agent|squatch-?code))\\b',
+  // "<target> is on its way / is with the coder / is back in the queue"
+  + '|\\b' + TARGET + '\\b\\s*(?:is|\'s|are)\\s+(?:now |already |back )?'
+  + '(?:on its way|in the queue|queued|re-?queued|with (?:the )?(?:coder|agent|squatch-?code))\\b',
   'i');
 
 // 3. BARE PARTICIPLE. A whole sentence that is just the report: "Sent."

@@ -3590,3 +3590,35 @@ body.coder-working { padding-top: 1.9rem; }
 @media (prefers-reduced-motion: reduce) {
   .coder-strip-dot { animation: none; }
 }
+
+/* ── System notices ───────────────────────────────────────────────────────
+   Server-authored, attached to the turn, and NEVER part of the message.
+   Deliberately unlike a message bubble: the entire reason this channel
+   exists is that a correction printed in the model's own text could be
+   written by the model, so it must not be mistakable for one. */
+.system-notice {
+  margin: 0.75rem 0 0.75rem auto;
+  max-width: 90%;
+  border-left: 3px solid var(--warning, #d08770);
+  background: color-mix(in srgb, var(--warning, #d08770) 8%, transparent);
+  border-radius: 0 6px 6px 0;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.9rem;
+}
+.system-notice-label {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.75;
+  margin-bottom: 0.3rem;
+  font-weight: 600;
+}
+.system-notice-body p:first-child { margin-top: 0; }
+.system-notice-body p:last-child { margin-bottom: 0; }
+/* Something was put right: the same channel, read as good news. */
+.system-notice.notice-sent-after-claim,
+.system-notice.notice-job-queued {
+  border-left-color: var(--success, #a3be8c);
+  background: color-mix(in srgb, var(--success, #a3be8c) 8%, transparent);
+}

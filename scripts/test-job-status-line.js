@@ -173,8 +173,14 @@ test('and a forged one is detected and marked', () => {
   const i = src.indexOf('forgedStatusLine(fullResponse)');
   assert.ok(/catch \(statusErr\)/.test(src.slice(i, i + 900)),
     'the check is not wrapped — a convenience could take out a turn');
-  assert.ok(/written by me, not by the system/.test(src),
+  // Wording changed when corrections moved OUT of his message (see the notice
+  // channel): the line is no longer written in his voice, because it is no
+  // longer his text. It is the system speaking about his text.
+  assert.ok(/written by the model, not by the system/.test(src),
     'a forged line must be marked in the turn she is reading, not only logged');
+  assert.ok(/notice\('forged-status'/.test(src),
+    'the mark must go out as a notice — appending it to his message would make '
+    + 'the correction itself forgeable, which is the bug one layer up');
 });
 
 test('the real one lives in UI chrome she can tell apart', () => {

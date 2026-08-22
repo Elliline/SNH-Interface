@@ -352,6 +352,74 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+## ⛔ She must be able to talk like a person — no phrase list may gate an action
+
+Coding dispatch ran at **2 real out of 7 claimed**. Every fix built for it —
+the `tool_choice` pin, the server backstop — was gated on `classifyCodingGoAhead`,
+a list of phrases: "send it", "send away", "ship it". On 2026-08-22 she wrote
+*"Please try sending the brief again. Something did not work the last time and
+it should be fixed."* An approval by any reading. It matched nothing, and
+because both consumers read one `forceCodingCall`, **a phrase miss killed the
+pin and the backstop together** and the turn fell through to a correction that
+only apologised.
+
+A phrase list is trying to enumerate one side of an open-ended conversation.
+Every miss is silent, and the only person who ever finds out is Ellie, when a
+job she approved did not run. **If a mechanism only works when she says the
+right words, it is wrong.**
+
+- **The trigger is a small constrained LLM call the SERVER makes**
+  (`db/approval-classifier.js`), not the chat model deciding mid-generation —
+  that is the thing that has been failing. One bit out, `maxTokens: 4`,
+  `temperature: 0`. It runs only when there is something to approve, so most
+  turns never pay for it.
+- **"Something to approve" is STRUCTURAL, not verbal.** `pendingBrief()` asks
+  whether an earlier reply holds something the dispatch path would accept and no
+  coding job has been created since. It skips a brief that `validateBrief` would
+  refuse — pinning on one guarantees a refusal.
+- **It fails CLOSED.** An engine error, a wedged brain, an answer that is not
+  YES or NO: all mean no pin, which is exactly today's behaviour. A false NO
+  costs a round trip and is caught by the claim-keyed backstop; a false YES pins
+  a turn she did not authorise. Not symmetric, so ambiguity takes the cheaper
+  mistake.
+- **What makes forcing safe is not the classifier.** A pin makes the model CALL
+  `dispatch_coding_job`; `db/brief-shown.js` still refuses any brief she has not
+  read. **The pin decides when to ask, never what is allowed** — which is why a
+  probabilistic trigger is acceptable in front of a deterministic guard.
+- **The phrase list is kept and gates nothing.** When it happens to hit it saves
+  a round trip. When they disagree the classifier wins, and the disagreement is
+  logged — that line is how anyone learns the list has drifted again.
+
+**The second trigger keys off HIS CLAIM, and must never share a signal with the
+first.** There are only so many ways to assert you dispatched something, and the
+phantom classifier reads them reliably; there is no bounded way to ASK. So when
+a reply claims a dispatch and no `coding_jobs` row exists, the server re-runs
+**one round with the pin set** (`forcedDispatchRound`) telling him to make the
+call he just described. He supplies project and brief, so nothing is inferred —
+which is what the old backstop could not do: the 2026-08-22 resend was in a
+brand-new conversation, so inference had no project and would have declined even
+had it run. Only if that round produces no valid call does the server infer, and
+if it cannot, **it says so plainly rather than guessing a project**.
+
+**A refused call and a call never made must not look the same.** `logAttempt()`
+existed from day one and had **never written a row**: the INSERT named a column
+`args` that does not exist (`args_json` does), `id` is a PRIMARY KEY with no
+default, and every failure went into `catch (_) {}`. That cost a whole
+diagnosis — on 2026-08-21 the tool was called, refused, and worked around, and
+the record showed nothing, so it was reported as "never called". A swallowed
+write is worse than no write: **it looks like evidence.** Refusals now record
+reason, project, brief hash, length and head, plus an ops line, and the catch
+logs to console because a logger that fails quietly is the thing being fixed.
+
+- Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-approval-trigger.js`
+  — her three real approvals, the phrase-miss case, fail-closed, the refusal
+  rows, the resend path, and source assertions that the pin is set before
+  generation and that the backstop does not read the phrase signal.
+- **A stub must return the shape the real dependency returns.** The first
+  version of that suite stubbed `callLLM` as returning a string; it returns
+  `{ content, reasoning, provider, truncated }`. The suite passed while the live
+  path read `"[object Object]"` and failed closed on every single turn.
+
 ## ⛔ Anything appended to his reply becomes his words, and then his to forge
 
 `statusBlock()` was appended to the end of a turn so she could see a running

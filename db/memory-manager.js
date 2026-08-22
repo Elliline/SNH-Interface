@@ -755,6 +755,11 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
     // No `stream` key here: streamChat owns that, and leaving a `stream: false`
     // behind would read as "this path does not stream" when it does.
     body = { messages, max_tokens: wireMaxTokens };
+    // A CALLER MAY PIN DETERMINISM. Only the approval classifier does today: it
+    // reads one bit out of a handful of tokens, and a sampled answer to a
+    // yes/no question is a coin weighted by temperature. Omitted entirely when
+    // not asked for, so every existing caller sends the body it always did.
+    if (Number.isFinite(options.temperature)) body.temperature = options.temperature;
     if (bgThinking > 0) body.thinking_token_budget = bgThinking;
     if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
     extract = (data) => data.choices?.[0]?.message?.content || '';
@@ -762,6 +767,7 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   } else {
     url = `${host}/api/chat`;
     body = { model: heartbeatModel.model, messages, options: { num_predict: maxTokens } };
+    if (Number.isFinite(options.temperature)) body.options.temperature = options.temperature;
     extract = (data) => data.message?.content || '';
     extractFinishReason = (data) => data.done_reason || '';
   }

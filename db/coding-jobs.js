@@ -39,7 +39,7 @@
  * nothing rots by being ignored.
  */
 
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -392,16 +392,63 @@ const BRIEF_PATH_PATTERNS = [
  * looked identical from the outside. They are different problems and
  * need different fixes.
  */
-function logAttempt(outcome, project, detail, conversationId) {
+/**
+ * A REFUSED CALL AND A CALL NEVER MADE MUST NOT LOOK THE SAME FROM OUTSIDE.
+ *
+ * This function existed from the first day and had NEVER ONCE WRITTEN A ROW.
+ * Two bugs, both silent: the INSERT named a column `args` that does not exist
+ * (the schema says `args_json`), and `id` is a PRIMARY KEY with no default, so
+ * even a corrected column list would have failed on a null id. Every failure
+ * went into `catch (_) {}`.
+ *
+ * The cost was a whole diagnosis. On 2026-08-21 the model called this tool,
+ * was refused because the project did not exist, and worked around the refusal
+ * by dispatching into an unrelated project — and the record showed nothing at
+ * all, so the refusal was invisible and I reported "the tool has never been
+ * called". A swallowed write is worse than no write: it looks like evidence.
+ *
+ * The catch stays — logging may never break a dispatch — but it now says so on
+ * the console, because a logger that fails quietly is the thing being fixed.
+ */
+function logAttempt(outcome, project, detail, conversationId, extra = {}) {
   try {
     const db = getSqliteDb();
     if (!db) return;
     db.prepare(`
-      INSERT INTO tool_call_log (tool, args, outcome, detail, conversation_id, created_at)
-      VALUES ('dispatch_coding_job', ?, ?, ?, ?, ?)
-    `).run(JSON.stringify({ project }), outcome, String(detail || '').slice(0, 300),
-           conversationId, new Date().toISOString());
-  } catch (_) { /* logging must never break a dispatch */ }
+      INSERT INTO tool_call_log (id, tool, args_json, outcome, detail, conversation_id, created_at)
+      VALUES (?, 'dispatch_coding_job', ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      JSON.stringify({ project: project || null, ...extra }),
+      outcome,
+      String(detail || '').slice(0, 300),
+      conversationId,
+      new Date().toISOString()
+    );
+  } catch (err) {
+    console.error('[CodingJobs] attempt log FAILED — a refusal is going unrecorded:', err.message);
+  }
+}
+
+/**
+ * The refusal record, with the brief that was refused.
+ *
+ * Separate from logAttempt because a refusal needs the brief to be diagnosable
+ * at all — "rejected-brief" without the text tells you a refusal happened and
+ * nothing about why it kept happening. The brief is stored as a hash plus a
+ * leading excerpt rather than whole: the full text is already in the reply that
+ * proposed it, and tool_call_log is read in bulk.
+ */
+function logRefusal({ reason, project, brief, conversationId, kind = 'rejected' }) {
+  const text = String(brief || '');
+  const hash = createHash('sha256').update(text).digest('hex').slice(0, 16);
+  logAttempt(kind, project, reason, conversationId, {
+    brief_sha256: hash,
+    brief_chars: text.length,
+    brief_head: text.slice(0, 160).replace(/\s+/g, ' '),
+  });
+  opsLog(`dispatch_coding_job REFUSED (${kind}): ${String(reason || '').slice(0, 200)} `
+    + `[project ${project || 'none'}, brief ${hash} ${text.length} chars]`);
 }
 
 
@@ -439,6 +486,7 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
                     userMessage = null }) {
   const c = cfg();
   if (c.enabled === false) {
+    logRefusal({ reason: 'coding jobs are switched off in configuration', project, brief, conversationId, kind: 'rejected-disabled' });
     return { ok: false, error: 'Dispatching coding jobs is switched off in configuration.' };
   }
 
@@ -447,12 +495,13 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   const bin = binaryStatus(c);
   if (!bin.ok) {
     opsLog(`dispatch_coding_job REFUSED: ${bin.why}`);
+    logRefusal({ reason: bin.why, project, brief, conversationId, kind: 'rejected-unrunnable' });
     return { ok: false, error: `squatch-code is not runnable from here. ${bin.why}`, unrunnable: true };
   }
 
   const v = validateProject(project);
   if (!v.ok) {
-    logAttempt('rejected-project', project, v.error, conversationId);
+    logRefusal({ reason: v.error, project, brief, conversationId, kind: 'rejected-project' });
     return { ok: false, error: v.error, suggestion: v.suggestion };
   }
   // Everything downstream uses the NORMALISED name, so what she was told
@@ -460,8 +509,12 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   const projectName = v.name;
 
   const text = String(brief || '').trim();
-  if (!text) return { ok: false, error: 'A brief is required - say what needs doing.' };
+  if (!text) {
+    logRefusal({ reason: 'no brief text', project, brief, conversationId, kind: 'rejected-empty' });
+    return { ok: false, error: 'A brief is required - say what needs doing.' };
+  }
   if (text.length > 4000) {
+    logRefusal({ reason: 'brief over 4000 characters', project, brief, conversationId, kind: 'rejected-long' });
     return { ok: false, error: 'That brief is too long to dispatch (4000 characters max).' };
   }
 
@@ -469,7 +522,7 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   // a path is refused here rather than argued with in a description.
   const briefCheck = validateBrief(text);
   if (!briefCheck.ok) {
-    logAttempt('rejected-brief', project, briefCheck.matched, conversationId);
+    logRefusal({ reason: `brief names a path: ${briefCheck.matched}`, project, brief, conversationId, kind: 'rejected-brief' });
     opsLog(`dispatch_coding_job REJECTED brief for ${project}: ${briefCheck.matched}`);
     return { ok: false, error: briefCheck.error, briefRejected: true };
   }
@@ -481,6 +534,7 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
     // failure the bell had: work that never happens and nothing says so.
     opsLog('dispatch_coding_job REFUSED for ' + project + ': ' + seen.reason +
            ' (best match ' + (seen.ratio * 100).toFixed(0) + '%)');
+    logRefusal({ reason: `brief not shown to her (coverage ${Math.round((seen.ratio || 0) * 100)}%)`, project, brief, conversationId, kind: 'rejected-unseen' });
     return { ok: false, error: seen.reason, unseen: true, ratio: seen.ratio };
   }
 
@@ -734,6 +788,18 @@ function backstopDispatch({ conversationId, messageId = null, userMessage = null
     : { ok: false, kind: 'refused', reason: result.error };
 }
 
+/** Coding jobs created in this conversation since a timestamp — "did THIS turn
+ *  dispatch?", which is what every guard actually wants to know. agent_jobs
+ *  counts research jobs too, and a research job is not an answer to a brief. */
+function dispatchedInTurn(conversationId, sinceIso) {
+  const db = getSqliteDb();
+  if (!db || !conversationId) return 0;
+  const row = db.prepare(
+    'SELECT COUNT(*) n FROM coding_jobs WHERE conversation_id = ? AND created_at >= ?'
+  ).get(conversationId, sinceIso);
+  return (row && row.n) || 0;
+}
+
 module.exports = {
   SOURCE,
   validateBrief,
@@ -742,6 +808,9 @@ module.exports = {
   running,
   statusBlock,
   backstopDispatch,
+  logAttempt,
+  logRefusal,
+  dispatchedInTurn,
   resolveBinary,
   binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,
