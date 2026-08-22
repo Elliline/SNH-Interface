@@ -50,9 +50,9 @@ class DispatchCodingJobTool {
       'project field — it will be created. Do NOT pick a different existing ' +
       'project to put it in, and do NOT ask the job to make directories, move ' +
       'between projects, or work anywhere outside the one project. The brief ' +
-      'describes work INSIDE that project; a brief that says "create a ' +
-      'directory in Projects/" is asking for something the job is not allowed ' +
-      'to do and it will fail. ' +
+      'describes work INSIDE that project. A brief that says "create a ' +
+      'directory in Projects/" is asking for something outside the job\'s ' +
+      'remit: its file tools will refuse it, and you must not ask for it. ' +
       'If a dispatch is refused for any reason, tell her what it said and stop. ' +
       'Do not look for another way to get the work started. ' +
       'The job runs unattended for a few minutes; it can edit files in that ' +

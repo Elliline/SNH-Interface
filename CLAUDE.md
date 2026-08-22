@@ -649,10 +649,47 @@ removes a clipboard from a loop she already ran by hand.
 - **A git restore point is the safety property, and the allowlist is
   not.** squatch-code commits any dirty work first so hers stays
   separable, commits a baseline, and the report carries
-  `git reset --hard <sha>`. Ellie chose the command allowlist knowing it
-  is a speed bump: an allowed interpreter can run anything. Every
-  project under `Projects/` was made a git repository as part of
-  shipping this, because without one `reversible: true` would be a lie.
+  `git reset --hard <sha> && git clean -fd`. Every project under
+  `Projects/` was made a git repository as part of shipping this,
+  because without one `reversible: true` would be a lie.
+
+- **⚠ WHAT STOPS A JOB LEAVING ITS PROJECT IS THE TOOL DESCRIPTION, NOT
+  THE SANDBOX — and that is a real gap, written here so nobody reads the
+  description and believes it is enforced.** Measured on 2026-08-21,
+  after the first real dispatch tried exactly this:
+
+      write_file ../squatch_crawler/main.py   -> REFUSED (path containment)
+      run_command mkdir -p ../squatch_crawler -> DENIED  (not on allowlist)
+      run_command python3 -c "import os; os.makedirs('../squatch_crawler')"
+                                              -> ALLOWED
+
+  The file tools are genuinely confined by `_resolve_path`. `run_command`
+  is not confined at all: it goes through a shell, and the allowlist
+  filters only the FIRST WORD. Every interpreter on that list — python,
+  python3, node, go, make, git — can do anything the user can, including
+  writing outside the project. `git init ../elsewhere` is allowed too.
+
+  So the honest layering, worst case first:
+
+  1. **The restore point is the only real control**, and it is a recovery
+     mechanism rather than a preventive one. It covers the project; it
+     does not cover a job that writes outside it.
+  2. **Path containment** genuinely prevents the file tools from
+     escaping. It is the one enforced boundary here.
+  3. **The allowlist** is a speed bump. Ellie accepted it as one, in
+     those words.
+  4. **The tool description** is the only thing stopping a job being
+     ASKED to leave its project, and a description is an argument, not a
+     mechanism. This is the same shape as the three incidents in *A
+     mechanism is only safe in the context that made it safe* — a stated
+     safety property with nothing behind it — and it is recorded as a
+     known gap rather than dressed up.
+
+  Closing it properly means confining `run_command` itself: a working
+  directory it cannot leave, which on this box means a container, a
+  user namespace or bubblewrap. That is a real piece of work and has not
+  been done. Until it is, **do not write anything that implies a job
+  cannot escape its project.** It can; nothing has yet made it try.
 - **ONE COARSE TOOL.** No read_file/write_file surface here -
   squatch-code has its own agentic loop and model; a tool layer driving
   it step by step would be a worse copy of the thing it calls.

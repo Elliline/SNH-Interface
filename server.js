@@ -3458,6 +3458,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         } else if (claimsDispatch) {
           console.log(`[AgentJobs] dispatch claim checks out — ${created.length} job(s) created in this turn`);
         }
+        // WHAT IS HAPPENING, WHILE IT HAPPENS. She found out a job had
+        // finished by opening a panel afterwards. A dispatched job now
+        // says where it is at the end of any turn taken while it runs -
+        // in the conversation she is already reading, not a new channel
+        // and not a new alert. A job that has gone quiet says so in the
+        // same line, because a stale action shown as current is worse
+        // than no line.
+        try {
+          const status = require('./db/coding-jobs').statusBlock();
+          if (status) append(status);
+        } catch (statusErr) {
+          console.error('[CodingJobs] status line failed:', statusErr.message);
+        }
       } catch (phantomErr) {
         console.error('[AgentJobs] phantom-dispatch check failed:', phantomErr.message);
       }

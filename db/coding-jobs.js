@@ -188,6 +188,101 @@ function binaryStatus(c = cfg()) {
 
 
 /**
+ * A one-line answer to "what is it doing", for the turn she is reading.
+ *
+ * She found out a job had finished by opening a panel afterwards. This
+ * exists so she does not have to go looking: a job that is running says
+ * so in the reply, and a job that has gone quiet says THAT in the same
+ * line rather than as a new alert - a stale action shown as if it were
+ * current is worse than no line at all.
+ *
+ * NOT A PERCENTAGE. The run does not know how much work is left, so any
+ * fraction would be invented. What it knows is what it just did and how
+ * long it has been going. This is also the line CLAUDE.md's rule allows:
+ * THAT a job runs and for how long, never how far along.
+ *
+ * Elapsed is computed HERE from started_at rather than read from the
+ * file, because the file is written on events and a stored elapsed
+ * freezes between them - it read "0s" for seventy seconds while a run
+ * waited on its first model response, which looks exactly like a job
+ * that has died.
+ */
+const QUIET_AFTER_MS = 120000;
+
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+}
+
+function progressLine(progressPath, now = Date.now()) {
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(progressPath, 'utf8'));
+  } catch (_) {
+    return null;                       // not started writing yet
+  }
+  if (!data || typeof data !== 'object') return null;
+
+  if (data.finished) {
+    return `finished after ${formatDuration(data.elapsed_seconds || 0)}`;
+  }
+
+  const startedMs = data.started_at ? data.started_at * 1000 : null;
+  const elapsed = startedMs ? (now - startedMs) / 1000 : (data.elapsed_seconds || 0);
+
+  const parts = [];
+  if (data.iteration) {
+    parts.push(`step ${data.iteration}` + (data.max_iterations ? `/${data.max_iterations}` : ''));
+  }
+  parts.push(data.last_action || 'thinking');
+  parts.push(formatDuration(elapsed));
+
+  const silentMs = data.updated_at ? now - data.updated_at * 1000 : 0;
+  if (silentMs >= QUIET_AFTER_MS) {
+    parts.push(`no activity for ${Math.floor(silentMs / 60000)}m`);
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * Every dispatched coding job currently running, with where it is.
+ * Empty array when nothing is running, so a caller renders nothing.
+ */
+function running(now = Date.now()) {
+  const db = getSqliteDb();
+  if (!db) return [];
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT cj.project, cj.progress_path, aj.id AS job_id, aj.status
+      FROM coding_jobs cj
+      JOIN agent_jobs aj ON aj.id = cj.agent_job_id
+      WHERE aj.status IN ('queued', 'running')
+      ORDER BY aj.created_at ASC
+    `).all();
+  } catch (_) {
+    return [];
+  }
+  return rows.map(r => ({
+    project: r.project,
+    jobId: r.job_id,
+    queued: r.status === 'queued',
+    line: r.status === 'queued'
+      ? 'queued, not started yet'
+      : (r.progress_path ? progressLine(r.progress_path, now) : null) || 'starting',
+  }));
+}
+
+/** The block appended to a reply while work is in flight. */
+function statusBlock(now = Date.now()) {
+  const live = running(now);
+  if (!live.length) return null;
+  const lines = live.map(j => `- **${j.project}** — ${j.line}`);
+  return `\n\n---\n\n_squatch-code, working:_\n${lines.join('\n')}`;
+}
+
+
+/**
  * Send a brief to squatch-code. Her go-ahead already happened, in chat.
  *
  * Refuses unless the brief is already on her screen. A refusal comes back
@@ -294,6 +389,15 @@ function runDispatched(job, { timeoutMs = null } = {}) {
       });
     }
 
+    const progressPath = path.join(path.dirname(reportPath), 'progress.json');
+    try {
+      const db = getSqliteDb();
+      if (db) {
+        db.prepare('UPDATE coding_jobs SET progress_path = ? WHERE agent_job_id = ?')
+          .run(progressPath, job.id);
+      }
+    } catch (_) { /* the status line is a convenience, never the job */ }
+
     const args = [
       '--project', project,
       '--projects-root', projectsRoot(),
@@ -391,6 +495,9 @@ function readReport(reportPath, fallback) {
 
 module.exports = {
   SOURCE,
+  progressLine,
+  running,
+  statusBlock,
   resolveBinary,
   binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,

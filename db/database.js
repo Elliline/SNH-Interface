@@ -946,10 +946,22 @@ function initDatabase() {
         -- is a paraphrase, dispatched but recorded as one.
         match_ratio REAL,
         match_exact INTEGER DEFAULT 0,
+        -- Where the running job writes its live position. Set when the
+        -- process starts, so a status line can be rendered while the job
+        -- is still working rather than only from the report afterwards.
+        progress_path TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_coding_jobs_status ON coding_jobs(status)');
+
+    // Migration: coding_jobs rows written before live progress existed
+    // have no place to look for it.
+    const codingCols = sqliteDb.prepare('PRAGMA table_info(coding_jobs)').all();
+    if (!codingCols.some(c => c.name === 'progress_path')) {
+      sqliteDb.exec('ALTER TABLE coding_jobs ADD COLUMN progress_path TEXT');
+      console.log('Migration: added progress_path to coding_jobs (live status line)');
+    }
 
     // ============ What the run PRODUCED, as a file ============
     //
