@@ -229,6 +229,96 @@ async function onProbeResult(probe) {
 }
 
 /** Test/inspection helper: current internal state. */
+/**
+ * What the watchdog currently believes about the brain, in words a
+ * person can use.
+ *
+ * WHY THIS EXISTS. On 2026-08-21 the watchdog detected a wedged engine,
+ * restarted the container, logged "model reloading, cooldown 5 min", and
+ * confirmed recovery itself - and while all that was happening Ellie's
+ * chat returned a bare "fetch failed". The system knew exactly what was
+ * wrong and how long it would last, and told her nothing. The knowledge
+ * existed; only the path from it to her did not.
+ *
+ * Read-only, synchronous, and never probes: it reports the state the
+ * probe loop has already established. A caller in a failing request path
+ * cannot afford to wait, and a status call that could itself hang would
+ * be a new way to fail.
+ */
+function brainStatus(now = Date.now()) {
+  return describeBrainState({
+    restartInFlight,
+    awaitingRecovery,
+    consecutiveFailures,
+    lastRestartAt,
+    wedgeDetectedAt,
+  }, cfg(), now);
+}
+
+/**
+ * The message for a given brain state. PURE - state in, words out.
+ *
+ * Separated from brainStatus() because the watchdog disables itself when
+ * SNH_DATA_DIR is set (a disposable instance must not restart the shared
+ * container), which means a test can never drive its state machine. That
+ * guard is right and stays; extracting the formatter is how the words
+ * get tested without it - and the words are the part that failed her.
+ */
+/** "1 minute" / "3 minutes" - a status line reading "1 minute(s)" is a
+ *  small thing that makes the whole message look machine-generated. */
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+function describeBrainState(st, c = {}, now = Date.now()) {
+  const cooldownMs = c.cooldownMs || 0;
+  const threshold = c.failureThreshold ?? 3;
+
+  if (st.restartInFlight) {
+    return {
+      healthy: false,
+      state: 'restarting',
+      message: 'The model engine is being restarted right now. It usually takes '
+             + 'a minute or two to load, and nothing was lost — try again shortly.',
+    };
+  }
+
+  if (st.awaitingRecovery) {
+    const since = st.lastRestartAt ? Math.round((now - st.lastRestartAt) / 1000) : null;
+    const left = st.lastRestartAt
+      ? Math.max(0, Math.round((st.lastRestartAt + cooldownMs - now) / 1000))
+      : 0;
+    return {
+      healthy: false,
+      state: 'reloading',
+      restartedSecondsAgo: since,
+      message: 'The model engine was restarted'
+             + (since !== null
+                 ? ` ${since < 60 ? plural(since, 'second') : plural(Math.round(since / 60), 'minute')} ago`
+                 : '')
+             + ' and is still loading its model. Nothing was lost — '
+             + (left
+                 ? `give it about ${left < 60 ? plural(left, 'more second') : plural(Math.ceil(left / 60), 'more minute')} and try again.`
+                 : 'try again in a minute.'),
+    };
+  }
+
+  if (st.consecutiveFailures > 0) {
+    const downFor = st.wedgeDetectedAt ? Math.round((now - st.wedgeDetectedAt) / 60000) : 0;
+    return {
+      healthy: false,
+      state: 'wedged',
+      consecutiveFailures: st.consecutiveFailures,
+      message: `The model engine has stopped responding${downFor ? ` (about ${plural(downFor, 'minute')} now)` : ''}. `
+             + (st.consecutiveFailures >= threshold
+                 ? 'A restart is due on the next check — try again in a minute or two.'
+                 : `I restart it automatically after ${threshold} failed checks; this is ${st.consecutiveFailures}. Try again in a minute.`),
+    };
+  }
+
+  return { healthy: true, state: 'ok', message: null };
+}
+
 function _getState() {
   return { consecutiveFailures, lastRestartAt, restartTimes: [...restartTimes], awaitingRecovery, restartInFlight, capCriticalLogged };
 }
@@ -245,4 +335,4 @@ function _reset() {
   capCriticalLogged = false;
 }
 
-module.exports = { onProbeResult, _getState, _reset };
+module.exports = { onProbeResult, brainStatus, describeBrainState, _getState, _reset };

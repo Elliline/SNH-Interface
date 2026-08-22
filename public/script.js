@@ -564,7 +564,12 @@ async function sendMessage(inputModality = 'typed') {
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
-      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      const err = new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      // When the server knows WHY - the model engine is restarting, say -
+      // the message explains itself and does not want a "Failed to send
+      // message:" bolted onto the front of it.
+      if (errorData.brain) { err.brain = errorData.brain; err.technical = errorData.technical; }
+      throw err;
     }
 
     // Get conversation ID from response headers
@@ -676,7 +681,12 @@ async function sendMessage(inputModality = 'typed') {
   } catch (error) {
     console.error('Error sending message:', error);
     ttsChunker.cancel();
-    addMessage('error', `Failed to send message: ${error.message}`);
+    // A known engine state is already a complete explanation; anything
+    // else is an unexplained failure and should say so.
+    addMessage('error', error.brain
+      ? error.message
+      : `Failed to send message: ${error.message}`);
+    if (error.technical) console.error('[Chat] underlying error:', error.technical);
   } finally {
     hideTypingIndicator();
     // Fix 6: Re-enable send button on all exit paths

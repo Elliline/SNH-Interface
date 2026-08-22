@@ -3557,8 +3557,33 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // `cause`, carrying no flag of its own.
       const networkFailure = !!error.cause?.code
         || (error.name === 'TypeError' && /fetch failed|network|socket/i.test(error.message || ''));
-      res.status(error.upstream || networkFailure ? 502 : 500)
-        .json({ error: error.message || 'Chat service unavailable' });
+
+      // SAY WHAT THE SYSTEM ALREADY KNOWS. On 2026-08-21 the watchdog
+      // detected a wedged engine, restarted the container, logged
+      // "cooldown 5 min" and confirmed recovery itself - and while all of
+      // that was happening her chat returned a bare "fetch failed". It
+      // knew what was wrong and roughly how long it would last. When the
+      // brain is down or reloading, the reply now carries the watchdog's
+      // own account: what happened, that nothing was lost, and when to
+      // try again.
+      let body = { error: error.message || 'Chat service unavailable' };
+      if (networkFailure) {
+        try {
+          const brain = require('./db/brain-watchdog').brainStatus();
+          if (!brain.healthy && brain.message) {
+            body = {
+              error: brain.message,
+              brain: brain.state,
+              technical: error.message || null,
+            };
+          }
+        } catch (statusErr) {
+          // A status lookup must never replace the error it explains.
+          console.error('[Watchdog] brainStatus failed:', statusErr.message);
+        }
+      }
+
+      res.status(error.upstream || networkFailure ? 502 : 500).json(body);
     } else if (!res.writableEnded) {
       // Stream already started (e.g. the upstream request was aborted mid-stream
       // by the stall watchdog or a client disconnect) — just close it out.
