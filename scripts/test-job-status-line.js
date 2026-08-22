@@ -144,20 +144,44 @@ test('it never claims to know how far along it is', () => {
     'the line implies progress it cannot know');
 });
 
-console.log('\nwired into the reply\n');
+console.log('\nNOT wired into the reply — that was the defect\n');
 
-test('server.js appends it to the turn', () => {
+// INVERTED ON 2026-08-22, and the old assertions are quoted here because the
+// reason matters more than the change:
+//
+//   assert.ok(/statusBlock\(\)/.test(src), 'the reply never renders a status line');
+//   assert.ok(/if \(status\) append\(status\)/.test(src), ...);
+//
+// Both passed, both were satisfied, and what they were guarding was the bug.
+// Appending the block put it inside his message; the message is stored whole,
+// so it came back on the next turn as his own words and he learned to write it.
+// An hour after the first real one he produced a fake with a command that does
+// not exist. A status line she cannot distinguish from narration is worse than
+// no status line, because she trusted it.
+test('the reply does NOT append a status block', () => {
   const src = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  assert.ok(/statusBlock\(\)/.test(src), 'the reply never renders a status line');
-  assert.ok(/if \(status\) append\(status\)/.test(src),
-    'a null status must append nothing at all');
+  assert.ok(!/if \(status\) append\(status\)/.test(src),
+    'the status block is being appended to message text again — it is forgeable there');
+  assert.ok(!/append\(\s*require\('\.\/db\/coding-jobs'\)\.statusBlock/.test(src),
+    'the status block is being appended to message text again');
 });
 
-test('a failure in the status line cannot break the reply', () => {
+test('and a forged one is detected and marked', () => {
   const src = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const i = src.indexOf('statusBlock()');
-  assert.ok(/catch \(statusErr\)/.test(src.slice(i, i + 400)),
-    'the status line is not wrapped — a convenience could take out a turn');
+  assert.ok(/forgedStatusLine\(fullResponse\)/.test(src),
+    'nothing checks whether he wrote a status line himself');
+  const i = src.indexOf('forgedStatusLine(fullResponse)');
+  assert.ok(/catch \(statusErr\)/.test(src.slice(i, i + 900)),
+    'the check is not wrapped — a convenience could take out a turn');
+  assert.ok(/written by me, not by the system/.test(src),
+    'a forged line must be marked in the turn she is reading, not only logged');
+});
+
+test('the real one lives in UI chrome she can tell apart', () => {
+  const page = fs.readFileSync(path.join(__dirname, '../public/script.js'), 'utf8');
+  assert.ok(/coderStrip/.test(page), 'there is no out-of-transcript place for live status');
+  assert.ok(/jobs\/coding\/active/.test(page),
+    'the strip must be fed by the queue, not by anything in a message');
 });
 
 console.log('\nthe brief cannot decide where work goes\n');

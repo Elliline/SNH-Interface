@@ -21,6 +21,8 @@ const factExtractor = require('./db/fact-extractor');
 const memoryFlush = require('./db/memory-flush');
 const memoryClusters = require('./db/memory-clusters');
 const memoryManager = require('./db/memory-manager');
+const dispatchClaims = require('./db/dispatch-claims');
+const codingJobs = require('./db/coding-jobs');
 const agentPool = require('./db/agent-pool');
 const identity = require('./db/identity');
 const capabilityManifest = require('./db/capability-manifest');
@@ -191,8 +193,40 @@ function generationParams(providerType) {
  * Fold + log, immediately before a provider request. Logs both sequences so the
  * shape actually sent is visible, not inferred.
  */
+/**
+ * A LIVE STATUS BLOCK IS STRIPPED OUT OF HISTORY BEFORE HE SEES IT AGAIN.
+ *
+ * Until 2026-08-22 the server appended `_squatch-code, working:_ …` to the
+ * reply. That put it inside his message, the message is stored whole, and the
+ * next turn handed it back to him as his own words. An hour after the first
+ * real one he wrote a fake — right format, invented command, nothing running.
+ *
+ * The append is gone, but two of those blocks are in the stored transcript and
+ * deleting her history to fix our bug is not on. So they are removed on the way
+ * OUT instead: the record keeps what happened, and he stops being shown a
+ * format that is no longer his to write. Same reasoning as never re-adding a
+ * vector for an inactive fact — the row stays, the retrieval stops.
+ */
+const STORED_STATUS_BLOCK =
+  /\n*(?:---\n+)?_squatch-?code, working:_\n(?:[ \t]*[-*].*\n?)*/gi;
+
+function stripStoredStatusBlocks(messages) {
+  let stripped = 0;
+  const out = messages.map(m => {
+    if (m.role !== 'assistant' || typeof m.content !== 'string') return m;
+    if (!/squatch-?code, working/i.test(m.content)) return m;
+    stripped++;
+    return { ...m, content: m.content.replace(STORED_STATUS_BLOCK, '\n').trimEnd() };
+  });
+  return { out, stripped };
+}
+
 function prepareOutboundMessages(messages, label) {
-  const folded = foldSystemMessages(messages);
+  const { out: cleaned, stripped } = stripStoredStatusBlocks(messages);
+  if (stripped) {
+    console.log(`[Outbound ${label}] stripped ${stripped} stored status block(s) — he must not relearn that format`);
+  }
+  const folded = foldSystemMessages(cleaned);
   console.log(`[Outbound ${label}] roles in : ${roleSequence(messages)}`);
   console.log(`[Outbound ${label}] roles out: ${roleSequence(folded)}`);
   return folded;
@@ -1810,6 +1844,26 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     const forceHandoffCall = needsHandoff && handoffSignal.tier === 1
       && mcpClient.hasTool('start_background_job');
 
+    // === SHE APPROVED A BRIEF: THE DISPATCH IS FORCED TOO ===
+    //
+    // Same argument as tier 1, and a worse record. He has claimed a coding
+    // dispatch five times; two were real. On 2026-08-22 "Send away" produced a
+    // real job and "Go ahead and send it" — an hour later, same conversation,
+    // same shape — produced "It's sent. The brief has been delivered" plus a
+    // forged progress line, with tool_calls empty. Asking has failed enough.
+    //
+    // WHAT MAKES FORCING SAFE HERE is not the phrase list. It is that
+    // dispatch_coding_job refuses any brief she has not been shown
+    // (db/brief-shown.js) and any brief that tries to name a directory. A pin
+    // can make him CALL the tool; it cannot make the tool accept something she
+    // never read. So the cost of a false positive is a refusal he is told how
+    // to act on, not work she did not approve.
+    const codingGoAhead = mcpClient.hasTool('dispatch_coding_job')
+      ? dispatchClaims.classifyCodingGoAhead(userMessage.content)
+      : { goAhead: false };
+    const forceCodingCall = codingGoAhead.goAhead;
+    if (forceCodingCall) console.log('Tool routing: SHE SAID SEND IT — pinning dispatch_coding_job this round');
+
     const classifierWouldHaveGated = needsSearchTools || needsActionTools || needsMemoryWrite
       || needsMemoryRead || needsMemoryCorrections || needsJobsRead || needsHandoff;
     const needsTools = mcpClient.hasTools();
@@ -2711,7 +2765,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           // is not optional. If the engine REFUSES the request outright, the same
           // round is retried without the pin rather than losing the turn — a
           // forced call is worth having, and it is not worth a failed reply.
-          const forceThisRound = forceHandoffCall && round === 0;
+          // TWO THINGS CAN BE PINNED, never both: a tool_choice names one
+          // function. Handoff wins if somehow both fire, because she named the
+          // mechanism explicitly there.
+          const forcedToolName = forceHandoffCall ? 'start_background_job'
+            : forceCodingCall ? 'dispatch_coding_job' : null;
+          const forceThisRound = !!forcedToolName && round === 0;
           // STREAMED SO THE DEADLINE CAN SEE PROGRESS. streamChat returns the
           // NON-streaming shape, so everything below reads `toolData` exactly
           // as it did when this was `stream: false` — that shape-preservation
@@ -2724,14 +2783,14 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               model,
               messages: prepareOutboundMessages(ollamaMessages, `ollama tool-round ${round + 1}`),
               tools,
-              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {})
+              ...(forced ? { tool_choice: { type: 'function', function: { name: forcedToolName } } } : {})
             },
             firstTokenMs: ct.firstTokenMs,
             stallMs: ct.stallMs,
             label: `ollama tool-round ${round + 1}`
           });
 
-          if (forceThisRound) console.log('MCP [ollama]: FORCING start_background_job this round — she named the agent (tier 1)');
+          if (forceThisRound) console.log(`MCP [ollama]: FORCING ${forcedToolName} this round — ${forceHandoffCall ? 'she named the agent (tier 1)' : 'she approved a brief and said send it'}`);
           let toolData;
           try {
             toolData = await postRound(forceThisRound);
@@ -2977,7 +3036,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           // is not optional. If the engine REFUSES the request outright, the same
           // round is retried without the pin rather than losing the turn — a
           // forced call is worth having, and it is not worth a failed reply.
-          const forceThisRound = forceHandoffCall && round === 0;
+          // TWO THINGS CAN BE PINNED, never both: a tool_choice names one
+          // function. Handoff wins if somehow both fire, because she named the
+          // mechanism explicitly there.
+          const forcedToolName = forceHandoffCall ? 'start_background_job'
+            : forceCodingCall ? 'dispatch_coding_job' : null;
+          const forceThisRound = !!forcedToolName && round === 0;
           // STREAMED SO THE DEADLINE CAN SEE PROGRESS — see the ollama round
           // above. streamChat hands back the non-streaming shape, so `toolData`
           // below is byte-identical in structure to what `stream: false` gave.
@@ -2993,7 +3057,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               // the wire format is canonicalised.
               messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} tool-round ${round + 1}`),
               tools,
-              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {}),
+              ...(forced ? { tool_choice: { type: 'function', function: { name: forcedToolName } } } : {}),
               ...generationParams(providerType)
             },
             firstTokenMs: ct.firstTokenMs,
@@ -3001,7 +3065,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             label: `${providerLabel} tool-round ${round + 1}`
           });
 
-          if (forceThisRound) console.log(`MCP [${providerLabel}]: FORCING start_background_job this round — she named the agent (tier 1)`);
+          if (forceThisRound) console.log(`MCP [${providerLabel}]: FORCING ${forcedToolName} this round — ${forceHandoffCall ? 'she named the agent (tier 1)' : 'she approved a brief and said send it'}`);
           let toolData;
           try {
             toolData = await postRound(forceThisRound);
@@ -3439,37 +3503,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // Same doctrine as the ledger funnel and the phantom guard — the outcome is
       // made true, and the truth is what reaches her.
       try {
-        // TWO FAMILIES OF CLAIM, and the second was added after the first
-        // real coding dispatch. The guard already covered narration - it
-        // reads the finished reply, not whether a tool was offered - but its
-        // vocabulary was written entirely for start_background_job, so it
-        // missed "Sending the directive to squatch-code now...", a
-        // parenthetical admitting it was simulating, and "I'll re-run the
-        // command now", none of which started anything.
+        // THE CLAIM PATTERNS LIVE IN db/dispatch-claims.js — pure and tested
+        // against the sentences he actually wrote, which is the only evidence
+        // that has ever improved them.
         //
-        // Present-progressive and imminent forms count, because a reply that
-        // says "sending now" and creates no row has said something untrue -
-        // the tense does not change that. What must NOT count is conditional
-        // intent: "shall I send this?" and "I'll send it once you confirm"
-        // are the correct behaviour and firing on them would punish it.
-        const claimedDone = /\b(i(?:'ve| have)? (?:just )?(?:started|kicked off|queued|launched|dispatched|sent|handed (?:this|that|it) (?:off|over))|i(?:'m| am) (?:now )?running (?:this|that|it) in the background|(?:i(?:'ve| have)? )?(?:handed|passed) (?:this|that|it) (?:off )?to (?:a|an|the|my) (?:background )?agent|background job (?:has been|is) (?:started|running)|the agent is (?:now )?(?:working|running))\b/i;
-        // An in-flight verb ALONE is not a claim - "the tests are running
-        // now" is about tests. The phrase has to name what is being sent,
-        // or it fires on every reply that mentions something running.
-        // "retry" and "resend" added after 2026-08-21, where "I will retry
-        // the job immediately" was followed by tool_calls: [] and nothing ran.
-        const target = '(?:squatch-?code|the coder|an? agent|the agent|a job|the job|background job|the brief|the directive|the command|it off)';
-        const claimedInFlight = new RegExp(
-          '\\b(?:sending|re-?sending|dispatching|re-?dispatching|handing|passing|queuing|queueing|kicking off|launching|re-?running|retrying)\\b'
-          + '[^.!?\\n]{0,60}\\b' + target + '\\b'
-          + '|\\bi(?:\'ll| will|\'m going to| am going to) (?:re-?run|run|send|re-?send|dispatch|re-?dispatch|retry|kick off|launch)\\b[^.!?\\n]{0,40}\\b' + target + '\\b[^.!?\\n]{0,30}\\b(?:now|immediately|right away)\\b',
-          'i');
-        // Hedges that mark a sentence as intent rather than a report.
-        const conditional = /\b(shall i|should i|would you like|do you want|once you|when you|if you|before i|let me know|say the word|awaiting|pending your)\b/i;
-
-        const claimsDispatch = (claimedDone.test(fullResponse)
-          || claimedInFlight.test(fullResponse))
-          && !conditional.test(fullResponse);
+        // They were inline here, and entirely FIRST-PERSON ACTIVE, with a
+        // comment calling that narrowness a virtue. On 2026-08-22 he wrote
+        // "It's sent. The brief has been delivered to the coding agent." and
+        // nothing fired, because he never said "I". Nothing had been
+        // dispatched. The first person was never what made a claim a claim —
+        // the discipline that keeps false positives down is the VERB (sent,
+        // dispatched, delivered) rather than the pronoun.
+        const claim = dispatchClaims.classifyDispatchClaim(fullResponse);
+        const claimsDispatch = claim.claims;
         const created = agentJobs.jobsStartedInTurn(convoId, turnStartedAt);
 
         const append = (text) => {
@@ -3511,6 +3557,44 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             try { factExtractor.appendToOpsLog(line, db.getOpsDir()); } catch { /* console is the floor */ }
             append(`\n\n---\n\n**No agent was started.** You asked for one and I could not queue it: ${started.error}`);
           }
+        } else if (forceCodingCall && created.length === 0) {
+          // === THE CODING BACKSTOP: SHE APPROVED IT, SO IT GOES ===
+          //
+          // Runs whether or not he claimed a dispatch — a turn that quietly
+          // answered inline after she said "send it" is the same failure with
+          // better manners. The pin above is the first line; this is the one
+          // that is checkable rather than hoped for.
+          const sent = codingJobs.backstopDispatch({
+            conversationId: convoId, messageId: userMsgId,
+            userMessage: userMessage.content,
+          });
+          if (sent.ok) {
+            const line = `CODING BACKSTOP: she approved a brief and the reply dispatched nothing, so the server sent it to ${sent.project} (${String(sent.id).slice(0, 8)}, convo ${convoId}).`;
+            console.warn(`[CodingJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line, db.getOpsDir()); } catch { /* console is the floor */ }
+            append(`\n\n---\n\n*(**Sent for real just now.** ${claimsDispatch
+              ? 'My reply above said it had gone before it had.'
+              : 'My reply did not actually send it.'} The server dispatched the brief above to `
+              + `\`${sent.project}\` — job \`${String(sent.id).slice(0, 8)}\`. Watch the strip at the top of the window; `
+              + `the write-up lands in the jobs panel. A restore point was committed first, so it can be undone.)*`);
+          } else {
+            // It could not work out where the work goes, and guessing a project
+            // would put her work somewhere she did not choose.
+            const line = `CODING BACKSTOP DECLINED: ${sent.reason} (convo ${convoId}).`;
+            console.warn(`[CodingJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line, db.getOpsDir()); } catch { /* console is the floor */ }
+            append(`\n\n---\n\n**Nothing was sent.** ${claimsDispatch
+              ? 'My reply above says it was; that is not true — no job exists. '
+              : ''}${sent.kind === 'refused'
+                // dispatch()'s refusals are written FOR THE MODEL and end in
+                // instructions to it ("show her the corrected brief"). Handing
+                // her that text addresses her as though she were the one being
+                // told what to do, so only the first sentence is surfaced and
+                // the full text goes to the ops log.
+                ? `The dispatch was refused: ${String(sent.reason).split(/(?<=\.)\s/)[0]}`
+                : `I could not send it for you either — ${sent.reason}.`} `
+              + `Tell me the project name and I will send it.`);
+          }
         } else if (claimsDispatch && created.length === 0) {
           const line = `PHANTOM DISPATCH: the reply claims a background job was started, and no agent_jobs row was created in this turn (convo ${convoId}).`;
           console.error(`[AgentJobs] ${line}`);
@@ -3526,18 +3610,49 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         } else if (claimsDispatch) {
           console.log(`[AgentJobs] dispatch claim checks out — ${created.length} job(s) created in this turn`);
         }
-        // WHAT IS HAPPENING, WHILE IT HAPPENS. She found out a job had
-        // finished by opening a panel afterwards. A dispatched job now
-        // says where it is at the end of any turn taken while it runs -
-        // in the conversation she is already reading, not a new channel
-        // and not a new alert. A job that has gone quiet says so in the
-        // same line, because a stale action shown as current is worse
-        // than no line.
+        // === THE LIVE STATUS LINE IS NOT WRITTEN HERE ANY MORE ===
+        //
+        // It used to be: statusBlock() was APPENDED to the reply so she could
+        // see a running job in the conversation she was already reading. That
+        // was the right instinct and the wrong channel, and it produced a
+        // forgery within a day.
+        //
+        // Appending it put the block INSIDE his message. The message is stored
+        // whole, so the block became part of his own words, and on the next
+        // turn it came back to him as conversation history — his own transcript
+        // teaching him the format. An hour after the first real one he wrote,
+        // unprompted and with nothing running:
+        //
+        //     _squatch-code, working:_
+        //     - **squatch_crawler** · step 1/25 · run_command update_brief_v1.1 · 1m45s
+        //
+        // She caught it only because `update_brief_v1.1` is not a real command.
+        // The line that existed to tell a real job from a story had become a
+        // thing the story could contain.
+        //
+        // So live status is UI CHROME, not message text: #coderStrip polls
+        // /api/jobs/coding/active and renders it outside the transcript, where
+        // he cannot write and cannot read it back. Nothing this server puts in
+        // message text ever looks like a status line again — which is precisely
+        // what makes the check below meaningful. Having removed the real one,
+        // ANY occurrence in a reply is fabricated.
+        //
+        // Do not re-add an append here. If she wants it in the transcript
+        // again, it has to arrive as its own frame the client renders as
+        // chrome, never as characters in his message.
         try {
-          const status = require('./db/coding-jobs').statusBlock();
-          if (status) append(status);
+          const forged = dispatchClaims.forgedStatusLine(fullResponse);
+          if (forged.forged) {
+            const line = `FORGED STATUS LINE: the reply contains a fabricated live-progress line (convo ${convoId}).`;
+            console.error(`[CodingJobs] ${line}`);
+            try { factExtractor.appendToOpsLog(line + ` Pattern ${forged.pattern}. Reply excerpt: "${fullResponse.slice(0, 200).replace(/\s+/g, ' ')}"`, db.getOpsDir()); } catch { /* console is the floor */ }
+            append('\n\n---\n\n**⚠ The progress line above was written by me, not by the system.** '
+              + 'I do not have a way to show live job status in my replies — the real one appears '
+              + 'in the strip at the top of the window, from the job queue itself. Whatever that '
+              + 'line says, treat it as invented until the strip or the jobs panel agrees.');
+          }
         } catch (statusErr) {
-          console.error('[CodingJobs] status line failed:', statusErr.message);
+          console.error('[CodingJobs] forged-status check failed:', statusErr.message);
         }
       } catch (phantomErr) {
         console.error('[AgentJobs] phantom-dispatch check failed:', phantomErr.message);

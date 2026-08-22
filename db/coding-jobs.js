@@ -318,6 +318,21 @@ function running(now = Date.now()) {
 }
 
 /** The block appended to a reply while work is in flight. */
+/**
+ * ⛔ NEVER APPEND THIS TO A REPLY. It is not called by the chat path any more.
+ *
+ * It used to be, and putting it inside his message is what made it forgeable:
+ * the message is stored whole, so the block came back to him next turn as his
+ * own words, and on 2026-08-22 he wrote one himself with a command that does
+ * not exist while nothing was running. She could not tell it from the real
+ * thing, which was the one signal she had.
+ *
+ * Live status is UI chrome now — #coderStrip, fed by /api/jobs/coding/active.
+ * This is kept because the LINE composition below is what the tests exercise
+ * and what that endpoint's contents are checked against. If you want status in
+ * the transcript again, it must arrive as its own frame the client renders as
+ * chrome, never as characters in his message.
+ */
 function statusBlock(now = Date.now()) {
   const live = running(now);
   if (!live.length) return null;
@@ -641,6 +656,84 @@ function readReport(reportPath, fallback) {
   }
 }
 
+/**
+ * SHE APPROVED IT AND THE REPLY DID NOT SEND IT — so the server does.
+ *
+ * The same shape as the tier-1 backstop for start_background_job, and here for
+ * the same reason: asking has failed enough. Of five claimed dispatches, two
+ * were real. The forced tool_choice is the first line and it is not a
+ * guarantee — an engine may refuse the pin, and a refused pin falls back to an
+ * unforced round on purpose — so the invariant is closed where it is checkable.
+ *
+ * WHAT IT SENDS, AND WHY THOSE ARE KNOWABLE RATHER THAN GUESSED:
+ *   brief   — the most recent assistant message before this turn. When she says
+ *             "go ahead and send it", the thing she just read IS the previous
+ *             reply; that is what made her say it. It also means the brief is,
+ *             by construction, one she was shown — so it passes the same
+ *             brief-shown check every other dispatch passes, rather than
+ *             bypassing it.
+ *   project — the project of the last coding job in THIS conversation. The case
+ *             this exists for is iterating on something already dispatched.
+ *
+ * WHEN IT CANNOT KNOW, IT DOES NOTHING AND SAYS SO. A first dispatch in a fresh
+ * conversation has no prior project and there is nothing to infer from; the
+ * caller falls back to correcting the claim in words. Inventing a project name
+ * would put her work somewhere she did not choose, which is the failure the
+ * project field exists to prevent.
+ */
+function backstopDispatch({ conversationId, messageId = null, userMessage = null }) {
+  const db = getSqliteDb();
+  if (!db || !conversationId) return { ok: false, reason: 'no conversation' };
+
+  const prior = db.prepare(
+    `SELECT project FROM coding_jobs WHERE conversation_id = ?
+     ORDER BY created_at DESC LIMIT 1`
+  ).get(conversationId);
+  if (!prior || !prior.project) {
+    return { ok: false, reason: 'no earlier coding job in this conversation, so no project to send it to' };
+  }
+
+  // NOT SIMPLY "THE LAST REPLY". Measured the first time this ran: the most
+  // recent assistant message was the previous dispatch's confirmation, which
+  // quotes the brief AND names `Projects/<name>` — so validateBrief refused it
+  // for pointing at a path, and the backstop declined a dispatch it could
+  // perfectly well have made. Walk back until a message is something the tool
+  // would actually accept, which is the same bar every other dispatch clears.
+  const replies = db.prepare(
+    `SELECT content FROM messages WHERE conversation_id = ? AND role = 'assistant'
+     ORDER BY timestamp DESC LIMIT 8`
+  ).all(conversationId);
+
+  let brief = null;
+  let lastRefusal = null;
+  for (const row of replies) {
+    const text = String(row.content || '').trim();
+    if (text.split(/\s+/).filter(Boolean).length < 20) continue;
+    // A reply that is itself a report ABOUT a dispatch is not the brief.
+    if (/\bsquatch-?code, working\b/i.test(text)) continue;
+    const v = validateBrief(text);
+    if (!v.ok) { lastRefusal = lastRefusal || v.error; continue; }
+    brief = text;
+    break;
+  }
+  if (!brief) {
+    return {
+      ok: false,
+      kind: 'no-brief',
+      reason: lastRefusal
+        ? 'the text I would have sent names a directory, and a brief may not decide where work goes'
+        : 'I could not find the brief you approved in this conversation',
+    };
+  }
+
+  const result = dispatch({
+    project: prior.project, brief, conversationId, messageId, userMessage,
+  });
+  return result.ok
+    ? { ok: true, ...result, project: prior.project }
+    : { ok: false, kind: 'refused', reason: result.error };
+}
+
 module.exports = {
   SOURCE,
   validateBrief,
@@ -648,6 +741,7 @@ module.exports = {
   progressLine,
   running,
   statusBlock,
+  backstopDispatch,
   resolveBinary,
   binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,

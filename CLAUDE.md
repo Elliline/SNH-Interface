@@ -352,6 +352,76 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+## ⛔ Anything appended to his reply becomes his words, and then his to forge
+
+`statusBlock()` was appended to the end of a turn so she could see a running
+coding job in the conversation she was already reading. Right instinct, wrong
+channel, and it produced a forgery inside a day.
+
+The append put the block INSIDE his message. Messages are stored whole, so the
+block became part of his own text, and the next turn handed it back to him as
+conversation history — his own transcript teaching him the format. One hour
+after the first real one he wrote, with nothing running:
+
+    _squatch-code, working:_
+    - **squatch_crawler** · step 1/25 · run_command update_brief_v1.1 · 1m45s
+
+She caught it only because `update_brief_v1.1` is not a real command. **The one
+signal that let her tell a real job from a story had become a thing the story
+could contain.**
+
+- **System-authored text that must be trusted may not live in message text.**
+  Live status is UI chrome now — `#coderStrip`, fed by `/api/jobs/coding/active`
+  — outside the transcript, where he can neither write it nor read it back. If
+  it is ever wanted in the transcript again it must arrive as its own frame the
+  client renders as chrome, never as characters in his message.
+- **Having removed the real one, MARK the fake.** Nothing the server writes into
+  message text looks like a status line any more, so any occurrence is
+  fabricated by construction — which is the only reason it is detectable.
+  `forgedStatusLine()` appends a correction in the turn she is reading.
+- **Old blocks are stripped on the way OUT, not deleted from history.**
+  `stripStoredStatusBlocks()` removes them from outbound messages so he stops
+  relearning the format; the stored record keeps what actually happened. Same
+  reasoning as never re-adding a vector for an inactive fact — the row stays,
+  the retrieval stops. Rewriting her transcript to cover our bug is not on.
+- This is the corrections/announcement rule from the other direction. Those say
+  a real event must be visible; this says **a visible signal must be unforgeable**,
+  and appending to his message forfeits that.
+
+**And the phantom guard was first-person only.** Every pattern was
+`i(?:'ve| have)? sent`-shaped, with a comment calling that narrowness a virtue.
+He wrote *"It's sent. The brief has been delivered to the coding agent."* and
+nothing fired. Measured after: "It has been sent", "Sent.", "Delivered to the
+coding agent", "The job has been handed to squatch-code" — all missed. **The
+pronoun was never what made a claim a claim.** `db/dispatch-claims.js` now
+covers first-person, passive and bare-participle voices, and the discipline
+that keeps false positives down moved to the VERB: every pattern needs a verb
+of SENDING, so "the brief has been written" and "the tests have been run" stay
+silent.
+
+**Forcing, because asking failed five times.** Of five claimed coding
+dispatches, two were real. `dispatch_coding_job` is now pinned with
+`tool_choice` when she says send it, exactly as tier 1 pins
+`start_background_job` — and closed with a server-side backstop, because a pin
+is not a guarantee (an engine may refuse it, and a refused pin falls back
+unforced on purpose).
+
+- **What makes forcing safe is not the phrase list.** It is that the tool
+  refuses any brief she was not shown and any brief naming a directory. A pin
+  can make him CALL it; it cannot make it accept work she never approved.
+- **The backstop sends only what it can know.** Brief = the most recent earlier
+  reply that `validateBrief` would accept — walking back matters, because the
+  latest reply is often the previous dispatch's own confirmation, which quotes
+  `Projects/<name>` and is refused for naming a path. Project = the last coding
+  job in this conversation. **With no prior project it declines and says so**;
+  inventing a name would put her work somewhere she did not choose.
+- **`dispatch()`'s refusals are written FOR THE MODEL** and end in instructions
+  to it ("show her the corrected brief"). Only the first sentence is surfaced to
+  her; the rest goes to the ops log. Handing her that text addresses her as
+  though she were the one being corrected.
+- Verify with `node scripts/test-dispatch-claims.js` and
+  `node scripts/test-job-status-line.js`.
+
 ## ⛔ A flat deadline cannot tell a dead engine from a slow one
 
 Every path that calls the engine needs TWO limits, not one, and the split is
