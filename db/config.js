@@ -257,6 +257,42 @@ const DEFAULTS = {
     stallTimeoutMs: 60000,
     firstTokenTimeoutMs: 300000
   },
+  // THE SAME TWO LIMITS, FOR THE PATH WITH A PERSON WAITING ON IT.
+  //
+  // Chat had one flat wall-clock — 120s per tool round, 90s on the final
+  // stream — and a flat deadline cannot tell a wedged engine from a slow
+  // one. On 2026-08-22 the engine stopped generating at 07:03 with two
+  // requests in flight; her turn went out at 07:07 and was killed at
+  // 07:09 by `AbortSignal.timeout(120000)`. The kill was correct. What was
+  // wrong is that the identical deadline would have killed a turn that was
+  // still producing tokens — a real brief, twelve tools and 6k of injected
+  // context is not "how was your day", and work in progress was thrown
+  // away on the same timer that catches a corpse.
+  //
+  // So chat measures GAPS, exactly as the background path does, and for the
+  // same reason (see generation.stallTimeoutMs above — the argument is not
+  // repeated here, it is the same argument). Tokens still arriving means the
+  // turn is working, however slowly; nothing for a minute means the engine is
+  // wedged. A heavy turn is now bounded by max_tokens and the round cap, not
+  // by a clock it can lose to for being big.
+  //
+  // WHY THESE ARE SEPARATE FROM generation.* RATHER THAN SHARED. The stall
+  // limit is the same number for the same reason and could have been shared.
+  // The first-token limit could not: background work waits behind whatever
+  // depth the queue has and 300s is right for it, while a person watching a
+  // blank screen for five minutes has been failed whatever the engine is
+  // doing. Two callers with genuinely different tolerances need two knobs,
+  // and folding them would mean one of the two paths is always wrong.
+  chat: {
+    // After the first token. Same 60s as background, same evidence: at the
+    // worst load measured here a token lands every ~95ms.
+    stallTimeoutMs: 60000,
+    // Before it. This is the whole budget for queue wait plus prefill, and it
+    // is deliberately NOT the background's 300s: it is the longest she should
+    // ever sit looking at nothing. 120s keeps the ceiling she already had for
+    // a dead engine while removing it from turns that are working.
+    firstTokenTimeoutMs: 120000
+  },
   // HTTP rate limiting. The old literals (100 requests / 15 minutes for ALL of
   // /api/) worked out to 6.7 req/min shared across every endpoint, which a
   // polling UI plus chunked TTS exhausts in a couple of minutes — that is what

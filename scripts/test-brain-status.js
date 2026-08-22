@@ -121,13 +121,27 @@ test('brainStatus is synchronous and does not probe', () => {
 
 console.log('\nthe chat route uses it\n');
 
-test('a network failure consults the watchdog', () => {
+test('an upstream failure consults the watchdog', () => {
+  // WIDENED ON 2026-08-22, deliberately. This used to require
+  // `if (networkFailure)` — only a call that never reached the engine. A
+  // TIMEOUT reaches it and then gets nothing back, which is equally upstream
+  // and is the more common failure on this box; excluding it is exactly what
+  // sent her a bare "operation was aborted due to timeout" while the watchdog
+  // had already recorded failed probes. The guard that matters is the one
+  // below: it must still NOT speak for our own bugs.
   const src = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const i = src.indexOf('const networkFailure');
-  const block = src.slice(i, i + 1600);
+  const i = src.indexOf('classifyChatFailure(error)');
+  assert.ok(i > 0, 'the chat handler no longer classifies its failures');
+  const block = src.slice(i, i + 800);
   assert.ok(/brainStatus\(\)/.test(block), 'chat never asks why the engine is unreachable');
-  assert.ok(/if \(networkFailure\)/.test(block),
-    'it should only speak for network failures, not for every error');
+  assert.ok(/if \(verdict\.upstream\)/.test(block),
+    'it should speak for upstream failures only, not for every error');
+
+  const { classifyChatFailure } = require(path.join(__dirname, '../db/chat-failure'));
+  assert.strictEqual(classifyChatFailure({ name: 'TimeoutError', message: 'x' }).upstream, true,
+    'a timeout waiting on the engine must be upstream');
+  assert.strictEqual(classifyChatFailure(new TypeError("Cannot read properties of null")).upstream, false,
+    'our own bug must not be blamed on the engine');
 });
 
 test('the status lookup cannot replace the error it explains', () => {
@@ -138,10 +152,19 @@ test('the status lookup cannot replace the error it explains', () => {
 });
 
 test('the technical error is kept, not discarded', () => {
-  const src = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const i = src.indexOf('brainStatus()');
-  assert.ok(/technical:/.test(src.slice(i, i + 500)),
-    'the underlying message must survive for diagnosis');
+  // The wording moved to db/chat-failure.js so it could be tested as words
+  // rather than as a regex over a request handler. Assert the behaviour.
+  const { chatFailureBody } = require(path.join(__dirname, '../db/chat-failure'));
+  const err = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+  const withBrain = chatFailureBody(err, { healthy: false, state: 'wedged', message: 'The model engine has stopped responding.' });
+  assert.strictEqual(withBrain.technical, err.message, 'the underlying message must survive for diagnosis');
+  assert.strictEqual(withBrain.error, 'The model engine has stopped responding.');
+
+  // And in the window before the watchdog has concluded anything.
+  const noBrain = chatFailureBody(err, { healthy: true, state: 'ok', message: null });
+  assert.strictEqual(noBrain.technical, err.message);
+  assert.ok(!/aborted due to timeout/i.test(noBrain.error),
+    'she should never be shown the raw abort string');
 });
 
 test('the frontend shows a known state without a generic prefix', () => {

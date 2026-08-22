@@ -1914,17 +1914,31 @@ async function loadSettingsBrainTab() {
       },
       {
         key: 'generation.stallTimeoutMs',
-        label: 'Give up if no new text arrives for (ms)',
+        label: 'Background work: give up if no new text arrives for (ms)',
         type: 'number', step: '10000', min: 5000,
         value: config.generation?.stallTimeoutMs,
         desc: 'Once a reply has started, this is how long a gap is allowed before the call is abandoned. It measures the GAP between pieces of text, not how fast the whole thing is, so a slow answer is never killed for being slow — only a dead one is. That matters when several agents run at once, because each one gets slower as the others start and a speed-based limit would kill exactly the work you asked for. 60000 is a minute; the real gap under heavy load is under a tenth of a second.'
       },
       {
         key: 'generation.firstTokenTimeoutMs',
-        label: 'Give up if the reply never starts within (ms)',
+        label: 'Background work: give up if the reply never starts within (ms)',
         type: 'number', step: '30000', min: 5000,
         value: config.generation?.firstTokenTimeoutMs,
         desc: 'Before any text arrives, silence is normal — the request may still be queued behind others, and reading a long conversation takes time before the first word comes out. So this is much longer than the gap limit above. Raise it if you run many agents at once and see jobs failing before they start; that is a queue that is deeper than this allows, not a broken engine.'
+      },
+      {
+        key: 'chat.stallTimeoutMs',
+        label: 'Chat: give up if no new text arrives for (ms)',
+        type: 'number', step: '10000', min: 5000,
+        value: config.chat?.stallTimeoutMs,
+        desc: 'The same gap limit as above, for your own conversation rather than background work. Once a reply has started, this is how long a silence is allowed before it is abandoned. Because it measures the gap and not the total, a long answer, a big brief or a turn using several tools is never cut off for taking a while — only a dead engine is. Chat used to have a single flat two-minute limit that could not tell those apart, and threw away turns that were still working.'
+      },
+      {
+        key: 'chat.firstTokenTimeoutMs',
+        label: 'Chat: give up if the reply never starts within (ms)',
+        type: 'number', step: '15000', min: 5000,
+        value: config.chat?.firstTokenTimeoutMs,
+        desc: 'How long to wait for the first word before deciding the engine is not going to answer. Deliberately shorter than the background setting above: a job can afford to sit in a queue for five minutes, and you watching a blank screen cannot. When this fires you get a message saying the engine stopped responding, rather than a raw error.'
       }
     ]));
 

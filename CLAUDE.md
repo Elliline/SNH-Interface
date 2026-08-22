@@ -352,6 +352,70 @@ Rules that are load-bearing:
   rest of the corpus. Dry runs neither read nor write that table, so a rehearsal
   cannot make the live pass skip work.
 
+## ⛔ A flat deadline cannot tell a dead engine from a slow one
+
+Every path that calls the engine needs TWO limits, not one, and the split is
+always the same: **before the first token, silence is normal; after it, silence
+means the engine is wedged.** The background path learned this on 2026-08-18
+(`generation.stallTimeoutMs` / `firstTokenTimeoutMs`, and the long note in
+`db/config.js` on why a rate-derived timeout got stricter exactly as the system
+got busier). Chat learned it on 2026-08-22, the expensive way.
+
+Chat had three hardcoded wall-clocks — 120s per tool round on each provider and
+`STREAM_STALL_MS = 90000` on the final stream — and one flat number cannot
+express both facts. The engine stopped generating at 07:03 with two requests in
+flight; her turn went out at 07:07 and our own deadline killed it at 07:09. The
+kill was correct. What was wrong is that **the identical clock would have killed
+a turn that was still producing tokens** — a real brief with twelve tool schemas
+and 6k of injected context is not "how was your day", and work in progress was
+being thrown away on the timer that catches a corpse.
+
+- **Measure GAPS, never totals.** A turn that keeps producing is working,
+  however slowly, and is now bounded by `max_tokens` and the round cap rather
+  than by a clock it can lose to for being big.
+- **Reuse `streamChat`, do not copy it.** It returns the NON-streaming shape, so
+  a caller that was doing `stream: false` reads `data.choices[0]` exactly as
+  before — that shape-preservation is what makes it safe to reuse, and it is why
+  the chat tool rounds could adopt stall detection without touching a line of
+  the tool-call handling below them. Its preconditions, per *A mechanism is only
+  safe in the context that made it safe*: the watchdog bounds it independently
+  of the caller; the caller must let a stall PROPAGATE (see below); and a
+  non-ok response is a refusal, not a stall, which is why it carries `.status`.
+- **Chat's first-token limit is deliberately NOT the background one.** A queued
+  job can afford to wait 300s; a person watching a blank screen cannot. Two
+  callers with genuinely different tolerances need two knobs — 120s for chat —
+  and folding them would leave one path permanently wrong. The stall limit is
+  60s on both because a stall is a stall.
+- **A refusal and a stall must stay distinguishable.** `err.status` means the
+  engine answered and said no — retry the round unforced, or give up on tools
+  and let the turn finish. No status means the call never completed, and that
+  must propagate to the chat error handler. Swallowing it produces a reply
+  written with no tools and nothing saying why.
+
+**And a timeout is an UPSTREAM failure.** The classifier tested `error.cause?.code`
+and `TypeError` — a `TimeoutError` has neither, so a wedged engine answered
+**500** ("our own bug") and skipped the watchdog block entirely, which is how she
+got a bare "The operation was aborted due to timeout" during a window the system
+already knew about. `db/chat-failure.js` is now pure and tested: `classifyChatFailure`
+decides 502-vs-500, `chatFailureBody` picks the words. **One predicate decides both
+the status and whether she gets an explanation**, so a future upstream flag cannot
+get the code right and the words wrong.
+
+- **The watchdog's silence is not evidence of health.** It needs
+  `failureThreshold` consecutive probes and its counters live in the server
+  process, so there is a multi-minute window where the engine is wedged and
+  `brainStatus()` honestly reports `ok`. Our own deadline firing IS knowledge —
+  the request reached the engine and the engine stopped producing — so there is
+  a plain-language floor beneath the watchdog's account, and the raw text moves
+  to a `technical` field rather than to her screen.
+- **Reading `brainStatus()` from a separate process always says healthy.** The
+  state is in-memory. A `node -e` probe of it measures nothing; that cost a wrong
+  observation during the 2026-08-22 diagnosis.
+- Verify with `node scripts/test-chat-timeouts.js` (stub engines — slow,
+  wedged-mid-answer, never-answers, and refusing — no GPU needed) and
+  `node scripts/test-brain-status.js`. `test-run-limits-exposed.js` fails if a
+  flat wall-clock reappears on the chat path.
+
 ## ⚠️ Two channels, and a job result may never use the loud one
 
 `db/agent-jobs.js` is the async handoff: a chat turn calls

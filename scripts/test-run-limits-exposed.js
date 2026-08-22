@@ -100,6 +100,25 @@ for (const k of [
   check(`${k} has a row`, exposed(k));
 }
 
+// THE CHAT PATH'S OWN TWO. Same rule, and it took the same shape of incident to
+// get here: three wall-clocks (120s per tool round on each provider, 90s on the
+// final stream) were literals in server.js until 2026-08-22, and the flat
+// deadline could not tell a wedged engine from a slow turn.
+console.log('\n── The chat path\'s deadlines ──');
+for (const k of ['chat.stallTimeoutMs', 'chat.firstTokenTimeoutMs']) {
+  check(`${k} has a row`, exposed(k));
+}
+const srv = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+check('no flat per-tool-round wall-clock is back in server.js',
+  !/AbortSignal\.timeout\(120000\)/.test(srv),
+  'AbortSignal.timeout(120000) is back on the chat path');
+check('the final stream reads its limits from config, not a literal',
+  !/STREAM_STALL_MS/.test(srv),
+  'STREAM_STALL_MS is back');
+check('and chat reads them through the shared helper',
+  /function chatTimeouts\(\)/.test(srv) && (srv.match(/chatTimeouts\(\)/g) || []).length >= 4,
+  'chatTimeouts() is missing or not used at all three call sites');
+
 console.log('\n── The HTTP timeouts a run can hang on ──');
 for (const k of ['tools.exa.timeoutMs', 'tools.searxng.timeoutMs', 'tools.webFetch.timeoutMs']) {
   check(`${k} has a row`, exposed(k));

@@ -435,6 +435,28 @@ function isValidOllamaHost(host) {
 }
 
 // SECURITY: Validate model name format
+/**
+ * The two deadlines every engine call on the CHAT path is held to.
+ *
+ * One flat wall-clock cannot tell a wedged engine from a slow one, and chat
+ * had three of them: 120s per tool round on each provider and 90s on the
+ * final stream. See the `chat` block in db/config.js for what that cost on
+ * 2026-08-22. These are read per call rather than captured at boot so a
+ * change in Settings takes effect on the next turn, not the next restart.
+ *
+ * Falls back to the shipped defaults on a missing or nonsense value — a
+ * timeout of 0 or NaN would mean "abort immediately", so a bad config would
+ * take chat down entirely rather than degrade it.
+ */
+function chatTimeouts() {
+  const c = (getConfig().chat) || {};
+  const pick = (v, dflt) => (Number.isFinite(v) && v > 0 ? v : dflt);
+  return {
+    stallMs: pick(c.stallTimeoutMs, 60000),
+    firstTokenMs: pick(c.firstTokenTimeoutMs, 120000)
+  };
+}
+
 function isValidModelName(model) {
   if (!model || typeof model !== 'string') return false;
 
@@ -2690,33 +2712,52 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           // round is retried without the pin rather than losing the turn — a
           // forced call is worth having, and it is not worth a failed reply.
           const forceThisRound = forceHandoffCall && round === 0;
-          const postRound = (forced) => fetch(`${host}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+          // STREAMED SO THE DEADLINE CAN SEE PROGRESS. streamChat returns the
+          // NON-streaming shape, so everything below reads `toolData` exactly
+          // as it did when this was `stream: false` — that shape-preservation
+          // is the whole reason it is reusable here rather than copied.
+          const ct = chatTimeouts();
+          const postRound = (forced) => memoryManager.streamChat({
+            url: `${host}/api/chat`,
+            openAiStyle: false,
+            body: {
               model,
               messages: prepareOutboundMessages(ollamaMessages, `ollama tool-round ${round + 1}`),
               tools,
-              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {}),
-              stream: false
-            }),
-            signal: AbortSignal.timeout(120000)
+              ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {})
+            },
+            firstTokenMs: ct.firstTokenMs,
+            stallMs: ct.stallMs,
+            label: `ollama tool-round ${round + 1}`
           });
 
           if (forceThisRound) console.log('MCP [ollama]: FORCING start_background_job this round — she named the agent (tier 1)');
-          let toolResponse = await postRound(forceThisRound);
-
-          if (!toolResponse.ok && forceThisRound) {
-            console.warn(`MCP [ollama]: engine refused the forced tool_choice (${toolResponse.status}) — retrying this round unforced`);
-            toolResponse = await postRound(false);
+          let toolData;
+          try {
+            toolData = await postRound(forceThisRound);
+          } catch (err) {
+            // A REFUSAL AND A STALL ARE DIFFERENT ANSWERS. `err.status` means the
+            // engine answered and said no: retry unforced, or give up on tools and
+            // let the turn finish. No status means the call never completed —
+            // wedged engine, killed by one of the two limits above — and that must
+            // propagate to the chat error handler, which turns it into a 502
+            // carrying the watchdog's account. Swallowing it here would produce a
+            // reply written with no tools and no sign anything went wrong.
+            if (!err.status) throw err;
+            if (forceThisRound) {
+              console.warn(`MCP [ollama]: engine refused the forced tool_choice (${err.status}) — retrying this round unforced`);
+              try {
+                toolData = await postRound(false);
+              } catch (err2) {
+                if (!err2.status) throw err2;
+                console.error(`MCP [ollama]: Tool call request failed with ${err2.status}`);
+                break;
+              }
+            } else {
+              console.error(`MCP [ollama]: Tool call request failed with ${err.status}`);
+              break;
+            }
           }
-
-          if (!toolResponse.ok) {
-            console.error(`MCP [ollama]: Tool call request failed with ${toolResponse.status}`);
-            break;
-          }
-
-          const toolData = await toolResponse.json();
           console.log('MCP [ollama]: Response keys:', Object.keys(toolData));
           console.log('MCP [ollama]: message.role:', toolData.message?.role);
           console.log('MCP [ollama]: message.tool_calls:', JSON.stringify(toolData.message?.tool_calls || 'none'));
@@ -2937,12 +2978,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           // round is retried without the pin rather than losing the turn — a
           // forced call is worth having, and it is not worth a failed reply.
           const forceThisRound = forceHandoffCall && round === 0;
-          const postRound = (forced) => fetch(`${llamacppHost}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+          // STREAMED SO THE DEADLINE CAN SEE PROGRESS — see the ollama round
+          // above. streamChat hands back the non-streaming shape, so `toolData`
+          // below is byte-identical in structure to what `stream: false` gave.
+          const ct = chatTimeouts();
+          const postRound = (forced) => memoryManager.streamChat({
+            url: `${llamacppHost}/v1/chat/completions`,
+            openAiStyle: true,
+            body: {
               model,
-              stream: false,
               // Folded per round, not once up front: the loop keeps appending to
               // llamacppMessages (assistant tool_calls, tool results, and the
               // post-tool nudge), so the working history stays as built and only
@@ -2951,27 +2995,37 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               tools,
               ...(forced ? { tool_choice: { type: 'function', function: { name: 'start_background_job' } } } : {}),
               ...generationParams(providerType)
-            }),
-            signal: AbortSignal.timeout(120000) // 2 minute timeout per tool round
+            },
+            firstTokenMs: ct.firstTokenMs,
+            stallMs: ct.stallMs,
+            label: `${providerLabel} tool-round ${round + 1}`
           });
 
           if (forceThisRound) console.log(`MCP [${providerLabel}]: FORCING start_background_job this round — she named the agent (tier 1)`);
-          let toolResponse = await postRound(forceThisRound);
-
-          if (!toolResponse.ok && forceThisRound) {
-            const errBody = await toolResponse.text().catch(() => '');
-            console.warn(`MCP [${providerLabel}]: engine refused the forced tool_choice (${toolResponse.status}: ${errBody.substring(0, 120)}) — retrying this round unforced`);
-            try { factExtractor.appendToOpsLog(`The engine refused a forced start_background_job (HTTP ${toolResponse.status}). The round was retried without it; the tier-1 backstop still applies.`, db.getOpsDir()); } catch { /* console is the floor */ }
-            toolResponse = await postRound(false);
+          let toolData;
+          try {
+            toolData = await postRound(forceThisRound);
+          } catch (err) {
+            // A refusal (`err.status` — the engine answered and said no) is
+            // recoverable here. A stall is not ours to swallow: it propagates to
+            // the chat error handler, which answers 502 with what the watchdog
+            // knows. See the ollama round for the full reasoning.
+            if (!err.status) throw err;
+            if (forceThisRound) {
+              console.warn(`MCP [${providerLabel}]: engine refused the forced tool_choice (${err.status}: ${String(err.body || '').substring(0, 120)}) — retrying this round unforced`);
+              try { factExtractor.appendToOpsLog(`The engine refused a forced start_background_job (HTTP ${err.status}). The round was retried without it; the tier-1 backstop still applies.`, db.getOpsDir()); } catch { /* console is the floor */ }
+              try {
+                toolData = await postRound(false);
+              } catch (err2) {
+                if (!err2.status) throw err2;
+                console.error(`MCP [${providerLabel}]: Tool call request failed with ${err2.status}:`, String(err2.body || '').substring(0, 200));
+                break;
+              }
+            } else {
+              console.error(`MCP [${providerLabel}]: Tool call request failed with ${err.status}:`, String(err.body || '').substring(0, 200));
+              break;
+            }
           }
-
-          if (!toolResponse.ok) {
-            const errBody = await toolResponse.text().catch(() => '');
-            console.error(`MCP [${providerLabel}]: Tool call request failed with ${toolResponse.status}:`, errBody.substring(0, 200));
-            break;
-          }
-
-          const toolData = await toolResponse.json();
           console.log(`MCP [${providerLabel}]: Response keys:`, Object.keys(toolData));
           const choice = toolData.choices?.[0];
           console.log(`MCP [${providerLabel}]: finish_reason:`, choice?.finish_reason);
@@ -3224,14 +3278,25 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Stall watchdog: if the engine sends no bytes for this long mid-stream it's
     // wedged, not slow — abort so we don't hold the socket (and its engine slot)
     // open indefinitely. Reset on every chunk; a healthy long stream keeps ticking.
-    const STREAM_STALL_MS = 90000;
+    // TWO LIMITS, NOT ONE — the same split the tool rounds and the background
+    // path use. A flat 90s here meant "the answer has not started" and "the
+    // answer died halfway" were the same event on the same clock, so the number
+    // had to be generous enough for the first and was therefore slack for the
+    // second. Before the first byte the wait is queue and prefill and silence is
+    // normal; after it, silence means the engine is wedged and the socket (and
+    // its engine slot) is being held for nothing.
+    const streamT = chatTimeouts();
+    let sawFirstByte = false;
     let stallTimer = null;
     const armStall = () => {
       if (stallTimer) clearTimeout(stallTimer);
+      const limit = sawFirstByte ? streamT.stallMs : streamT.firstTokenMs;
       stallTimer = setTimeout(() => {
-        console.warn(`[Chat] Upstream ${providerType} stream stalled >${STREAM_STALL_MS}ms — aborting to free the engine`);
+        console.warn(`[Chat] Upstream ${providerType} stream ${sawFirstByte
+          ? `stalled >${limit}ms mid-answer`
+          : `never started within ${limit}ms`} — aborting to free the engine`);
         streamAbort.abort();
-      }, STREAM_STALL_MS);
+      }, limit);
     };
 
     try {
@@ -3239,6 +3304,7 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        sawFirstByte = true;
         armStall();
 
         const chunk = decoder.decode(value, { stream: true });
@@ -3542,48 +3608,28 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
   } catch (error) {
     console.error('Memory chat error:', error.message);
     if (!res.headersSent) {
-      // 502, not 503. The whole handler used to answer 503 for anything that
-      // threw, and 503 says "this service is temporarily unavailable, retry" —
-      // which is a claim about SNH, and a wrong one when the engine has rejected
-      // the request body. On 2026-08-15 that read as an outage separate from the
-      // provider's 400 it was actually carrying, and cost a round of diagnosis.
+      // WHAT IT WAS, AND WHAT TO SAY, ARE BOTH IN db/chat-failure.js — pure,
+      // and tested there. This handler's job is to fetch the one piece of live
+      // state the words depend on and send the result.
       //
-      // Upstream failure (engine returned an error, or could not be reached) is
-      // 502 Bad Gateway. Anything else that reaches here is our own bug: 500.
-      // The body shape is unchanged — the frontend branches on response.ok and
-      // renders `error`, never on the number.
-      // A fetch that never got a response — engine down, refused, DNS — is
-      // upstream too, and arrives here as a bare TypeError with the reason on
-      // `cause`, carrying no flag of its own.
-      const networkFailure = !!error.cause?.code
-        || (error.name === 'TypeError' && /fetch failed|network|socket/i.test(error.message || ''));
+      // 502 vs 500 is the same distinction it always was: upstream failure is
+      // Bad Gateway, anything else reaching here is our own bug. What changed on
+      // 2026-08-22 is that a TIMEOUT counts as upstream — it did not, and that
+      // is why a wedged engine answered 500 with a bare abort string.
+      const { classifyChatFailure, chatFailureBody } = require('./db/chat-failure');
+      const verdict = classifyChatFailure(error);
 
-      // SAY WHAT THE SYSTEM ALREADY KNOWS. On 2026-08-21 the watchdog
-      // detected a wedged engine, restarted the container, logged
-      // "cooldown 5 min" and confirmed recovery itself - and while all of
-      // that was happening her chat returned a bare "fetch failed". It
-      // knew what was wrong and roughly how long it would last. When the
-      // brain is down or reloading, the reply now carries the watchdog's
-      // own account: what happened, that nothing was lost, and when to
-      // try again.
-      let body = { error: error.message || 'Chat service unavailable' };
-      if (networkFailure) {
+      let brain = null;
+      if (verdict.upstream) {
         try {
-          const brain = require('./db/brain-watchdog').brainStatus();
-          if (!brain.healthy && brain.message) {
-            body = {
-              error: brain.message,
-              brain: brain.state,
-              technical: error.message || null,
-            };
-          }
+          brain = require('./db/brain-watchdog').brainStatus();
         } catch (statusErr) {
           // A status lookup must never replace the error it explains.
           console.error('[Watchdog] brainStatus failed:', statusErr.message);
         }
       }
 
-      res.status(error.upstream || networkFailure ? 502 : 500).json(body);
+      res.status(verdict.status).json(chatFailureBody(error, brain));
     } else if (!res.writableEnded) {
       // Stream already started (e.g. the upstream request was aborted mid-stream
       // by the stall watchdog or a client disconnect) — just close it out.

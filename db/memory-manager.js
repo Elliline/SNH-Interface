@@ -400,7 +400,20 @@ async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label
       body: JSON.stringify({ ...body, stream: true }),
       signal: controller.signal
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      // THE STATUS IS CARRIED, NOT JUST THE MESSAGE. The chat path retries a
+      // round without its forced tool_choice when the engine REFUSES the
+      // request, and it decides that on the status code. Throwing a bare
+      // `HTTP 400` string would have made it parse the message back out —
+      // which is how a refusal quietly becomes a lost turn the first time
+      // the wording changes. The message text is unchanged, so the
+      // circuit-breaker classifier and every existing log line still match.
+      const body = await response.text().catch(() => '');
+      const e = new Error(`HTTP ${response.status}`);
+      e.status = response.status;
+      e.body = body;
+      throw e;
+    }
     if (!response.body) throw new Error('no response body to stream');
 
     const reader = response.body.getReader();
