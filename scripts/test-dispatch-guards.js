@@ -138,22 +138,41 @@ for (const [text, why] of SHOULD_NOT) {
 // ── the description carries the constraint ────────────────────────
 console.log('\nthe tool description\n');
 
-test('it says a missing project is named, not substituted', () => {
-  const d = new (require('../mcp/tools/dispatch-coding-job'))().description;
-  assert.match(d, /does not exist yet, put THAT name/i);
-  assert.match(d, /not pick a different existing project/i);
+// These used to assert the DESCRIPTION's exact wording. It said all the
+// right things at length and did not hold - three dispatches wrote
+// directory instructions into the brief anyway. So they now assert the
+// MECHANISM, and only that the description still points at it. A rule
+// that lives only in prose is the thing tonight disproved.
+
+test('the brief validator is wired into dispatch, not just described', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../db/coding-jobs.js'), 'utf8');
+  const fn = src.slice(src.indexOf('function dispatch('), src.indexOf('function get(id)'));
+  assert.ok(/validateBrief\(/.test(fn), 'dispatch does not check the brief');
+  assert.ok(/validateProject\(/.test(fn), 'dispatch does not check the project');
+  assert.ok(fn.indexOf('validateBrief(') < fn.indexOf('agentJobs.enqueue'),
+    'the brief is checked after the job is queued, which is too late');
 });
 
-test('it forbids asking the job to make directories', () => {
-  const d = new (require('../mcp/tools/dispatch-coding-job'))().description;
-  assert.match(d, /not ask the job to make directories/i);
-  assert.match(d, /will fail/i);
+test('a rejected brief comes back with something to do this turn', () => {
+  const r = codingJobs.validateBrief(
+    'check if Projects\\squatch crawler exists, create it if not. Build the game.');
+  assert.ok(!r.ok);
+  assert.match(r.error, /project field/i);
+  assert.match(r.error, /created if it does not exist/i,
+    'it refuses without saying the project would be made for it');
 });
 
-test('it says to stop rather than find another route', () => {
+test('the description points at the project field as the deciding thing', () => {
   const d = new (require('../mcp/tools/dispatch-coding-job'))().description;
-  assert.match(d, /tell her what it said and stop/i);
-  assert.match(d, /not look for another way/i);
+  assert.match(d, /project field alone/i);
+  assert.match(d, /refusal tells you what to change/i);
+});
+
+test('the description is not a wall of prohibitions', () => {
+  // A tool described mostly by what it refuses is easier not to call,
+  // and on the night it mattered the model returned tool_calls: [].
+  const d = new (require('../mcp/tools/dispatch-coding-job'))().description;
+  assert.ok(d.length < 1200, `description is ${d.length} chars; it was 1822 and went uncalled`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

@@ -5990,3 +5990,49 @@ function createConfigSection(title, fields) {
   return section;
 }
 
+
+
+// ── squatch-code working strip ──────────────────────────────────────
+// She could not tell whether the coder was working without opening a
+// panel after the fact. This polls the one endpoint that knows and
+// shows a strip while anything is running - and shows nothing at all
+// when nothing is, which is the other half of the requirement.
+(function coderStrip() {
+  const strip = document.getElementById('coderStrip');
+  const body = document.getElementById('coderStripBody');
+  if (!strip || !body) return;
+
+  // Slow enough to be free, fast enough that "is it working" is answered
+  // before she goes looking. The line's own elapsed comes from the
+  // server, so it stays truthful between polls.
+  const EVERY_MS = 5000;
+
+  async function tick() {
+    let jobs = [];
+    try {
+      const res = await fetch('/api/jobs/coding/active');
+      if (res.ok) jobs = (await res.json()).jobs || [];
+    } catch (_) {
+      // A failed poll must not blank a strip that is legitimately up:
+      // leave whatever is showing and try again.
+      return;
+    }
+
+    if (!jobs.length) {
+      strip.style.display = 'none';
+      document.body.classList.remove('coder-working');
+      return;
+    }
+
+    const quiet = jobs.some(j => /no activity/i.test(j.line || ''));
+    body.textContent = jobs
+      .map(j => `${j.project} — ${j.line}`)
+      .join('   •   ');
+    strip.classList.toggle('is-quiet', quiet);
+    strip.style.display = 'flex';
+    document.body.classList.add('coder-working');
+  }
+
+  tick();
+  setInterval(tick, EVERY_MS);
+})();

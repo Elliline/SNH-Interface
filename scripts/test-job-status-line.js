@@ -160,5 +160,58 @@ test('a failure in the status line cannot break the reply', () => {
     'the status line is not wrapped — a convenience could take out a turn');
 });
 
+console.log('\nthe brief cannot decide where work goes\n');
+
+const BRIEF = 'Build a roguelike crawler: a Player class, a Level class, fog of war, '
+  + 'and a scoring system that awards points for speed.';
+
+// Her actual failures, verbatim.
+for (const [text, why] of [
+  ['check if Projects\\squatch crawler exists, create it if not. ' + BRIEF, 'her exact wording'],
+  ['Create a new directory named squatch_crawler in Projects/. ' + BRIEF, 'the first attempt'],
+  ['Build it in Projects/squatch_crawler', 'a bare path reference'],
+  ['First mkdir the output folder, then write the module.', 'mkdir'],
+  ['cd ../elsewhere and build there', 'escaping the project'],
+]) {
+  test(`brief rejected: ${why}`, () => {
+    const r = codingJobs.validateBrief(text);
+    assert.ok(!r.ok, 'a directory instruction reached the job');
+    assert.match(r.error, /project field/i, 'the refusal does not say what to do instead');
+  });
+}
+
+for (const [text, why] of [
+  [BRIEF, 'an ordinary brief'],
+  ['Add a tests directory listing to the README.', 'mentions a directory without instructing one'],
+  ['Create a config module that reads settings.json.', 'creates a module, not a directory'],
+  ['Refactor auth.py and keep the tests green.', 'ordinary work'],
+]) {
+  test(`brief allowed: ${why}`, () => {
+    assert.ok(codingJobs.validateBrief(text).ok, 'a legitimate brief was refused');
+  });
+}
+
+console.log('\nthe project name is the only thing that decides where work goes\n');
+
+test('"Squatch Crawler" becomes squatch_crawler', () => {
+  assert.strictEqual(codingJobs.normaliseProjectName('Squatch Crawler'), 'squatch_crawler');
+});
+
+test('a name that is already right is untouched', () => {
+  assert.strictEqual(codingJobs.normaliseProjectName('todoapp'), 'todoapp');
+});
+
+test('a path is refused, and the refusal names the project to use', () => {
+  const v = codingJobs.validateProject('Projects\\squatch crawler');
+  assert.ok(!v.ok);
+  assert.strictEqual(v.suggestion, 'squatch_crawler',
+    'the refusal does not hand back a usable name');
+});
+
+test('a forward-slash path is refused the same way', () => {
+  const v = codingJobs.validateProject('Projects/squatch_crawler');
+  assert.ok(!v.ok && v.suggestion === 'squatch_crawler');
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

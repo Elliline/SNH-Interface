@@ -3537,3 +3537,56 @@ a.msg-source:hover {
   margin-top: 6px;
   line-height: 1.35;
 }
+
+
+/* ── squatch-code working strip ───────────────────────────────────────
+   Ellie could not tell, from the conversation, whether the coder was
+   working. This is the glanceable answer: present means working, absent
+   means nothing is running. It carries the last thing the job did and
+   how long it has been going - never a percentage, which the run cannot
+   know. */
+.coder-strip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+  color: #06281c;
+  background: linear-gradient(90deg, #7ee2b8, #4fc99a);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
+}
+.coder-strip-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: #06281c;
+  flex: none;
+  animation: coder-pulse 1.4s ease-in-out infinite;
+}
+@keyframes coder-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(0.75); }
+}
+.coder-strip-label { font-weight: 700; letter-spacing: 0.02em; flex: none; }
+.coder-strip-body { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A job that has gone quiet is a different fact from one that is
+   working, and must not look the same. */
+.coder-strip.is-quiet {
+  background: linear-gradient(90deg, #f6d365, #f0a63a);
+  color: #3a2400;
+}
+.coder-strip.is-quiet .coder-strip-dot { animation: none; background: #3a2400; }
+
+/* The strip is fixed, so the page needs room for it. */
+body.coder-working { padding-top: 1.9rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  .coder-strip-dot { animation: none; }
+}

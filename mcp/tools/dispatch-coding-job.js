@@ -29,36 +29,27 @@ const codingJobs = require('../../db/coding-jobs');
 class DispatchCodingJobTool {
   constructor() {
     this.name = 'dispatch_coding_job';
+    // SHORTER ON PURPOSE. This grew into a wall of prohibitions - do not
+    // substitute a project, do not ask for directories, do not, do not -
+    // and on the night it mattered the model returned tool_calls: [] and
+    // narrated the work instead. A tool described mostly by what it
+    // refuses is a tool that is easier not to call. The prohibitions are
+    // now ENFORCED in db/coding-jobs.js (validateBrief, validateProject),
+    // which is where they belong, so this can say what the tool is for.
     this.description =
-      'Send coding work to squatch-code, the local coding agent, to carry out ' +
-      'on its own in one of the projects under Projects/. If the project does ' +
-      'not exist yet it is created — starting something new is an ordinary ' +
-      'request, not an error. ' +
-      'USE THIS ONLY WHEN ELLIE HAS TOLD YOU TO SEND IT — "send that to the ' +
-      'coder", "go ahead", "ship it". It is not for proposing work and not for ' +
-      'starting something you think would be useful. ' +
-      'Before it can be used she must have READ the brief: write the brief out ' +
-      'in an ordinary reply first, in full, and wait for her to say go. A brief ' +
-      'she has not seen is refused, so a call on the same turn you first write ' +
-      'one will fail and nothing will run. ' +
-      'When she does say go, send the SAME brief she read, word for word — do ' +
-      'not rewrite, tidy or re-summarise it on the way out. If she asked for a ' +
-      'change, write the revised brief out in your reply and wait for her to ' +
-      'approve that one. ' +
-      'ONE PROJECT, NAMED IN THE project FIELD, AND NEVER ANOTHER. If the work ' +
-      'belongs in a project that does not exist yet, put THAT name in the ' +
-      'project field — it will be created. Do NOT pick a different existing ' +
-      'project to put it in, and do NOT ask the job to make directories, move ' +
-      'between projects, or work anywhere outside the one project. The brief ' +
-      'describes work INSIDE that project. A brief that says "create a ' +
-      'directory in Projects/" is asking for something outside the job\'s ' +
-      'remit: its file tools will refuse it, and you must not ask for it. ' +
-      'If a dispatch is refused for any reason, tell her what it said and stop. ' +
-      'Do not look for another way to get the work started. ' +
-      'The job runs unattended for a few minutes; it can edit files in that ' +
-      'project and run test commands there. A restore point is committed first, ' +
-      'so the whole job can be undone. The write-up arrives in her jobs panel, ' +
-      'not in this conversation, so do not describe a result you do not have.';
+      'Send coding work to squatch-code, the local coding agent, which does it ' +
+      'on its own in one project and writes up what it did. ' +
+      'Use it when Ellie tells you to send work: "send that to the coder", ' +
+      '"go ahead", "ship it". ' +
+      'Two rules, both checked for you: she must have READ the brief in an ' +
+      'earlier reply, and the brief must say WHAT to build, never where to put ' +
+      'it. Where it goes is decided by the project field alone — give it a ' +
+      'plain name like "squatch_crawler" and it is created if it does not ' +
+      'exist. If a call is refused, the refusal tells you what to change; do ' +
+      'that and call again in the same reply. ' +
+      'The write-up arrives in her jobs panel, so do not describe a result you ' +
+      'do not have, and do not say you have sent anything unless this returned ' +
+      'success.';
 
     this.parameters = {
       type: 'object',
@@ -117,14 +108,28 @@ class DispatchCodingJobTool {
     });
 
     if (!result.ok) {
-      const unseen = result.unseen
-        ? ' Write the brief out in this reply so she can read it, and send it ' +
-          'once she says to. Do not claim anything has been sent.'
-        : ' Tell her plainly that you did not send it, and why.';
+      // Every refusal ends with something to DO this turn, because a
+      // refusal the model cannot act on costs a round trip and, three
+      // times tonight, produced a claim that work had started instead.
+      let next;
+      if (result.unseen) {
+        next = ' Write the brief out in this reply so she can read it, and send ' +
+               'it once she says to. Do not claim anything has been sent.';
+      } else if (result.briefRejected) {
+        next = ' Rewrite the brief with the directory instructions removed, put ' +
+               'the project name in the project field instead, show her the ' +
+               'corrected brief, and send that in this same reply if she has ' +
+               'already said go.';
+      } else if (result.suggestion) {
+        next = ` Call this again with project: "${result.suggestion}".`;
+      } else {
+        next = ' Tell her plainly that you did not send it, and why.';
+      }
       return {
         success: false,
         error: result.error,
-        message: 'Nothing was sent. ' + result.error + unseen,
+        retry_with_project: result.suggestion || undefined,
+        message: 'NOT SENT. ' + result.error + next,
       };
     }
 
@@ -140,8 +145,12 @@ class DispatchCodingJobTool {
     // hear in this reply, not discover later. And if the name is close to
     // one she already has, that is where a typo gets caught.
     let newProject = '';
+    if (result.renamed) {
+      newProject += ` You asked for "${result.renamed}"; the project is ` +
+        `Projects/${result.project}. Use that name when you refer to it.`;
+    }
     if (result.isNewProject) {
-      newProject = ` This project did not exist, so a new one was created at Projects/${project.trim()}.`;
+      newProject += ` This project did not exist, so a new one was created at Projects/${result.project}.`;
       if (result.nearMatches && result.nearMatches.length) {
         newProject += ` Say so plainly, and mention that she already has ` +
           `Projects/${result.nearMatches.join(' and Projects/')} — if that is ` +

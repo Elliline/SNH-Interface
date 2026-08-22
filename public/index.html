@@ -180,6 +180,14 @@
   <div id="initiativePanelOverlay" class="initiative-panel-overlay"></div>
 
   <!-- Jobs Panel (results of background work — never opens a conversation) -->
+  <!-- Visible while squatch-code is working. Hidden entirely otherwise:
+       "when nothing is running, I see nothing". -->
+  <div id="coderStrip" class="coder-strip" style="display: none;">
+    <span class="coder-strip-dot"></span>
+    <span class="coder-strip-label">squatch-code</span>
+    <span id="coderStripBody" class="coder-strip-body"></span>
+  </div>
+
   <div id="jobsPanel" class="initiative-panel jobs-panel">
     <div class="initiative-panel-header">
       <h2>Background Jobs</h2>

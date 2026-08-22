@@ -3390,11 +3390,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         // An in-flight verb ALONE is not a claim - "the tests are running
         // now" is about tests. The phrase has to name what is being sent,
         // or it fires on every reply that mentions something running.
+        // "retry" and "resend" added after 2026-08-21, where "I will retry
+        // the job immediately" was followed by tool_calls: [] and nothing ran.
         const target = '(?:squatch-?code|the coder|an? agent|the agent|a job|the job|background job|the brief|the directive|the command|it off)';
         const claimedInFlight = new RegExp(
-          '\\b(?:sending|dispatching|handing|passing|queuing|queueing|kicking off|launching|re-?running)\\b'
+          '\\b(?:sending|re-?sending|dispatching|re-?dispatching|handing|passing|queuing|queueing|kicking off|launching|re-?running|retrying)\\b'
           + '[^.!?\\n]{0,60}\\b' + target + '\\b'
-          + '|\\bi(?:\'ll| will) (?:re-?run|run|send|dispatch|kick off|launch)\\b[^.!?\\n]{0,40}\\b' + target + '\\b[^.!?\\n]{0,20}\\bnow\\b',
+          + '|\\bi(?:\'ll| will|\'m going to| am going to) (?:re-?run|run|send|re-?send|dispatch|re-?dispatch|retry|kick off|launch)\\b[^.!?\\n]{0,40}\\b' + target + '\\b[^.!?\\n]{0,30}\\b(?:now|immediately|right away)\\b',
           'i');
         // Hedges that mark a sentence as intent rather than a report.
         const conditional = /\b(shall i|should i|would you like|do you want|once you|when you|if you|before i|let me know|say the word|awaiting|pending your)\b/i;
@@ -3634,6 +3636,20 @@ app.listen(PORT, HOST, () => {
   console.log('  - Memory clusters: Associative cluster-aware retrieval');
   console.log(`  - Long-term memory: rendered from SQLite per request`);
   console.log(`  - Memory files: data/memory/ (USER.md, daily/)`);
+  // WHICH BUILD IS ACTUALLY RUNNING. Twice on 2026-08-21 a fix was made,
+  // committed, and then debugged for a while against a process still on
+  // the previous build. A line naming the commit at boot answers
+  // "is the live process current?" without inferring it from timestamps.
+  try {
+    const { execSync } = require('child_process');
+    const opts = { cwd: __dirname, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] };
+    const sha = execSync('git rev-parse --short HEAD', opts).trim();
+    const subject = execSync('git log -1 --format=%s', opts).trim();
+    const dirty = execSync('git status --porcelain', opts).trim() ? ' +uncommitted changes' : '';
+    console.log(`  - Build: ${sha}${dirty} — ${subject}`);
+  } catch (_) {
+    console.log('  - Build: unknown (not a git checkout)');
+  }
   console.log(`  - MCP tools: ${mcpClient.hasTools() ? mcpClient.getToolNames().join(', ') : 'None'}`);
   console.log(`  - Memory heartbeat: ${startupConfig.heartbeat.enabled ? `Every ${startupConfig.heartbeat.intervalHours}h (first run in ${startupConfig.heartbeat.warmupMinutes}min)` : 'Disabled'}`);
   if (ALLOWED_OLLAMA_HOSTS.length > 0) {

@@ -74,11 +74,25 @@ function projectsRoot() {
  * again at its own boundary.
  */
 function validateProject(name) {
-  const n = String(name || '').trim();
-  if (!n) return { ok: false, error: 'A project name is required.' };
-  if (n.includes('/') || n.includes('\\') || n.startsWith('.')) {
-    return { ok: false, error: `Give the project NAME, not a path: got ${JSON.stringify(n)}.` };
+  const raw = String(name || '').trim();
+  if (!raw) return { ok: false, error: 'A project name is required.' };
+
+  if (raw.includes('/') || raw.includes('\\') || raw.startsWith('.')) {
+    const suggestion = suggestFromPath(raw);
+    return {
+      ok: false,
+      error: `Give the project NAME, not a path: got ${JSON.stringify(raw)}.` +
+        (suggestion
+          ? ` Use "${suggestion}" as the project — it is created if it does not exist — and take the path out of the brief.`
+          : ' A project is a single name under Projects/, never a path.'),
+      suggestion,
+    };
   }
+
+  // "Squatch Crawler" -> "squatch_crawler", which is what she means and
+  // what she expects to find on disk.
+  const n = normaliseProjectName(raw);
+  if (!n) return { ok: false, error: 'A project name is required.' };
   const dir = path.join(projectsRoot(), n);
   // A project that does not exist yet is NOT an error. A new build is an
   // ordinary thing to ask for, and squatch-code creates the directory,
@@ -88,7 +102,7 @@ function validateProject(name) {
   // where a typo gets caught, without blocking a legitimate new project
   // whose name happens to resemble an old one.
   const exists = fs.existsSync(dir) && fs.statSync(dir).isDirectory();
-  return { ok: true, dir, isNew: !exists };
+  return { ok: true, dir, isNew: !exists, name: n, renamed: n !== raw };
 }
 
 /**
@@ -99,6 +113,36 @@ function validateProject(name) {
  * project may legitimately resemble an old one - it gives him something
  * to say at the moment she is reading the reply.
  */
+/**
+ * The directory name for a project the user described in words.
+ *
+ * She says "build Squatch Crawler" and expects Projects/squatch_crawler.
+ * Lowercased, spaces and hyphens to underscores, nothing else touched -
+ * so a name that arrives already correct passes through unchanged.
+ */
+function normaliseProjectName(raw) {
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+
+/**
+ * What a path-shaped name was probably meant to be, for the refusal.
+ *
+ * A refusal that only says "no" costs a turn. This turns
+ * "Projects\\squatch crawler" into "use squatch_crawler", which the
+ * model can act on immediately.
+ */
+function suggestFromPath(raw) {
+  const last = String(raw || '').split(/[\\/]+/).filter(Boolean).pop() || '';
+  const name = normaliseProjectName(last);
+  return name && name !== 'projects' ? name : null;
+}
+
+
 function nearMatches(name) {
   const existing = listProjects().filter(p => p !== name);
   const a = String(name).toLowerCase();
@@ -283,6 +327,93 @@ function statusBlock(now = Date.now()) {
 
 
 /**
+ * Refuse a brief that tries to decide WHERE the work goes.
+ *
+ * The tool description said not to do this. It said so at length, and it
+ * did not hold: three times the entity wrote directory instructions into
+ * the brief instead of naming the project - "check if Projects\\squatch
+ * crawler exists, create it if not" - with a backslash and a space that
+ * match no project name, dispatched into an unrelated project.
+ *
+ * A description is an argument. This is the mechanism. The project field
+ * is the ONLY thing that decides where work lands, and a brief that
+ * reaches for a path is refused with something the model can act on in
+ * the same turn.
+ *
+ * Deliberately narrow: it matches instructions ABOUT directories and
+ * project paths, not ordinary code that happens to mention a folder. A
+ * false refusal here blocks real work, so the patterns require both a
+ * verb of creation-or-location AND a path-like or Projects-rooted
+ * object.
+ */
+const BRIEF_PATH_PATTERNS = [
+  {
+    // "create a directory", "make a folder", "mkdir ..."
+    re: /\b(creat(e|ing)|make|mkdir|set up|initialise|initialize)\b[^.\n]{0,40}\b(director(y|ies)|folder|sub-?folder)\b/i,
+    why: 'it tells the job to create a directory',
+  },
+  {
+    // any reference rooted at Projects/, with either slash
+    re: /\bprojects[\\/][^\s.,;)]+/i,
+    why: 'it points at a path under Projects/',
+  },
+  {
+    // "in the <name> directory/folder" as a placement instruction
+    re: /\b(in|into|under|inside)\b[^.\n]{0,30}\b(director(y|ies)|folder)\b[^.\n]{0,20}\b(exists?|create|if not)\b/i,
+    why: 'it tells the job where to put itself',
+  },
+  {
+    // cd / chdir out of the project
+    re: /\bcd\s+\.\.|\bchdir\b|\.\.[\\/]/i,
+    why: 'it tries to move outside the project',
+  },
+];
+
+/**
+ * Record every dispatch attempt, including the refused ones.
+ *
+ * "Did it even try?" was unanswerable tonight: the tool wrote nothing to
+ * tool_call_log, so a refusal and a model that never called the tool
+ * looked identical from the outside. They are different problems and
+ * need different fixes.
+ */
+function logAttempt(outcome, project, detail, conversationId) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    db.prepare(`
+      INSERT INTO tool_call_log (tool, args, outcome, detail, conversation_id, created_at)
+      VALUES ('dispatch_coding_job', ?, ?, ?, ?, ?)
+    `).run(JSON.stringify({ project }), outcome, String(detail || '').slice(0, 300),
+           conversationId, new Date().toISOString());
+  } catch (_) { /* logging must never break a dispatch */ }
+}
+
+
+function validateBrief(text) {
+  const brief = String(text || '');
+  for (const { re, why } of BRIEF_PATH_PATTERNS) {
+    const m = brief.match(re);
+    if (m) {
+      return {
+        ok: false,
+        matched: m[0].slice(0, 60),
+        error:
+          `The brief was rejected because ${why} ("${m[0].slice(0, 60).trim()}"). ` +
+          `A brief describes WHAT to build, never where to put it. ` +
+          `Where the work goes is decided by the project field and nothing else: ` +
+          `put the project name there — "squatch_crawler", not a path, not ` +
+          `"Projects\\squatch crawler" — and it is created if it does not exist. ` +
+          `Remove the directory instructions from the brief, show her the ` +
+          `corrected brief, and send that.`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+
+/**
  * Send a brief to squatch-code. Her go-ahead already happened, in chat.
  *
  * Refuses unless the brief is already on her screen. A refusal comes back
@@ -305,12 +436,27 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   }
 
   const v = validateProject(project);
-  if (!v.ok) return { ok: false, error: v.error };
+  if (!v.ok) {
+    logAttempt('rejected-project', project, v.error, conversationId);
+    return { ok: false, error: v.error, suggestion: v.suggestion };
+  }
+  // Everything downstream uses the NORMALISED name, so what she was told
+  // and what is on disk are the same string.
+  const projectName = v.name;
 
   const text = String(brief || '').trim();
   if (!text) return { ok: false, error: 'A brief is required - say what needs doing.' };
   if (text.length > 4000) {
     return { ok: false, error: 'That brief is too long to dispatch (4000 characters max).' };
+  }
+
+  // The project field decides where work goes. A brief that reaches for
+  // a path is refused here rather than argued with in a description.
+  const briefCheck = validateBrief(text);
+  if (!briefCheck.ok) {
+    logAttempt('rejected-brief', project, briefCheck.matched, conversationId);
+    opsLog(`dispatch_coding_job REJECTED brief for ${project}: ${briefCheck.matched}`);
+    return { ok: false, error: briefCheck.error, briefRejected: true };
   }
 
   // THE GUARD.
@@ -328,7 +474,7 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
 
   const agentJobs = require('./agent-jobs');
   const queued = agentJobs.enqueue({
-    title: 'squatch-code: ' + project.trim(),
+    title: 'squatch-code: ' + projectName,
     task: text,
     why: 'Sent to squatch-code after Ellie gave the go-ahead in conversation.',
     conversationId,
@@ -342,17 +488,19 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
     'INSERT INTO coding_jobs (id, project, brief, status, conversation_id, ' +
     'message_id, agent_job_id, match_ratio, match_exact, created_at) ' +
     "VALUES (?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?)"
-  ).run(id, project.trim(), text, conversationId, messageId, queued.id,
+  ).run(id, projectName, text, conversationId, messageId, queued.id,
         seen.ratio, seen.exact ? 1 : 0, new Date().toISOString());
 
-  opsLog('dispatch_coding_job sent to ' + project + ': "' + text.slice(0, 80) +
+  opsLog('dispatch_coding_job sent to ' + projectName + ': "' + text.slice(0, 80) +
          '" (job ' + queued.id.slice(0, 8) + (seen.exact ? '' : ', paraphrased') + ')');
 
   return {
     ok: true, id, agentJobId: queued.id,
     exact: seen.exact, ratio: seen.ratio, matchedIn: seen.source,
     isNewProject: !!v.isNew,
-    nearMatches: v.isNew ? nearMatches(project.trim()) : [],
+    nearMatches: v.isNew ? nearMatches(projectName) : [],
+    project: projectName,
+    renamed: v.renamed ? String(project).trim() : null,
   };
 }
 
@@ -495,6 +643,8 @@ function readReport(reportPath, fallback) {
 
 module.exports = {
   SOURCE,
+  validateBrief,
+  normaliseProjectName,
   progressLine,
   running,
   statusBlock,

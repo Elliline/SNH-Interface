@@ -186,4 +186,19 @@ router.post('/:id/cancel', actionLimiter, (req, res) => {
   }
 });
 
+/**
+ * What squatch-code is doing right now.
+ *
+ * Feeds the strip in the header. Returns an empty array when nothing is
+ * running, so the UI renders nothing at all rather than an empty shell -
+ * "when nothing is running, I see nothing" is half the requirement.
+ */
+router.get('/coding/active', (req, res) => {
+  try {
+    res.json({ jobs: require('../db/coding-jobs').running() });
+  } catch (err) {
+    res.json({ jobs: [], error: err.message });
+  }
+});
+
 module.exports = router;
