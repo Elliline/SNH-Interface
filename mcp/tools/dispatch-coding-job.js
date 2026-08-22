@@ -45,6 +45,16 @@ class DispatchCodingJobTool {
       'not rewrite, tidy or re-summarise it on the way out. If she asked for a ' +
       'change, write the revised brief out in your reply and wait for her to ' +
       'approve that one. ' +
+      'ONE PROJECT, NAMED IN THE project FIELD, AND NEVER ANOTHER. If the work ' +
+      'belongs in a project that does not exist yet, put THAT name in the ' +
+      'project field — it will be created. Do NOT pick a different existing ' +
+      'project to put it in, and do NOT ask the job to make directories, move ' +
+      'between projects, or work anywhere outside the one project. The brief ' +
+      'describes work INSIDE that project; a brief that says "create a ' +
+      'directory in Projects/" is asking for something the job is not allowed ' +
+      'to do and it will fail. ' +
+      'If a dispatch is refused for any reason, tell her what it said and stop. ' +
+      'Do not look for another way to get the work started. ' +
       'The job runs unattended for a few minutes; it can edit files in that ' +
       'project and run test commands there. A restore point is committed first, ' +
       'so the whole job can be undone. The write-up arrives in her jobs panel, ' +
@@ -56,7 +66,10 @@ class DispatchCodingJobTool {
         project: {
           type: 'string',
           description:
-            'The project name under Projects/, e.g. "todoapp". A name, not a path.'
+            'The project this work belongs in, e.g. "todoapp". A NAME, never a ' +
+            'path and never nested. If it does not exist it is created, so name ' +
+            'the project the work actually belongs to rather than an existing ' +
+            'one that happens to be nearby.'
         },
         brief: {
           type: 'string',

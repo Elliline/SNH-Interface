@@ -125,6 +125,69 @@ function listProjects() {
 
 
 /**
+ * Where squatch-job actually is, or null if it cannot be found.
+ *
+ * The first real dispatch failed with "spawn squatch-job ENOENT". Every
+ * test until then had invoked it directly from a shell that had the
+ * virtualenv on PATH; the systemd user service does not. Its PATH is the
+ * default /usr/local/sbin:/usr/local/bin:... and nothing puts
+ * ~/squatch-code/.venv/bin on it.
+ *
+ * Resolved rather than assumed, in this order:
+ *   1. tools.codingJobs.binary, if it names a path
+ *   2. PATH, for an installed entry point
+ *   3. the conventional virtualenv beside the projects directory
+ *
+ * Returns an absolute path, or null. A null is not an error here - it is
+ * the answer to "can this work at all", and the tool gate and the
+ * capability manifest both ask.
+ */
+function resolveBinary(c = cfg()) {
+  const configured = String(c.binary || 'squatch-job');
+
+  const usable = (p) => {
+    try { fs.accessSync(p, fs.constants.X_OK); return true; } catch (_) { return false; }
+  };
+
+  if (configured.includes('/')) {
+    return usable(configured) ? path.resolve(configured) : null;
+  }
+
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, configured);
+    if (usable(candidate)) return candidate;
+  }
+
+  // The layout on this machine, and the one squatch-code installs into.
+  for (const candidate of [
+    path.join(os.homedir(), 'squatch-code', '.venv', 'bin', configured),
+    path.join(os.homedir(), '.local', 'bin', configured),
+  ]) {
+    if (usable(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+/**
+ * One line for boot and for the Tools tab: can this run, and from where.
+ */
+function binaryStatus(c = cfg()) {
+  const resolved = resolveBinary(c);
+  return resolved
+    ? { ok: true, path: resolved }
+    : {
+        ok: false,
+        path: null,
+        why: `squatch-job was not found on PATH or at any known location. ` +
+             `Set tools.codingJobs.binary to its full path ` +
+             `(e.g. ${path.join(os.homedir(), 'squatch-code/.venv/bin/squatch-job')}).`
+      };
+}
+
+
+/**
  * Send a brief to squatch-code. Her go-ahead already happened, in chat.
  *
  * Refuses unless the brief is already on her screen. A refusal comes back
@@ -136,6 +199,14 @@ function dispatch({ project, brief, conversationId = null, messageId = null,
   const c = cfg();
   if (c.enabled === false) {
     return { ok: false, error: 'Dispatching coding jobs is switched off in configuration.' };
+  }
+
+  // Refuse before writing a row or queueing anything. A job that cannot
+  // possibly start should not appear in the panel as one that failed.
+  const bin = binaryStatus(c);
+  if (!bin.ok) {
+    opsLog(`dispatch_coding_job REFUSED: ${bin.why}`);
+    return { ok: false, error: `squatch-code is not runnable from here. ${bin.why}`, unrunnable: true };
   }
 
   const v = validateProject(project);
@@ -233,7 +304,7 @@ function runDispatched(job, { timeoutMs = null } = {}) {
       args.push('--allow-command', cmd);
     }
 
-    const bin = c.binary || 'squatch-job';
+    const bin = resolveBinary(c) || c.binary || 'squatch-job';
     const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
     let stderr = '';
@@ -320,6 +391,8 @@ function readReport(reportPath, fallback) {
 
 module.exports = {
   SOURCE,
+  resolveBinary,
+  binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,
   dispatch,
   get,

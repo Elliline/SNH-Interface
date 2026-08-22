@@ -139,9 +139,18 @@ const TOOL_CATALOGUE = [
     title: 'Send coding work to squatch-code',
     Tool: DispatchCodingJobTool,
     card: 'coding',
-    gate: ({ cfg }) => ((cfg.tools && cfg.tools.codingJobs) || {}).enabled === true,
-    gateWhy: ({ cfg }) => ((cfg.tools && cfg.tools.codingJobs) || {}).enabled === true
-      ? null : 'turned off here',
+    // Two conditions, and the second is not a formality: the first real
+    // dispatch failed with "spawn squatch-job ENOENT" because the service
+    // PATH does not include the virtualenv. A tool that cannot possibly
+    // work should not be offered to the model or listed as a capability.
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.codingJobs) || {}).enabled === true
+      && require('../db/coding-jobs').binaryStatus(
+           (cfg.tools && cfg.tools.codingJobs) || {}).ok,
+    gateWhy: ({ cfg }) => {
+      const c = (cfg.tools && cfg.tools.codingJobs) || {};
+      if (c.enabled !== true) return 'turned off here';
+      return require('../db/coding-jobs').binaryStatus(c).why;
+    },
     toggle: 'tools.codingJobs.enabled',
     toggleNote: 'An approved brief runs unattended and can edit files in the project. A git restore point is committed before it starts.',
     writes: true,

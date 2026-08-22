@@ -494,8 +494,19 @@ const CONDITIONAL_CAPABILITIES = [
     // Honesty gate: off means the tool is not registered at all, so the
     // capability is genuinely absent and must not be claimed. Same reasoning
     // as web search staying out while its provider is disabled.
-    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.codingJobs
-      && cfg.tools.codingJobs.enabled === true),
+    // Enabled AND runnable. Claiming a capability whose binary cannot be
+    // found is the exact over-claim this manifest exists to prevent - and
+    // it happened: the first real dispatch failed at spawn while the
+    // capability was being advertised in every turn.
+    when: (cfg) => {
+      if (!(cfg && cfg.tools && cfg.tools.codingJobs
+            && cfg.tools.codingJobs.enabled === true)) return false;
+      try {
+        return require('./coding-jobs').binaryStatus(cfg.tools.codingJobs).ok;
+      } catch (_) {
+        return false;
+      }
+    },
     coversConfig: ['tools.codingJobs']
   }
 ];

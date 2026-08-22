@@ -3373,7 +3373,35 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       // Same doctrine as the ledger funnel and the phantom guard — the outcome is
       // made true, and the truth is what reaches her.
       try {
-        const claimsDispatch = /\b(i(?:'ve| have)? (?:just )?(?:started|kicked off|queued|launched|dispatched|handed (?:this|that|it) (?:off|over))|i(?:'m| am) (?:now )?running (?:this|that|it) in the background|(?:i(?:'ve| have)? )?(?:handed|passed) (?:this|that|it) (?:off )?to (?:a|an|the|my) (?:background )?agent|background job (?:has been|is) (?:started|running)|the agent is (?:now )?(?:working|running))\b/i.test(fullResponse);
+        // TWO FAMILIES OF CLAIM, and the second was added after the first
+        // real coding dispatch. The guard already covered narration - it
+        // reads the finished reply, not whether a tool was offered - but its
+        // vocabulary was written entirely for start_background_job, so it
+        // missed "Sending the directive to squatch-code now...", a
+        // parenthetical admitting it was simulating, and "I'll re-run the
+        // command now", none of which started anything.
+        //
+        // Present-progressive and imminent forms count, because a reply that
+        // says "sending now" and creates no row has said something untrue -
+        // the tense does not change that. What must NOT count is conditional
+        // intent: "shall I send this?" and "I'll send it once you confirm"
+        // are the correct behaviour and firing on them would punish it.
+        const claimedDone = /\b(i(?:'ve| have)? (?:just )?(?:started|kicked off|queued|launched|dispatched|sent|handed (?:this|that|it) (?:off|over))|i(?:'m| am) (?:now )?running (?:this|that|it) in the background|(?:i(?:'ve| have)? )?(?:handed|passed) (?:this|that|it) (?:off )?to (?:a|an|the|my) (?:background )?agent|background job (?:has been|is) (?:started|running)|the agent is (?:now )?(?:working|running))\b/i;
+        // An in-flight verb ALONE is not a claim - "the tests are running
+        // now" is about tests. The phrase has to name what is being sent,
+        // or it fires on every reply that mentions something running.
+        const target = '(?:squatch-?code|the coder|an? agent|the agent|a job|the job|background job|the brief|the directive|the command|it off)';
+        const claimedInFlight = new RegExp(
+          '\\b(?:sending|dispatching|handing|passing|queuing|queueing|kicking off|launching|re-?running)\\b'
+          + '[^.!?\\n]{0,60}\\b' + target + '\\b'
+          + '|\\bi(?:\'ll| will) (?:re-?run|run|send|dispatch|kick off|launch)\\b[^.!?\\n]{0,40}\\b' + target + '\\b[^.!?\\n]{0,20}\\bnow\\b',
+          'i');
+        // Hedges that mark a sentence as intent rather than a report.
+        const conditional = /\b(shall i|should i|would you like|do you want|once you|when you|if you|before i|let me know|say the word|awaiting|pending your)\b/i;
+
+        const claimsDispatch = (claimedDone.test(fullResponse)
+          || claimedInFlight.test(fullResponse))
+          && !conditional.test(fullResponse);
         const created = agentJobs.jobsStartedInTurn(convoId, turnStartedAt);
 
         const append = (text) => {
