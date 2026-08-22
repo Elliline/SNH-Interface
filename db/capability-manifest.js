@@ -491,6 +491,11 @@ const CONDITIONAL_CAPABILITIES = [
     intro: 'When Ellie and I have worked out a change to one of her projects, I can write it up as a brief and hand it to squatch-code to carry out on its own. I do not decide to send it — I write the brief where she can read it, and it only goes when she tells me to, in the conversation. I can only send a brief she has actually seen. The job works in that one project, commits a restore point before it starts so the whole thing can be undone, and its write-up arrives in her jobs panel rather than in our conversation',
     schedule: 'When she tells you to send a brief to squatch-code',
     dateAdded: '2026-08-21',
+    // Without this the tool is ALSO listed as a derived entry of its own,
+    // which cost the injection budget twice over and - because a derived
+    // id is "tool:<name>" and getById only searches the real arrays -
+    // crashed syncToOps on the boot where it first appeared.
+    coversTools: ['dispatch_coding_job'],
     // Honesty gate: off means the tool is not registered at all, so the
     // capability is genuinely absent and must not be claimed. Same reasoning
     // as web search staying out while its provider is disabled.
@@ -1224,9 +1229,16 @@ function syncToOps() {
   const added = current.filter(c => !knownIds.has(c.id)).map(c => c.id);
   const removed = (state.known || []).filter(k => !currentIds.has(k.id)).map(k => k.id);
 
+  // Use the entry we already have. activeCapabilities() includes DERIVED
+  // tool entries whose ids are "tool:<name>", and getById only searches
+  // the static and conditional arrays - so looking one up again returned
+  // null and threw on c.name, taking out boot-time bookkeeping the first
+  // time a new tool registered without a capability covering it.
+  const currentById = new Map(current.map(c => [c.id, c]));
   for (const id of added) {
-    const c = getById(id);
-    logOps(`entry added — "${c.name}" (${c.schedule}, since ${c.dateAdded})`);
+    const c = currentById.get(id) || getById(id);
+    if (!c) { logOps(`entry added — "${id}"`); continue; }
+    logOps(`entry added — "${c.name}" (${c.schedule}, since ${c.dateAdded || 'undated'})`);
   }
   for (const id of removed) logOps(`entry removed — "${id}"`);
 

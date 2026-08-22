@@ -70,8 +70,11 @@ test('the tool is NOT registered when the binary is missing', () => {
 
 test('the capability manifest does not claim it either', () => {
   const src = fs.readFileSync(path.join(__dirname, '../db/capability-manifest.js'), 'utf8');
-  const entry = src.slice(src.indexOf("id: 'coding-jobs'"));
-  assert.ok(/binaryStatus/.test(entry.slice(0, 3000)),
+  // Slice to the END of the entry rather than a fixed character count -
+  // the first version used 3000 chars and broke the moment the entry grew.
+  const start = src.indexOf("id: 'coding-jobs'");
+  const entry = src.slice(start, src.indexOf('\n  }', start));
+  assert.ok(/binaryStatus/.test(entry),
     'the manifest gate does not check the binary — it would advertise a tool that cannot run');
 });
 
