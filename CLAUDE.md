@@ -392,6 +392,50 @@ pending.** A genuine re-run request had nowhere to land.
   including for "How did the job go?". It parses the body and reads her message
   now. Second time in two commits that a stub's shape hid a real result.
 
+## ⚠️ squatch-code's editing workflow: search → ranged read → targeted edit → verify
+
+Lives in the squatch-code repo, recorded here because this is the file that gets
+read when a coding job misbehaves.
+
+**The 8/22 autopsy blamed a missing tool. `edit_file` was never missing** — it
+was implemented, declared in `TOOLS`, dispatched, and the system prompt already
+called it "preferred for existing files". The agent used `write_file` anyway,
+because the guidance listed both as equals with `write_file` first and the tool
+descriptions gave no reason to prefer one. **A capability that exists and is not
+chosen is indistinguishable from a missing one until you look.** The fix was
+where the model actually reads: the descriptions and the workflow, not the
+registry.
+
+- **`edit_file` is described as THE DEFAULT**, and `write_file`'s own
+  description now points at it. Cost scales with the change, not the file — the
+  killed job spent ~5,900 tokens and ~170s per iteration rewriting a 20KB file
+  to fix one loop.
+- **Refusals teach the next move and never mention `write_file`.** Zero matches
+  → re-read and copy exactly, do not retype from memory. Multiple → says HOW
+  MANY and asks for more surrounding lines. "Just rewrite it" is always
+  available and always wrong here; a hint that offers it will be taken.
+- **A full read has NO line numbers; a ranged read does, and says they are
+  display-only.** This is the interaction that decides whether any of it works:
+  `old_str` must match byte for byte, and a model copying `  240 | code` gets a
+  zero-match refusal. The full read — the one most likely to be copied into an
+  edit — is returned raw.
+- **`search_files` is literal by default**, regex behind a flag. Real searches
+  are for `game.state.phase` and `ctx.fillRect(`, where every dot and paren is
+  code; compiling those as a regex matches the wrong lines or throws.
+- **Verification is a HABIT, not a hook.** The prompt requires a check after each
+  change and the report shows, per file, whether one ran after that file's last
+  change — `[checked: node --check game.js -> ok]` or
+  `[not checked after this change]`. **Deliberately not automated:** a hook that
+  ran checks outside the loop would make the report always say "checked" while
+  the agent never learned to look, and it is the agent seeing its own failure
+  that fixes the next one. A check BEFORE the change does not count.
+- **An unattended run is told the definition of done is something it RUNS.** No
+  requirement may be written up as satisfied without saying how that was
+  established; where the brief's check is not command-expressible, the report
+  must say so and name what is left for her to confirm by hand.
+- Verify with `.venv/bin/python -m pytest tests/test_editing_workflow.py
+  tests/test_editing_endtoend.py`.
+
 ## ⛔ A coding job is killed for STALLING, never for taking time
 
 `tools.codingJobs.timeoutMinutes` was a flat 20-minute wall clock and it is
