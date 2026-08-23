@@ -995,7 +995,39 @@ const DEFAULTS = {
     codingJobs: {
       enabled: false,
       projectsRoot: require('path').join(require('os').homedir(), 'Projects'),
-      timeoutMinutes: 20,
+      // === A STALL AND A CEILING, NOT ONE FLAT WALL CLOCK ===
+      //
+      // `timeoutMinutes` is RETIRED and is no longer shipped as a default — a
+      // key we set ourselves must never trip our own deprecation warning. It is
+      // still READ FOR THE WARNING if an existing data/config.json sets it. On
+      // 2026-08-22 it killed a job that was working perfectly: measured on the
+      // engine side, generation ran at 33.7 tok/s continuously for the whole
+      // twenty minutes — 40,439 output tokens, ZERO samples at 0 tok/s, and
+      // never more than one request in flight. It was not stuck and it was not
+      // queued behind anything. It was rewriting a 20KB file every iteration,
+      // six iterations at 160–170s each, and 25 of those needs ~71 minutes. The
+      // ceiling was doing the pacing, and pacing is not what a ceiling is for.
+      //
+      // WHERE THE REAL STALL CHECK LIVES, and why this one is coarse. The
+      // fine-grained signal is token flow, and SNH cannot see it: squatch-code
+      // is a separate process that writes progress only when a STEP completes.
+      // But squatch-code already has that check — its httpx client is built
+      // with `timeout=120`, which on a stream is a per-read deadline, i.e. no
+      // bytes for 120s. A wedged engine is caught there, one layer down, on the
+      // right signal, within two minutes.
+      //
+      // So this window is a backstop for what that check cannot see:
+      // squatch-code itself stuck — a hung command, a loop that stops calling
+      // the model. Its signal is "no completed step", whose measured legitimate
+      // gap in real work is 170s. A 120s window here would have killed the
+      // healthy job above, so the number has to clear a slow step by a wide
+      // margin: ten minutes, not two.
+      stallTimeoutMs: 600000,
+      // The runaway backstop, and nothing else. The 25-iteration job above
+      // needed ~71 minutes at measured rates, so 60 is a ceiling rather than a
+      // comfortable fit — raise it if real work ever hits it, because hitting
+      // it should mean something is wrong.
+      maxRuntimeMinutes: 60,
       maxPendingProposals: 3,
       binary: 'squatch-job',
       // A speed bump on top of the git restore point, not a security

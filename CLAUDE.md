@@ -392,6 +392,58 @@ pending.** A genuine re-run request had nowhere to land.
   including for "How did the job go?". It parses the body and reads her message
   now. Second time in two commits that a stub's shape hid a real result.
 
+## ⛔ A coding job is killed for STALLING, never for taking time
+
+`tools.codingJobs.timeoutMinutes` was a flat 20-minute wall clock and it is
+RETIRED (`warnRetiredCodingTimeout`). On 2026-08-22 it killed a job that was
+working. Measured on the engine, not inferred:
+
+    33.7 tok/s mean, continuously, for the whole 1200s
+    40,439 output tokens generated
+    0 samples at 0 tok/s        <- a wedge would show these
+    running=1 in 116/120 samples, waiting=0 always
+    six iterations, 160-170s each, ~5,900 tokens per iteration
+
+It was rewriting a 20KB file every iteration; 25 of those needs ~71 minutes. The
+ceiling was doing the PACING, and pacing is not what a ceiling is for. It died
+mid-refactor with the phase/hunter logic torn out and the replacement unwritten,
+which is why the game stopped starting — the kill did not corrupt anything, it
+interrupted a half-applied edit.
+
+- **Two limits.** `stallTimeoutMs` is the kill condition; `maxRuntimeMinutes`
+  (60) is a runaway guard. A job still making progress runs until the ceiling.
+- **The stall signal here is COARSE, and the fine one already exists.** SNH
+  cannot see token flow — squatch-code is a separate process that writes
+  progress only when a STEP completes. But squatch-code's httpx client is built
+  with `timeout=120`, which on a stream is a per-read deadline: no bytes for
+  120s. **A wedged engine is caught there, one layer down, in two minutes.** So
+  SNH's window is a backstop for what that cannot see — squatch-code itself
+  stuck — and its measured legitimate gap is 170s, which is why the default is
+  ten minutes and **why 120s here would have killed the healthy job above.**
+  Do not "fix" this number down to match the chat path; it is a different signal.
+- **A stall card and a ceiling card say different things**, because they mean
+  different things and she reads them to decide what to do: "Stopped: no
+  activity for X minutes" versus "Stopped: exceeded maximum runtime… it had made
+  progress Ns ago". The second one ends by saying to raise the ceiling rather
+  than split the brief.
+- **A kill mid-edit hands her the way back.** The old card said "check the
+  project's git status" and left her to find the sha. `dirtyStateNote()` reports
+  how many files are uncommitted and prints the exact
+  `git reset --hard <sha> && git clean -fd`. A killed job does not commit, so
+  the restore point IS HEAD — and that is CHECKED, not assumed: if HEAD is not a
+  restore-point commit, something committed since, and it says so instead of
+  offering a command that would destroy real work.
+- **`data/config.json` IS NOT REDIRECTED BY `SNH_DATA_DIR`, so a test that calls
+  `updateConfig()` writes the LIVE file.** This suite did exactly that while
+  being written: the live projects root became `/tmp/cjlimits-*` and the live
+  binary became a stub. `runDispatched(job, { config })` and `projectsRoot(c)`
+  are the seam, the same one `getSearchConfig(config)` uses, and the suite
+  asserts the live config is untouched when it finishes.
+- Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-coding-job-limits.js`
+  — the stub writes the real progress file in the real shape, because a stall
+  watcher tested against a stub that does not write progress is a timer tested
+  against nothing.
+
 ## ⛔ She must be able to talk like a person — no phrase list may gate an action
 
 Coding dispatch ran at **2 real out of 7 claimed**. Every fix built for it —

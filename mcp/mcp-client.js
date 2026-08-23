@@ -157,8 +157,10 @@ const TOOL_CATALOGUE = [
     fields: [
       { path: 'tools.codingJobs.projectsRoot', label: 'Projects directory', type: 'text',
         hint: 'Where projects live. squatch-code refuses any path outside it.' },
-      { path: 'tools.codingJobs.timeoutMinutes', label: 'Timeout (minutes)', type: 'number', min: 1, max: 120,
-        hint: 'How long one job may run before it is stopped. A stopped job keeps whatever it had already written; the restore point is how it is undone.' },
+      { path: 'tools.codingJobs.stallTimeoutMs', label: 'Coding job: give up if no step completes for (ms)', type: 'number', step: '60000', min: 60000,
+        hint: 'A coding job writes a line of progress each time it finishes a step. This is how long a silence is allowed before it is assumed stuck. It measures the GAP between steps, not how long the job takes, so a slow job is never killed for being slow. Steps that rewrite a whole file legitimately take two to three minutes, which is why this is ten and not two — and the finer check, for the engine going quiet mid-answer, already runs inside the coding agent at two minutes.' },
+      { path: 'tools.codingJobs.maxRuntimeMinutes', label: 'Coding job: maximum runtime (minutes)', type: 'number', min: 5, max: 600,
+        hint: 'The runaway guard, not a pace. A job that is still making progress is left alone until it hits this. It replaced a flat 20-minute limit that killed a healthy job mid-edit on 2026-08-22 — that job was generating steadily and needed about 70 minutes. If real work hits this ceiling, raise it; hitting it should mean something is wrong.' },
       { path: 'tools.codingJobs.maxPendingProposals', label: 'Briefs awaiting approval', type: 'number', min: 1, max: 20,
         hint: 'How many un-decided briefs may pile up before the tool refuses to write another.' }
     ]

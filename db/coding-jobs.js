@@ -64,8 +64,11 @@ const SOURCE = 'squatch-code';
  * squatch-code session used that layout, so this follows what is already
  * true rather than declaring something.
  */
-function projectsRoot() {
-  return cfg().projectsRoot || path.join(os.homedir(), 'Projects');
+/** @param {object} [c] a config to read INSTEAD of the live one — see the seam
+ *  note on runDispatched. Without it this reads data/config.json, which a test
+ *  cannot redirect. */
+function projectsRoot(c = null) {
+  return (c || cfg()).projectsRoot || path.join(os.homedir(), 'Projects');
 }
 
 /**
@@ -589,9 +592,90 @@ function get(id) {
  * started must always come back with something a person can read, and that
  * rule does not get an exception for the process failing to launch.
  */
-function runDispatched(job, { timeoutMs = null } = {}) {
-  const c = cfg();
-  const limitMs = timeoutMs || (c.timeoutMinutes ?? 20) * 60 * 1000;
+let warnedRetiredCodingTimeout = false;
+/** Same warn-once shape as generation's retired rate knobs: a key that no
+ *  longer does anything must SAY so, or the next person tunes a dead number. */
+function warnRetiredCodingTimeout(c) {
+  if (warnedRetiredCodingTimeout || c.timeoutMinutes === undefined) return;
+  warnedRetiredCodingTimeout = true;
+  const line =
+    `tools.codingJobs.timeoutMinutes (${c.timeoutMinutes}) in data/config.json is NO LONGER READ — `
+    + 'a coding job is killed on a STALL (tools.codingJobs.stallTimeoutMs) with a runaway ceiling '
+    + '(tools.codingJobs.maxRuntimeMinutes), not on one flat wall clock. The flat clock killed a '
+    + 'healthy job on 2026-08-22 that was generating 33.7 tok/s at the moment it died. Delete the '
+    + 'old key; it does nothing.';
+  console.warn(`[CodingJobs] ${line}`);
+  opsLog(line);
+}
+
+/**
+ * The two limits a dispatched job is held to, and what each one means.
+ *
+ * A caller may still pass `timeoutMs`, which pins the CEILING only — it is what
+ * the tests use, and it must not silently become a stall window.
+ */
+function runLimits(c, timeoutMs = null) {
+  warnRetiredCodingTimeout(c);
+  const num = (v, dflt) => (Number.isFinite(v) && v > 0 ? v : dflt);
+  return {
+    stallMs: num(c.stallTimeoutMs, 600000),
+    ceilingMs: timeoutMs || num(c.maxRuntimeMinutes, 60) * 60 * 1000,
+  };
+}
+
+/**
+ * WHAT SHE IS LEFT WITH WHEN A JOB IS KILLED MID-EDIT.
+ *
+ * The old card said "check the project's git status" and left her to work out
+ * the rest. On 2026-08-22 that meant a game that no longer started and no way
+ * back written down anywhere — the job's restore point existed, and nothing
+ * told her its sha.
+ *
+ * A killed job does not commit, so the restore point IS HEAD. That is checked
+ * rather than assumed: if HEAD is not a restore-point commit something has
+ * committed since, and printing a reset command would then destroy real work.
+ * In that case it says what it found and does not offer a command.
+ */
+function dirtyStateNote(projectDir) {
+  const run = (args) => {
+    const r = require('child_process').spawnSync('git', ['-C', projectDir, ...args],
+      { encoding: 'utf8', timeout: 10000 });
+    return r.status === 0 ? String(r.stdout || '').trim() : null;
+  };
+  const dirty = run(['status', '--porcelain']);
+  if (dirty === null) return '\n\nThe project is not a git repository, so there is no restore point to go back to.';
+  if (!dirty) return '\n\nThe project has no uncommitted changes — nothing it wrote survived, and there is nothing to undo.';
+
+  const files = dirty.split('\n').length;
+  const sha = run(['rev-parse', 'HEAD']);
+  const subject = run(['log', '-1', '--format=%s']) || '';
+  const head = `\n\n**The project is in a modified, possibly broken state.** `
+    + `${files} file${files === 1 ? '' : 's'} changed and not committed — a job stopped part-way `
+    + `through is a half-applied edit, not a smaller version of the finished thing.`;
+
+  if (!sha || !/restore point/i.test(subject)) {
+    return head + `\n\nSomething has been committed since the job's restore point `
+      + `(HEAD is "${subject || 'unknown'}"), so no undo command is offered here — `
+      + `run \`git -C ${projectDir} log\` and pick the restore point yourself.`;
+  }
+  return head + `\n\nTo put it back exactly as it was before the job:\n\n`
+    + `    git -C ${projectDir} reset --hard ${sha} && git -C ${projectDir} clean -fd`;
+}
+
+/**
+ * @param {object} opts
+ * @param {number} [opts.timeoutMs]  pins the CEILING only, never the stall window.
+ * @param {object} [opts.config]     a config to use INSTEAD of the live one.
+ *
+ * THE CONFIG SEAM IS NOT A CONVENIENCE. `data/config.json` is deliberately not
+ * redirected by SNH_DATA_DIR, so `updateConfig()` in a test writes the REAL
+ * file — which is exactly what happened while this function was being tested:
+ * the live projects root became a temp directory and the live binary became a
+ * stub. Same seam, same reason, as `getSearchConfig(config)`.
+ */
+function runDispatched(job, { timeoutMs = null, config = null } = {}) {
+  const c = config || cfg();
+  const { stallMs, ceilingMs } = runLimits(c, timeoutMs);
   const project = projectOf(job);
 
   return new Promise(resolve => {
@@ -617,7 +701,7 @@ function runDispatched(job, { timeoutMs = null } = {}) {
 
     const args = [
       '--project', project,
-      '--projects-root', projectsRoot(),
+      '--projects-root', projectsRoot(c),
       '--brief-file', '-',
       '--report-json', reportPath
     ];
@@ -633,22 +717,70 @@ function runDispatched(job, { timeoutMs = null } = {}) {
     const done = (payload) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      // Defined below; a job can finish before the watcher is armed, so this is
+      // called defensively rather than assumed to exist.
+      try { clearWatchers(); } catch (_) { /* not armed yet */ }
       resolve(payload);
     };
+    let clearWatchers = () => {};
 
-    const timer = setTimeout(() => {
+    // === A STALL AND A CEILING SAY DIFFERENT THINGS, SO THEY ARE SAID ===
+    //
+    // One flat clock could only ever report "it was still running", which is
+    // true of a wedged job and of a job three quarters done, and she reads
+    // these cards to decide what to do next. Those are different decisions.
+    const startedAt = Date.now();
+    const projectDir = require('path').join(projectsRoot(c), project);
+
+    const killWith = (reason, resultText, errorText) => {
       try { child.kill('SIGKILL'); } catch (_) { /* already gone */ }
       done(readReport(reportPath, {
         status: 'partial',
-        resultText:
-          `The job was still running after ${Math.round(limitMs / 60000)} minutes and was stopped.\n\n` +
-          `Files it had already changed are still changed. Check the project's git status; ` +
-          `the job commits a restore point before it starts, so "git log" in Projects/${project} ` +
-          `will show it.`,
-        error: `killed after ${limitMs}ms`
+        resultText: resultText + dirtyStateNote(projectDir),
+        error: errorText,
       }));
-    }, limitMs);
+    };
+
+    // The stall watcher reads the progress file the run writes as it goes. Its
+    // resolution is one COMPLETED STEP, not one token — see the note in
+    // db/config.js for why that is the best signal available here and where the
+    // token-level one actually lives.
+    let lastSeen = startedAt;
+    let lastStamp = null;
+    const watcher = setInterval(() => {
+      let stamp = null;
+      try {
+        const raw = fs.readFileSync(progressPath, 'utf8');
+        const p = JSON.parse(raw);
+        stamp = p && p.updated_at ? Number(p.updated_at) : null;
+      } catch (_) { /* not written yet, or mid-write: not evidence of a stall */ }
+      if (stamp && stamp !== lastStamp) { lastStamp = stamp; lastSeen = Date.now(); }
+
+      const idle = Date.now() - lastSeen;
+      const ran = Date.now() - startedAt;
+
+      if (idle >= stallMs) {
+        clearInterval(watcher);
+        const mins = Math.round(idle / 60000);
+        killWith('stall',
+          `**Stopped: no activity for ${mins} minute${mins === 1 ? '' : 's'}.** The job stopped `
+          + `making progress and was killed after waiting ${Math.round(stallMs / 60000)} minutes for `
+          + `it to do something. It had been running ${Math.round(ran / 60000)} minutes in total.`,
+          `stalled — no progress for ${Math.round(idle / 1000)}s (limit ${Math.round(stallMs / 1000)}s)`);
+      } else if (ran >= ceilingMs) {
+        clearInterval(watcher);
+        killWith('ceiling',
+          `**Stopped: exceeded maximum runtime.** The job was still working — it had made progress `
+          + `${Math.round(idle / 1000)}s ago — but it passed the ${Math.round(ceilingMs / 60000)}-minute `
+          + `ceiling and was stopped. That ceiling is a runaway guard, not a pace: if this was `
+          + `legitimate work, raise it in Settings rather than splitting the brief.`,
+          `exceeded maximum runtime of ${Math.round(ceilingMs / 60000)} minutes`);
+      }
+      // Poll fast enough that the window means what it says. A fixed 5s tick
+      // makes a short window unreportable — a 1.5s stall window would still
+      // take 10s to notice, and the number in the card would be a fiction.
+    }, Math.max(250, Math.min(5000, Math.floor(stallMs / 4))));
+    clearWatchers = () => clearInterval(watcher);
 
     child.stderr.on('data', d => { stderr += d.toString().slice(0, 4000); });
     child.on('error', err => done({
@@ -835,6 +967,10 @@ module.exports = {
   logRefusal,
   dispatchedInTurn,
   activeForProject,
+  runLimits,
+  /** Test hook: the retired-key warning is warn-ONCE per process, so a suite
+   *  that exercises it more than once has to clear the latch. */
+  _resetRetiredWarning: () => { warnedRetiredCodingTimeout = false; },
   resolveBinary,
   binaryStatus,
   DEFAULT_ALLOWED_COMMANDS,
