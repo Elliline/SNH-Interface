@@ -1868,6 +1868,39 @@ async function loadSettingsBrainTab() {
       { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
     ]));
 
+    // THE SITTER. These two numbers multiplied together ARE the downtime of a
+    // wedged engine, and they were invisible while costing 15 minutes a time.
+    container.appendChild(createConfigSection('Engine Sitter', [
+      {
+        key: 'livenessProbe.intervalSeconds',
+        label: 'Check the engine every (seconds)',
+        type: 'number', step: '15', min: 5,
+        value: config.livenessProbe?.intervalSeconds,
+        desc: 'A healthy engine answers this check in milliseconds — a recovered one was measured at 228ms — so a failed check does not mean "busy", it means the engine is already gone. Asking more often costs nothing and is the difference between noticing in a minute and noticing in fifteen.'
+      },
+      {
+        key: 'watchdog.failureThreshold',
+        label: 'Restart after this many failed checks in a row',
+        type: 'number', min: 1, max: 10,
+        value: config.watchdog?.failureThreshold,
+        desc: 'Two is deliberate: one failed check could be a hiccup, two in a row at this interval is a wedge. Multiply this by the interval above to get the worst case before a restart begins — it used to be 3 x 5 minutes, which is where the fifteen minutes came from.'
+      },
+      {
+        key: 'watchdog.cooldownMinutes',
+        label: 'Grace period while the model reloads (minutes)',
+        type: 'number', min: 1, max: 30,
+        value: config.watchdog?.cooldownMinutes,
+        desc: 'After a restart the engine spends a few minutes loading the model and cannot answer. This stops the sitter restarting it again while that happens.'
+      },
+      {
+        key: 'watchdog.maxRestartsPerHour',
+        label: 'Most restarts per hour',
+        type: 'number', min: 1, max: 10,
+        value: config.watchdog?.maxRestartsPerHour,
+        desc: 'A hard cap. Past it the sitter stops restarting and says so loudly, because a restart loop that is not healing means the problem is not the engine.'
+      }
+    ]));
+
     // Generation budgets. Every field here is NULLABLE and ships empty: empty
     // means the setting is not sent to the engine at all, which is what a model
     // without a reasoning channel needs. The placeholders say what happens when

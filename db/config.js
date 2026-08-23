@@ -587,14 +587,26 @@ const DEFAULTS = {
   // `retentionDays` bounds the per-probe log (liveness_probes). At the default
   // 5-minute cadence that's ~288 rows/day, so 14 days is ~4k rows — enough to
   // see a pattern of intermittent failures without growing forever.
-  livenessProbe: { enabled: true, intervalMinutes: 5, timeoutMs: 8000, retentionDays: 14 },
+  // A HEALTHY ENGINE ANSWERS THIS IN MILLISECONDS, so a failed probe is not a
+  // hint — it is the engine already gone. Measured on 2026-08-22: a recovered
+  // probe came back in 228ms. There is nothing to be gained by asking slowly.
+  //
+  // The old cadence was 5 minutes x 3 failures = 15 minutes minimum before a
+  // restart, and that is exactly what it cost: "down ~15 min from first
+  // failure", with her chat sitting on a spinner for most of it. 60s x 2 puts
+  // the worst case at ~2-3 minutes including the model reload.
+  //
+  // intervalSeconds replaces intervalMinutes (retired, warn-once) because the
+  // useful range is now below a minute and a knob that cannot express it is a
+  // knob that has to be replaced again next time.
+  livenessProbe: { enabled: true, intervalSeconds: 60, timeoutMs: 8000, retentionDays: 14 },
   // Brain watchdog: the self-healing ACTION for the vLLM wedge. Fed each liveness
   // probe result — after `failureThreshold` consecutive failures it runs
   // `docker restart <container>`. `cooldownMinutes` is grace while the model
   // reloads (no re-trigger). `maxRestartsPerHour` is a hard cap: past it the
   // watchdog stops restarting, logs CRITICAL, and leaves the circuit breaker as
   // the fallback (a restart loop that isn't healing means something worse).
-  watchdog: { enabled: true, container: 'sparky-brain', failureThreshold: 3, cooldownMinutes: 5, maxRestartsPerHour: 2 },
+  watchdog: { enabled: true, container: 'sparky-brain', failureThreshold: 2, cooldownMinutes: 5, maxRestartsPerHour: 2 },
   // Self-identity: a deliberately minimal seed. We do NOT define the AI's
   // personality — it develops one through its own accumulated self-observations
   // (self-facts). maxSelfFacts budgets how many active self-facts inject.

@@ -89,6 +89,9 @@ const DISPOSABLE_INSTANCE = !!process.env.SNH_DATA_DIR;
 let disposableNoticeLogged = false;
 
 /** Read + normalize the watchdog config each probe so knobs take effect live. */
+/** The whole config, for the probe cadence the alert quotes. */
+function cfgAll() { return require('./config').getConfig(); }
+
 function cfg() {
   const w = (getConfig().watchdog) || {};
   // Spoken, not silent — a guard that disables a self-healing action without
@@ -205,7 +208,13 @@ async function onProbeResult(probe) {
   restartInFlight = true;
   wedgeDetectedAtBeforeRestart = wedgeDetectedAt; // preserve original wedge time across the counter reset
   const attemptNum = restartTimes.length + 1;
-  const fireMsg = `🔧 Brain watchdog: ${consecutiveFailures} consecutive liveness failures (last: ${probe.error || 'unknown'}) — restarting ${c.container} (restart ${attemptNum}/${c.maxRestartsPerHour} this hour).`;
+  // THE CARD SAYS WHICH POLICY FIRED. Reading "3 consecutive failures" tells
+  // you nothing about how long that took unless you also know the interval —
+  // and the interval is exactly what changed after the 15-minute detection on
+  // 2026-08-22. Stating both makes a slow detection self-explaining.
+  const everySec = Math.max(5, ((cfgAll().livenessProbe || {}).intervalSeconds) || 60);
+  const policy = `${c.failureThreshold} failed checks ${everySec}s apart`;
+  const fireMsg = `🔧 Brain watchdog: ${consecutiveFailures} consecutive liveness failures (last: ${probe.error || 'unknown'}) — restarting ${c.container} (restart ${attemptNum}/${c.maxRestartsPerHour} this hour). Policy: ${policy}.`;
   console.warn(`[Watchdog] ${fireMsg}`);
   opsLog(fireMsg);
 

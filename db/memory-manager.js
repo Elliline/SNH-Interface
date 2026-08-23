@@ -742,11 +742,19 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   // what a background system needs — see the note on streamChat. Neither of
   // these scales with the budget, so raising a budget can no longer kill a job.
   warnRetiredRateKnobs(gen);
+  // A CALLER MAY BRING ITS OWN DEADLINES. The config values are sized for
+  // background work waiting behind a queue — 300s to the first token is right
+  // for a job and wrong for a four-token classifier that runs in front of a
+  // person's turn, where it becomes 300 seconds of spinner with no error.
+  // Only tightening is meaningful here, but the override is honoured either
+  // way: a caller that knows its own shape knows better than the default.
   const timeouts = {
-    stallMs: Number.isFinite(gen.stallTimeoutMs) && gen.stallTimeoutMs > 0
-      ? gen.stallTimeoutMs : 60000,
-    firstTokenMs: Number.isFinite(gen.firstTokenTimeoutMs) && gen.firstTokenTimeoutMs > 0
-      ? gen.firstTokenTimeoutMs : 300000
+    stallMs: Number.isFinite(options.stallMs) && options.stallMs > 0
+      ? options.stallMs
+      : (Number.isFinite(gen.stallTimeoutMs) && gen.stallTimeoutMs > 0 ? gen.stallTimeoutMs : 60000),
+    firstTokenMs: Number.isFinite(options.firstTokenMs) && options.firstTokenMs > 0
+      ? options.firstTokenMs
+      : (Number.isFinite(gen.firstTokenTimeoutMs) && gen.firstTokenTimeoutMs > 0 ? gen.firstTokenTimeoutMs : 300000)
   };
 
   let url, body, extract, extractFinishReason;
@@ -2705,9 +2713,20 @@ function startLivenessProbe() {
     return;
   }
 
-  const intervalMs = Math.max(1, lp.intervalMinutes || 5) * 60 * 1000;
+  // intervalSeconds is the knob; intervalMinutes is retired and warns once,
+  // because a config still setting 5 would silently keep the old 15-minute
+  // detection the new default exists to remove.
+  if (lp.intervalMinutes !== undefined) {
+    const line = `livenessProbe.intervalMinutes (${lp.intervalMinutes}) in data/config.json is NO LONGER READ — `
+      + 'the probe interval is livenessProbe.intervalSeconds now (default 60). A healthy engine answers '
+      + 'in milliseconds, so 5-minute polling only delayed detection: 5min x 3 failures was the 15 minutes '
+      + 'of downtime measured on 2026-08-22. Delete the old key; it does nothing.';
+    console.warn(`[Liveness] ${line}`);
+    try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* console is the floor */ }
+  }
+  const intervalMs = Math.max(5, lp.intervalSeconds || 60) * 1000;
   const timeoutMs = lp.timeoutMs || 8000;
-  console.log(`[Liveness] Probing brain every ${intervalMs / 60000}min (timeout ${timeoutMs}ms)`);
+  console.log(`[Liveness] Probing brain every ${intervalMs / 1000}s (timeout ${timeoutMs}ms)`);
 
   const retentionDays = Math.max(1, lp.retentionDays ?? 14);
 

@@ -172,10 +172,26 @@ function parseVerdict(raw) {
 async function isApproval({ brief, message, callLLM }) {
   if (!brief || !String(message || '').trim()) return { approved: false, reason: 'nothing to decide' };
   try {
+    // A DEADLINE OF ITS OWN, because this runs BEFORE the turn's own clock.
+    //
+    // callLLM's defaults are the BACKGROUND ones — 60s stall, 300s first token
+    // — which are right for a queued job and absurd for a four-token yes/no
+    // that decides whether to pin a tool. On 2026-08-22 the engine wedged and
+    // her chat sat on a spinner for 500+ seconds with no error: the 120s chat
+    // deadline fired correctly, but only once the turn reached the engine, and
+    // everything before that had no deadline at all. Measured the next morning:
+    // 7m14s between this classifier returning and the first tool round going
+    // out. The turn's clock had not started yet, so nothing could time out.
+    //
+    // A wedged engine now costs this call 15 seconds, not five minutes, and it
+    // fails closed — no pin — which is exactly what should happen when the
+    // engine cannot answer anyway.
     const answer = await callLLM(SYSTEM, buildUserPrompt(brief, message), {
       maxTokens: 4,
       temperature: 0,
       thinkingTokens: 0,
+      firstTokenMs: 15000,
+      stallMs: 10000,
     });
     // callLLM resolves to { content, reasoning, provider, truncated } — not a
     // string. Reading it as one produced "[object Object]", which parsed as
@@ -272,6 +288,9 @@ async function isRerunRequest({ brief, message, lastJob = null, callLLM }) {
       maxTokens: 4,
       temperature: 0,
       thinkingTokens: 0,
+      // Same short deadline as isApproval — see the note there.
+      firstTokenMs: 15000,
+      stallMs: 10000,
     });
     const raw = (answer && typeof answer === 'object') ? answer.content : answer;
     const verdict = parseVerdict(raw);
