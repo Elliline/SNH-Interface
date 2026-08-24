@@ -1370,3 +1370,32 @@ the `anomaly_count` column matches it; the pass's real total stays in
   throttles to yield to live chat.
 - The server runs as the systemd **user** service `snh.service`
   (`systemctl --user restart snh.service`); port 3000.
+
+## ⛔ Verification turns are temporary by default
+
+Verification turns through a live SNH instance are temporary by default: any
+test conversation created during a work session gets deleted — with its
+extracted facts, cluster entries, and vector rows — as the final step of that
+session, before reporting done. Tests aren't complete until their residue is
+gone. Only turns the human explicitly marks as keep-worthy stay.
+
+WHY THIS IS A RULE AND NOT A PREFERENCE. Athena's day-one database ended up
+holding 18 test conversations against 2 real ones, and the reflection pass had
+already turned four of those test turns into five self-facts — an identity
+assembled out of "what is 12 times 8" and a Python version lookup. That is the
+same failure the aiserver instance hit on 2026-08-15, and it is worse on day
+one, because there is nothing real yet to outweigh it.
+
+WHAT "RESIDUE" MEANS, because deleting the conversation is not enough. There
+are no triggers on this database and foreign keys are off by default, so
+nothing cascades on its own. A test turn leaves rows in: messages,
+messages_fts, cluster_members, fact_corroborations, tool_call_log,
+memory_clusters (left empty once its members go), both LanceDB tables
+(message_embeddings keyed on conversation_id, cluster_embeddings keyed on
+member_id — NOT on id), the daily log under data/memory/daily/, and
+reflections.jsonl. Take a verified backup first; the cleanup is only safe
+because it is reversible.
+
+IDENTIFY TEST TURNS FROM YOUR OWN RECORDS — the conversation ids and timestamps
+in your session notes — not by reading content and guessing. Where something is
+derived from both a test turn and a real one, KEEP it and say so.
