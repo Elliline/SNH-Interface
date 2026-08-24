@@ -1,0 +1,15 @@
+[Unit]
+Description=SNH Interface (production entity, Qwen3.8-27B NVFP4)
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ellie/snh-prod
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+EnvironmentFile=/home/ellie/snh-prod/.env
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,333 @@
+#!/bin/bash
+#
+# Nightly backup: sparky -> NAS, of the things git cannot rebuild.
+#
+# DAEMON MODE, NOT SSH. Synology DSM only permits SSH command execution for
+# members of the administrators group, so rsync-over-SSH would have meant making
+# an unattended backup key an admin of the NAS — giving back exactly the
+# isolation a separate account was for. The rsync daemon needs no shell at all,
+# and with `auth users` set per module the account cannot read or write any
+# other machine's module. Measured, not assumed: a cross-module attempt fails
+# with "@ERROR: auth failed on module <other>" for both read and write.
+#
+# WHAT DAEMON MODE TAKES AWAY, and what replaces it. There is no remote shell,
+# so every remote operation here is an rsync call:
+#   mkdir      -> send an empty scaffold tree (works on any rsync version;
+#                 --mkpath would need 3.2.3+ and DSM's version is not ours to
+#                 assume)
+#   ls         -> rsync --list-only
+#   rm -rf     -> rsync -d --delete --force against a scaffold of what to KEEP
+#   ln -s      -> nothing. An rsyncd rewrites symlinks it receives into
+#                 /rsyncd-munged/... by design, so `latest` is a FILE holding
+#                 the snapshot name, not a link.
+#   rm marker  -> inverted. A finished snapshot gains a COMPLETE file at the
+#                 end rather than losing an .INCOMPLETE one, because writing a
+#                 file is one rsync and deleting one is a --delete.
+#
+# --link-dest IS MODULE-RELATIVE AND NEEDS A LEADING SLASH. `/daily/<prev>/<x>`
+# resolves against the module root and hardlinks correctly; `daily/<prev>/<x>`
+# resolves against the destination, does not exist, and rsync says so and then
+# copies everything anyway. That difference is the whole 30-days-for-the-price-
+# of-one property, so it is asserted after the run rather than trusted.
+#
+# WHY IT IS NOT A MIRROR. Each night writes its own dated directory and nothing
+# rewrites an older one, so a deletion or a corrupted write at the source cannot
+# reach the copies already taken. Unchanged files are hardlinked to the previous
+# night. Verified: pruning the snapshot that was linked AGAINST leaves the newer
+# snapshots' contents intact.
+#
+# WHY THE DATABASE IS NOT COPIED. chat.db runs in WAL mode with a live writer.
+# `cp` yields a file that opens and is wrong. sqlite3 .backup uses SQLite's
+# online backup API; the result is integrity-checked and its rows counted before
+# it is allowed to leave the box.
+set -euo pipefail
+
+CONF=${SNH_BACKUP_CONF:-/etc/snh-backup.conf}
+[[ -r $CONF ]] || { echo "no config at $CONF" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+STATE_DIR=${SNH_BACKUP_STATE:-/var/lib/snh-backup}
+STAGE=$(mktemp -d /var/tmp/snh-backup-stage.XXXXXX)
+STAMP=$(date +%Y-%m-%dT%H%M%S)
+RC=1
+
+log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+die() { printf '%s  FATAL: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
+cleanup() {
+  rm -rf "$STAGE"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s rc=%s snapshot=%s\n' "$(date -Is)" "$RC" "$STAMP" >> "$STATE_DIR/history.log" 2>/dev/null || true
+  printf 'last_run=%s\nlast_rc=%s\nlast_snapshot=%s\n' "$(date -Is)" "$RC" "$STAMP" \
+    > "$STATE_DIR/last-status" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+URL="rsync://$NAS_RSYNC_USER@$NAS_HOST:${NAS_PORT:-873}/$NAS_MODULE"
+# --no-o --no-g: MEASURED, not defensive. A non-admin DSM user cannot chgrp on
+# the NAS, so plain -a dies with `chgrp failed: Operation not permitted` and
+# exit 23 the moment it meets a file it does not own — and this tree has five
+# (sparky-stt/__pycache__ written root:root by the STT container, searxng-config
+# owned by the container's uid 977). Ownership is recorded in
+# MANIFEST-OWNERSHIP.txt instead and reapplied at restore time, which is the
+# only way it can survive: the NAS will not store it.
+#
+# --exclude=@eaDir: Synology writes metadata directories inside shared folders.
+# Left alone, one appearing under daily/ is read by list_daily() as a snapshot
+# name — it could be chosen as the --link-dest base, which silently costs a full
+# copy every night while still looking like a working backup.
+RS=(rsync --password-file="$NAS_PASSWORD_FILE" --timeout=300 --exclude='@eaDir')
+
+# ---- 1. preflight ----------------------------------------------------------
+[[ -r $NAS_PASSWORD_FILE ]] || die "no password file at $NAS_PASSWORD_FILE"
+PERM=$(stat -c %a "$NAS_PASSWORD_FILE")
+[[ $PERM == 600 || $PERM == 400 ]] || die "$NAS_PASSWORD_FILE is mode $PERM; rsync requires 600"
+
+log "checking the NAS"
+if ! MODS=$(timeout 60 rsync "rsync://$NAS_HOST:${NAS_PORT:-873}/" 2>&1); then
+  die "no rsync daemon answering on $NAS_HOST:${NAS_PORT:-873} — is 'Enable rsync service' ticked in DSM? ($(head -1 <<< "$MODS"))"
+fi
+grep -qw "$NAS_MODULE" <<< "$MODS" \
+  || die "the daemon is up but exports no module called '$NAS_MODULE'. It exports: $(awk '{print $1}' <<< "$MODS" | tr '\n' ' ')"
+
+if ! ERR=$("${RS[@]}" --list-only "$URL/" 2>&1 >/dev/null); then
+  case $ERR in
+    *"auth failed"*) die "module '$NAS_MODULE' rejected the account '$NAS_RSYNC_USER' — check the rsync account and its password. ($ERR)";;
+    *) die "cannot list $URL: $ERR";;
+  esac
+fi
+log "module $NAS_MODULE is reachable as $NAS_RSYNC_USER"
+
+# ---- 2. what to hardlink against -------------------------------------------
+# Only a COMPLETE snapshot is a valid base: linking against a half-written one
+# would silently carry its gaps forward into every night after it.
+list_daily() {
+  # Directories only, never "." and never Synology's @eaDir — see --exclude above.
+  "${RS[@]}" --list-only "$URL/daily/" 2>/dev/null \
+    | awk '$1 ~ /^d/ && $NF != "." && $NF !~ /@eaDir/ {print $NF}' | sort
+}
+PREV=""
+for cand in $(list_daily | tac); do
+  if "${RS[@]}" --list-only "$URL/daily/$cand/COMPLETE" >/dev/null 2>&1; then PREV=$cand; break; fi
+  log "ignoring $cand as a link base — it has no COMPLETE marker"
+done
+if [[ -n $PREV ]]; then log "hardlinking unchanged files against $PREV"
+else log "no completed snapshot to link against — this one is a full copy"; fi
+
+# ---- 3. the directories, since a daemon will not mkdir -p for us ------------
+mkdir -p "$STAGE/scaffold/daily/$STAMP"
+"${RS[@]}" -a --no-o --no-g "$STAGE/scaffold/" "$URL/" || die "could not create daily/$STAMP on the NAS"
+
+# ---- 4. the database, snapshotted rather than copied ------------------------
+log "snapshotting $SNH_DB"
+# THE LIVE DATABASE'S LABEL. The snapshot must land in the directory of the
+# instance it was taken from. This was hardcoded to snh-data, and when SNH_DB
+# moved to the production entity the 356KB new database was shipped on top of
+# Aurelius's 16MB one inside the snapshot — his data replaced by another
+# instance's, in the backup, silently.
+LIVE_LABEL=snh-prod-data
+mkdir -p "$STAGE/$LIVE_LABEL"
+sqlite3 "$SNH_DB" ".backup '$STAGE/$LIVE_LABEL/chat.db'" || die "sqlite .backup failed"
+INTEGRITY=$(sqlite3 "$STAGE/$LIVE_LABEL/chat.db" 'PRAGMA integrity_check;' 2>&1 | head -1)
+[[ $INTEGRITY == ok ]] || die "the snapshot failed its integrity check: $INTEGRITY"
+log "snapshot integrity: ok"
+
+count() { sqlite3 "$1" "SELECT COUNT(*) FROM $2;" 2>/dev/null || echo "n/a"; }
+FACTS=$(count "$STAGE/$LIVE_LABEL/chat.db" cluster_members)
+CLUSTERS=$(count "$STAGE/$LIVE_LABEL/chat.db" memory_clusters)
+CONVOS=$(count "$STAGE/$LIVE_LABEL/chat.db" conversations)
+MSGS=$(count "$STAGE/$LIVE_LABEL/chat.db" messages)
+LIVE_FACTS=$(count "$SNH_DB" cluster_members)
+log "snapshot holds $FACTS facts, $CLUSTERS clusters, $CONVOS conversations, $MSGS messages (live reads $LIVE_FACTS)"
+# WHAT THIS GUARD IS FOR: a snapshot that lost the corpus. It used to be an
+# absolute floor — "0 facts, refuse" — and that is right for a mature store and
+# wrong for a newborn one. The production entity was created empty on
+# 2026-08-23 and the first backup after it refused to ship: 4 messages, 2
+# conversations, 0 facts, because nothing had been extracted yet. A backup that
+# will not run until the thing it protects is old enough to matter is a backup
+# that is missing for exactly the window it is most needed.
+#
+# So it compares the snapshot against the LIVE database instead of against
+# zero. Losing facts still refuses; having none yet does not. A store that
+# genuinely has facts and snapshots none still fails, which is the case that
+# mattered.
+[[ $FACTS =~ ^[0-9]+$ ]] || die "could not count facts in the snapshot — refusing to ship it"
+[[ $LIVE_FACTS =~ ^[0-9]+$ ]] || die "could not count facts in the live database — refusing to ship it"
+if (( LIVE_FACTS > 0 )) && (( FACTS < LIVE_FACTS )); then
+  die "the snapshot holds $FACTS facts but the live database has $LIVE_FACTS — refusing to ship it"
+fi
+if (( FACTS == 0 )); then
+  log "note: 0 facts — live also reads $LIVE_FACTS, so this is a young store, not a lost one"
+fi
+
+# ---- 5. secrets, encrypted before they leave -------------------------------
+if [[ -r ${SECRETS_FILE:-} ]]; then
+  KEYID=$(cat "$GPG_KEYID_FILE")
+  mkdir -p "$STAGE/secrets"
+  GNUPGHOME="$GPG_HOME" gpg --batch --yes --trust-model always \
+    --encrypt --recipient "$KEYID" --output "$STAGE/secrets/secrets.json.gpg" "$SECRETS_FILE" \
+    || die "could not encrypt $SECRETS_FILE"
+  log "secrets encrypted to $KEYID"
+fi
+
+# ---- 6. everything else ----------------------------------------------------
+RSYNC_EXCLUDES=()
+while read -r pat; do [[ -n $pat ]] && RSYNC_EXCLUDES+=(--exclude "$pat"); done <<< "$EXCLUDES"
+# Aurelius's directory keeps its database (see the send loop below); only the
+# plaintext secrets and chromium scratch are held back.
+AURELIUS_EXCLUDES=(--exclude 'secrets.json' --exclude 'print-work/')
+
+send() {  # send <label> <source-dir> [extra rsync args...]
+  local label=$1 src=$2; shift 2
+  local link=()
+  # Leading slash: module-root-relative. Without it rsync resolves against the
+  # destination, fails to find it, and copies everything instead of linking.
+  [[ -n $PREV ]] && link=(--link-dest "/daily/$PREV/$label")
+  "${RS[@]}" -a --no-o --no-g --stats "${link[@]}" "$@" \
+    "$src/" "$URL/daily/$STAMP/$label/" \
+    | awk '/Number of regular files transferred|Total transferred file size/ {print "         " $0}'
+}
+
+while IFS='|' read -r label src; do
+  [[ -z $label || -z $src ]] && continue
+  if [[ -d $src ]]; then
+    log "sending $label"
+    # THE EXCLUDES BELONG TO THE LIVE INSTANCE, NOT TO A DIRECTORY NAME.
+    # They drop chat.db/-wal/-shm because the sqlite3 .backup snapshot replaces
+    # them, and that snapshot is taken from SNH_DB — the PRODUCTION entity's
+    # database since the 8/23 engine swap. Leaving this keyed to "snh-data"
+    # would have excluded Aurelius's chat.db while snapshotting a different
+    # database, so his would have left the backup silently.
+    #
+    # Aurelius is stopped, so his chat.db and its WAL are consistent on disk and
+    # travel as plain files; he only needs the secrets exclusion, because his
+    # secrets.json is what SECRETS_FILE encrypts separately.
+    if [[ $label == snh-prod-data ]]; then send "$label" "$src" "${RSYNC_EXCLUDES[@]}"
+    elif [[ $label == snh-data ]]; then send "$label" "$src" "${AURELIUS_EXCLUDES[@]}"
+    else send "$label" "$src"; fi
+  elif [[ -f $src ]]; then
+    # A source can be a single FILE — "/home/ellie/Squatch Code" is the v0.2
+    # design note for a codebase in no repository, and it looks like a directory
+    # in a size listing. It gets a directory of its own so restore and
+    # hardlinking are the same shape as everything else.
+    log "sending $label (single file)"
+    file_link=()
+    [[ -n $PREV ]] && file_link=(--link-dest "/daily/$PREV/$label")
+    "${RS[@]}" -a --no-o --no-g "${file_link[@]}" "$src" "$URL/daily/$STAMP/$label/"
+  else
+    log "skipping $label — $src is not there"
+  fi
+done <<< "$SOURCES"
+
+log "sending the database snapshot and encrypted secrets"
+"${RS[@]}" -a --no-o --no-g "$STAGE/$LIVE_LABEL/chat.db" "$URL/daily/$STAMP/$LIVE_LABEL/chat.db"
+[[ -f $STAGE/secrets/secrets.json.gpg ]] && "${RS[@]}" -a --no-o --no-g "$STAGE/secrets/" "$URL/daily/$STAMP/secrets/"
+
+# ---- 7. what this snapshot is, written down beside it ----------------------
+mkdir -p "$STAGE/final"
+
+# OWNERSHIP, RECORDED BECAUSE THE NAS WILL NOT STORE IT.
+#
+# Everything lands on the NAS owned by the DSM backup user, so a restore that
+# just copies back produces files owned by whoever ran the restore. For most of
+# this tree that is correct — it is all Ellie's. For searxng-config it is a
+# BROKEN RESTORE THAT LOOKS FINE: those files belong to uid 977, the SearXNG
+# container's user, and handing them back as ellie:ellie leaves the container
+# unable to read its own configuration. So every file whose owner or group is
+# not the account running this backup is written down, with its mode, and the
+# restore instructions say how to put it back.
+ME_U=$(id -un); ME_G=$(id -gn)
+OWNFILE="$STAGE/final/MANIFEST-OWNERSHIP.txt"
+{
+  printf '# owner:group\tmode\tpath (relative to this snapshot)\n'
+  printf '# Reapply after restoring, from the snapshot root:\n'
+  printf '#   grep -v "^#" MANIFEST-OWNERSHIP.txt | while IFS=$\x27\\t\x27 read -r og mode path; do\n'
+  printf '#     sudo chown "$og" "$path" && sudo chmod "$mode" "$path"; done\n'
+  while IFS='|' read -r label src; do
+    [[ -z $label || -z $src ]] && continue
+    [[ -e $src ]] || continue
+    if [[ -d $src ]]; then
+      find "$src" \( ! -user "$ME_U" -o ! -group "$ME_G" \) -printf '%u:%g\t%m\t%P\n' 2>/dev/null \
+        | awk -F'\t' -v L="$label" 'BEGIN{OFS="\t"} {print $1, $2, ($3=="" ? L : L "/" $3)}'
+    else
+      # a single-file source lands as <label>/<basename>
+      find "$src" \( ! -user "$ME_U" -o ! -group "$ME_G" \) -printf '%u:%g\t%m\n' 2>/dev/null \
+        | awk -F'\t' -v P="$label/$(basename "$src")" 'BEGIN{OFS="\t"} {print $1, $2, P}'
+    fi
+  done <<< "$SOURCES"
+} > "$OWNFILE"
+NOWN=$(grep -v '^#' "$OWNFILE" | wc -l)
+log "recorded ownership for $NOWN file(s) the NAS cannot preserve"
+
+cat > "$STAGE/final/MANIFEST.txt" <<MANIFEST
+snapshot      $STAMP
+host          $(hostname)
+taken         $(date -Is)
+source db     $SNH_DB
+integrity     $INTEGRITY
+facts         $FACTS   (cluster_members; live read $LIVE_FACTS at snapshot time)
+clusters      $CLUSTERS
+conversations $CONVOS
+messages      $MSGS
+secrets       $( [[ -f $STAGE/secrets/secrets.json.gpg ]] && echo "secrets.json.gpg, encrypted to $(cat "$GPG_KEYID_FILE")" || echo "none" )
+hardlinked    ${PREV:-none (full copy)}
+module        $NAS_MODULE on $NAS_HOST as $NAS_RSYNC_USER
+sources
+$(while IFS='|' read -r l s; do [[ -n $l ]] && printf '  %-22s %s\n' "$l" "$s"; done <<< "$SOURCES")
+
+Restore:
+  rsync -a --password-file=<pw> $URL/daily/$STAMP/ /some/scratch/
+The live database is snh-prod-data/chat.db and is a consistent snapshot, not a
+file copy. snh-data/ is Aurelius (stopped, Gemma lineage); his chat.db there is
+a plain copy with its WAL beside it.
+Ownership is NOT preserved by the NAS. After restoring, reapply it from
+MANIFEST-OWNERSHIP.txt in this snapshot, or searxng-config comes back owned by
+the restoring user and the SearXNG container can no longer read it.
+Decrypt secrets with the private key held off this machine:
+  gpg --decrypt secrets/secrets.json.gpg > secrets.json
+MANIFEST
+"${RS[@]}" -a --no-o --no-g "$STAGE/final/MANIFEST.txt" "$URL/daily/$STAMP/MANIFEST.txt"
+"${RS[@]}" -a --no-o --no-g "$OWNFILE" "$URL/daily/$STAMP/MANIFEST-OWNERSHIP.txt"
+
+# ---- 8. only now is it a backup -------------------------------------------
+# COMPLETE is written last and is what makes this snapshot eligible as a link
+# base and as a restore source. LATEST is a file, not a symlink: an rsync daemon
+# rewrites received symlinks into /rsyncd-munged/... by design.
+date -Is > "$STAGE/final/COMPLETE"
+printf '%s\n' "$STAMP" > "$STAGE/final/LATEST"
+"${RS[@]}" -a --no-o --no-g "$STAGE/final/COMPLETE" "$URL/daily/$STAMP/COMPLETE"
+"${RS[@]}" -a --no-o --no-g "$STAGE/final/LATEST" "$URL/LATEST"
+log "snapshot complete: daily/$STAMP"
+
+# ---- 9. the hardlinks actually happened ------------------------------------
+# Asserted rather than trusted: a --link-dest that silently missed would look
+# like a working backup and quietly consume a full copy every night until the
+# volume filled.
+if [[ -n $PREV ]]; then
+  NEWBYTES=$("${RS[@]}" --list-only -r "$URL/daily/$STAMP/" 2>/dev/null | awk '{gsub(/,/,"",$2); s+=$2} END {print s+0}')
+  log "snapshot totals $(numfmt --to=iec "${NEWBYTES:-0}" 2>/dev/null || echo "$NEWBYTES") of files (hardlinked where unchanged)"
+fi
+
+# ---- 10. retention ---------------------------------------------------------
+# rsync -d (non-recursive) --delete --force against a scaffold naming only the
+# snapshots to keep: extraneous directories go, kept ones are not descended into
+# and keep their contents. Verified against a live daemon.
+mapfile -t ALL < <(list_daily)
+if (( ${#ALL[@]} > KEEP )); then
+  KEEPDIR="$STAGE/keep"; mkdir -p "$KEEPDIR"
+  KEEPERS=("${ALL[@]: -$KEEP}")
+  # The guard that makes --delete --force safe to point at a directory of
+  # backups: an empty or short keep-list would delete every snapshot there is.
+  (( ${#KEEPERS[@]} == KEEP )) || die "retention refused: computed ${#KEEPERS[@]} keepers, expected $KEEP"
+  for k in "${KEEPERS[@]}"; do mkdir -p "$KEEPDIR/$k"; done
+  grep -qx "$STAMP" <<< "$(printf '%s\n' "${KEEPERS[@]}")" \
+    || die "retention refused: tonight's snapshot $STAMP is not in the keep list"
+  "${RS[@]}" -d --delete --force "$KEEPDIR/" "$URL/daily/" >/dev/null \
+    || die "retention pass failed"
+  log "pruned $(( ${#ALL[@]} - KEEP )) old snapshot(s); $KEEP kept"
+else
+  log "keeping ${#ALL[@]} of $KEEP snapshots; nothing to prune"
+fi
+
+RC=0
+log "done"

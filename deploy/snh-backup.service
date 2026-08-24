@@ -1,0 +1,27 @@
+[Unit]
+Description=Nightly backup of SNH data and the rest of what git cannot rebuild, to the NAS
+Documentation=file:/etc/snh-backup.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ellie
+Group=ellie
+# Runs as Ellie because everything it reads is hers — the SNH data directory,
+# the SSH key for the NAS and the gpg keyring that encrypts the secrets.
+ExecStart=/usr/local/bin/snh-backup
+StateDirectory=snh-backup
+# One at a time: systemd will not start a second copy while this one runs, so a
+# slow night cannot overlap the next one.
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=idle
+# It reads a great deal and writes almost nothing locally: /var/tmp for the
+# database snapshot, and its own state directory.
+PrivateTmp=false
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly SNH backup to the NAS
+
+[Timer]
+# Overnight, after the day's work and outside the entity's quiet-hours boundary.
+OnCalendar=*-*-* 03:15:00
+# So thirty machines (or thirty reboots) do not all hit the NAS on the same second.
+RandomizedDelaySec=15m
+# A box that was asleep at 03:15 runs the backup when it wakes rather than
+# skipping the night silently.
+Persistent=true
+Unit=snh-backup.service
+
+[Install]
+WantedBy=timers.target

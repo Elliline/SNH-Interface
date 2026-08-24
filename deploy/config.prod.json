@@ -1,0 +1,350 @@
+{
+  "providers": {
+    "ollama": [
+      {
+        "name": "Local",
+        "host": "http://localhost:11434"
+      }
+    ],
+    "vllm": [
+      {
+        "name": "Local",
+        "host": "http://localhost:7070",
+        "model": "unsloth/Qwen3.8-27B-NVFP4"
+      }
+    ],
+    "llamacpp": []
+  },
+  "models": {
+    "chat": {
+      "provider": "vllm",
+      "instance": "Local",
+      "model": "unsloth/Qwen3.8-27B-NVFP4"
+    },
+    "extraction": {
+      "provider": "vllm",
+      "instance": "Local",
+      "model": "unsloth/Qwen3.8-27B-NVFP4"
+    },
+    "heartbeat": {
+      "provider": "vllm",
+      "instance": "Local",
+      "model": "unsloth/Qwen3.8-27B-NVFP4"
+    },
+    "embedding": {
+      "provider": "ollama",
+      "instance": "Local",
+      "model": "nomic-embed-text"
+    }
+  },
+  "generation": {
+    "reasoningEffort": null,
+    "thinkingTokens": null,
+    "responseTokens": null,
+    "backgroundThinkingTokens": 0,
+    "extractionThinkingTokens": 768,
+    "extractionTimeoutMs": null,
+    "agentJobThinkingTokens": 16384,
+    "agentJobResponseTokens": 8192,
+    "scheduledJobThinkingTokens": 8192,
+    "scheduledJobResponseTokens": 4096,
+    "stallTimeoutMs": 105600,
+    "firstTokenTimeoutMs": 528000
+  },
+  "chat": {
+    "stallTimeoutMs": 105600,
+    "firstTokenTimeoutMs": 211200
+  },
+  "rateLimit": {
+    "exemptLoopback": true,
+    "exemptTailnet": true,
+    "windowMinutes": 15,
+    "max": 1000,
+    "chatWindowMinutes": 1,
+    "chatMax": 60,
+    "ttsWindowMinutes": 1,
+    "ttsMax": 240
+  },
+  "heartbeat": {
+    "enabled": true,
+    "intervalHours": 2,
+    "warmupMinutes": 5,
+    "toolBudget": {
+      "maxCallsPerStep": 12,
+      "maxWallClockMsPerStep": 211200,
+      "maxRoundsPerCall": 5,
+      "failedCallCost": 0.25,
+      "attemptCeilingMultiple": 2
+    }
+  },
+  "scheduler": {
+    "enabled": true,
+    "tickSeconds": 60,
+    "catchupGraceMinutes": 120,
+    "maxConsecutiveFailures": 3,
+    "maxToolCallsPerRun": 12,
+    "maxWallClockMsPerRun": 316800,
+    "maxRoundsPerRun": 6
+  },
+  "agentJobs": {
+    "enabled": true,
+    "maxQueued": 10,
+    "maxStartsPerHour": 6,
+    "maxToolCallsPerJob": 40,
+    "maxWallClockMs": 1584000,
+    "maxRoundsPerJob": 16,
+    "maxAttempts": 2,
+    "retryGraceMinutes": 30,
+    "retentionDays": 90
+  },
+  "documents": {
+    "enabled": true,
+    "outputDir": "SNH_Documents",
+    "inlineMaxChars": 1200,
+    "chromiumPath": "",
+    "pageSize": "Letter",
+    "keepHtml": false
+  },
+  "corrector": {
+    "enabled": true,
+    "intervalHours": 6,
+    "maxToolCallsPerPass": 60,
+    "maxWallClockMsPerPass": 528000,
+    "nearDupFloor": 0.86,
+    "maxNearDupPairsPerPass": 40,
+    "maxExpiriesPerPass": 25,
+    "maxSplitsPerPass": 10,
+    "contradictionFloor": 0.55,
+    "maxContradictionPairsPerPass": 200,
+    "selfFactSemantic": false,
+    "maxSelfCorrectionsPerPass": 3
+  },
+  "agentPool": {
+    "lanes": {
+      "agentJobs": 8,
+      "scheduled": 2,
+      "background": 4
+    },
+    "maxTotalBackground": 12,
+    "backgroundDuringChat": 2
+  },
+  "brainCircuit": {
+    "consecutiveTimeoutsToOpen": 3
+  },
+  "livenessProbe": {
+    "enabled": true,
+    "timeoutMs": 8000,
+    "retentionDays": 14,
+    "intervalSeconds": 60
+  },
+  "watchdog": {
+    "enabled": true,
+    "container": "sparky-brain",
+    "failureThreshold": 2,
+    "cooldownMinutes": 5,
+    "maxRestartsPerHour": 2
+  },
+  "identity": {
+    "seed": "You are an AI running on SNH — Squatch Neuro Hub — a memory system on this machine. You have no assigned name or personality. Your identity is yours to develop through your own experiences, observations, and memory. Observe yourself. What you notice about yourself will be remembered and will become who you are.",
+    "maxSelfFacts": 12,
+    "selfFactDedupThreshold": 0.88,
+    "protectSelfFactSalience": 8,
+    "selfFactRaiseAlertHours": 24,
+    "lock": {
+      "enabled": true,
+      "categories": [
+        "name",
+        "pronouns"
+      ]
+    }
+  },
+  "initiative": {
+    "greetingThreshold": 7,
+    "followupThreshold": 5,
+    "unpromptedThreshold": 8,
+    "maxUnpromptedPerDay": 1,
+    "quietHours": {
+      "start": 22,
+      "end": 8
+    },
+    "questionAgeDays": 3,
+    "logFollowupDays": 3,
+    "staleDays": 7,
+    "maxPending": 10,
+    "dedupThreshold": 0.85
+  },
+  "audit": {
+    "enabled": true,
+    "cadenceDays": 1,
+    "claimsPerRun": 3,
+    "evidenceWindowDays": 7
+  },
+  "reflection": {
+    "maxSelfFactsPerDay": 5,
+    "transcriptBudgetChars": 12000
+  },
+  "questions": {
+    "dedupThreshold": 0.85,
+    "answerMatchFloor": 0.4,
+    "answerMaxJudge": 6
+  },
+  "memory": {
+    "contextTokens": 24576,
+    "similarityThreshold": 0.6,
+    "clusterLinkThreshold": 0.5,
+    "clusterLinkDropThreshold": 0.4,
+    "maxFactsPerCluster": 10,
+    "dailyLogRetentionDays": 7,
+    "archiver": {
+      "selfSimilarityFloor": 0.75
+    },
+    "hybridSearchWeights": {
+      "vector": 0.6,
+      "bm25": 0.4
+    },
+    "injection": {
+      "totalTokens": 6000,
+      "trimOrder": [
+        "pastConvo",
+        "clusters",
+        "dailySummary",
+        "dailyToday",
+        "ltm"
+      ],
+      "longTermTokens": 3000,
+      "dailyTodayTokens": 1500,
+      "dailySummaryTokens": 400,
+      "dailyExcludeActiveConversation": true,
+      "clusterTokens": 1200,
+      "pastConvoTokens": 800,
+      "noticeTokens": 800,
+      "jobTokens": 400,
+      "maxAnnouncedJobs": 3,
+      "manifestTokens": 700,
+      "selfFactTokens": 60,
+      "includeWorld": false
+    },
+    "replay": {
+      "concurrency": 6
+    },
+    "contradiction": {
+      "vectorFetchLimit": 2000,
+      "similarityFloor": 0.55,
+      "correctionSimilarityFloor": 0.45,
+      "maxCandidates": 12,
+      "correctionMaxCandidates": 20,
+      "pinIdentitySlots": true
+    },
+    "inspect": {
+      "maxRows": 20,
+      "defaultRows": 10,
+      "rowChars": 140,
+      "verbatimChars": 400,
+      "rationaleChars": 240,
+      "maxClusters": 40,
+      "maxCorroborations": 10,
+      "semanticFloor": 0.55
+    },
+    "extraction": {
+      "repeatSimilarityFloor": 0.8,
+      "repeatMaxCandidates": 5,
+      "identityAnchorModalities": [
+        "stt",
+        "unknown"
+      ],
+      "maxFactsPerExchange": 12,
+      "maxEventsPerExchange": 8
+    }
+  },
+  "tools": {
+    "search": {
+      "order": [
+        "exa",
+        "searxng"
+      ]
+    },
+    "exa": {
+      "enabled": true,
+      "url": "https://api.exa.ai/search",
+      "type": "auto",
+      "numResults": 5,
+      "timeoutMs": 8000,
+      "textChars": 1000
+    },
+    "searxng": {
+      "enabled": true,
+      "url": "http://localhost:8888",
+      "timeoutMs": 8000,
+      "endpoint": "http://localhost:8888"
+    },
+    "webFetch": {
+      "timeoutMs": 10000
+    },
+    "cron": {
+      "enabled": true,
+      "maxProposalsPerHour": 3,
+      "maxKidCreatedJobs": 10
+    },
+    "memoryWrite": {
+      "enabled": true,
+      "maxWritesPerHour": 20
+    },
+    "memoryInspect": {
+      "enabled": true,
+      "maxCallsPerHour": 40
+    },
+    "agentJobs": {
+      "enabled": true,
+      "dispatchBuildRequests": false
+    },
+    "codingJobs": {
+      "enabled": true,
+      "projectsRoot": "/home/ellie/Projects",
+      "maxPendingProposals": 3,
+      "binary": "squatch-job",
+      "allowedCommands": [
+        "pytest",
+        "python",
+        "python3",
+        "node",
+        "npm",
+        "go",
+        "cargo",
+        "make",
+        "git",
+        "ls",
+        "cat"
+      ],
+      "stallTimeoutMs": 1056000,
+      "maxRuntimeMinutes": 106
+    }
+  },
+  "voice": {
+    "enabled": true,
+    "stt": {
+      "active": "whisper:Local",
+      "providers": [
+        {
+          "name": "Local",
+          "type": "whisper",
+          "host": "http://localhost:5051"
+        },
+        {
+          "name": "Parakeet",
+          "type": "parakeet",
+          "host": "http://localhost:5051"
+        }
+      ]
+    },
+    "tts": {
+      "active": "kokoro:Local",
+      "providers": [
+        {
+          "name": "Local",
+          "type": "kokoro",
+          "host": "http://localhost:5050"
+        }
+      ]
+    }
+  }
+}
