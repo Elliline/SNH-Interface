@@ -22,6 +22,7 @@
  */
 
 const factStore = require('../../db/fact-store');
+const factMerge = require('../../db/fact-merge');
 
 class BaseCorrectTool {
   constructor() {
@@ -52,18 +53,28 @@ class BaseCorrectTool {
 /**
  * Fold a near-duplicate or subset fact into the one that survives.
  *
- * The loser goes inactive/superseded pointing at the survivor, so the history
- * says what happened rather than the row simply vanishing. The survivor picks up
- * a corroboration, because two facts asserting the same thing IS a second
- * assertion of it, and that is evidence the corrector's own dominance rules read
- * later.
+ * THE SURVIVOR IS REWRITTEN TO CARRY BOTH (2026-08-24). This used to be a
+ * straight supersede, which meant the survivor kept its own wording and anything
+ * the loser asserted and it did not was gone from the active corpus — the
+ * silent data loss Athena reported from inside her own store, where a Juno
+ * hardware spec and a Juno role each disappeared into a "duplicate" of the
+ * other. The judges upstream have not been relaxed: the same pairs merge. What
+ * changed is that the merge now produces the UNION of the two, via
+ * db/fact-merge.js, and falls back to the old behaviour only when a union
+ * cannot be computed or verified.
+ *
+ * The loser goes inactive/superseded pointing at the survivor either way, so the
+ * history says what happened rather than the row simply vanishing. The survivor
+ * picks up a corroboration, because two facts asserting the same thing IS a
+ * second assertion of it, and that is evidence the corrector's own dominance
+ * rules read later.
  */
 class MergeFactsTool extends BaseCorrectTool {
   constructor() {
     super();
     this.name = 'memory_merge_facts';
     this.description =
-      'Fold one fact into another that says the same thing. The loser is marked superseded and points at the survivor; nothing is deleted.';
+      'Fold one fact into another that says the same thing. The survivor is first rewritten to carry every assertion from both, then the loser is marked superseded and points at it; nothing is deleted and nothing is dropped.';
     this.parameters = {
       type: 'object',
       properties: {
@@ -85,8 +96,19 @@ class MergeFactsTool extends BaseCorrectTool {
     if (!survivor) return { error: `no fact with id ${survivorId}` };
     if (survivor.status !== 'active') return { error: 'the survivor is not active' };
 
-    const res = await factStore.supersede(loserId, survivorId);
+    // UNION FIRST, then the link. Two rows that "say the same thing" routinely
+    // do not say ALL the same things, and the difference is exactly what used to
+    // be destroyed here. mode 'union' forbids dropping anything: a merger that
+    // loses a clause is refused and this falls back to the plain supersede.
+    const res = await factMerge.mergePreservingUnion(loserId, survivorId, {
+      mode: 'union',
+      ledgerTier: 'mechanical'
+    });
     if (res.locked) return { status: 'refused_locked', written: false, message: res.reason };
+    // The union could not be trusted, so nothing was written and the loser is
+    // still active. Not an error — a merge deliberately not made, because making
+    // it would have deleted an assertion. Try again on a later pass.
+    if (res.deferred) return { status: 'deferred_no_union', written: false, message: res.reason };
     if (!res.ok) return { error: res.reason || 'merge failed' };
 
     // The loser's own assertion becomes a corroboration of the survivor, with the
@@ -106,7 +128,13 @@ class MergeFactsTool extends BaseCorrectTool {
     // already filed (2026-08-18) rather than filing a second one for the same
     // change. The funnel records that the change happened; the corrector alone
     // knows which pass made it and on what evidence.
-    return { status: 'merged', loser_id: loserId, survivor_id: survivorId, vector_cleared: res.vector, ledger_id: res.ledgerId || null };
+    return {
+      status: 'merged', loser_id: loserId, survivor_id: survivorId,
+      vector_cleared: res.vector, ledger_id: res.ledgerId || null,
+      union_applied: !!(res.union && res.union.applied),
+      union_text: res.union && res.union.applied ? res.union.to : null,
+      union_skipped: res.union ? res.union.skipped : null
+    };
   }
 }
 
@@ -133,18 +161,40 @@ class ExpireFactTool extends BaseCorrectTool {
   }
 }
 
-/** Supersede a fact that a better-evidenced one contradicts. */
+/**
+ * Supersede a fact that a better-evidenced one contradicts.
+ *
+ * A CONTRADICTION IS RARELY TOTAL (2026-08-24). Two facts can conflict on one
+ * attribute and agree — or say nothing at all — about half a dozen others, and
+ * retiring the loser whole took those others with it. That is Athena's second
+ * loss exactly: her re-saved Juno hardware fact contradicted an older Juno fact
+ * on nothing but wording, and "will be the main person helping User with
+ * MettaSphere" went out of the corpus because it happened to be sitting in the
+ * sentence that lost. So the winner is first rewritten to carry over everything
+ * it does NOT contradict (db/fact-merge.js, contradiction mode), and only then
+ * does the loser go inactive and point at it.
+ *
+ * `carry_over: false` turns that off, and the compound SPLIT path is the one
+ * caller that passes it: its atoms were made FROM the original and already hold
+ * every clause, so merging the original back into the first atom would undo the
+ * split it just performed.
+ */
 class SupersedeFactTool extends BaseCorrectTool {
   constructor() {
     super();
     this.name = 'memory_supersede_fact';
     this.description =
-      'Mark a fact superseded by another that contradicts it and is better evidenced. The old fact stays as history and points at the new one.';
+      'Mark a fact superseded by another that contradicts it and is better evidenced. The winner first carries over every assertion the loser made that it does not contradict. The old fact stays as history and points at the new one.';
     this.parameters = {
       type: 'object',
       properties: {
         old_id: { type: 'string', description: 'The fact that loses.' },
-        new_id: { type: 'string', description: 'The fact that wins.' }
+        new_id: { type: 'string', description: 'The fact that wins.' },
+        carry_over: {
+          type: 'boolean',
+          description: 'Default true. Set false only when the winner is already known to hold everything the loser said (the compound split).'
+        },
+        tier: { type: 'string', description: 'Ledger tier for the carry-over rewrite: mechanical | semantic | intake.' }
       },
       required: ['old_id', 'new_id']
     };
@@ -154,12 +204,23 @@ class SupersedeFactTool extends BaseCorrectTool {
     const { old_id: oldId, new_id: newId } = args;
     if (!oldId || !newId) return { error: 'old_id and new_id are both required' };
     if (oldId === newId) return { error: 'a fact cannot supersede itself' };
-    const res = await factStore.supersede(oldId, newId);
+    const res = await factMerge.mergePreservingUnion(oldId, newId, {
+      mode: 'contradiction',
+      carryOver: args.carry_over !== false,
+      ledgerTier: args.tier || 'semantic'
+    });
     // A refusal is a RESULT, not an error. The identity lock exists to be hit,
     // and the corrector has to be able to record that it was told no.
     if (res.locked) return { status: 'refused_locked', written: false, message: res.reason };
+    if (res.deferred) return { status: 'deferred_no_union', written: false, message: res.reason };
     if (!res.ok) return { error: res.reason || 'supersede failed' };
-    return { status: 'superseded', old_id: oldId, new_id: newId, vector_cleared: res.vector, ledger_id: res.ledgerId || null };
+    return {
+      status: 'superseded', old_id: oldId, new_id: newId,
+      vector_cleared: res.vector, ledger_id: res.ledgerId || null,
+      union_applied: !!(res.union && res.union.applied),
+      union_text: res.union && res.union.applied ? res.union.to : null,
+      union_skipped: res.union ? res.union.skipped : null
+    };
   }
 }
 

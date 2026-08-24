@@ -137,12 +137,18 @@ class WriteMemoryTool {
     return {
       status: 'saved',
       fact_id: result.memberId,
+      // What the row NOW reads, which differs from what was asked for when a
+      // supersession carried the old fact's uncontested assertions across.
       stored_as: result.fact,
+      requested_as: result.requestedFact || result.fact,
+      carried_over: result.carriedOver || null,
       about,
       salience: result.salience,
       replaced: result.superseded || null,
       locked: result.lockedCategories || null,
-      message: (result.superseded
+      message: (result.carriedOver
+        ? `Saved to long-term memory as a fact about ${about}. It replaced what you held before ("${result.superseded}"), and rather than dropping that fact's other details they were carried into this one, which now reads: "${result.carriedOver}". Tell her you have updated it, what it replaced, and that nothing from the old one was lost.`
+        : result.superseded
         ? `Saved to long-term memory as a fact about ${about}, replacing what you held before: "${result.superseded}". Tell her you have updated it, and say what it replaced.`
         : `Saved to long-term memory as a fact about ${about}. It is stored now, not pending — you can say so plainly.`)
         + (result.lockedCategories

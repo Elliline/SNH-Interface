@@ -1827,6 +1827,7 @@ async function applyExtraction(plan, opts = {}) {
   const logDaily = (summary) => appendToDailyLog(summary, dailyDir, dateStamp);
   const memoryClusters = require('./memory-clusters');
   const factStore = require('./fact-store');
+  const factMerge = () => require('./fact-merge');
   const questions = require('./questions');
   const config = getConfig();
 
@@ -1870,8 +1871,24 @@ async function applyExtraction(plan, opts = {}) {
       detectedBy: rep.detectedBy
     });
     result.repeats++;
+    if (!absorbed.corroborated) {
+      // The corroboration IS the restatement's only record outside the day's
+      // log. Losing it silently is how a fold becomes unauditable.
+      appendToOpsLog(`Repeat fold recorded no corroboration for ${String(rep.existingId).slice(0, 8)} — the restatement "${rep.text}" is held only in the day's log.`, opsDir);
+    }
+    // A REPEAT THAT IS NOT QUITE A REPEAT (2026-08-24). The judge's bar is
+    // "adds no information", and when it misjudges, the extra clause is written
+    // nowhere active — there is no second row to correct later. This does not
+    // relax the fold: still one row. It just makes the row know both things,
+    // and it costs a token comparison and nothing else when the restatement
+    // really is a restatement.
+    const carried = await factMerge().carryIntoSurvivor(rep.existingId, rep.text, { ledgerTier: 'intake' });
     logDaily(`Already knew this, so I did not write it down twice — "${rep.text}" restates "${rep.existingContent}"` +
-      `${absorbed.raised ? ` (its salience rose to ${absorbed.salience})` : ''}.${src}`);
+      `${absorbed.raised ? ` (its salience rose to ${absorbed.salience})` : ''}` +
+      `${carried.applied ? `, but it knew something the held fact did not, so that was merged in — it now reads "${carried.to}"` : ''}.${src}`);
+    if (carried.skipped) {
+      appendToOpsLog(`Repeat fold could not carry the restatement's extra detail into ${String(rep.existingId).slice(0, 8)} — ${carried.skipped}. Restatement: "${rep.text}"`, opsDir);
+    }
   }
 
   // ---- facts: the only write path ----
@@ -1896,14 +1913,39 @@ async function applyExtraction(plan, opts = {}) {
   }
 
   // ---- supersessions, after the replacing facts exist ----
+  //
+  // CARRY-OVER, not replacement (2026-08-24). The judge answers one question —
+  // "can these both be true?" — and a YES on one attribute says nothing about
+  // the others. Retiring the loser whole took every uncontested assertion it
+  // held out of the corpus with it, silently, which is the defect Athena
+  // reported. mergePreservingUnion rewrites the winner to carry everything it
+  // does not contradict, then supersedes and links the loser as before.
   for (const s of plan.supersessions) {
     const newMemberId = factToMemberId.get(s.newFact);
     if (!newMemberId) continue;
-    const res = await factStore.supersede(s.oldMemberId, newMemberId);
+    const res = await factMerge().mergePreservingUnion(s.oldMemberId, newMemberId, {
+      mode: 'contradiction', ledgerTier: 'intake'
+    });
     if (res.ok) {
       result.superseded++;
-      logDaily(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" ` +
-        `(${s.explicitCorrection ? 'explicit user correction' : 'user correction'}).${src}`);
+      if (res.union && res.union.applied) {
+        result.carriedOver = (result.carriedOver || 0) + 1;
+        logDaily(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}", and I kept what the old one knew ` +
+          `that the new one did not contradict — the fact now reads "${res.union.to}"` +
+          `${res.union.dropped.length ? ` (dropped as contradicted: ${res.union.dropped.join(', ')})` : ''}.${src}`);
+      } else {
+        logDaily(`Superseded fact: "${s.oldContent}" → replaced by "${s.newFact}" ` +
+          `(${s.explicitCorrection ? 'explicit user correction' : 'user correction'}).${src}`);
+        if (res.union && res.union.skipped) {
+          appendToOpsLog(`Supersession carried nothing over — ${res.union.skipped}. The old fact is kept as linked history: "${s.oldContent}"`, opsDir);
+        }
+      }
+    } else if (res.deferred) {
+      // Not superseded, and deliberately so: the union could not be verified, so
+      // retiring the old fact would have taken assertions nobody corrected out of
+      // the corpus. Both stay active until a later pass merges them cleanly.
+      logDaily(`Did NOT supersede "${s.oldContent}" with "${s.newFact}" — the merge could not be made without losing something (${res.reason}), so both are kept.${src}`);
+      appendToOpsLog(`Supersession deferred: "${s.oldContent}" → "${s.newFact}" — ${res.reason}. Both facts remain active; a later merge pass will see the pair again.`, opsDir);
     } else if (res.locked) {
       // A refused lock must be spoken. Storage guards run after the reply, so
       // this half lands in the record; the live-chat half is the [LOCKED] marker
@@ -2747,18 +2789,31 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
         continue;
       }
 
-      const res = await factStore.supersede(sup.oldMemberId, newMemberId, {
-        noticeSource,
-        caller: `self-fact pipeline (${source})`,
-        ledger: {
-          tier: 'intake',
-          reason: `A new self-observation contradicted this one and is better evidenced on ${bar.axis}, so this was retired and kept as history. Both came from the self-fact pipeline (${source}).`,
-          evidence: { deciding_axis: bar.axis, ...bar.evidence, judged_by: 'self-fact contradiction judge' }
+      // Same carry-over as every other supersede (2026-08-24): a revised
+      // self-view contradicts what it contradicts, and the rest of what the old
+      // observation knew about him is not the judge's to throw away.
+      const res = await require('./fact-merge').mergePreservingUnion(sup.oldMemberId, newMemberId, {
+        mode: 'contradiction',
+        ledgerTier: 'intake',
+        supersedeOpts: {
+          noticeSource,
+          caller: `self-fact pipeline (${source})`,
+          ledger: {
+            tier: 'intake',
+            reason: `A new self-observation contradicted this one and is better evidenced on ${bar.axis}, so this was retired and kept as history. Both came from the self-fact pipeline (${source}).`,
+            evidence: { deciding_axis: bar.axis, ...bar.evidence, judged_by: 'self-fact contradiction judge' }
+          }
         }
       });
-      if (res.ok) {
+      if (res.deferred) {
+        appendToDailyLog(`Did NOT supersede self-fact "${sup.oldContent}" with "${sup.newFact}" — the merge could not be made without losing something (${res.reason}), so both are kept.`, dailyDir);
+      } else if (res.ok) {
         result.superseded++;
-        appendToDailyLog(`Superseded self-fact: "${sup.oldContent}" → "${sup.newFact}" (revised self-view, on ${bar.axis})`, dailyDir);
+        appendToDailyLog(
+          res.union && res.union.applied
+            ? `Superseded self-fact: "${sup.oldContent}" → "${sup.newFact}" (revised self-view, on ${bar.axis}), keeping what the old one knew that the new one did not contradict — it now reads "${res.union.to}"`
+            : `Superseded self-fact: "${sup.oldContent}" → "${sup.newFact}" (revised self-view, on ${bar.axis})`,
+          dailyDir);
       }
     }
 

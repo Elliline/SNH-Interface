@@ -429,12 +429,41 @@ async function write({ statement, context = '', conversationId = null, userMessa
   // and the reply he is about to give already says what it replaced. A private
   // note telling him about a change he made a second ago is noise, and noise in
   // that channel is what would make a real notice skippable.
+  //
+  // AND IT CARRIES THE OLD FACT'S UNCONTESTED ASSERTIONS ACROSS (2026-08-24).
+  // This path is where Athena lost the MettaSphere role: she re-saved Juno's
+  // hardware spec, findSupersession matched it against a fuller Juno fact, the
+  // judge said YES, and everything in that fuller fact which the hardware spec
+  // did not so much as mention went out of the corpus with it. An explicit
+  // "remember this" is an instruction to ADD something to the record, and it
+  // must never be able to subtract something nobody corrected.
   let superseded = null;
+  let carriedOver = null;
   if (supersession) {
-    const sres = await factStore().supersede(supersession.oldMemberId, res.memberId, { conversational: true });
-    if (sres.ok) {
+    const sres = await require('./fact-merge').mergePreservingUnion(supersession.oldMemberId, res.memberId, {
+      mode: 'contradiction',
+      ledgerTier: 'intake',
+      supersedeOpts: { conversational: true }
+    });
+    if (sres.deferred) {
+      // The old fact keeps standing. An explicit "remember this" adds; it must
+      // never subtract, and a union that could not be verified is not grounds to
+      // retire assertions nobody corrected.
+      dailyLog(`Wrote "${fact}" but did NOT retire "${supersession.oldContent}" — merging them would have lost something (${sres.reason}), so both are kept.`);
+      opsLog(`Explicit write deferred a supersession — ${sres.reason}. Both facts remain active: "${supersession.oldContent}" and "${fact}".`);
+    } else if (sres.ok) {
       superseded = supersession.oldContent;
-      dailyLog(`Superseded fact on request: "${supersession.oldContent}" → "${fact}" (asked to remember it directly)`);
+      if (sres.union && sres.union.applied) {
+        carriedOver = sres.union.to;
+        dailyLog(`Superseded fact on request: "${supersession.oldContent}" → "${fact}" (asked to remember it directly), ` +
+          `keeping what the old one knew that the new one did not contradict — it now reads "${carriedOver}"` +
+          `${sres.union.dropped.length ? ` (dropped as contradicted: ${sres.union.dropped.join(', ')})` : ''}`);
+      } else {
+        dailyLog(`Superseded fact on request: "${supersession.oldContent}" → "${fact}" (asked to remember it directly)`);
+        if (sres.union && sres.union.skipped) {
+          opsLog(`Explicit write superseded a fact and carried nothing over — ${sres.union.skipped}. The old fact is kept as linked history: "${supersession.oldContent}"`);
+        }
+      }
     }
   }
 
@@ -447,7 +476,11 @@ async function write({ statement, context = '', conversationId = null, userMessa
     ok: true,
     memberId: res.memberId,
     subject,
-    fact,
+    // What the row NOW says, which is not what was asked for when the write
+    // carried an older fact's assertions across. The chat turn reports this.
+    fact: carriedOver || fact,
+    requestedFact: fact,
+    carriedOver,
     salience,
     cluster: res.clusterName,
     superseded,

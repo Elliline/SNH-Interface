@@ -1059,7 +1059,11 @@ async function repairCompounds(pass, { subject = null } = {}) {
 
       await act(pass, {
         tool: 'memory_supersede_fact',
-        args: { old_id: row.id, new_id: created[0].id },
+        // carry_over:false — the atoms were made FROM this row and between them
+        // hold every clause it had, so the union merge that protects every other
+        // supersede would here fold the compound back into its own first atom
+        // and undo the split. See mcp/tools/memory-correct.js.
+        args: { old_id: row.id, new_id: created[0].id, carry_over: false, tier: 'mechanical' },
         entry: {
           tier: 'mechanical', action: 'split', subject: row.subject || 'user',
           targetId: row.id, targetText: row.content,
