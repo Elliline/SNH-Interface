@@ -190,8 +190,8 @@ async function isApproval({ brief, message, callLLM }) {
       maxTokens: 4,
       temperature: 0,
       thinkingTokens: 0,
-      firstTokenMs: 15000,
-      stallMs: 10000,
+      firstTokenMs: 26400,
+      stallMs: 17600,
     });
     // callLLM resolves to { content, reasoning, provider, truncated } — not a
     // string. Reading it as one produced "[object Object]", which parsed as
@@ -289,8 +289,8 @@ async function isRerunRequest({ brief, message, lastJob = null, callLLM }) {
       temperature: 0,
       thinkingTokens: 0,
       // Same short deadline as isApproval — see the note there.
-      firstTokenMs: 15000,
-      stallMs: 10000,
+      firstTokenMs: 26400,
+      stallMs: 17600,
     });
     const raw = (answer && typeof answer === 'object') ? answer.content : answer;
     const verdict = parseVerdict(raw);

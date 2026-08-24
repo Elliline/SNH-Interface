@@ -367,8 +367,27 @@ function warnRetiredRateKnobs(gen) {
  * @returns {Promise<object>} { choices: [{ message, finish_reason }] } or
  *                            { message, done_reason } for the Ollama shape
  */
-async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label }) {
+/**
+ * `onFrame` — OPTIONAL, and the reason multi-round turns stopped looking hung.
+ *
+ * A tool round streams from the engine exactly like the final round does, but
+ * this function consumed that stream privately and handed back the
+ * non-streaming shape, so nothing reached the browser until the LAST round
+ * began. Athena's second turn spent 168s generating across five rounds and the
+ * UI showed dead air for the first ~183s of it: the work was happening and
+ * invisible. Callers that own a client connection now pass onFrame and get the
+ * reasoning tokens as they land. Callers that do not pass it are unchanged.
+ */
+async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label, onFrame, abortSignal }) {
   const controller = new AbortController();
+  // WHEN THE READER LEAVES, THE ENGINE SHOULD STOP. A round used to be an
+  // internal request with no relationship to the client, so closing the tab
+  // left it generating to the end for nobody. Now that rounds ARE the visible
+  // turn, the caller's signal is chained onto this one.
+  if (abortSignal) {
+    if (abortSignal.aborted) controller.abort();
+    else abortSignal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
   let lastProgress = Date.now();
   let sawFirstToken = false;
   let killReason = null;
@@ -451,9 +470,23 @@ async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label
         if (typeof delta.content === 'string' && delta.content.length) {
           content += delta.content;
           progress();
+          // The ANSWER of a round, relayed as it lands. A round that calls no
+          // tool is the final answer, so without this the turn streams its
+          // thinking and then goes silent with nothing to show for it.
+          if (onFrame) {
+            try { onFrame(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: delta.content }, finish_reason: null }] })}\n\n`); }
+            catch { /* a broken client must not kill the turn */ }
+          }
         }
         const r = reasoningChannel.extractReasoning(delta);
         if (r) { reasoning += r; progress(); }
+
+        // Relay the thinking of a round as it lands, on its own channel so the
+        // UI's thinking panel works from round one rather than only the last.
+        if (onFrame && r) {
+          try { onFrame(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning: r }, finish_reason: null }] })}\n\n`); }
+          catch { /* a broken client must not kill the turn */ }
+        }
 
         // TOOL CALLS ARRIVE IN PIECES on the OpenAI wire: one fragment per
         // chunk, keyed by `index`, with `arguments` split across as many chunks
@@ -769,6 +802,23 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
     // not asked for, so every existing caller sends the body it always did.
     if (Number.isFinite(options.temperature)) body.temperature = options.temperature;
     if (bgThinking > 0) body.thinking_token_budget = bgThinking;
+    // A CALLER MAY TURN THINKING OFF, and on a reasoning model it must be able
+    // to. thinkingTokens: 0 used to mean "send no budget", which on Qwen3.8
+    // means UNBOUNDED thinking — so the approval classifier, which allows
+    // itself 4 tokens for a yes/no, spent all four on reasoning and returned
+    // nothing. Measured on every call: "spent the whole budget reasoning and
+    // produced no answer (19 chars of reasoning, max_tokens 4, finish_reason
+    // length)", failing closed to NO. An approval that can never say YES is
+    // not a safe default, it is a broken gate.
+    //
+    // thinking_token_budget: 0 is not honoured as "off" by this engine, but
+    // the chat template's own switch is, so 0 sends that instead. Verified on
+    // vLLM 0.24 / Qwen3.8-27B-NVFP4: enable_thinking false -> 0 chars of
+    // reasoning, true -> reasoning present. reasoning_effort is NOT a control
+    // here - low/medium/high produced 462/513/204 chars, non-monotonic.
+    if (bgThinking === 0) {
+      body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), enable_thinking: false };
+    }
     if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
     extract = (data) => data.choices?.[0]?.message?.content || '';
     extractFinishReason = (data) => data.choices?.[0]?.finish_reason || '';

@@ -3622,3 +3622,17 @@ body.coder-working { padding-top: 1.9rem; }
   border-left-color: var(--success, #a3be8c);
   background: color-mix(in srgb, var(--success, #a3be8c) 8%, transparent);
 }
+
+/* The running-tool rail. Tool execution emits no tokens, so without this a
+   multi-round turn shows nothing at all while the work happens. */
+.tool-rail { margin: 0 0 6px 0; display: flex; flex-direction: column; gap: 2px; }
+.tool-rail-row {
+  font-size: 0.78rem; line-height: 1.5; opacity: 0.85;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 1px 8px; border-left: 2px solid currentColor;
+}
+.tool-rail-row.running { color: #c98a2b; }
+.tool-rail-row.running::after { content: ""; animation: toolDots 1.2s steps(4,end) infinite; }
+.tool-rail-row.done { color: #6a8f5f; opacity: 0.7; }
+@keyframes toolDots { 0%{content:""} 25%{content:"."} 50%{content:".."} 75%{content:"..."} }
+.tool-rail-row.failed { color: #b4544a; opacity: 0.85; }

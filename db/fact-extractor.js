@@ -365,6 +365,12 @@ async function extractFromLlamacpp(systemPrompt, exchange, model, host, signal) 
     stream: false
   };
   if (think > 0) body.thinking_token_budget = think;
+  // 0 means OFF, not "send nothing" — the same defect callLLM had. On a
+  // reasoning model "send nothing" is unbounded thinking, which is how a
+  // 220-token classifier spent all 220 tokens reasoning and returned nothing.
+  if (think === 0) {
+    body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), enable_thinking: false };
+  }
   if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
 
   const response = await fetch(`${host}/v1/chat/completions`, {

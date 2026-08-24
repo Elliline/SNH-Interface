@@ -2841,12 +2841,60 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Route to appropriate provider
     let response;
     let toolsUsed = false;
+    // Declared out here, not in the provider branch, because the shared
+    // streaming tail below seeds fullResponse from them. Block-scoping these
+    // beside the loop made them invisible exactly where they are read.
+    let answeredInRound = false;
+    let streamedContent = '';
+    let streamedReasoning = '';
     // Sources (title+url) the model drew from during the tool loop, in [S#] order.
     // Populated by both provider loops, persisted with the assistant message so a
     // later "cite your sources" reads retained links instead of reconstructing them.
     const usedSources = [];
     console.log(`=== Routing to provider: ${providerType} ===`);
 
+    // ENGINE ARTIFACTS — tool-call markup written as prose.
+    //
+    // A model asked for something it has no tool for writes the call it wishes it
+    // could make, as text, in the middle of its answer. It is not in
+    // message.tool_calls, nothing executes it, and nothing used to catch it — it
+    // is ordinary content and it renders. That is what Ellie saw on 2026-08-06.
+    //
+    // Filtered HERE, in the shared streaming path, so both branches are covered:
+    // the tool branch's final answer and — the one that actually failed — the
+    // no-tool branch, which has no tool loop between the engine and the browser at
+    // all. The filter holds back only a tail that could still become an opener, so
+    // ordinary prose is delayed a few characters and never altered.
+    const artifactFilter = createToolArtifactFilter();
+
+    /** Rewrite one SSE/NDJSON frame's content, or drop it if nothing survives. */
+    const filterFrame = (raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === 'data: [DONE]') return raw;
+      const isSSE = trimmed.startsWith('data: ');
+      const jsonStr = isSSE ? trimmed.slice(6) : trimmed;
+      if (jsonStr === '[DONE]') return raw;
+      let data;
+      try { data = JSON.parse(jsonStr); } catch { return raw; }
+
+      // Where this engine puts the text. Only these carry prose; anything else
+      // (role, finish_reason, usage) passes through untouched.
+      const slots = [
+        () => data.choices?.[0]?.delta,
+        () => data.choices?.[0]?.message,
+        () => data.message,
+        () => data.delta
+      ];
+      for (const get of slots) {
+        const node = get();
+        if (!node || typeof node.content !== 'string' || node.content === '') continue;
+        const kept = artifactFilter.feed(node.content);
+        if (kept === node.content) return raw;      // untouched — send the original bytes
+        node.content = kept;
+        return isSSE ? `data: ${JSON.stringify(data)}\n\n` : `${JSON.stringify(data)}\n`;
+      }
+      return raw;
+    };
     if (providerType === 'ollama') {
       // providerHost was already resolved (instance lookup or env fallback); validate it
       const host = instanceName ? providerHost : getOllamaHost({ ollamaHost });
@@ -3167,6 +3215,65 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
         console.log(`MCP [${providerLabel}]: Starting tool loop, tools:`, JSON.stringify(tools.map(t => t.function.name)));
 
+
+        // ── STREAM FROM ROUND ONE ────────────────────────────────────────
+        //
+        // Round 1 used to run as a private request and then a SEPARATE final
+        // streaming request produced the answer — even when no tool was ever
+        // called. Every turn generated twice, and the first pass was invisible:
+        // Athena's traced turn showed 183s of dead air before the last round
+        // began, and a plain conversational turn spent 38.5s generating an
+        // answer nobody could see before regenerating it.
+        //
+        // Now every round streams down the same SSE channel, so headers must be
+        // out before the first byte. The values that are only known after the
+        // loop (sources, tools-used) move to the terminal `meta` frame; the
+        // headers are still emitted, best-effort, for consumers that predate it.
+        const hoistedContentType = 'text/event-stream';
+        const ensureStreamHeaders = () => {
+          if (res.headersSent) return;
+          res.setHeader('Content-Type', hoistedContentType);
+          res.setHeader('X-Conversation-Id', convoId);
+          res.setHeader('X-Injected-Tokens', String(injectedTokens));
+          res.setHeader('X-Has-Memory-Context',
+            (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user) ? 'true' : 'false');
+          // Not knowable before the stream starts. Authoritative values ride the
+          // terminal meta frame; these stay so an old consumer still parses.
+          res.setHeader('X-Tools-Used', 'deferred');
+          res.setHeader('X-Sources', '');
+          res.setHeader('X-Memory-Sources', 'deferred');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          res.setHeader('X-Accel-Buffering', 'no');
+          if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        };
+
+        /** One versioned envelope for everything that is not model output. */
+        const emitFrame = (obj) => {
+          ensureStreamHeaders();
+          try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client gone */ }
+        };
+
+        // What the client has already been shown this turn. If the loop ends
+        // without a tool call, this IS the answer and there is no second pass.
+
+
+        // Relays one engine frame to the browser and accumulates what it carried.
+        const relayRoundFrame = (frame) => {
+          ensureStreamHeaders();
+          try {
+            const t = frame.trim();
+            if (t.startsWith('data: ')) {
+              const j = JSON.parse(t.slice(6));
+              const d = j.choices?.[0]?.delta || {};
+              if (typeof d.content === 'string') streamedContent += d.content;
+              const r = d.reasoning ?? d.reasoning_content;
+              if (typeof r === 'string') streamedReasoning += r;
+            }
+          } catch { /* a frame we cannot read is still worth relaying */ }
+          try { res.write(filterFrame(frame)); } catch { /* client gone */ }
+        };
+
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
           console.log(`MCP [${providerLabel}]: Tool call round ${round + 1}/${MAX_TOOL_ROUNDS}`);
 
@@ -3202,7 +3309,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
             },
             firstTokenMs: ct.firstTokenMs,
             stallMs: ct.stallMs,
-            label: `${providerLabel} tool-round ${round + 1}`
+            label: `${providerLabel} tool-round ${round + 1}`,
+            onFrame: relayRoundFrame,
+            abortSignal: streamAbort.signal
           });
 
           if (forceThisRound) console.log(`MCP [${providerLabel}]: FORCING ${forcedToolName} this round — ${forceHandoffCall ? 'she named the agent (tier 1)' : 'she approved a brief and said send it'}`);
@@ -3238,7 +3347,13 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           console.log(`MCP [${providerLabel}]: message.content (first 100):`, (choice?.message?.content || '').substring(0, 100));
 
           if (!choice?.message?.tool_calls?.length) {
-            console.log(`MCP [${providerLabel}]: No tool calls requested, proceeding to final response`);
+            // THIS ROUND WAS THE ANSWER. It already streamed to the browser, so
+            // re-requesting it would generate the same reply a second time and
+            // charge the user for both. The old code did exactly that on every
+            // turn, tools or no tools.
+            console.log(`MCP [${providerLabel}]: No tool calls requested — this round is the answer `
+              + `(${streamedContent.length} chars streamed, ${streamedReasoning.length} reasoning); no second pass`);
+            answeredInRound = true;
             break;
           }
 
@@ -3254,6 +3369,12 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
           for (const toolCall of assistantMsg.tool_calls) {
             const fnName = toolCall.function.name;
             console.log(`MCP [${providerLabel}]: Executing tool "${fnName}", raw arguments:`, toolCall.function.arguments);
+            // Tool execution emits no tokens. Unannounced it is a silent gap of
+            // however long the tool takes — write_memory alone spent 48s of the
+            // traced turn.
+            const toolStartedAt = Date.now();
+            emitFrame({ type: 'tool_start', v: 1, tool: fnName, round: round + 1 });
+
 
             let args;
             try {
@@ -3300,6 +3421,9 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
               result = await mcpClient.executeTool(fnName, args, toolContext);
             }
             console.log(`MCP [${providerLabel}]: Tool "${fnName}" result:`, JSON.stringify(result).substring(0, 200));
+            emitFrame({ type: 'tool_end', v: 1, tool: fnName, round: round + 1,
+                        ms: Date.now() - toolStartedAt,
+                        ok: !(result && typeof result === 'object' && result.error) });
 
             llamacppMessages.push({
               role: 'tool',
@@ -3369,12 +3493,22 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
       console.log(`MCP [${providerLabel}]: Final request body keys:`, Object.keys(finalBody), 'tools included:', !!finalBody.tools);
 
-      response = await fetch(`${llamacppHost}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(finalBody),
-        signal: streamAbort.signal
-      });
+      if (answeredInRound) {
+        // ALREADY ANSWERED, ALREADY ON SCREEN. An empty stream is handed to the
+        // relay below so the whole tail of this handler — artifact filters,
+        // phantom-dispatch checks, saving, fact extraction — runs exactly as it
+        // does for a normal turn, with the text seeded from what was streamed.
+        console.log(`MCP [${providerLabel}]: reusing the streamed round as the answer — final request skipped`);
+        response = new Response(new ReadableStream({ start(c) { c.close(); } }),
+                                { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      } else {
+        response = await fetch(`${llamacppHost}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(finalBody),
+          signal: streamAbort.signal
+        });
+      }
     } else {
       return res.status(400).json({ error: 'Unknown provider' });
     }
@@ -3394,18 +3528,31 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Set up streaming response
     // Ollama and SquatchServe use NDJSON; everything else (Claude, Grok, OpenAI, llamacpp, vllm) uses SSE
     const contentType = (providerType === 'ollama' || providerType === 'squatchserve') ? 'application/x-ndjson' : 'text/event-stream';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('X-Conversation-Id', convoId);
-    res.setHeader('X-Injected-Tokens', String(injectedTokens));
-    res.setHeader('X-Has-Memory-Context', (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user) ? 'true' : 'false');
-    res.setHeader('X-Tools-Used', toolsUsed ? 'true' : 'false');
+    // May already be on the wire — the tool loop streams now. Guarded rather
+    // than assumed; the hoisted call set the same value.
+    if (!res.headersSent) res.setHeader('Content-Type', contentType);
+    // HEADERS ARE BEST-EFFORT NOW, NOT THE CONTRACT.
+    //
+    // Streaming starts in the tool loop, so by the time these values are known
+    // the headers may already be on the wire. They are still set when they can
+    // be — a consumer that predates the meta frame keeps working — and the
+    // authoritative copy goes out in the terminal frame below. setHeader after
+    // flush throws, so each is guarded rather than assumed.
+    const setLateHeader = (k, v) => {
+      if (res.headersSent) return false;
+      try { res.setHeader(k, v); return true; } catch { return false; }
+    };
+    const lateHeadersLanded = setLateHeader('X-Conversation-Id', convoId);
+    setLateHeader('X-Injected-Tokens', String(injectedTokens));
+    setLateHeader('X-Has-Memory-Context', (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user) ? 'true' : 'false');
+    setLateHeader('X-Tools-Used', toolsUsed ? 'true' : 'false');
     // Search provenance for the live turn: hand the frontend the (light) source
     // links so it can render the clickable [S#] list under the message right away,
     // matching what it will show on reload from the DB. URL-encoded (headers are
     // ASCII); snippets are dropped — the UI only needs n/title/url.
     if (usedSources.length) {
       const light = usedSources.map(s => ({ n: s.n, title: s.title, url: s.url }));
-      res.setHeader('X-Sources', encodeURIComponent(JSON.stringify(light)));
+      setLateHeader('X-Sources', encodeURIComponent(JSON.stringify(light)));
     }
     // Count memory sources for the frontend
     const memorySources = [
@@ -3416,68 +3563,30 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       memoryContext.length > 0 ? `${memoryContext.length}-conversations` : null,
       clusterContext.length > 0 ? `${clusterContext.length}-clusters` : null
     ].filter(Boolean);
-    res.setHeader('X-Memory-Sources', memorySources.join(',') || 'none');
+    setLateHeader('X-Memory-Sources', memorySources.join(',') || 'none');
 
     if (contentType === 'text/event-stream') {
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
+      if (!res.headersSent) {
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
+      }
     }
 
     // Flush headers immediately to start streaming
     res.flushHeaders();
 
     // Collect full response for saving
-    let fullResponse = '';
+    // Seeded, not empty: on a turn answered inside the tool loop the text is
+    // already streamed and this is where it continues from.
+    let fullResponse = answeredInRound ? streamedContent : '';
     // The thinking channel, kept strictly apart from the answer. It is measured
     // and logged, forwarded to the browser to show or hide, and never saved as
     // the assistant's message — what SNH said is the answer, not the working out.
-    let fullReasoning = '';
+    let fullReasoning = answeredInRound ? streamedReasoning : '';
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
-    // ENGINE ARTIFACTS — tool-call markup written as prose.
-    //
-    // A model asked for something it has no tool for writes the call it wishes it
-    // could make, as text, in the middle of its answer. It is not in
-    // message.tool_calls, nothing executes it, and nothing used to catch it — it
-    // is ordinary content and it renders. That is what Ellie saw on 2026-08-06.
-    //
-    // Filtered HERE, in the shared streaming path, so both branches are covered:
-    // the tool branch's final answer and — the one that actually failed — the
-    // no-tool branch, which has no tool loop between the engine and the browser at
-    // all. The filter holds back only a tail that could still become an opener, so
-    // ordinary prose is delayed a few characters and never altered.
-    const artifactFilter = createToolArtifactFilter();
-
-    /** Rewrite one SSE/NDJSON frame's content, or drop it if nothing survives. */
-    const filterFrame = (raw) => {
-      const trimmed = raw.trim();
-      if (!trimmed || trimmed === 'data: [DONE]') return raw;
-      const isSSE = trimmed.startsWith('data: ');
-      const jsonStr = isSSE ? trimmed.slice(6) : trimmed;
-      if (jsonStr === '[DONE]') return raw;
-      let data;
-      try { data = JSON.parse(jsonStr); } catch { return raw; }
-
-      // Where this engine puts the text. Only these carry prose; anything else
-      // (role, finish_reason, usage) passes through untouched.
-      const slots = [
-        () => data.choices?.[0]?.delta,
-        () => data.choices?.[0]?.message,
-        () => data.message,
-        () => data.delta
-      ];
-      for (const get of slots) {
-        const node = get();
-        if (!node || typeof node.content !== 'string' || node.content === '') continue;
-        const kept = artifactFilter.feed(node.content);
-        if (kept === node.content) return raw;      // untouched — send the original bytes
-        node.content = kept;
-        return isSSE ? `data: ${JSON.stringify(data)}\n\n` : `${JSON.stringify(data)}\n`;
-      }
-      return raw;
-    };
 
     // Stall watchdog: if the engine sends no bytes for this long mid-stream it's
     // wedged, not slow — abort so we don't hold the socket (and its engine slot)
@@ -3870,6 +3979,31 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
 
       if (fullReasoning) {
         console.log(`[Chat] reasoning ${fullReasoning.length} chars / answer ${fullResponse.length} chars`);
+      }
+
+      // ── TERMINAL META FRAME ──────────────────────────────────────────────
+      //
+      // What the X- headers used to carry. It is last because two of its fields
+      // are only true once the tool loop has finished, and it is versioned
+      // because this is now the contract: `v` moves when a field changes
+      // meaning, new fields just appear. Clients read this and fall back to the
+      // headers, so an old client and a new one both work during a rollout.
+      try {
+        const memSources = (typeof memorySources !== 'undefined' && memorySources.length)
+          ? memorySources.join(',') : 'none';
+        res.write(`data: ${JSON.stringify({
+          type: 'meta',
+          v: 1,
+          conversationId: convoId,
+          injectedTokens,
+          hasMemoryContext: (memoryContext.length > 0 || memoryFiles.memory || memoryFiles.user),
+          toolsUsed,
+          answeredInRound,
+          sources: usedSources.map(s => ({ n: s.n, title: s.title, url: s.url })),
+          memorySources: memSources
+        })}\n\n`);
+      } catch (metaErr) {
+        console.error('[Chat] could not emit meta frame:', metaErr.message);
       }
 
       res.end();

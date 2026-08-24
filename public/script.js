@@ -633,6 +633,11 @@ async function sendMessage(inputModality = 'typed') {
     // Search provenance for the live turn: the server hands us the source links it
     // drew from (URL-encoded JSON). Attached to the assistant message below so the
     // clickable [S#] list renders immediately, matching the reload view.
+    // THE TERMINAL META FRAME lands here. Sources and tools-used are only known
+    // after the tool loop, and the stream now starts before that — so they
+    // arrive at the end of the body instead of in the headers. Headers are
+    // still read first as a fallback for a server that predates the frame.
+    window.__snhLastMeta = null;
     let responseSources = null;
     const sourcesHeader = response.headers.get('X-Sources');
     if (sourcesHeader) {
@@ -675,6 +680,14 @@ async function sendMessage(inputModality = 'typed') {
     // Update the assistant message with the complete response
     console.log('[sendMessage] Stream complete, fullResponse length:', fullResponse.length);
     const assistantMessageIndex = conversation.findIndex(msg => msg.id === assistantMessageId);
+    // The frame is authoritative; the header value was a best-effort guess made
+    // before the tool loop had run.
+    const meta = window.__snhLastMeta;
+    if (meta) {
+      if (Array.isArray(meta.sources) && meta.sources.length) responseSources = meta.sources;
+      if (meta.conversationId && !currentConversationId) currentConversationId = meta.conversationId;
+      if (meta.toolsUsed) showToolsIndicator();
+    }
     if (assistantMessageIndex !== -1) {
       conversation[assistantMessageIndex].content = fullResponse;
       if (responseSources) conversation[assistantMessageIndex].sources = responseSources;
@@ -904,6 +917,76 @@ async function processClaudeStream(response) {
  * would put the model's working out in the reply, in the transcript, and in
  * everything downstream that reads a message as what SNH said.
  */
+
+/**
+ * The running-tool line, above the answer and beside the thinking panel.
+ *
+ * At 22 tok/s a multi-round turn is legitimately a minute or two. Silence for
+ * that long reads as a hang; the same wait with "using web_search…" on screen
+ * reads as work. One line per tool, rewritten in place when it finishes, so a
+ * five-round turn leaves five short lines rather than a scrolling log.
+ */
+function renderToolStatus(st) {
+  if (!streamingMessageElement) return;
+  let rail = streamingMessageElement.querySelector('.tool-rail');
+  if (!rail) {
+    rail = document.createElement('div');
+    rail.className = 'tool-rail';
+    streamingMessageElement.insertBefore(rail, streamingMessageElement.firstChild);
+  }
+  const id = `tool-${st.round}-${st.tool}`;
+  let row = rail.querySelector(`[data-tool-id="${id}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'tool-rail-row running';
+    row.dataset.toolId = id;
+    rail.appendChild(row);
+  }
+  if (st.phase === 'tool_start') {
+    row.className = 'tool-rail-row running';
+    row.textContent = `using ${st.tool}…`;
+  } else if (st.phase === 'tool_end') {
+    row.className = 'tool-rail-row done';
+    const secs = st.ms != null ? ` — ${(st.ms / 1000).toFixed(1)}s` : '';
+    row.textContent = `${st.tool}${secs}`;
+  }
+}
+
+
+/**
+ * The running-tool rail: one line per tool, rewritten in place when it ends.
+ *
+ * Tool execution produces no tokens, so without this a multi-round turn shows
+ * nothing while the work happens. Round-1 content that arrived BEFORE a tool
+ * call is left on screen and the answer continues after it — the model's
+ * "let me look that up" is true and worth keeping, and erasing text the reader
+ * has already seen is worse than appending to it.
+ */
+function renderToolStatus(st) {
+  if (!streamingMessageElement) return;
+  let rail = streamingMessageElement.querySelector('.tool-rail');
+  if (!rail) {
+    rail = document.createElement('div');
+    rail.className = 'tool-rail';
+    streamingMessageElement.insertBefore(rail, streamingMessageElement.firstChild);
+  }
+  const id = `tool-${st.round}-${st.tool}`;
+  let row = rail.querySelector(`[data-tool-id="${id}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.dataset.toolId = id;
+    rail.appendChild(row);
+  }
+  if (st.type === 'tool_start') {
+    row.className = 'tool-rail-row running';
+    row.textContent = `using ${st.tool}`;
+  } else {
+    const secs = st.ms != null ? ` — ${(st.ms / 1000).toFixed(1)}s` : '';
+    row.className = `tool-rail-row ${st.ok === false ? 'failed' : 'done'}`;
+    row.textContent = `${st.tool}${secs}${st.ok === false ? ' — failed' : ''}`;
+  }
+}
+
 function extractReasoningDelta(parsed) {
   const c = parsed.choices?.[0];
   const node = c?.delta || c?.message;
@@ -972,6 +1055,19 @@ async function processGrokStream(response) {
             renderSystemNotice(parsed.snh_notice);
             continue;
           }
+
+          // Not model output: turn metadata and live phase markers.
+          if (parsed.type === 'meta') { window.__snhLastMeta = parsed; continue; }
+          if (parsed.type === 'tool_start' || parsed.type === 'tool_end') {
+            renderToolStatus(parsed);
+            continue;
+          }
+
+          // WHAT IS HAPPENING RIGHT NOW, for the phases that emit no tokens.
+          // A tool round's thinking streams; executing the tool does not, and
+          // that gap was most of the dead air on a multi-round turn.
+          const status = parsed.choices?.[0]?.delta?.snh_status;
+          if (status) { renderToolStatus(status); continue; }
 
           // THINKING — its own channel, never the answer.
           const reasoned = extractReasoningDelta(parsed);
