@@ -105,20 +105,35 @@ function cfg() {
   return {
     enabled: w.enabled !== false && !DISPOSABLE_INSTANCE,
     container: w.container || 'sparky-brain',
+    // NOT EVERY BOX RUNS THE BRAIN IN A CONTAINER. `watchdog.restartCommand`,
+    // when set, is an argv array run instead of `docker restart <container>`.
+    // aiserver is why: the engine there is a systemd --user unit, the inherited
+    // container name pointed at nothing, and every fire would have failed with
+    // "no such container" while reporting a restart had been attempted.
+    // Unset (the default) keeps the container path exactly as it was.
+    restartArgv: Array.isArray(w.restartCommand) && w.restartCommand.length
+      ? w.restartCommand.map(String)
+      : null,
     failureThreshold: Math.max(1, w.failureThreshold || 3),
     cooldownMs: Math.max(0, (w.cooldownMinutes ?? 5) * 60 * 1000),
     maxRestartsPerHour: Math.max(1, w.maxRestartsPerHour || 2)
   };
 }
 
+/** How the restart reads in a log line — the real command, not an assumed one. */
+function restartLabel(c) {
+  return c.restartArgv ? c.restartArgv.join(' ') : `docker restart ${c.container}`;
+}
+
 /**
- * Run `docker restart <container>`. Resolves { ok, ms, error }.
- * execFile (no shell) — container name is config, not user input, but keep it clean.
+ * Restart the brain. Resolves { ok, ms, error }.
+ * execFile (no shell) — argv comes from config, not user input, but keep it clean.
  */
-function dockerRestart(container) {
+function restartBrain(c) {
+  const argv = c.restartArgv || ['docker', 'restart', c.container];
   const started = Date.now();
   return new Promise(resolve => {
-    execFile('docker', ['restart', container], { timeout: 90000 }, (err, stdout, stderr) => {
+    execFile(argv[0], argv.slice(1), { timeout: 90000 }, (err, stdout, stderr) => {
       const ms = Date.now() - started;
       if (err) {
         resolve({ ok: false, ms, error: (stderr || err.message || '').toString().trim() });
@@ -214,11 +229,11 @@ async function onProbeResult(probe) {
   // 2026-08-22. Stating both makes a slow detection self-explaining.
   const everySec = Math.max(5, ((cfgAll().livenessProbe || {}).intervalSeconds) || 60);
   const policy = `${c.failureThreshold} failed checks ${everySec}s apart`;
-  const fireMsg = `🔧 Brain watchdog: ${consecutiveFailures} consecutive liveness failures (last: ${probe.error || 'unknown'}) — restarting ${c.container} (restart ${attemptNum}/${c.maxRestartsPerHour} this hour). Policy: ${policy}.`;
+  const fireMsg = `🔧 Brain watchdog: ${consecutiveFailures} consecutive liveness failures (last: ${probe.error || 'unknown'}) — restarting via \`${restartLabel(c)}\` (restart ${attemptNum}/${c.maxRestartsPerHour} this hour). Policy: ${policy}.`;
   console.warn(`[Watchdog] ${fireMsg}`);
   opsLog(fireMsg);
 
-  const result = await dockerRestart(c.container);
+  const result = await restartBrain(c);
   restartInFlight = false;
   lastRestartAt = Date.now();
   restartTimes.push(lastRestartAt);
@@ -227,11 +242,11 @@ async function onProbeResult(probe) {
 
   if (result.ok) {
     awaitingRecovery = true;
-    const okMsg = `Brain watchdog: \`docker restart ${c.container}\` completed in ${(result.ms / 1000).toFixed(1)}s — model reloading, cooldown ${Math.round(c.cooldownMs / 60000)} min before any re-trigger. Watching for recovery.`;
+    const okMsg = `Brain watchdog: \`${restartLabel(c)}\` completed in ${(result.ms / 1000).toFixed(1)}s — model reloading, cooldown ${Math.round(c.cooldownMs / 60000)} min before any re-trigger. Watching for recovery.`;
     console.log(`[Watchdog] ${okMsg}`);
     opsLog(okMsg);
   } else {
-    const failMsg = `⚠️ Brain watchdog: \`docker restart ${c.container}\` FAILED: ${result.error}. Will retry next cycle (subject to cap). Check docker permissions / daemon.`;
+    const failMsg = `⚠️ Brain watchdog: \`${restartLabel(c)}\` FAILED: ${result.error}. Will retry next cycle (subject to cap). Check the command's permissions and that the target exists.`;
     console.error(`[Watchdog] ${failMsg}`);
     opsLog(failMsg);
   }

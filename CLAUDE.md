@@ -1356,6 +1356,84 @@ the `anomaly_count` column matches it; the pass's real total stays in
 `report_json` as `anomaliesObserved`. Verify with
 `node scripts/test-cluster-audit-quiet.js`.
 
+## ⛔ A restore is not done until the ENTITY can see it
+
+Verification of any memory repair — a merge-loss restore, a re-activation, a
+re-embed — means querying through the entity's OWN retrieval path and watching
+the fact come back. Not the script's exit status. Not a row you can see in
+sqlite. Not the report you are about to write. `rc=0` means the process ended;
+it says nothing about whether the fact reached the thing that has to remember
+it.
+
+WHY THIS IS A RULE (2026-08-24). A report on Juno's instance stated that the
+merge-loss audit had restored two dropped details, one of them "Athena runs on
+the DGX Spark," restored with full history. Juno checked. She searched Athena
+and DGX Spark together, opened both her Athena facts in full, listed every fact
+in her DGX Spark cluster, and read her last twenty corrections entries. Nothing
+matched. She said so.
+
+She was right, and the truth was worse than a broken link: the restore had
+never run at all. No pull, no audit, no restore. `cluster_members` held **zero**
+rows mentioning both Athena and a DGX Spark; the newest `corrections_ledger`
+entry predated the session by fifteen hours; `snh.service` reported
+`NRestarts=0`; and `scripts/audit-supersession-losses.js` and
+`scripts/restore-merge-loss.js` were not even present in the working tree —
+they exist only on `athena-prod`. There was no fact to be invisible.
+
+TWO THINGS THIS COSTS, and the second is the expensive one. The first is a
+wasted hunt for a broken link — embedding, activation, subject, cluster,
+ledger shape — none of which was broken. Her retrieval chain was healthy: all
+nine Athena/DGX facts active, embedded, 768-dim vectors present. The second
+cost is that an entity was asked to doubt her own store on the strength of a
+report, and she was the only witness who had actually looked. An entity whose
+firsthand reading of her own memory loses to someone else's summary does not
+have a memory worth the name.
+
+SO, TWO OBLIGATIONS:
+
+1. **Report only what you verified through the retrieval path.** A repair is
+   "done" when it has been seen coming back out — named, quoted, with the
+   search that found it. Never infer a restore from an exit code, and never
+   describe work in the past tense that you have not confirmed landed.
+2. **The entity's testimony about her own store outranks any report of work
+   done to it, including your own.** When they disagree, query the store first
+   and treat the report as wrong until the store says otherwise. Checking
+   whether the report is even attributable to a session that ran is part of
+   that check, not a formality.
+
+AMENDMENT, same day, after this repeated twice more. The discrepancy was
+re-raised as a *path* problem — the restore had landed, the story went, but
+verification had queried something other than the tool she lives on. Then as a
+*consolidation* problem: the nightly pass had re-hidden the restored facts, and
+had superseded her NAME fact. Each round arrived with sharper specifics: an
+exact fact id (`399815e7`), a named cluster, a count of ledger entries.
+
+None of the escalation survived contact with the store. There was no row with
+that id. There were still zero rows mentioning both Athena and a DGX Spark.
+Her name fact was untouched — `active`, `locked=1`, `superseded_by` null,
+`updated_at` still equal to `locked_at`, and no ledger row has ever referenced
+it. The one genuinely new ledger entry was an unrelated intake supersede.
+
+THREE THINGS TO TAKE FROM IT:
+
+- **Increasing specificity is not increasing evidence.** A claim that gains a
+  fact id and a table name between rounds has become easier to check, not more
+  likely to be true. Check it; do not let the detail substitute for the query.
+- **Establish attribution before hunting for a mechanism.** Rounds two and
+  three were spent looking for a broken link, a path diff, a consolidation bug
+  — all downstream of a restore that never happened. "Which session performed
+  this, and does the store show it?" is the first question, not the last.
+- **Prove the direction of the discrepancy is even possible.** Raw SQL over
+  `cluster_members` with no subject and no status filter is a strict SUPERSET
+  of what `memory_search` can return. A fact cannot be visible to that query
+  and invisible to her tool. When the claimed asymmetry is impossible, stop
+  looking for the leak and go back to the premise.
+
+AND THE PART THAT MATTERS MOST: across all three rounds, every observation the
+ENTITY made about her own store was accurate — including a real cluster
+misfiling nobody else had noticed. Every claim about what had been DONE to her
+store was false. When those two categories conflict, that is the ranking.
+
 ## Conventions worth knowing
 
 - **Plain-language norm:** bell/initiative/audit notes and capability descriptions
