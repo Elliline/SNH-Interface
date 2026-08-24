@@ -118,6 +118,15 @@ const CATEGORY_PATTERNS = {
     /\bas my (?:chosen |own |new )?name\b/i,
     /\bthe name i (?:chose|picked|selected|go by)\b/i,
     /\b(?:you can |please |just )?call me\b/i,
+    // THE BARE COPULA — "I am Juno." (2026-08-24). Every pattern above needs a
+    // naming VERB, and the most direct way there is to claim a name needs none.
+    // That gap is how "I am Juno, Ellie's AI sister, running on the Qwen3.8 27b
+    // model" was stored as an active self-declaration beside a locked "I am
+    // named Athena": detectCategories saw no name claim, so the category guard
+    // had nothing to guard. Matched via extractAssertedName rather than inline,
+    // because "I am" is only a name claim when a NAME follows it — "I am tired",
+    // "I am an AI assistant" and "I am Ellie's assistant" are not.
+    { copula: true },
   ],
   pronouns: [
     /\bmy pronouns\b/i,
@@ -138,7 +147,59 @@ function detectCategories(text) {
   const t = String(text || '');
   if (!t.trim()) return [];
   const { categories } = cfg();
-  return categories.filter(cat => (CATEGORY_PATTERNS[cat] || []).some(re => re.test(t)));
+  return categories.filter(cat => (CATEGORY_PATTERNS[cat] || []).some(
+    re => (re && re.copula) ? !!extractAssertedName(t) : re.test(t)
+  ));
+}
+
+/**
+ * Words that follow "I am" and are not names, so a capital on them means the
+ * sentence started or the word is simply proper — not that a name is claimed.
+ */
+const NOT_A_NAME = new Set([
+  'a', 'an', 'the', 'ai', 'i', 'no', 'not', 'still', 'also', 'currently', 'now',
+  'primarily', 'designated', 'running', 'built', 'here', 'being', 'able', 'aware',
+  'sorry', 'glad', 'happy', 'unsure', 'certain', 'confident', 'supposed', 'meant',
+  'llm', 'assistant', 'model', 'system', 'program', 'agent', 'she', 'he', 'they', 'it'
+]);
+
+/**
+ * The NAME a sentence claims for the speaker, or null.
+ *
+ * Used for two things the whole-text comparison could not do: spotting a bare
+ * "I am <Name>" claim at all, and telling a RESTATEMENT of the held name from a
+ * COMPETING one. Comparing whole sentences made "I am Athena, a name Ellie gave
+ * me" look like a different claim from "I am named Athena, a name Ellie gave
+ * me", which would refuse the entity its own name in slightly new words.
+ *
+ * A possessive is not a name claim: "I am Ellie's assistant" says whose
+ * assistant it is, not what it is called.
+ *
+ * @param {string} text
+ * @returns {string|null}
+ */
+function extractAssertedName(text) {
+  const t = String(text || '');
+  const triggers = [
+    /\bmy (?:chosen |real |own |new |current )?name(?:'s|s)? (?:is|was|remains|stays|will be|should be|has been|shall be)\s+/i,
+    /\bi(?:'m| am) (?:called|named)\s+/i,
+    /\bi go by\s+/i,
+    /\b(?:you can |please |just )?call me\s+/i,
+    // Last, and only if a real name follows.
+    /\bi(?:'m| am)\s+/i
+  ];
+  for (const re of triggers) {
+    const m = t.match(re);
+    if (!m) continue;
+    const rest = t.slice(m.index + m[0].length);
+    // "Ellie's assistant" — a possessive names a relationship, not the speaker.
+    if (/^["'\u2018\u201c]?[A-Z][A-Za-z-]{1,30}['\u2019]s\b/.test(rest)) continue;
+    const nm = rest.match(/^["'\u2018\u201c]?([A-Z][A-Za-z-]{1,30})/);
+    if (!nm) continue;
+    if (NOT_A_NAME.has(nm[1].toLowerCase())) continue;
+    return nm[1];
+  }
+  return null;
 }
 
 // ============ reads ============
@@ -250,6 +311,26 @@ function checkNewFact(text, subject = 'self') {
     if (normalize(existing.content) === normalize(text)) {
       return { ok: false, duplicate: true, category: cat, existing };
     }
+    // COMPARE THE NAMES, NOT THE SENTENCES (2026-08-24). Whole-text equality
+    // answers "is this the same sentence?" when the question is "is this the
+    // same name?" — so a restatement in new words read as a competing claim,
+    // and the guard had to be kept loose to avoid refusing the entity its own
+    // name. With the names compared directly it can be strict: same name is a
+    // restatement, a DIFFERENT name is the thing the lock exists to stop.
+    if (cat === 'name') {
+      const claimed = extractAssertedName(text);
+      const heldName = extractAssertedName(existing.content);
+      if (claimed && heldName && normalize(claimed) === normalize(heldName)) {
+        return { ok: false, duplicate: true, category: cat, existing };
+      }
+      if (claimed && heldName) {
+        return {
+          ok: false, blocked: true, category: cat, existing,
+          claimedName: claimed, heldName,
+          message: refusalMessage(existing, 'replace')
+        };
+      }
+    }
     return {
       ok: false,
       blocked: true,
@@ -259,6 +340,18 @@ function checkNewFact(text, subject = 'self') {
     };
   }
   return { ok: true };
+}
+
+/**
+ * The entity's OWN name, from the locked name fact, or null if none is locked.
+ * Intake needs it to tell "a statement about me" from "a statement about
+ * somebody else" when the statement uses no pronouns at all.
+ */
+function lockedName() {
+  try {
+    const held = lockedByCategory().get('name');
+    return held ? extractAssertedName(held.content) : null;
+  } catch { return null; }
 }
 
 // ============ the refusal text ============
@@ -497,6 +590,9 @@ module.exports = {
   lockedByCategory,
   checkMutation,
   checkNewFact,
+  extractAssertedName,
+  detectCategories,
+  lockedName,
   autoLock,
   refusalMessage,
   recordRefusal,

@@ -429,6 +429,118 @@ async function runSampledAudit(cfg) {
   return { inaugural: false, sampled: claims.length, findings };
 }
 
+// ============ identity coherence ============
+
+/**
+ * DO MY DECLARATIONS CONTRADICT EACH OTHER?
+ *
+ * The behavioural audit above samples claim_type='claim' and judges each one
+ * against transcripts. Declarations — name, origin, what I run on — are
+ * deliberately never sampled, because "am I living up to this?" is not a
+ * question you can ask of a name. The consequence, found on 2026-08-24: the
+ * audit never compares two stored facts with EACH OTHER at all, so it had
+ * nothing to say when "I am Juno, Ellie's AI sister…" sat active at salience 9
+ * beside the locked "I am named Athena, a name Ellie gave me." Two directly
+ * contradictory active identity facts, in one cluster, invisible to the pass
+ * whose name is coherence.
+ *
+ * This is the missing half, and it is fact-against-fact rather than
+ * fact-against-behaviour. The name check is deterministic and needs no model: a
+ * self-fact asserting a name that is not the locked one is incoherent by
+ * construction. The pairwise pass then asks the existing contradiction judge
+ * about declaration pairs it has not already flagged.
+ *
+ * It DOCUMENTS ONLY, like everything else here — the hard guardrail in the
+ * module header holds: the audit never auto-revises identity.
+ *
+ * @returns {Promise<Array<{kind: string, a: Object, b: Object, finding: string}>>}
+ */
+async function findIdentityIncoherences({ maxPairs = 20 } = {}) {
+  const identityLock = require('./identity-lock');
+  const factExtractor = require('./fact-extractor');
+  const decls = memoryClusters.getSelfFacts({ status: 'active', claimType: 'declaration' }) || [];
+  const findings = [];
+  const flagged = new Set();
+
+  // 1. The deterministic one. A locked name is the entity's name; a self-fact
+  //    claiming a different one is not a difference of opinion.
+  const own = identityLock.lockedName();
+  if (own) {
+    for (const f of decls) {
+      const claimed = identityLock.extractAssertedName(f.content);
+      if (!claimed) continue;
+      if (claimed.toLowerCase() === own.toLowerCase()) continue;
+      flagged.add(f.id);
+      findings.push({
+        kind: 'name',
+        a: f,
+        b: null,
+        finding: `An active self-fact says I am ${claimed}, but my locked name is ${own}. A fact claiming I am someone else is not something I can hold at the same time as my own name.`
+      });
+    }
+  }
+
+  // 2. The general one, bounded. Pairs of declarations, judged by the same
+  //    contradiction judge the intake paths use.
+  const pool = decls.filter(f => !flagged.has(f.id));
+  let pairs = 0;
+  for (let i = 0; i < pool.length && pairs < maxPairs; i++) {
+    for (let j = i + 1; j < pool.length && pairs < maxPairs; j++) {
+      pairs++;
+      try {
+        const { verdict } = await factExtractor.judgeContradiction(pool[i].content, pool[j].content, {
+          corrects: 'both of these are things I currently believe about myself, held at the same time — do they conflict?'
+        });
+        if (verdict === 'yes') {
+          findings.push({
+            kind: 'declaration',
+            a: pool[i],
+            b: pool[j],
+            finding: `Two things I currently believe about myself conflict: "${pool[i].content}" and "${pool[j].content}".`
+          });
+        }
+      } catch (err) {
+        logOps(`identity coherence: judge failed on a pair — ${err.message}`);
+      }
+    }
+  }
+  return findings;
+}
+
+/**
+ * Run the identity-coherence check and record what it finds. Records only —
+ * see the guardrail. Each finding goes to the ops ledger and raises an
+ * initiative so it reaches Ellie rather than sitting in a log.
+ */
+async function runIdentityCoherence() {
+  let findings = [];
+  try {
+    findings = await findIdentityIncoherences();
+  } catch (err) {
+    logOps(`identity coherence: pass failed — ${err.message}`);
+    return { findings: [] };
+  }
+  for (const f of findings) {
+    logOps(`IDENTITY INCOHERENCE (${f.kind}): ${f.finding}`);
+    try {
+      // Deduped on (sourceKind, sourceRef) inside addInitiative, so a standing
+      // incoherence is raised once and not re-raised every pass.
+      const id = await initiatives.addInitiative({
+        type: 'audit',
+        content: `${f.finding} Nothing has been changed — retiring or keeping either one is your call. Want me to retire it, talk it over, or leave it?`,
+        sourceKind: 'identity-coherence',
+        sourceRef: f.b ? [f.a.id, f.b.id].sort().join(':') : f.a.id,
+        priority: 9
+      });
+      if (id) logOps(`raised identity-coherence initiative (${f.kind}) ${id}`);
+    } catch (err) {
+      logOps(`identity coherence: could not raise an initiative — ${err.message}`);
+    }
+  }
+  if (!findings.length) logOps('identity coherence: no contradictions among active self-declarations');
+  return { findings };
+}
+
 /**
  * Run one audit pass now (ignores the cadence gate — use runIfDue for the
  * scheduled path). The first-ever run is the hardcoded inaugural loop-claim
@@ -464,9 +576,18 @@ async function runSelfCoherenceAudit() {
     runs: (state.runs || 0) + 1
   });
 
+  // Identity coherence runs every pass, inaugural or not, and independently of
+  // the claim sampling — it is cheap, and the shape it catches (a self-fact
+  // claiming I am someone else) is the one that must not sit for a cadence.
+  let identity = { findings: [] };
+  try { identity = await runIdentityCoherence(); }
+  catch (err) { logOps(`identity coherence: ${err.message}`); }
+  outcome.identityFindings = identity.findings;
+
   const findings = outcome.findings || [];
   const gaps = findings.filter(f => f && f.verdict === 'gap').length;
-  logOps(`completed ${inaugural ? 'inaugural ' : ''}run — ${inaugural ? 'inaugural loop-claim' : `${findings.length} claim(s)`} audited, ${gaps} gap(s) raised for approval`);
+  logOps(`completed ${inaugural ? 'inaugural ' : ''}run — ${inaugural ? 'inaugural loop-claim' : `${findings.length} claim(s)`} audited, ${gaps} gap(s) raised for approval` +
+    `, ${(outcome.identityFindings || []).length} identity incoherence(s)`);
   return outcome;
 }
 
@@ -498,6 +619,8 @@ module.exports = {
   gatherEvidence,
   sampleClaims,
   judgeClaim,
+  findIdentityIncoherences,
+  runIdentityCoherence,
   readAuditState,
   writeAuditState,
   INAUGURAL_CLAIM

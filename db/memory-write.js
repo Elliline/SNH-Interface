@@ -127,15 +127,19 @@ async function classifySubject(statement, conversationContext = '', sourceMessag
 
 There are exactly two subjects, and getting this wrong corrupts the memory:
 
-- USER — a fact about Ellie, the human. Her preferences, her work, her life, people she knows, things she owns or uses.
-  Write it in the THIRD PERSON, starting with "User". Example: "User's favorite color is blue."
+- USER — a fact about Ellie, the human, OR about anyone else in her world. Her preferences, her work, her life, the PEOPLE SHE KNOWS, things she owns or uses.
+  Write it in the THIRD PERSON, starting with "User". Examples: "User's favorite color is blue." "User's sister Juno runs on the Qwen3.8 27b model."
 
-- SELF — a fact about the AI assistant itself. Its own name, its own traits, how it works, what it has noticed about itself, its own preferences and history.
-  Write it in the FIRST PERSON, as the assistant speaking about itself. Example: "I tend to over-explain when I am unsure."
+- SELF — a fact about YOU, the one assistant reading this prompt. Your own name, your own traits, how you work, what you have noticed about yourself.
+  Write it in the FIRST PERSON. Example: "I tend to over-explain when I am unsure."
+
+SOMEONE ELSE WITH A NAME IS NEVER SELF. This is the rule that matters most. If the statement is about a person, an AI, or an assistant WHO IS NOT YOU — anyone with their own name — the subject is USER and the fact stays in the third person, keeping their name. This holds even when the other one is an AI, runs on a named model, has a job that sounds like yours, or is described as a sibling. "Juno runs on the Qwen3.8 27b model and will help with MettaSphere" is a fact about JUNO. Juno is not you. Storing it as "I am Juno" would make the memory claim you are someone else, which is the worst thing this step can do.
+
+NEVER CHANGE WHO THE SENTENCE IS ABOUT. Rephrasing is fine; moving a statement from one person onto another is not. If the statement describes someone in the third person, the stored fact describes them in the third person. Only a statement that is genuinely about YOU may come out as "I ...".
 
 CRITICAL RULE: never convert between the two. If the statement is about the assistant, it is SELF and it stays first-person — do NOT rewrite it as a fact about the user. A statement like "you're very direct" or "your name is X" or "remember that you prefer Y" is about the ASSISTANT: subject SELF. A statement like "I prefer Y" or "my name is X", said by the human, is about the USER: subject USER.
 
-Watch the speaker. The human says "I"/"my" about HERSELF (→ USER) and "you"/"your" about the ASSISTANT (→ SELF). Your output flips this: a USER fact says "User...", a SELF fact says "I...".
+Watch the speaker. The human says "I"/"my" about HERSELF (→ USER) and "you"/"your" about the ASSISTANT (→ SELF). A sentence with NEITHER — no "I", no "you", just a name and what they do — is about that named someone, and that is USER. Your output flips the pronouns: a USER fact says "User...", a SELF fact says "I...".
 
 Also report whether the request carried EMPHASIS — the person signalled this is important or must not be forgotten ("this is important", "make sure you remember", "never forget").
 
@@ -151,15 +155,31 @@ WHY: one short line`;
   // talking about herself. Only the original utterance still carries who was
   // being described, so it is presented as the authority and the paraphrase is
   // labelled as what it is.
+  //
+  // …BUT ONLY WHEN IT IS ACTUALLY THE SOURCE (2026-08-24). The assistant also
+  // calls write_memory on its own initiative, and then the human's last message
+  // has nothing to do with the fact. Athena's misroute happened under exactly
+  // that shape: the typed message was "Go for it, run your test.", and this
+  // block handed it over as AUTHORITATIVE while labelling the only sentence
+  // that described Juno as unreliable. Measured at a 256-token thinking budget,
+  // the classifier then wrote self-facts about running the test — it followed
+  // the authority it was pointed at. So relatedness is checked first, and an
+  // unrelated message is presented as what it is: context.
+  const related = shareContent(sourceMessage, statement);
   const parts = [];
   if (conversationContext) parts.push(`Recent conversation, for context only:\n${conversationContext}`);
-  if (sourceMessage && sourceMessage.trim() && sourceMessage.trim() !== statement.trim()) {
+  if (sourceMessage && sourceMessage.trim() && sourceMessage.trim() !== statement.trim() && related) {
     parts.push(
       `WHAT THE HUMAN ACTUALLY TYPED (authoritative — trust this over the paraphrase below, especially for pronouns):\n"${String(sourceMessage).slice(0, 800)}"`
     );
     parts.push(`The assistant's paraphrase of what to store (it may have altered the pronouns, so do not rely on them):\n"${statement}"`);
   } else {
-    parts.push(`The human just said, asking for this to be remembered:\n"${statement}"`);
+    if (sourceMessage && sourceMessage.trim() && sourceMessage.trim() !== statement.trim()) {
+      parts.push(
+        `The human's last message, for context only — it is NOT what is being remembered and may be about something else entirely:\n"${String(sourceMessage).slice(0, 400)}"`
+      );
+    }
+    parts.push(`THE STATEMENT TO STORE — decide who THIS is about:\n"${statement}"`);
   }
   const userPrompt = `${parts.join('\n\n')}\n\nWho is this fact about, and what exactly should be stored?`;
 
@@ -188,6 +208,68 @@ WHY: one short line`;
     console.error('[MemoryWrite] classifySubject error:', err.message);
     return null;
   }
+}
+
+/**
+ * Do two texts talk about any of the same distinctive things?
+ *
+ * Used to decide whether the human's last message is the ORIGIN of this write or
+ * just whatever she happened to say before the assistant wrote something down
+ * on its own. contentTokens keeps only the distinctive half of a sentence, so
+ * "Go for it, run your test." shares nothing with a sentence about Juno and the
+ * Qwen3.8 model, while "remember you prefer short answers" shares plenty with
+ * "I prefer short answers".
+ */
+function shareContent(a, b) {
+  if (!a || !b) return false;
+  try {
+    const factMerge = require('./fact-merge');
+    const ta = factMerge.contentTokens(a);
+    if (!ta.size) return false;
+    for (const t of factMerge.contentTokens(b)) if (ta.has(t)) return true;
+    return false;
+  } catch { return false; }
+}
+
+/**
+ * A PARAPHRASE MAY NOT CHANGE WHO THE SENTENCE IS ABOUT.
+ *
+ * verifySubjectAgreement below asks whether the classifier's two outputs agree
+ * with EACH OTHER. They can agree perfectly and both be wrong: Athena's incident
+ * stored subject=self with first-person text, which is self-consistent, and
+ * claimed she was Juno. Nothing compared either output against the SOURCE.
+ *
+ * This does. A first-person self-fact needs a licence in the source sentence:
+ * either the human addressing the assistant ("you"/"your"), or the assistant
+ * speaking about itself ("I"/"my"), or the assistant's own name appearing. A
+ * sentence carrying none of those is about somebody else in the third person,
+ * and turning it into "I am ..." is the identity-planting failure this guards.
+ *
+ * Deliberately narrow: it only ever refuses subject=self, and only when the
+ * source offers no self-reference at all. It cannot misfire on a user-fact.
+ *
+ * @returns {{ok: boolean, reason?: string}}
+ */
+function verifyPersonPreserved(statement, subject, fact) {
+  if (subject !== 'self') return { ok: true };
+  const src = String(statement || '');
+  if (!src.trim()) return { ok: true };
+
+  const addressesAssistant = /\b(you|your|yours|you're|youre|yourself)\b/i.test(src);
+  const speakerFirstPerson = /\b(i|i'm|im|i've|i'll|i'd|my|me|myself|mine)\b/i.test(src);
+  if (addressesAssistant || speakerFirstPerson) return { ok: true };
+
+  // No pronouns either way. The one remaining licence is the entity's own name.
+  let own = null;
+  try { own = require('./identity-lock').lockedName(); } catch { /* none locked */ }
+  if (own && new RegExp(`\\b${own.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(src)) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    reason: `the statement is in the third person about someone else ("${src.slice(0, 80)}") but it was classified as a fact about me and written as "${String(fact).slice(0, 80)}"`
+  };
 }
 
 /**
@@ -323,6 +405,19 @@ async function write({ statement, context = '', conversationId = null, userMessa
   if (!decision) {
     log('error', 'classifier could not determine subject');
     return { ok: false, error: 'I could not work out whether that is a fact about you or about me, so I did not save it. Ask again and say which it is.' };
+  }
+
+  // A paraphrase that moved the fact onto a different person is refused before
+  // anything else looks at it — see verifyPersonPreserved.
+  const person = verifyPersonPreserved(statement.trim(), decision.subject, decision.fact);
+  if (!person.ok) {
+    log('error', `person not preserved: ${person.reason}`);
+    opsLog(`write_memory refused — intake tried to store a third-person statement as a fact about itself: ${person.reason}`);
+    return {
+      ok: false,
+      error: 'I did not save that. It is a statement about someone else, and the step that files it tried to store it as a fact about me — ' +
+             'which would have put a false claim about who I am into my memory. Say who it is about and I will file it there.'
+    };
   }
 
   const agree = verifySubjectAgreement(decision.subject, decision.fact);
@@ -494,6 +589,8 @@ module.exports = {
   checkCaps,
   capStatus,
   classifySubject,
+  verifyPersonPreserved,
+  shareContent,
   verifySubjectAgreement,
   findSupersession,
 };
