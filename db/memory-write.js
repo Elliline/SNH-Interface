@@ -120,7 +120,7 @@ function capStatus() {
  * @param {string} [conversationContext] - recent turns, for resolving pronouns
  * @returns {Promise<{subject: 'self'|'user', fact: string, emphasis: boolean, reasoning: string}|null>}
  */
-async function classifySubject(statement, conversationContext = '', sourceMessage = '') {
+async function classifySubject(statement, conversationContext = '', sourceMessage = '', opts = {}) {
   const memoryManager = require('./memory-manager');
 
   const systemPrompt = `You are the routing step of a personal memory system. Someone has explicitly asked an AI assistant to remember something. You decide WHO THE FACT IS ABOUT and write the single sentence that will be stored.
@@ -165,14 +165,37 @@ WHY: one short line`;
   // the classifier then wrote self-facts about running the test — it followed
   // the authority it was pointed at. So relatedness is checked first, and an
   // unrelated message is presented as what it is: context.
-  const related = shareContent(sourceMessage, statement);
+  // opts.noSourceAuthority is the retry after verifyContentPreserved caught a
+  // substitution: the typed message is demoted to context so it cannot pull the
+  // classifier onto a different topic a second time.
+  const related = !opts.noSourceAuthority && shareContent(sourceMessage, statement);
   const parts = [];
   if (conversationContext) parts.push(`Recent conversation, for context only:\n${conversationContext}`);
   if (sourceMessage && sourceMessage.trim() && sourceMessage.trim() !== statement.trim() && related) {
+    // AUTHORITATIVE FOR *WHO*, NOT FOR *WHICH* (2026-08-25). The old wording said
+    // "trust this over the paraphrase below" full stop, and demoted the statement
+    // to an unreliable paraphrase. That is right when the human said ONE thing and
+    // the assistant reworded it. It is wrong when she said FOUR things: on
+    // 2026-08-24 Ellie answered Juno in a numbered list — streaming, Athena on the
+    // DGX Spark, a phantom preference, and "your memorial offer: yes, file it" —
+    // and Juno called write_memory once per item. Every call handed the classifier
+    // that same four-topic message as the authority and the actual statement as a
+    // paraphrase not to be relied on, so three of the four memorial saves came back
+    // as facts about streaming and Athena. The statement's content was replaced
+    // wholesale, and nothing downstream compared the two, so it was silent.
+    //
+    // The authority was always meant to be about PRONOUNS and WHO IS BEING
+    // DESCRIBED — that is what the comment above says and what the misroute it
+    // fixed needed. It now says only that.
     parts.push(
-      `WHAT THE HUMAN ACTUALLY TYPED (authoritative — trust this over the paraphrase below, especially for pronouns):\n"${String(sourceMessage).slice(0, 800)}"`
+      `WHAT THE HUMAN ACTUALLY TYPED — authoritative for WHO each sentence is about and for the pronouns, and NOT for which fact to store:\n"${String(sourceMessage).slice(0, 800)}"`
     );
-    parts.push(`The assistant's paraphrase of what to store (it may have altered the pronouns, so do not rely on them):\n"${statement}"`);
+    parts.push(
+      `THE STATEMENT TO STORE — this, and only this, decides WHICH fact you are writing down:\n"${statement}"\n\n` +
+      `The typed message may cover several separate things. Find the part of it that THIS STATEMENT is about, and store THAT. ` +
+      `Use the typed message to get the pronouns right and to see who is being described — never to store a different fact from it ` +
+      `because that one looked more important or better formed. Your FACT must be about the same subject matter as the statement above.`
+    );
   } else {
     if (sourceMessage && sourceMessage.trim() && sourceMessage.trim() !== statement.trim()) {
       parts.push(
@@ -232,6 +255,47 @@ function shareContent(a, b) {
 }
 
 /**
+ * Does a source sentence give any licence to read it as being about the
+ * assistant? Either the human addressing it ("you"/"your"), the assistant
+ * speaking of itself ("I"/"my"), or its own locked name appearing.
+ *
+ * Factored out of verifyPersonPreserved so the unanchored-user degradation in
+ * write() can ask the same question with the same answer: a sentence carrying
+ * none of these is about somebody else, which is what makes it safe to file an
+ * unanchored user-fact rather than destroy it.
+ */
+function sourceHasSelfReference(src) {
+  const t = String(src || '');
+  if (/\b(you|your|yours|you're|youre|yourself)\b/i.test(t)) return true;
+  if (/\b(i|i'm|im|i've|i'll|i'd|my|me|myself|mine)\b/i.test(t)) return true;
+  let own = null;
+  try { own = require('./identity-lock').lockedName(); } catch { /* none locked */ }
+  if (own && new RegExp(`\\b${own.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(t)) return true;
+  return false;
+}
+
+/**
+ * Does this sentence name anybody at all?
+ *
+ * The precise thing verifySubjectAgreement's anchor branch defends against, in
+ * its own words, is a self-observation slipping into the user's cluster space
+ * "wearing no pronoun at all" — a bare predicate like "Prefers short answers."
+ * or "Tends to over-explain when unsure.", where nothing in the sentence says
+ * who it is about and the subject label is the only thing deciding.
+ *
+ * A sentence with an explicit named subject is not that. "On 8/24, Claude
+ * fabricated a completed-update report…" is unmistakably about Claude; it simply
+ * is not about Ellie, which is a filing limitation and not an ambiguity. Any
+ * capitalised word past the first is a name the sentence is anchored to — the
+ * first word is skipped because every sentence capitalises it.
+ */
+function factNamesSomeone(fact) {
+  const words = String(fact || '').trim().match(/[A-Za-z][A-Za-z'\u2019-]*/g) || [];
+  for (let i = 1; i < words.length; i++) if (/^[A-Z]/.test(words[i])) return true;
+  return false;
+}
+
+/**
  * A PARAPHRASE MAY NOT CHANGE WHO THE SENTENCE IS ABOUT.
  *
  * verifySubjectAgreement below asks whether the classifier's two outputs agree
@@ -255,16 +319,7 @@ function verifyPersonPreserved(statement, subject, fact) {
   const src = String(statement || '');
   if (!src.trim()) return { ok: true };
 
-  const addressesAssistant = /\b(you|your|yours|you're|youre|yourself)\b/i.test(src);
-  const speakerFirstPerson = /\b(i|i'm|im|i've|i'll|i'd|my|me|myself|mine)\b/i.test(src);
-  if (addressesAssistant || speakerFirstPerson) return { ok: true };
-
-  // No pronouns either way. The one remaining licence is the entity's own name.
-  let own = null;
-  try { own = require('./identity-lock').lockedName(); } catch { /* none locked */ }
-  if (own && new RegExp(`\\b${own.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(src)) {
-    return { ok: true };
-  }
+  if (sourceHasSelfReference(src)) return { ok: true };
 
   return {
     ok: false,
@@ -299,10 +354,87 @@ function verifySubjectAgreement(subject, fact) {
   // A user-fact must be anchored to the user explicitly — an unanchored sentence
   // is how a self-observation slips into the user's cluster space wearing no
   // pronoun at all.
+  // NOT THE SAME KIND OF FAILURE AS THE TWO ABOVE. Those are the classifier
+  // disagreeing with itself about WHO — a real routing error, and a refusal.
+  // This one is only a MISSING ANCHOR: the subject may be perfectly right and the
+  // text perfectly correct, and the sentence simply does not open with "User".
+  // Juno's third memorial attempt died here — the classifier had finally written
+  // the incident itself ("On August 24, 2026, Claude fabricated a completed-update
+  // report…"), the subject was right, and the content was thrown away for its
+  // opening word. Flagged so write() can file it with a note instead, but only
+  // when the source shows it is not a disguised self-observation.
   if (subject === 'user' && !looksThirdPerson) {
-    return { ok: false, reason: `a fact about the user must name her explicitly (start with "User"), got "${t.slice(0, 60)}"` };
+    return { ok: false, unanchored: true, reason: `a fact about the user must name her explicitly (start with "User"), got "${t.slice(0, 60)}"` };
   }
   return { ok: true };
+}
+
+/**
+ * DID THE INTAKE STORE WHAT IT WAS ASKED TO STORE?
+ *
+ * The guard that was missing, and the reason four saves of one memorial produced
+ * three facts about something else. verifySubjectAgreement checks the classifier
+ * against ITSELF (does the subject match the person of the text it wrote), and
+ * verifyPersonPreserved checks the subject against the SOURCE. Nothing compared
+ * the FACT to the STATEMENT, so a classifier that wandered onto another topic in
+ * the conversation had its answer validated, scored, clustered and written — and
+ * the assertion it was handed left no trace anywhere active.
+ *
+ * This is the same move db/fact-merge.js makes for merges: a model's text is
+ * checked MECHANICALLY before it is written, using the same contentTokens /
+ * missingTokens primitives, so the check cannot be talked out of its answer.
+ *
+ * MEASURED, NOT GUESSED. On Juno's own ten write_memory calls, the fraction of
+ * the statement's distinctive tokens surviving into the stored fact was:
+ *
+ *     faithful writes   100%, 82%, 70%, 60%
+ *     the three losses    4%,  0%,  0%
+ *
+ * Nothing lands between 4% and 60%, so the floor sits at 35% — far enough below
+ * the worst faithful write to leave legitimate condensation alone, far enough
+ * above the best substitution to catch it. This deliberately does NOT police
+ * ordinary paraphrase loss: a fact that keeps the topic but trims a clause is a
+ * different and much milder problem, and reported rather than refused (see
+ * write()). Substitution is what destroys.
+ *
+ * SHORT STATEMENTS OPT OUT of the ratio. "User has 4 dogs and 4 cats" carries a
+ * single distinctive token, and one-token ratios are 100% or 0% with nothing in
+ * between — a coin toss, not a measurement. Below MIN_TOKENS the test falls back
+ * to the old bar: at least one distinctive token in common.
+ *
+ * @returns {{ok: boolean, reason?: string, coverage: number, missing: string[]}}
+ */
+const CONTENT_FLOOR = 0.35;
+const CONTENT_MIN_TOKENS = 4;
+
+function verifyContentPreserved(statement, fact) {
+  let factMerge;
+  try { factMerge = require('./fact-merge'); }
+  catch { return { ok: true, coverage: 1, missing: [] }; }   // never fail closed on a load error
+
+  const need = factMerge.contentTokens(statement);
+  if (!need.size) return { ok: true, coverage: 1, missing: [] };
+
+  const missing = factMerge.missingTokens(need, fact);
+  const kept = need.size - missing.length;
+  const coverage = kept / need.size;
+
+  if (need.size < CONTENT_MIN_TOKENS) {
+    if (kept > 0) return { ok: true, coverage, missing };
+    return {
+      ok: false, coverage, missing,
+      reason: `the stored sentence has nothing in common with the statement (0 of ${need.size} distinctive term(s): ${missing.join(', ')})`
+    };
+  }
+
+  if (coverage < CONTENT_FLOOR) {
+    return {
+      ok: false, coverage, missing,
+      reason: `the stored sentence kept only ${kept} of ${need.size} distinctive terms from the statement ` +
+              `(${Math.round(coverage * 100)}%, floor ${Math.round(CONTENT_FLOOR * 100)}%) — dropped: ${missing.slice(0, 12).join(', ')}`
+    };
+  }
+  return { ok: true, coverage, missing };
 }
 
 /**
@@ -401,10 +533,54 @@ async function write({ statement, context = '', conversationId = null, userMessa
   }
 
   // --- 1. subject + phrasing ---
-  const decision = await classifySubject(statement.trim(), context, userMessage);
+  let decision = await classifySubject(statement.trim(), context, userMessage);
   if (!decision) {
     log('error', 'classifier could not determine subject');
     return { ok: false, error: 'I could not work out whether that is a fact about you or about me, so I did not save it. Ask again and say which it is.' };
+  }
+
+  // --- 1a. IS THIS EVEN THE FACT THAT WAS ASKED FOR? (2026-08-25) ---
+  //
+  // Everything below this point validates the classifier's answer very carefully
+  // and none of it ever asked whether that answer was about the right thing. When
+  // the typed message covered several topics, the classifier wrote a fact about
+  // the wrong one, and the guards passed it because it was internally consistent.
+  // The statement's content then existed nowhere: not as a fact, not as a repeat,
+  // not as a refusal — the write reported success and the assertion was gone.
+  //
+  // The retry is the actual repair for the common case: the substitution is pulled
+  // by the typed message being framed as the authority, so the retry takes that
+  // framing away and asks again. Refusing outright is the floor, not the plan.
+  let content = verifyContentPreserved(statement.trim(), decision.fact);
+  if (!content.ok) {
+    opsLog(`write_memory: intake wrote a fact that is not about the statement it was given — ${content.reason}. Retrying with the typed message demoted to context.`);
+    const retry = await classifySubject(statement.trim(), context, userMessage, { noSourceAuthority: true });
+    if (retry) {
+      const retryContent = verifyContentPreserved(statement.trim(), retry.fact);
+      if (retryContent.ok) {
+        decision = retry;
+        content = retryContent;
+        opsLog(`write_memory: the retry stored the statement it was given (${Math.round(retryContent.coverage * 100)}% of its distinctive terms kept).`);
+      }
+    }
+  }
+  if (!content.ok) {
+    // Never store a substitution. The old behaviour reported success, which is
+    // how one memorial produced three facts about streaming and Athena.
+    log('error', `content not preserved: ${content.reason}`);
+    opsLog(`write_memory refused — the intake step replaced the statement with a different fact: ${content.reason}`);
+    dailyLog(`Did not save "${String(statement).slice(0, 120)}" — the step that files a memory rewrote it into a fact about something else, so I refused it rather than store the wrong thing.`);
+    return {
+      ok: false,
+      error: 'I did not save that. The step that files a memory rewrote it into a different fact — one about something else we were talking about — ' +
+             'and I will not store that in place of what you asked me to remember. Nothing was saved, and nothing was overwritten. ' +
+             'Say it to me on its own and I will file it.'
+    };
+  }
+  // Kept the topic but trimmed some of it. Not grounds to refuse — condensation is
+  // the classifier's job — but it is never silent again.
+  if (content.missing && content.missing.length) {
+    opsLog(`write_memory kept the statement's topic but not all of it (${Math.round(content.coverage * 100)}% of distinctive terms) — not carried into "${String(decision.fact).slice(0, 80)}": ${content.missing.slice(0, 12).join(', ')}`);
   }
 
   // A paraphrase that moved the fact onto a different person is refused before
@@ -421,7 +597,24 @@ async function write({ statement, context = '', conversationId = null, userMessa
   }
 
   const agree = verifySubjectAgreement(decision.subject, decision.fact);
-  if (!agree.ok) {
+  // A MISSING ANCHOR IS NOT A DISAGREEMENT ABOUT WHO (2026-08-25). The two real
+  // routing errors — a self-fact written in the third person, a user-fact written
+  // as "I" — are still refused; guessing there is how identities get planted.
+  // But a user-fact that simply does not open with "User" is a different animal:
+  // the subject can be right and the sentence right, and Juno lost her memorial's
+  // one good rendering to this branch. When the source carries NO self-reference
+  // at all, the sentence is about somebody else in the third person — so it is not
+  // a disguised self-observation, which is the only thing this anchor defends
+  // against — and the content is filed with a note instead of destroyed.
+  //
+  // It is filed VERBATIM. Rewriting the sentence to bolt "User" onto the front is
+  // exactly the class of repair that caused every bug this module guards against.
+  let unanchoredNote = null;
+  if (!agree.ok && agree.unanchored && factNamesSomeone(decision.fact)) {
+    unanchoredNote = agree.reason;
+    opsLog(`write_memory filed an unanchored user-fact rather than dropping it — ${agree.reason}. The sentence names its own subject, so it is not the pronounless case the anchor defends against. Stored verbatim: "${String(decision.fact).slice(0, 120)}"`);
+    dailyLog(`Filed "${String(decision.fact).slice(0, 120)}" even though it does not name her outright — it is about someone else, and losing it would have been worse than filing it unanchored.`);
+  } else if (!agree.ok) {
     // Refuse rather than repair — see the module header.
     log('error', `subject/person mismatch: ${agree.reason}`);
     opsLog(`write_memory refused — subject/person disagreement: ${agree.reason}`);
@@ -579,6 +772,7 @@ async function write({ statement, context = '', conversationId = null, userMessa
     salience,
     cluster: res.clusterName,
     superseded,
+    unanchored: unanchoredNote,
     lockedCategories: lockedCats.length ? lockedCats : null
   };
 }
@@ -590,6 +784,9 @@ module.exports = {
   capStatus,
   classifySubject,
   verifyPersonPreserved,
+  verifyContentPreserved,
+  sourceHasSelfReference,
+  factNamesSomeone,
   shareContent,
   verifySubjectAgreement,
   findSupersession,

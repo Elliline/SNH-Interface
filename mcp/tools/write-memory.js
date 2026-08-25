@@ -145,12 +145,19 @@ class WriteMemoryTool {
       about,
       salience: result.salience,
       replaced: result.superseded || null,
+      // Filed even though the sentence does not name Ellie outright. She is told,
+      // because a fact quietly sitting under the wrong subject is the thing she
+      // asked to be able to see — and because losing it instead was the bug.
+      filed_without_user_anchor: result.unanchored || null,
       locked: result.lockedCategories || null,
       message: (result.carriedOver
         ? `Saved to long-term memory as a fact about ${about}. It replaced what you held before ("${result.superseded}"), and rather than dropping that fact's other details they were carried into this one, which now reads: "${result.carriedOver}". Tell her you have updated it, what it replaced, and that nothing from the old one was lost.`
         : result.superseded
         ? `Saved to long-term memory as a fact about ${about}, replacing what you held before: "${result.superseded}". Tell her you have updated it, and say what it replaced.`
         : `Saved to long-term memory as a fact about ${about}. It is stored now, not pending — you can say so plainly.`)
+        + (result.unanchored
+          ? ` One thing to say plainly: this sentence does not name her outright — it is about someone or something else — so it is filed under her as the only subject available, not because it is a fact about her. It is stored and searchable; the filing is the limitation, and it was better than losing it.`
+          : '')
         + (result.lockedCategories
           ? ` This set your ${result.lockedCategories.join(' and ')} for the first time, so it is now LOCKED — say that too: it can't be changed from a conversation any more, only through the Self tab or the identity-lock script.`
           : '')
