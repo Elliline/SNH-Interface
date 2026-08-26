@@ -162,6 +162,10 @@ function foldSystemMessages(messages) {
 // joins the reply, is never embedded, and is never stored as what SNH said.
 const { extractReasoning } = require('./db/reasoning-channel');
 
+// An engine that returns nothing has not answered. What that looks like, what
+// to say when a retry does not fix it, and why there is exactly one retry.
+const emptyReplyRetry = require('./db/empty-reply-retry');
+
 /**
  * Generation budgets for one provider request.
  *
@@ -2847,6 +2851,15 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     let answeredInRound = false;
     let streamedContent = '';
     let streamedReasoning = '';
+    // HOW TO ASK ONE MORE TIME, if the turn comes back empty. Each provider
+    // branch that can be retried fills this in with a self-contained request —
+    // the same generation the turn already tried, minus the tools, because a
+    // turn that reached the empty check has already declined to call any and a
+    // retry that came back with a tool call would have nowhere to put it.
+    // Left null by a provider we cannot re-ask, and the empty check then does
+    // what it did before this existed: send the honest sentence.
+    // See db/empty-reply-retry.js for what this is for and why it is one retry.
+    let retryRequest = null;
     // Sources (title+url) the model drew from during the tool loop, in [S#] order.
     // Populated by both provider loops, persisted with the assistant message so a
     // later "cite your sources" reads retained links instead of reconstructing them.
@@ -3086,14 +3099,20 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         }
       }
 
+      const ollamaFinalBody = {
+        model,
+        messages: prepareOutboundMessages(ollamaMessages, 'ollama final'),
+        stream: true
+      };
+      // Same messages, same model — the retry re-asks the question, it does not
+      // change it. No tools key here: Ollama's /api/chat was called without one
+      // on this path anyway.
+      retryRequest = { url: `${host}/api/chat`, openAiStyle: false, body: ollamaFinalBody };
+
       response = await fetch(`${host}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: prepareOutboundMessages(ollamaMessages, 'ollama final'),
-          stream: true
-        }),
+        body: JSON.stringify(ollamaFinalBody),
         signal: streamAbort.signal
       });
     } else if (providerType === 'claude') {
@@ -3487,6 +3506,17 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
         messages: prepareOutboundMessages(llamacppMessages, `${providerLabel} final`),
         ...generationParams(providerType)
       };
+      // Captured BEFORE the tools key goes on, and from a copy: the retry wants
+      // the same prompt and the same generation budget, without the tools. This
+      // is the request that produced the empty turn, so re-issuing it is exactly
+      // what Ellie did by hand — the engine samples, and a resend lands
+      // differently. See db/empty-reply-retry.js.
+      retryRequest = {
+        url: `${llamacppHost}/v1/chat/completions`,
+        openAiStyle: true,
+        body: { ...finalBody }
+      };
+
       if (toolsUsed) {
         finalBody.tools = mcpClient.getToolsForOpenAI();
       }
@@ -3968,13 +3998,84 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       //
       // thinking_token_budget makes this rare rather than impossible, so the
       // honest sentence stays. An empty message reads as answered.
-      if (!fullResponse.trim() && fullReasoning.trim()) {
-        const msg = 'I thought about that but never actually wrote an answer — my reasoning ran to the end of its budget without producing a reply. Ask me again and I should get there.';
-        console.warn(`[Chat] reply was ${fullReasoning.length} chars of reasoning and no answer — sending the honest note instead`);
-        fullResponse = msg;
-        res.write(contentType === 'text/event-stream'
-          ? `data: ${JSON.stringify({ choices: [{ delta: { content: msg } }] })}\n\n`
-          : `${JSON.stringify({ message: { content: msg } })}\n`);
+      // AND THE OTHER HALF: IT NEVER SPOKE AT ALL. Measured 2026-08-26, twice in
+      // forty minutes — `finish_reason: stop`, zero content AND zero reasoning,
+      // vLLM's own counter at 0.1 tokens/s against a full prefill. That misses
+      // the `fullReasoning` condition the guard above was written with, so it
+      // fell through both this branch and the truthiness-guarded save below:
+      // blank bubble, no stored message, no log line. Ellie fixed it by hand
+      // both times by sending the same message again. That is now automatic.
+      //
+      // ONE RETRY, THEN THE TURN SURFACES. See db/empty-reply-retry.js for why
+      // one and not more. Everything is logged either way — the rescues too,
+      // because a silent recovery is how a regression stops being measurable.
+      const emptyKind = emptyReplyRetry.classifyEmptyReply(fullResponse, fullReasoning);
+      if (emptyKind) {
+        const before = `${fullResponse.length} chars of answer, ${fullReasoning.length} of reasoning`;
+        console.warn(`[Chat] EMPTY REPLY (${emptyKind}) on convo ${convoId} — ${before}; retrying once`);
+
+        let rescued = false;
+        let failure = 'no retry request was available for this provider';
+
+        if (retryRequest) {
+          try {
+            const rt = chatTimeouts();
+            const retryData = await memoryManager.streamChat({
+              url: retryRequest.url,
+              openAiStyle: retryRequest.openAiStyle,
+              body: retryRequest.body,
+              firstTokenMs: rt.firstTokenMs,
+              stallMs: rt.stallMs,
+              label: `${providerType} empty-reply retry`,
+              abortSignal: streamAbort.signal
+            });
+            // NOT RELAYED FRAME BY FRAME. The retry's whole point is that the
+            // first attempt put nothing on the wire, so there is nothing to
+            // continue from and no partial text to keep consistent. Taking the
+            // finished string and writing it once is the same bytes to the
+            // browser with none of the wire-shape translation a second relay
+            // path would need for two content types.
+            const retried = emptyReplyRetry.replyFromStreamResult(retryData);
+            const stillEmpty = emptyReplyRetry.classifyEmptyReply(retried.content, retried.reasoning);
+            if (stillEmpty) {
+              failure = `the retry was also empty (${stillEmpty}: ${retried.content.length} chars of answer, ${retried.reasoning.length} of reasoning)`;
+            } else {
+              const text = stripToolArtifacts(retried.content).text.trim()
+                || retried.content;
+              fullResponse = text;
+              fullReasoning = retried.reasoning || fullReasoning;
+              rescued = true;
+              res.write(contentType === 'text/event-stream'
+                ? `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+                : `${JSON.stringify({ message: { content: text } })}\n`);
+              console.warn(`[Chat] EMPTY REPLY RESCUED on convo ${convoId} — the retry answered in ${text.length} chars`);
+            }
+          } catch (retryErr) {
+            // A failed retry must not take out the turn. It falls through to the
+            // honest sentence, which is strictly better than the 502 an escaped
+            // throw would turn this into.
+            failure = `the retry call failed: ${retryErr.message}`;
+          }
+        }
+
+        if (!rescued) {
+          const msg = emptyReplyRetry.noteForEmptyReply(emptyKind);
+          console.error(`[Chat] EMPTY REPLY NOT RECOVERED (${emptyKind}) on convo ${convoId} — ${failure}; sending the honest note instead`);
+          fullResponse = msg;
+          res.write(contentType === 'text/event-stream'
+            ? `data: ${JSON.stringify({ choices: [{ delta: { content: msg } }] })}\n\n`
+            : `${JSON.stringify({ message: { content: msg } })}\n`);
+        }
+
+        // MEASURABLE, NOT JUST VISIBLE. The journal rotates; the ops log is what
+        // gets read when someone asks "how often does this happen".
+        try {
+          factExtractor.appendToOpsLog(
+            `EMPTY REPLY (${emptyKind}) on conversation ${convoId} — ${before}. `
+            + (rescued ? 'One retry rescued it.' : `One retry did not rescue it: ${failure}.`),
+            db.getOpsDir()
+          );
+        } catch { /* console is the floor */ }
       }
 
       if (fullReasoning) {
