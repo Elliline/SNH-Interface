@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig, getProviderInstance } = require('./config');
-const { getCurrentDateTimeString, formatFactTimestamp, getLocalDateStamp } = require('./datetime');
+const { getCurrentDateTimeString, formatFactTimestamp, getLocalDateStamp, formatLogClock } = require('./datetime');
 const agentPool = require('./agent-pool');
 
 const MEMORY_DIR = require('./database').getMemoryDir();
@@ -636,7 +636,7 @@ function appendToDailyLog(summary, dailyDir, dateStamp = null) {
     // never happened. Live intake passes nothing and gets today, as before.
     const now = new Date();
     const date = dateStamp || getLocalDateStamp(now); // local Pacific YYYY-MM-DD
-    const time = now.toTimeString().slice(0, 5); // HH:MM
+    const time = formatLogClock(now);
 
     const entry = `### ${time}\n- ${summary}\n\n`;
     const dailyFile = prependDailyEntry(entry, dailyDir, date);
@@ -663,7 +663,7 @@ function appendToOpsLog(summary, opsDir) {
     }
     const now = new Date();
     const date = getLocalDateStamp(now);
-    const time = now.toTimeString().slice(0, 5);
+    const time = formatLogClock(now);
     const entry = `### ${time}\n- ${summary}\n\n`;
     prependDailyEntry(entry, opsDir, date, 'Ops Log');
   } catch (error) {

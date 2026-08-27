@@ -36,6 +36,7 @@ const identity = require('../db/identity');
 const initiatives = require('../db/initiatives');
 const { getConfig, getProviderInstance } = require('../db/config');
 
+const { toUtcDate } = require('../db/datetime');
 const MEMORY_DIR = require('../db/database').getMemoryDir();
 
 // ============ Validation Helpers ============
@@ -1091,10 +1092,13 @@ router.get('/thinking', (req, res) => {
     const traces = initiatives.listFollowupTraces({ limit: 80 });
     const heartbeats = memoryManager.getHeartbeatReports(80);
 
+    // Sorting/fusing, not display — but it needs the SAME parse, because getting
+    // it wrong here would fuse the wrong reflection with the wrong trace. This
+    // was the fifth place in the codebase to have independently re-derived
+    // `iso.replace(' ','T') + 'Z'`; that is what db/datetime.js exists to stop.
     const ms = (iso) => {
-      if (!iso) return 0;
-      const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-      return isNaN(d.getTime()) ? 0 : d.getTime();
+      const d = toUtcDate(iso);
+      return d ? d.getTime() : 0;
     };
     const FUSE_WINDOW = 5 * 60 * 1000; // reflection + its follow-up trace share a cycle
 

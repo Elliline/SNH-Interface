@@ -327,11 +327,17 @@ function callRoute(method, routePath, body) {
   const escapeHtml = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   const ui = {};
-  new Function('escapeHtml', [
+  // The display-time layer is lifted alongside them, because renderSecretField
+  // stamps "saved <when>" through it now (2026-08-27). Lifting it rather than
+  // stubbing it keeps the promise this block is written on: what runs here is
+  // what ships, including the timezone conversion.
+  new Function('escapeHtml', 'INSTANCE_TZ', [
+    liftFn('toUtcDate'), liftFn('formatLocalTime'),
     liftFn('renderToolRow'), liftFn('renderToolField'),
     liftFn('renderSearchProviders'), liftFn('renderSecretField'),
-    'this.renderToolRow = renderToolRow; this.renderSearchProviders = renderSearchProviders;'
-  ].join('\n')).call(ui, escapeHtml);
+    'this.renderToolRow = renderToolRow; this.renderSearchProviders = renderSearchProviders;',
+    'this.formatLocalTime = formatLocalTime;'
+  ].join('\n')).call(ui, escapeHtml, 'America/Los_Angeles');
 
   // A key IS set for this stretch, which is the case that could leak one.
   callRoute('put', '/secrets', { secrets: { EXA_API_KEY: 'render-check-key-zzz999' } });

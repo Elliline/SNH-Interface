@@ -26,7 +26,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config');
-const { getLocalDateStamp } = require('./datetime');
+const { getLocalDateStamp, formatLogClock } = require('./datetime');
 
 // Background-pass telemetry is operational, not cognitive, so it goes to the
 // ops log (Thinking tab) rather than the daily log that gets injected into chat.
@@ -297,7 +297,7 @@ class AgentPool {
       if (!fs.existsSync(OPS_DIR)) fs.mkdirSync(OPS_DIR, { recursive: true });
       const now = new Date();
       const date = getLocalDateStamp(now); // local Pacific date
-      const time = now.toTimeString().slice(0, 5);
+      const time = formatLogClock(now);
       const opsFile = path.join(OPS_DIR, `${date}.md`);
       const header = `# Ops Log - ${date}\n\n`;
       const entry = `### ${time}\n- ${summary}\n\n`;

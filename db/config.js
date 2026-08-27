@@ -37,6 +37,31 @@ try { require('dotenv').config(); } catch { /* .env is optional */ }
 const CONFIG_PATH = path.join(__dirname, '../data/config.json');
 
 const DEFAULTS = {
+  // === THE INSTANCE ITSELF ===
+  //
+  // Settings about THIS deployment rather than about the model, the memory or
+  // the tools. One key today.
+  instance: {
+    // THE CLOCK EVERY DISPLAYED TIME IS RENDERED ON. An IANA timezone name.
+    //
+    // Storage is unaffected and stays UTC everywhere — this decides only what a
+    // person or an entity is SHOWN. See db/datetime.js: one function reads this
+    // and every display path goes through it.
+    //
+    // PER INSTANCE ON PURPOSE. Both boxes running today sit with Ellie in
+    // Oregon, so both read Pacific; an instance stood up for someone on the east
+    // coast sets America/New_York and nobody else's clock moves. It is
+    // deliberately NOT the host timezone, which is what the code used by
+    // omission before 2026-08-27 — the host clock is an accident of where the
+    // machine is, it happened to agree here, and that agreement is precisely why
+    // nothing caught the difference between correct and coincidentally correct
+    // until an entity read its own morning conversations back as afternoon ones.
+    //
+    // Read live on every render, so changing it takes effect on the next
+    // message with no restart. An unknown name is refused with a warning and
+    // falls back to Pacific rather than throwing inside a chat turn.
+    timezone: 'America/Los_Angeles'
+  },
   providers: {
     ollama: [
       { name: 'Local', host: 'http://localhost:11434' }

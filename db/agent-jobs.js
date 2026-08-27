@@ -54,6 +54,7 @@ const { randomUUID } = require('crypto');
 const path = require('path');
 const { getSqliteDb, getDataDir } = require('./database');
 const agentPool = require('./agent-pool');
+const { formatLocalTime } = require('./datetime');
 
 // Read through the module object rather than destructuring at load time, so the
 // config seen here is always the one the process currently holds — and so a test
@@ -481,7 +482,7 @@ function systemPrompt(job, tools) {
     `You are Aurelius, running one of your own background jobs. Nobody is in the room. This is not a ` +
     `conversation — it is a job you started during one and then let go of, and what you write goes to ` +
     `Ellie's jobs panel, where she will read it when she is ready.\n\n` +
-    `It is ${now.toLocaleString()}.\n\n` +
+    `It is ${formatLocalTime(now, { style: 'full' })}.\n\n` +
     `THE JOB, as you set it when you handed it off:\n"${job.task}"\n` +
     (job.why ? `Why you handed it off: "${job.why}"\n` : '') +
     `\n` +
@@ -1355,7 +1356,7 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
   const rest = items.filter(i => i.kind !== 'history');
 
   const lateLines = late.map(it => {
-    const when = it.finished_at ? new Date(it.finished_at).toLocaleString() : 'recently';
+    const when = formatLocalTime(it.finished_at, { fallback: 'recently' });
     const body = String(it.text || '').trim() ||
       `It produced nothing. What went wrong: ${it.error || 'unrecorded'}.`;
     return `--- Your question, asked ${when}: "${it.question || it.title}"\n${body}`;
@@ -1375,7 +1376,7 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
   const kept = [...late];
   let used = estTokens(header + footer + lateBlock);
   for (const it of rest) {
-    const when = it.finished_at ? new Date(it.finished_at).toLocaleString() : 'recently';
+    const when = formatLocalTime(it.finished_at, { fallback: 'recently' });
     // WHAT HE IS TOLD MATCHES WHAT IS ON THE CARD. Before `partial` existed this
     // read "status is ok, or it produced nothing" — so a run that wrote up half
     // an answer was announced to him as having produced nothing, and he had no

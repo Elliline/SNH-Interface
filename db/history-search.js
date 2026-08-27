@@ -78,6 +78,7 @@
  */
 
 const { getSqliteDb } = require('./database');
+const { formatLocalTime } = require('./datetime');
 
 // Read config through the module object, not destructured at load — the rule
 // db/agent-jobs.js follows, for the same two reasons: the process's current
@@ -256,7 +257,10 @@ function find({ query, limit } = {}) {
         conversation_id: r.conversation_id,
         conversation_title: squash(r.conversation_title) || '(untitled)',
         role: r.role,
-        timestamp: r.timestamp,
+        // The run READS these, so they are on the instance's clock like
+        // everything else it is shown. Handing the agent UTC and the digest
+        // local time would give one lookup two clocks.
+        timestamp: formatLocalTime(r.timestamp, { fallback: r.timestamp }),
         // Whitespace-squashed, exactly as verifyQuote squashes the stored
         // content before comparing — so text copied from here verifies.
         text: whole ? squash(r.content) : squash(r.snippet),
@@ -319,7 +323,7 @@ function readAround({ message_id, before, after } = {}) {
     messages: rows.map(r => ({
       message_id: r.id,
       role: r.role,
-      timestamp: r.timestamp,
+      timestamp: formatLocalTime(r.timestamp, { fallback: r.timestamp }),
       is_hit: r.id === anchorId,
       text: clip(r.content, c.messageChars),
       truncated: String(r.content || '').length > c.messageChars
@@ -466,7 +470,17 @@ function parseRunOutput(text) {
 // ---------------------------------------------------------------------------
 
 function refLine(n, ref) {
-  const when = String(ref.timestamp || '').replace('T', ' ').replace(/\.\d+Z?$/, '');
+  // THE LINE THE WHOLE TIMEZONE LAYER CAME OUT OF (2026-08-27).
+  //
+  // This used to hand the stored value straight through with the 'T' swapped
+  // for a space, which printed raw UTC: Athena read a morning's conversations
+  // back as "1:09 PM" to "1:24 PM" and knew they had happened at breakfast.
+  //
+  // Note what it is NOT doing now, either: `new Date(ts).toLocaleString()` would
+  // still be wrong here, because messages.timestamp is SQLite's
+  // CURRENT_TIMESTAMP — UTC with no marker, which V8 reads as local. That is
+  // what formatLocalTime is for; see db/datetime.js.
+  const when = formatLocalTime(ref.timestamp, { fallback: 'time unknown' });
   return `[${n}] ${clip(ref.conversation_title, 60)} · conv ${ref.conversation_id.slice(0, 8)}` +
     ` · ${ref.role} at ${when} · msg ${ref.message_id.slice(0, 8)}`;
 }

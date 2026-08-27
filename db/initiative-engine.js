@@ -22,6 +22,7 @@ const path = require('path');
 
 const DAILY_DIR = require('./database').getDailyDir();
 
+const { instanceTimezone } = require('./datetime');
 /**
  * Ops-log handle. Resolved per call rather than at module load, because
  * SNH_DATA_DIR redirects a PROCESS and a value captured at require() time would
@@ -727,17 +728,23 @@ async function prioritize() {
 
 // ============ 3. Unprompted delivery ============
 
-/** Current local Pacific hour (0–23). */
-function pacificHour() {
+/**
+ * Current hour (0–23) on the INSTANCE's clock.
+ *
+ * Quiet hours are about when the person is asleep, so they have to run on that
+ * person's clock rather than a pinned Pacific one — otherwise an east-coast
+ * instance goes quiet at 9pm Pacific, which is midnight where they are.
+ */
+function localHour() {
   const s = new Date().toLocaleString('en-US', {
-    timeZone: 'America/Los_Angeles', hour: '2-digit', hour12: false
+    timeZone: instanceTimezone(), hour: '2-digit', hour12: false
   });
   return parseInt(s, 10) % 24;
 }
 
 /** Whether we are currently inside quiet hours. */
 function inQuietHours(cfg) {
-  const h = pacificHour();
+  const h = localHour();
   const { start, end } = cfg.quietHours || { start: 22, end: 8 };
   return start <= end ? (h >= start && h < end) : (h >= start || h < end);
 }
@@ -896,6 +903,9 @@ module.exports = {
   deliverUnprompted,
   startDiscussion,
   inQuietHours,
-  pacificHour,
+  localHour,
+  // Kept as an alias: the name was accurate only while the clock was pinned to
+  // Pacific. Anything still calling it gets the instance clock.
+  pacificHour: localHour,
   initiativeConfig
 };

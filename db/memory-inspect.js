@@ -538,7 +538,9 @@ function get(args = {}) {
     claim_type: row.claim_type || null,
     locked: !!row.locked,
     lock_category: row.lock_category || null,
-    learned: row.created_at ? formatFactTimestamp(new Date(row.created_at)) : null,
+    // The raw stored value, NOT new Date(...) — pre-parsing here would strip
+    // the layer of its chance to read an unmarked timestamp as UTC.
+    learned: formatFactTimestamp(row.created_at),
     learned_iso: row.created_at || null,
     updated_iso: row.updated_at || null,
     source: row.source || null,

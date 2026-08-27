@@ -37,6 +37,7 @@ const path = require('path');
 const md = require('./markdown');
 const { getDataDir } = require('./database');
 
+const { formatLocalTime } = require('./datetime');
 function getConfig() { return require('./config').getConfig(); }
 
 /** The documents settings, with the defaults spelled out for a config that predates them. */
@@ -288,9 +289,7 @@ function formatAsText(source, { title, task, date = new Date(), note = '' } = {}
     out.push(String(title));
     out.push('='.repeat(Math.min(78, String(title).length)));
   }
-  out.push(date.toLocaleString('en-US', {
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit'
-  }));
+  out.push(formatLocalTime(date, { style: 'full' }));
   if (task) { out.push(''); out.push(`The job: ${task}`); }
   out.push('');
 

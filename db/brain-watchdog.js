@@ -39,6 +39,7 @@ const path = require('path');
 const { getConfig } = require('./config');
 
 const OPS_DIR = require('./database').getOpsDir();
+const { formatLocalTime } = require('./datetime');
 const HOUR_MS = 60 * 60 * 1000;
 
 // ---- State (module-local; single brain, single watchdog) --------------------
@@ -152,8 +153,9 @@ function restartBrain(c) {
 async function queueRecoveryInitiative(wedgeAt, downMs) {
   try {
     const initiatives = require('./initiatives');
-    const when = new Date(wedgeAt);
-    const clock = when.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+    // Was pinned to America/Los_Angeles. It reads the instance clock now, so a
+    // box that is not in Oregon tells its own person the right time.
+    const clock = formatLocalTime(wedgeAt, { style: 'time', fallback: 'an unclear time' });
     const downMin = Math.max(1, Math.round(downMs / 60000));
     await initiatives.addInitiative({
       type: 'alert',

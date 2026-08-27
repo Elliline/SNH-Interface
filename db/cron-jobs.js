@@ -27,6 +27,7 @@ const { getSqliteDb } = require('./database');
 const { getConfig } = require('./config');
 
 const MEMORY_DIR = require('./database').getMemoryDir();
+const { formatLocalTime } = require('./datetime');
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
 const OPS_DIR = path.join(MEMORY_DIR, 'ops');
 
@@ -308,11 +309,11 @@ function approve(id, { note = null } = {}) {
   // of both: an approved-but-disabled job is recorded and NOT armed, and that
   // distinction is exactly the sort of thing this system has been wrong about.
   const when = armedFor
-    ? `first run ${new Date(armedFor).toLocaleString()}`
+    ? `first run ${formatLocalTime(armedFor)}`
     : (job.enabled ? 'NOT armed — its schedule could not be evaluated' : 'not armed — it was proposed as disabled');
   opsLog(`cron proposal APPROVED: "${job.description}" @ ${job.schedule} (job ${id.slice(0, 8)}) — ${when}`);
   dailyLog(armedFor
-    ? `Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}). It is scheduled now — the first run is ${new Date(armedFor).toLocaleString()}.`
+    ? `Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}). It is scheduled now — the first run is ${formatLocalTime(armedFor)}.`
     : `Ellie approved my proposed scheduled job: ${job.description} (${job.schedule}), but it is not armed: ${when}.`);
 
   return { ok: true, job: get(id), nextRunAt: armedFor };

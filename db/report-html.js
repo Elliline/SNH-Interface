@@ -38,6 +38,7 @@
 const md = require('./markdown');
 const charts = require('./charts');
 
+const { formatLocalTime } = require('./datetime');
 /**
  * Print CSS.
  *
@@ -221,10 +222,7 @@ function chartFence(lang, code) {
 
 /** A date a person would write, for the header and the running footer. */
 function stamp(date) {
-  return date.toLocaleString('en-US', {
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-    hour: 'numeric', minute: '2-digit'
-  });
+  return formatLocalTime(date, { style: 'full' });
 }
 
 /**

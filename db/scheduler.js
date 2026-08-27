@@ -51,6 +51,7 @@ const { getSqliteDb, getDataDir } = require('./database');
 const { getConfig } = require('./config');
 const cronEval = require('./cron-eval');
 
+const { formatLocalTime } = require('./datetime');
 /** Resolved per call from the PROCESS's data dir — never a module constant. */
 function memoryDir() { return path.join(getDataDir(), 'memory'); }
 function opsDir() { return path.join(memoryDir(), 'ops'); }
@@ -363,7 +364,7 @@ function systemPrompt(job, tools, lastRunAt) {
     `the period are genuinely empty.\n` +
     `If a tool result says it is capped, partial, or showing only the most recent few, say so rather than ` +
     `treating what you were given as all there is.\n\n` +
-    `Cover the period since ${lastRunAt ? `your last run of this job (${new Date(lastRunAt).toLocaleString()})` : 'roughly the last 24 hours (this is the first time this job has ever run)'}.\n\n` +
+    `Cover the period since ${lastRunAt ? `your last run of this job (${formatLocalTime(lastRunAt)})` : 'roughly the last 24 hours (this is the first time this job has ever run)'}.\n\n` +
     `Write for Ellie, in your own voice: a few plain sentences. No headings, no bullet lists unless they are ` +
     `genuinely the clearest form, no preamble like "here is your digest" — she knows what she is reading. ` +
     `If there is nothing worth reporting, one line saying so is the correct output.`
@@ -695,7 +696,7 @@ async function tick({ now = new Date() } = {}) {
         status: 'skipped', durationMs: 0, trigger: 'catchup',
         error: `missed by ${lateMin} min, past the ${c.catchupGraceMinutes} min catch-up window — not run, and not backfilled`
       });
-      const line = `Scheduled job "${job.description}" (${job.id.slice(0, 8)}) missed its ${new Date(scheduledFor).toLocaleString()} run by ${lateMin} min — past the ${c.catchupGraceMinutes} min catch-up window, so it was skipped rather than run late.`;
+      const line = `Scheduled job "${job.description}" (${job.id.slice(0, 8)}) missed its ${formatLocalTime(scheduledFor)} run by ${lateMin} min — past the ${c.catchupGraceMinutes} min catch-up window, so it was skipped rather than run late.`;
       console.warn(`[Scheduler] ${line}`);
       opsLog(line);
       armJob(job.id, { from: now, reason: 'after a skipped catch-up' });

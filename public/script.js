@@ -3,6 +3,92 @@
  * Neural-linked AI assistant with associative cluster memory and multi-provider support
  */
 
+// ============ Display time: the browser half of the timezone layer ============
+//
+// The server has db/datetime.js; this is the same contract for the surfaces that
+// render in the page. It exists for two reasons, and the second is the one that
+// bites.
+//
+// 1. THE CLOCK IS THE INSTANCE'S, NOT THE VIEWER'S. `toLocaleString()` with no
+//    timeZone renders in whatever timezone the browser is in. That agrees with
+//    the instance today because Ellie reads it from a machine in Oregon, but it
+//    is the same "coincidentally correct" the server side had: open the panel
+//    from a laptop in another timezone and every stored time silently shifts,
+//    while the digests the entity reads do not. One instance, one clock.
+//
+// 2. AN UNMARKED TIMESTAMP IS UTC. `messages.timestamp` and
+//    `conversations.updated_at` come from SQLite's CURRENT_TIMESTAMP as
+//    "2026-08-25 00:38:07" — UTC with nothing saying so, which the Date
+//    constructor reads as LOCAL. Four helpers in this file had already worked
+//    that out independently and each patched it in place with
+//    `iso.replace(' ','T') + 'Z'`; formatRelativeTime never got the memo, so
+//    every conversation in the sidebar read as seven hours in the future and
+//    therefore said "Just now" for most of the day. That is the whole argument
+//    for having one of these instead of six.
+let INSTANCE_TZ = null;
+
+async function loadInstanceTimezone() {
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    const tz = cfg && cfg.instance && cfg.instance.timezone;
+    if (tz) {
+      // Prove it before adopting it: an unknown name makes Intl throw, and a
+      // throw in a formatter blanks whatever was rendering.
+      new Intl.DateTimeFormat('en-US', { timeZone: tz }).format(new Date());
+      INSTANCE_TZ = tz;
+    }
+  } catch {
+    // Leave INSTANCE_TZ null — every formatter below falls back to the
+    // browser's own zone, which is what this page did before the layer existed.
+  }
+}
+
+/** Parse a stored instant, treating an unmarked timestamp as UTC. */
+function toUtcDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    const d = new Date(raw);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0), +(m[7] || 0)));
+  const dOnly = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dOnly) return new Date(Date.UTC(+dOnly[1], +dOnly[2] - 1, +dOnly[3], 12));
+  const f = new Date(raw);
+  return isNaN(f.getTime()) ? null : f;
+}
+
+/**
+ * Render a stored instant on the instance's clock.
+ * @param {string|Date} value
+ * @param {'datetime'|'date'|'time'} [style='datetime']
+ * @param {string} [fallback='']
+ */
+function formatLocalTime(value, style = 'datetime', fallback = '') {
+  const d = toUtcDate(value);
+  if (!d) return fallback;
+  const tz = INSTANCE_TZ || undefined;   // undefined = the browser's own zone
+  const dayOnly = typeof value === 'string' && /^\s*\d{4}-\d{2}-\d{2}\s*$/.test(value);
+  try {
+    if (style === 'date' || dayOnly) return d.toLocaleDateString('en-CA', { timeZone: tz });
+    const clock = d.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
+    const zone = INSTANCE_TZ
+      ? (new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+          .formatToParts(d).find(p => p.type === 'timeZoneName')?.value || '')
+      : '';
+    if (style === 'time') return zone ? `${clock} ${zone}` : clock;
+    const day = d.toLocaleDateString('en-CA', { timeZone: tz });
+    return `${day} ${clock}${zone ? ' ' + zone : ''}`;
+  } catch {
+    return fallback;
+  }
+}
+
 // DOM Elements
 const providerSelect = document.getElementById('providerSelect');
 const modelSelect = document.getElementById('modelSelect');
@@ -263,6 +349,9 @@ let sidebarCollapsed = false;
 
 // Initialize the app
 document.addEventListener('DOMContentLoaded', () => {
+  // Before anything renders a timestamp. It resolves fast and every formatter
+  // degrades to the browser's own zone until it lands, so nothing waits on it.
+  loadInstanceTimezone();
   loadProviders();
   loadConversations();
   setupEventListeners();
@@ -1753,6 +1842,43 @@ async function loadSettingsChatTab() {
     container.appendChild(section);
   }
 
+  // === This instance ===
+  //
+  // First in the tab because it is about the deployment rather than about a
+  // provider. One setting today: the clock every displayed time is rendered on.
+  const instSection = document.createElement('div');
+  instSection.className = 'settings-section';
+  // INSTANCE_TZ is loaded from /api/config at boot, so it is the value the page
+  // is actually formatting with — which is the one worth showing as current.
+  const currentTz = INSTANCE_TZ || 'America/Los_Angeles';
+  // The full IANA list where the browser exposes it; a short sensible list where
+  // it does not. Either way the CURRENT value is always present, so opening this
+  // page can never silently offer to change a setting it could not display.
+  let zones = [];
+  try { zones = Intl.supportedValuesOf('timeZone') || []; } catch { zones = []; }
+  if (!zones.length) {
+    zones = ['America/Los_Angeles', 'America/Denver', 'America/Phoenix', 'America/Chicago',
+             'America/New_York', 'America/Anchorage', 'Pacific/Honolulu', 'UTC'];
+  }
+  if (!zones.includes(currentTz)) zones.unshift(currentTz);
+  instSection.innerHTML = `
+    <h3>This Instance</h3>
+    <p class="settings-hint">Settings for this deployment, not for the model.</p>
+    <div class="setting-item">
+      <label for="settings-instanceTimezone">Timezone</label>
+      <select id="settings-instanceTimezone" data-config-key="instance.timezone">
+        ${zones.map(z => `<option value="${escapeHtml(z)}"${z === currentTz ? ' selected' : ''}>${escapeHtml(z)}</option>`).join('')}
+      </select>
+    </div>
+    <p class="settings-hint">
+      Every time shown to you or to the entity — chat, memory, digests, the jobs panel,
+      daily logs — is rendered on this clock, and so is its own sense of "now".
+      Stored data is always UTC and is not affected; changing this changes only what is displayed,
+      and it takes effect on the next thing rendered, with no restart.
+    </p>
+  `;
+  container.appendChild(instSection);
+
   // SquatchServe host (single instance, not converted to instance manager)
   const sqSection = document.createElement('div');
   sqSection.className = 'settings-section';
@@ -1882,6 +2008,10 @@ async function handleAddInstance(event, providerType, hasModel) {
       body: JSON.stringify(partial)
     });
     if (!saveRes.ok) throw new Error('Failed to save');
+
+    // The clock may have just changed. Re-read it before anything re-renders,
+    // or the page keeps formatting on the old zone until it is reloaded.
+    await loadInstanceTimezone();
 
     // Clear inputs
     nameInput.value = '';
@@ -3042,7 +3172,7 @@ function renderSecretField(secret) {
   } else if (st.source === 'env') {
     state = `<span class="secret-state secret-state-on">set in .env</span>`;
   } else if (st.set) {
-    state = `<span class="secret-state secret-state-on">saved${st.updatedAt ? ` ${escapeHtml(new Date(st.updatedAt).toLocaleString())}` : ''}</span>`;
+    state = `<span class="secret-state secret-state-on">saved${st.updatedAt ? ` ${escapeHtml(formatLocalTime(st.updatedAt))}` : ''}</span>`;
   } else {
     state = '<span class="secret-state secret-state-off">not set</span>';
   }
@@ -3461,7 +3591,12 @@ function renderConversationList() {
 function formatRelativeTime(dateString) {
   if (!dateString) return '';
 
-  const date = new Date(dateString);
+  // toUtcDate, NOT new Date(): conversations.updated_at is SQLite's unmarked
+  // CURRENT_TIMESTAMP, so the plain constructor read it as local and put every
+  // recent conversation seven hours in the FUTURE — which made diffMs negative
+  // and pinned the whole sidebar to "Just now" for most of the day.
+  const date = toUtcDate(dateString);
+  if (!date) return '';
   const now = new Date();
   const diffMs = now - date;
   const diffMins = Math.floor(diffMs / 60000);
@@ -3474,7 +3609,7 @@ function formatRelativeTime(dateString) {
   if (diffDays === 1) return 'Yesterday';
   if (diffDays < 7) return `${diffDays}d ago`;
 
-  return date.toLocaleDateString();
+  return formatLocalTime(date, 'date');
 }
 
 // Load a specific conversation by ID
@@ -3844,14 +3979,16 @@ function closeInitiativePanel() {
 
 // Compact local timestamp for initiatives, e.g. "7/5 6:42 AM".
 function formatInitiativeTime(iso) {
-  if (!iso) return '';
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-  if (isNaN(d.getTime())) return '';
-  let h = d.getHours();
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12 || 12;
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${d.getMonth() + 1}/${d.getDate()} ${h}:${mm} ${ampm}`;
+  const d = toUtcDate(iso);
+  if (!d) return '';
+  // Built from parts ON THE INSTANCE CLOCK rather than from d.getHours(), which
+  // is the browser's. Same reason as everywhere else in this file: the panel and
+  // the digests have to agree about what time something happened.
+  const tz = INSTANCE_TZ || undefined;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true
+  }).formatToParts(d).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+  return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute} ${parts.dayPeriod}`;
 }
 
 async function loadInitiativeList() {
@@ -4083,8 +4220,11 @@ function closeJobsPanel() {
 
 /** How long something has been going, for a job that has not finished. */
 function formatElapsed(startedIso) {
-  const started = new Date(startedIso.includes('T') ? startedIso : startedIso.replace(' ', 'T') + 'Z');
-  if (isNaN(started.getTime())) return '';
+  // A duration, so no timezone is involved — but the PARSE still has to be
+  // right, or an unmarked timestamp is read hours off and the elapsed time is
+  // nonsense (or negative).
+  const started = toUtcDate(startedIso);
+  if (!started) return '';
   const secs = Math.max(0, Math.round((Date.now() - started.getTime()) / 1000));
   if (secs < 90) return `${secs}s so far`;
   const mins = Math.floor(secs / 60);
@@ -4377,15 +4517,12 @@ function switchMemoryTab(name) {
 // them). Anything without run history says so rather than showing a blank.
 
 function fmtWhen(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  return formatLocalTime(iso, 'datetime', '—');
 }
 
 function fmtRelative(iso) {
-  if (!iso) return '';
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-  if (isNaN(d.getTime())) return '';
+  const d = toUtcDate(iso);
+  if (!d) return '';
   const diff = d.getTime() - Date.now();
   const abs = Math.abs(diff);
   const mins = Math.round(abs / 60000);
@@ -4878,11 +5015,7 @@ async function loadSelfTab() {
     const superseded = data.supersededSelfFacts || [];
     const reflections = data.reflections || [];
 
-    const fmtDate = (iso) => {
-      if (!iso) return '';
-      const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-      return isNaN(d.getTime()) ? '' : d.toLocaleString();
-    };
+    const fmtDate = (iso) => formatLocalTime(iso);
 
     let html = '';
 
@@ -5176,8 +5309,7 @@ async function loadToolCallSection() {
       'rejected-cap': '⛔', error: '⚠️'
     };
     const items = calls.map(c => {
-      const d = new Date((c.created_at || '').includes('T') ? c.created_at : (c.created_at || '').replace(' ', 'T') + 'Z');
-      const when = isNaN(d.getTime()) ? '' : d.toLocaleString();
+      const when = formatLocalTime(c.created_at);
       return `<div class="thinking-anomaly">${ICON[c.outcome] || '🔧'} <span class="thinking-dim">${escapeHtml(when)}</span> <strong>${escapeHtml(c.tool)}</strong> · ${escapeHtml(c.outcome)}${c.detail ? ` — ${escapeHtml(c.detail)}` : ''}</div>`;
     }).join('');
 
@@ -5231,11 +5363,7 @@ async function loadThinkingTab() {
   if (!container) return;
   container.innerHTML = '<div class="memory-loading">Loading thinking…</div>';
 
-  const fmtDate = (iso) => {
-    if (!iso) return '';
-    const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-    return isNaN(d.getTime()) ? '' : d.toLocaleString();
-  };
+  const fmtDate = (iso) => formatLocalTime(iso);
 
   try {
     const [res, opsHtml, toolHtml] = await Promise.all([
@@ -5432,9 +5560,7 @@ function mapRefit() {
 function mapEscape(s) { return escapeHtml(String(s == null ? '' : s)); }
 
 function mapFmtDate(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  return formatLocalTime(iso, 'datetime', '—');
 }
 
 async function loadMapTab() {
