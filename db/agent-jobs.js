@@ -720,7 +720,11 @@ async function runJob(id) {
       status: outcome.status,
       resultText: outcome.resultText,
       error: outcome.error || null,
-      toolCalls: outcome.toolCalls || 0
+      toolCalls: outcome.toolCalls || 0,
+      // budget_json carries the run's own timing/reasoning breakdown for this
+      // source. It was empty for every v1 run, which is why the first slow one
+      // had to be autopsied out of journalctl.
+      budget: outcome.metrics || null
     });
   }
 
@@ -1181,6 +1185,41 @@ function pendingAnnouncements({ limit = 3 } = {}) {
     artifact_kind: j.artifact_kind, artifact_name: j.artifact_name
   }));
 
+  // UNDELIVERED IN-TURN DIGESTS — the late-delivery path (v1.1).
+  //
+  // These are excluded from the block by `inTurnSql` above and re-admitted here
+  // on one condition: the answer was never delivered. A history_search that came
+  // back inside its wait stamped `delivered_at` and is done; one that outlived
+  // the wait left a complete, verified digest on a row nobody can reach, while
+  // the entity told Ellie she would report back. That happened on the first
+  // live run, and the digest is still sitting there.
+  //
+  // They ride the ANNOUNCEMENT channel rather than getting one of their own,
+  // and that is the deliberate choice among the three that were open. A
+  // system-injected turn would have the queue speak into a conversation, which
+  // is the exact boundary this file is built around (ROBOT, NOT BELL) — a
+  // finished job does not get to open its mouth. A bespoke next-turn injection
+  // would be a second mechanism doing what this one already does: hold a
+  // finished result until the next time she speaks, hand it to him once, stamp
+  // it, and never repeat it. This channel already has the stamping, the token
+  // cap, the "she has not seen this" framing and the rule that he relays it in
+  // his own words if it is worth saying. The only thing it needed was to know
+  // this kind is different — see renderAnnouncementBlock.
+  //
+  // `announced_at IS NULL` still gates it, so a digest is handed over exactly
+  // once whether or not he chooses to say it out loud.
+  const lateDigests = db.prepare(`
+    SELECT id, title, task, status, finished_at, result_text, error, duration_ms
+    FROM agent_jobs
+    WHERE announced_at IS NULL AND delivered_at IS NULL
+      AND status IN (${TERMINAL.map(() => '?').join(',')})
+      AND source IN (${IN_TURN_SOURCES.map(() => '?').join(',')})
+    ORDER BY datetime(finished_at) DESC LIMIT ?
+  `).all(...TERMINAL, ...IN_TURN_SOURCES, lim).map(j => ({
+    kind: 'history', id: j.id, title: j.title, question: j.task, status: j.status,
+    finished_at: j.finished_at, text: j.result_text, error: j.error, duration_ms: j.duration_ms
+  }));
+
   const RS2 = runResultStatuses();
   const runs = db.prepare(`
     SELECT r.id, r.status, r.finished_at, r.output_text, r.error, r.duration_ms,
@@ -1193,8 +1232,10 @@ function pendingAnnouncements({ limit = 3 } = {}) {
     finished_at: r.finished_at, text: r.output_text, error: r.error, duration_ms: r.duration_ms
   }));
 
-  return [...jobs, ...runs]
-    .sort((a, b) => new Date(b.finished_at || 0) - new Date(a.finished_at || 0))
+  // Late digests first, unconditionally. They are an answer he PROMISED her and
+  // could not give; a scheduled cluster audit can wait a turn.
+  return [...lateDigests, ...[...jobs, ...runs]
+    .sort((a, b) => new Date(b.finished_at || 0) - new Date(a.finished_at || 0))]
     .slice(0, lim);
 }
 
@@ -1302,10 +1343,38 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
     'If none of it matters to what she just said, let it go; they are already recorded and you are not ' +
     'obliged to report them. Do not claim a result you cannot see here.';
 
+  // A LATE DIGEST IS NOT "BACKGROUND WORK THAT FINISHED", and telling him it is
+  // would be wrong in both directions: the header above says it landed in her
+  // jobs panel (this did not — it is not in her panel at all) and that she has
+  // probably not read it (she has not, but more importantly she is WAITING for
+  // it, because he said he would come back to her). So this kind gets its own
+  // section, its own framing, and its own token allowance, and the digest goes
+  // in WHOLE — it is already capped at digestChars, and half of a set of quotes
+  // is not a smaller answer, it is a worse one.
+  const late = items.filter(i => i.kind === 'history');
+  const rest = items.filter(i => i.kind !== 'history');
+
+  const lateLines = late.map(it => {
+    const when = it.finished_at ? new Date(it.finished_at).toLocaleString() : 'recently';
+    const body = String(it.text || '').trim() ||
+      `It produced nothing. What went wrong: ${it.error || 'unrecorded'}.`;
+    return `--- Your question, asked ${when}: "${it.question || it.title}"\n${body}`;
+  });
+  const lateBlock = late.length
+    ? '=== The Lookup You Were Waiting On ===\n' +
+      'You called history_search earlier, it did not come back inside the turn, and you said you would ' +
+      'return to it. This is what it found. She has NOT seen any of this — it went nowhere except here.\n' +
+      'Tell her now, in your own words, and say which question it answers, because the conversation may ' +
+      'have moved on since you asked. The quoted lines are verified verbatim from her own messages and ' +
+      'yours; everything else is the lookup\'s framing. If it says nothing was found, tell her that — ' +
+      'do not fill it in.\n\n' +
+      lateLines.join('\n\n')
+    : '';
+
   const lines = [];
-  const kept = [];
-  let used = estTokens(header + footer);
-  for (const it of items) {
+  const kept = [...late];
+  let used = estTokens(header + footer + lateBlock);
+  for (const it of rest) {
     const when = it.finished_at ? new Date(it.finished_at).toLocaleString() : 'recently';
     // WHAT HE IS TOLD MATCHES WHAT IS ON THE CARD. Before `partial` existed this
     // read "status is ok, or it produced nothing" — so a run that wrote up half
@@ -1336,7 +1405,11 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
     used += t;
   }
 
-  const text = header + lines.join('\n') + footer;
+  // The ordinary block is only rendered when there is something ordinary to put
+  // in it — a late digest alone must not drag in a header about her jobs panel.
+  const ordinary = lines.length ? header + lines.join('\n') + footer : '';
+  const text = [lateBlock, ordinary].filter(Boolean).join('\n\n');
+  if (!text) return null;
   return { text, items: kept, tokens: estTokens(text) };
 }
 

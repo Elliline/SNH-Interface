@@ -118,9 +118,13 @@ db.prepare('INSERT INTO messages_fts (content, conversation_id, message_id) VALU
 let mode = 'good';
 let lastSession = null;
 let stubCalls = 0;
+let genCfgProbe = null;
+let lastMetrics = null;
+let releaseSlow = null;
 memoryManager.callLLM = async (systemPrompt, userPrompt, options = {}) => {
   stubCalls++;
   lastSession = options.toolSession || null;
+  genCfgProbe = options.thinkingTokens;
 
   // Exercise the real tools the way a run would, so the digest's own counters
   // ("read N messages from M hits") are measured rather than asserted.
@@ -131,6 +135,13 @@ memoryManager.callLLM = async (systemPrompt, userPrompt, options = {}) => {
     await client.executeTool('history_read', { message_id: found.hits[0].message_id }, { caller });
   }
 
+  // A run that outlives the wait. `waitMs` has a 5s floor in cfg(), so a late
+  // run cannot be faked with a tiny wait — it has to actually be slow.
+  if (mode === 'slow') {
+    await new Promise(res => { releaseSlow = res; });
+  }
+
+  const pick = mode === 'slow' ? 'good' : mode;
   const body = {
     good: () => JSON.stringify({
       found: true,
@@ -164,9 +175,11 @@ memoryManager.callLLM = async (systemPrompt, userPrompt, options = {}) => {
       })),
       gaps: ''
     })
-  }[mode]();
+  }[pick]();
 
-  return { content: body, toolCalls: [], budget: null, truncated: false, outOfRounds: false };
+  // The instrumentation runToolLoop now returns, so the metrics path is exercised.
+  return { content: body, toolCalls: [], budget: null, truncated: false, outOfRounds: false,
+           reasoningChars: 42, roundMs: [10, 20] };
 };
 
 // --- store snapshot, for the read-only claim ------------------------------
@@ -191,8 +204,30 @@ function storeHash() {
   return h.digest('hex');
 }
 
+/**
+ * Start a lookup that outlives the wait, then let it finish.
+ * Returns the still-running reply the caller actually got.
+ */
+async function runLate(conv, question = 'What did the script for Lincoln City Animal Clinic do?') {
+  mode = 'slow';
+  const reply = await historySearch.ask({ question, conversationId: conv });
+  if (releaseSlow) { releaseSlow(); releaseSlow = null; }
+  mode = 'good';
+  for (let i = 0; i < 100; i++) {
+    const row = db.prepare('SELECT finished_at FROM agent_jobs WHERE id = ?').get(reply.job_id);
+    if (row && row.finished_at) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return reply;
+}
+
 async function runOnce(question = 'What did the script for Lincoln City Animal Clinic do?') {
-  return historySearch.ask({ question, conversationId: convOther });
+  // A fresh conversation each time, so the v1.1 one-per-conversation rule does
+  // not make these reuse each other's runs.
+  const c = database.createConversation('probe', 'test-model');
+  const r = await historySearch.ask({ question, conversationId: c });
+  try { lastMetrics = JSON.parse(db.prepare('SELECT budget_json FROM agent_jobs WHERE id = ?').get(r.job_id || '').budget_json || 'null'); } catch { lastMetrics = null; }
+  return r;
 }
 
 (async () => {
@@ -338,8 +373,12 @@ async function runOnce(question = 'What did the script for Lincoln City Animal C
   console.log('\n9. The run writes nothing');
   {
     mode = 'good';
+    // The conversation is created BEFORE the snapshot on purpose: what is under
+    // test is whether the RUN writes, and the harness making a row to hang the
+    // question on is the harness, not the run.
+    const conv = database.createConversation('read-only probe', 'test-model');
     const before = storeHash();
-    const r = await runOnce();
+    const r = await historySearch.ask({ question: 'What did the script for Lincoln City Animal Clinic do?', conversationId: conv });
     const after = storeHash();
     check('a completed run leaves every store byte-identical', before === after,
       'something outside agent_jobs/tool_call_log changed during a read-only job');
@@ -423,6 +462,117 @@ async function runOnce(question = 'What did the script for Lincoln City Animal C
         quote: 'was a synthetic test fixture and the clinic does not exist'
       }).ok === false,
       'the prefix path bypassed the hidden filter');
+  }
+
+  console.log('\n13. v1.1 — a search hit carries enough text to quote from');
+  {
+    const r = historySearch.find({ query: 'Lincoln City Animal Clinic script' });
+    const hit = r.hits.find(h => h.message_id === mAsstA);
+    check('a short message comes back COMPLETE, not as a locator', hit && hit.complete === true);
+    check('…and its text is quotable as-is',
+      hit && historySearch.verifyQuote({ message_id: hit.message_id, quote: hit.text }).ok === true,
+      'text handed back by find did not verify against the store — a read would be forced for nothing');
+    check('…and it says so, so the run knows not to call history_read',
+      /no history_read needed/.test((hit && hit.quotable) || ''));
+
+    // A long message must NOT claim to be complete: an excerpt has elision in
+    // it, and a quote spanning an elision has to fail verification.
+    const longConv = database.createConversation('A long one', 'test-model');
+    const longId = database.addMessage(longConv, 'assistant',
+      'PREAMBLE '.repeat(60) + 'the Lincoln City Animal Clinic invoice reconciliation ran nightly. ' + 'TAIL '.repeat(60));
+    const r2 = historySearch.find({ query: 'invoice reconciliation nightly' });
+    const long = r2.hits.find(h => h.message_id === longId);
+    check('a long message is marked as an excerpt', long && long.complete === false);
+    check('…and is told to read before quoting', /Call history_read before quoting/.test((long && long.quotable) || ''));
+  }
+
+  console.log('\n14. v1.1 — the run gets its own small thinking budget');
+  {
+    const c = historySearch.cfg();
+    check('it does NOT inherit the agent-job thinking budget',
+      c.thinkingTokens === 128,
+      `got ${c.thinkingTokens} — v1 inherited generation.agentJobThinkingTokens, which is 16384 on this box`);
+    genCfgProbe = null;
+    mode = 'good';
+    await runOnce();
+    check('…and that is what is actually sent to the model',
+      genCfgProbe === 128, `callLLM was handed thinkingTokens=${genCfgProbe}`);
+    check('…and the run records where its time went',
+      lastMetrics && Number.isFinite(lastMetrics.totalMs) && Array.isArray(lastMetrics.roundMs),
+      JSON.stringify(lastMetrics));
+  }
+
+  console.log('\n15. v1.1 — a late digest is delivered, not orphaned');
+  {
+    const conv = database.createConversation('Late delivery', 'test-model');
+    const late = await runLate(conv);
+    check('the caller is told it is still running, with no result',
+      late.status === 'still-running' && !/polled their practice/.test(late.digest));
+    check('…and is told the answer is not lost', /IT IS NOT LOST/.test(late.digest));
+    check('…and is NOT told to just ask again blindly', !/offer to ask again/.test(late.digest));
+
+    const row = db.prepare('SELECT * FROM agent_jobs WHERE id = ?').get(late.job_id);
+    check('the run finished and wrote a real digest', row.status === 'ok' && /polled their practice/.test(row.result_text || ''));
+    check('…and is marked UNDELIVERED', row.delivered_at === null,
+      'a digest the caller never saw was marked as delivered');
+
+    const ann = agentJobs.pendingAnnouncements({ limit: 5 });
+    const mine = ann.find(a => a.id === late.job_id);
+    check('THE ORPHANED DIGEST IS NOW IN THE ANNOUNCEMENT QUEUE', !!mine,
+      'this is the v1 bug: a finished digest nobody can reach');
+    check('…carrying the question it answers', mine && /Lincoln City/.test(mine.question || ''));
+
+    const block = agentJobs.renderAnnouncementBlock({ limit: 5, tokenCap: 400 });
+    check('…and it renders with its own framing, not "landed in her jobs panel"',
+      /The Lookup You Were Waiting On/.test(block.text));
+    check('…with the digest whole, quotes included',
+      /polled their practice management system every fifteen minutes/.test(block.text));
+    check('…labelled as the answer to the earlier question, since the chat may have moved on',
+      /Your question, asked/.test(block.text) && /which question it answers/.test(block.text));
+    check('…and it is stamped once, so he is not told twice',
+      agentJobs.markAnnounced(block.items) >= 1 &&
+      !agentJobs.pendingAnnouncements({ limit: 5 }).some(a => a.id === late.job_id));
+  }
+
+  console.log('\n16. v1.1 — a repeat ask joins the lookup, never starts a second');
+  {
+    mode = 'good';
+    const conv = database.createConversation('No duplicates', 'test-model');
+    const before = db.prepare("SELECT COUNT(*) n FROM agent_jobs WHERE source=? AND conversation_id=?").get(historySearch.SOURCE, conv).n;
+
+    // First ask times out; its digest lands undelivered.
+    const first = await runLate(conv);
+
+    const second = await historySearch.ask({ question: 'Ask me again about that clinic script', conversationId: conv });
+    const after = db.prepare("SELECT COUNT(*) n FROM agent_jobs WHERE source=? AND conversation_id=?").get(historySearch.SOURCE, conv).n;
+
+    check('NO SECOND JOB WAS STARTED', after - before === 1, `${after - before} jobs for one conversation`);
+    check('…the finished digest was handed back instead', second.status === 'recovered' && second.reused === true);
+    check('…and it is the same job', second.job_id === first.job_id);
+    check('…with the real quotes in it', /polled their practice management system/.test(second.digest));
+    check('…labelled as the answer to the EARLIER question', /answers: "What did the script/.test(second.digest));
+    check('…and now marked delivered, so it will not also be announced',
+      db.prepare('SELECT delivered_at FROM agent_jobs WHERE id = ?').get(first.job_id).delivered_at !== null);
+    check('…so the announcement queue no longer holds it',
+      !agentJobs.pendingAnnouncements({ limit: 10 }).some(a => a.id === first.job_id));
+
+    // A different conversation is a different question and gets its own run.
+    const other = database.createConversation('Someone else asking', 'test-model');
+    const r3 = await historySearch.ask({ question: 'What did the script for Lincoln City Animal Clinic do?', conversationId: other });
+    check('a DIFFERENT conversation still gets its own lookup', r3.job_id !== first.job_id && !r3.reused);
+  }
+
+  console.log('\n17. v1.1 — a digest delivered inline is never announced');
+  {
+    mode = 'good';
+    const conv = database.createConversation('Delivered inline', 'test-model');
+    const r = await historySearch.ask({ question: 'What did the script for Lincoln City Animal Clinic do?', conversationId: conv });
+    check('it came back inside the wait', r.status === 'ok' && !!r.digest);
+    check('…stamped delivered immediately',
+      db.prepare('SELECT delivered_at FROM agent_jobs WHERE id = ?').get(r.job_id).delivered_at !== null);
+    check('…and never enters the announcement queue',
+      !agentJobs.pendingAnnouncements({ limit: 10 }).some(a => a.id === r.job_id),
+      'he would be told about a lookup he already read out to her');
   }
 
   console.log('\n12. The prompt itself carries the contract');

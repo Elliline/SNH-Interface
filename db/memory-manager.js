@@ -566,6 +566,22 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
   const convo = [...messages];
   const toolCalls = [];
 
+  // WHERE A RUN'S TIME ACTUALLY WENT — measured, not inferred.
+  //
+  // Added 2026-08-27, after a history_search run took 192s on a store of 103
+  // messages and nothing in the record could say why. The row kept a duration
+  // and a tool-call count; both were innocent (4 calls, and the SQLite behind
+  // them costs single-digit milliseconds). The cost was in the engine, spread
+  // across rounds, and invisible: this loop returned `content` and never told
+  // anyone how much of the wall clock had gone into reasoning nobody read.
+  //
+  // Purely additive — a count of characters and a list of round durations, on
+  // every return path. No caller has to read it, and the two that do (agent
+  // jobs, history search) write it into the row so the next person tuning a
+  // budget starts from a number rather than from a guess.
+  let reasoningChars = 0;
+  const roundMs = [];
+
   if (specs.length === 0) {
     session.exhaust('no allowed tools are registered');
   }
@@ -581,11 +597,14 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
     console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
                 `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
 
+    const roundStarted = Date.now();
     const data = await streamChat({
       url, body: roundBody, openAiStyle,
       firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
       label: `${session.stepName} round ${round + 1}`
     });
+    roundMs.push(Date.now() - roundStarted);
+    reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
 
     const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
     const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
@@ -598,7 +617,9 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
         provider: providerName,
         truncated: finishReason === 'length',
         toolCalls,
-        budget: session.summary()
+        budget: session.summary(),
+        reasoningChars,
+        roundMs
       };
     }
 
@@ -664,11 +685,14 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
     const lastBody = { ...body, messages: convo };
     delete lastBody.tools;
     {
+      const writeupStarted = Date.now();
       const data = await streamChat({
         url, body: lastBody, openAiStyle,
         firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
         label: `${session.stepName} writeup`
       });
+      roundMs.push(Date.now() - writeupStarted);
+      reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
       const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
       const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
       closeCircuit();
@@ -678,6 +702,8 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
         truncated: finishReason === 'length',
         toolCalls,
         budget: session.summary(),
+        reasoningChars,
+        roundMs,
         // The caller needs to know this was cut short even when the text reads
         // whole — a partial run reported as complete is the same lie in a nicer
         // shape.

@@ -1001,7 +1001,21 @@ function initDatabase() {
       ['artifact_name', 'TEXT', 'basename, for the card and the download'],
       ['artifact_bytes', 'INTEGER', 'size on disk'],
       ['artifact_error', 'TEXT', 'why there is no file, or why it was downgraded'],
-      ['summary_text', 'TEXT', 'the few lines the card shows instead of the document']
+      ['summary_text', 'TEXT', 'the few lines the card shows instead of the document'],
+      // WHEN THE ANSWER ACTUALLY REACHED THE CONVERSATION THAT ASKED FOR IT.
+      //
+      // Only in-turn sources set it (history_search today). A handed-off job has
+      // no equivalent question: it is delivered by being announced, and
+      // `announced_at` already records that. This is for the case that has two
+      // possible endings — the digest came back inside the wait and went
+      // straight into the turn, or it did not, and is owed to a later one.
+      //
+      // Null on a FINISHED in-turn job is the whole signal: it means a real
+      // answer exists that nobody has ever seen. v1 had no way to express that,
+      // so the first slow run's digest sat in this table, complete and correct,
+      // while the entity told Ellie she would come back to it and then could
+      // not. Everything in v1.1's late delivery hangs off this column.
+      ['delivered_at', 'DATETIME', 'when an in-turn digest reached the conversation that asked']
     ]) {
       if (!jobCols.some(c => c.name === col)) {
         sqliteDb.exec(`ALTER TABLE agent_jobs ADD COLUMN ${col} ${type}`);

@@ -1011,7 +1011,53 @@ const DEFAULTS = {
     //                reported rather than timed out.
     historySearch: {
       enabled: true,
-      maxHits: 12,             // FTS rows one history_find call may return
+      // === THE SPEED SETTINGS (v1.1, 2026-08-27) ===
+      //
+      // WHAT THE FIRST LIVE RUN COST AND WHERE IT WENT. Asked about Ellie's
+      // dogs against 103 messages, v1 took 192s live and 122s on a quiet clone
+      // — against a 90s wait. The SQLite behind it took 0.4ms per search and
+      // 0.1ms per read (20 of each: 8ms and 2ms). Every second of it was the
+      // engine, and 74% of the tokens it generated were REASONING nobody reads.
+      //
+      // The cause was inherited, not chosen: cfg() read
+      // generation.agentJobThinkingTokens, which this box sets to 16384. That
+      // is a sane number for a research job and an absurd one for a fetch-and-
+      // quote errand — 16k thinking tokens at ~22 tok/s is a licence to
+      // deliberate for twelve minutes about which five sentences to copy.
+      //
+      // So the three numbers below, and the reasoning is the same for all
+      // three: ON THIS BOX, GENERATING IS EXPENSIVE AND READING IS FREE.
+      // Prefill is fast, the store is instant, and the only thing that costs
+      // wall clock is tokens coming out of the model. Every setting here trades
+      // input for output.
+      //
+      //   thinkingTokens  ITS OWN, not the agent-job budget. See cfg() in
+      //                   db/history-search.js — this is the one place that
+      //                   deliberately does NOT inherit
+      //                   generation.agentJobThinkingTokens, because the job is
+      //                   search → read → emit ids and quotes, and the harness
+      //                   writes everything else. MEASURED on the dogs question
+      //                   against a clone of this store, rounds fixed at 2:
+      //                   16384 -> 122s (74% of generated tokens were
+      //                   reasoning), 256 -> 52s (51%), 128 -> 41s (33%). All
+      //                   three returned the same five or six verified quotes
+      //                   and zero rejections, so the deliberation was not
+      //                   buying accuracy — the harness was already supplying
+      //                   it. 0 turns thinking off entirely on this engine
+      //                   (chat_template_kwargs.enable_thinking=false) and is a
+      //                   legitimate setting, not a broken one.
+      //   snippetChars    HOW MUCH TEXT A SEARCH HIT CARRIES. The lever that
+      //                   removes whole rounds. A hit shorter than this comes
+      //                   back COMPLETE, so it can be quoted from without a
+      //                   second call — and on this store 39 of 53 user
+      //                   messages and every message that answered the dogs
+      //                   question is under 700 characters. A round costs tens
+      //                   of seconds; 700 characters of prefill costs
+      //                   milliseconds. Raising this is almost always right.
+      //   maxHits         Fewer hits, more text each. Same trade.
+      maxHits: 8,
+      snippetChars: 700,
+      thinkingTokens: 128,
       windowBefore: 1,         // messages before a hit that history_read shows
       windowAfter: 2,          // and after — an answer usually follows the question
       maxWindow: 4,
@@ -1020,10 +1066,19 @@ const DEFAULTS = {
       quoteChars: 400,
       summaryChars: 700,
       digestChars: 4000,
-      maxToolCalls: 8,
-      maxRounds: 4,
-      maxWallClockMs: 75000,
-      waitMs: 90000
+      // Tightened with the same intent: a run that is going badly should stop
+      // being a 192-second run. The wall clock is checked BETWEEN rounds, so it
+      // overshoots by however long the round in progress takes — v1 blew 75s by
+      // 31s that way, which is itself an argument for a smaller number.
+      maxToolCalls: 6,
+      maxRounds: 2,
+      maxWallClockMs: 45000,
+      waitMs: 90000,
+      // How long a finished-but-undelivered digest is still handed back to a
+      // repeat ask instead of starting a fresh run. Past this it stays on the
+      // row and reaches him through the announcement block like any other
+      // finished work. See ask() in db/history-search.js.
+      undeliveredGraceMinutes: 30
     },
     // start_background_job — the async handoff tool. Starts work and returns a
     // job id immediately; the turn ends normally. Its rate cap lives in

@@ -103,7 +103,9 @@ function cfg() {
   const gen = getConfig().generation || {};
   return {
     enabled: c.enabled !== false,
-    maxHits: Math.max(1, c.maxHits ?? 12),
+    maxHits: Math.max(1, c.maxHits ?? 8),
+    // HOW MUCH TEXT A HIT CARRIES. The lever that removes rounds — see find().
+    snippetChars: Math.max(80, c.snippetChars ?? 700),
     windowBefore: Math.max(0, c.windowBefore ?? 1),
     windowAfter: Math.max(0, c.windowAfter ?? 2),
     maxWindow: Math.max(1, c.maxWindow ?? 4),
@@ -113,15 +115,32 @@ function cfg() {
     summaryChars: Math.max(100, c.summaryChars ?? 700),
     // THE CAP. See renderDigest() for what it costs and why it is this number.
     digestChars: Math.max(500, c.digestChars ?? 4000),
-    maxToolCalls: Math.max(1, c.maxToolCalls ?? 8),
-    maxRounds: Math.max(1, c.maxRounds ?? 4),
-    maxWallClockMs: Math.max(5000, c.maxWallClockMs ?? 75000),
+    maxToolCalls: Math.max(1, c.maxToolCalls ?? 6),
+    maxRounds: Math.max(1, c.maxRounds ?? 2),
+    maxWallClockMs: Math.max(5000, c.maxWallClockMs ?? 45000),
+    undeliveredGraceMinutes: Math.max(0, c.undeliveredGraceMinutes ?? 30),
     // How long the chat turn will actually sit here. Longer than the run's own
     // wall clock so a run that stops cleanly is still reported as a result
     // rather than as a timeout — the gap is deliberate.
     waitMs: Math.max(5000, c.waitMs ?? 90000),
     answerTokens: Math.max(256, gen.agentJobResponseTokens ?? 8192),
-    thinkingTokens: Number.isFinite(gen.agentJobThinkingTokens) ? gen.agentJobThinkingTokens : null
+    // ITS OWN THINKING BUDGET, AND THE ONE PLACE THAT DELIBERATELY DOES NOT
+    // INHERIT generation.agentJobThinkingTokens.
+    //
+    // v1 read that key, and on this box it is set to 16384. The first live run
+    // spent 74% of everything it generated on reasoning and came back at 192s
+    // against a 90s wait — the digest was good and arrived where nobody could
+    // see it. The budget was not wrong for what it was written for; a research
+    // job that reads six web pages and forms a view should think. This job
+    // searches, reads, and copies text out — the harness writes the references,
+    // enforces the quotes and renders the digest, so there is nothing here for
+    // a long deliberation to decide.
+    //
+    // The fallback is the LOCAL default, never the agent-job one: if this key
+    // is ever removed from config, the right behaviour is a small budget, not a
+    // silent return to 16k. 0 is honoured as "no thinking at all" by callLLM
+    // (enable_thinking=false on this engine) and is a legitimate setting here.
+    thinkingTokens: Number.isFinite(c.thinkingTokens) ? Math.max(0, c.thinkingTokens) : 128
   };
 }
 
@@ -192,7 +211,9 @@ function find({ query, limit } = {}) {
         c.title                                AS conversation_title,
         m.role                                 AS role,
         m.timestamp                            AS timestamp,
-        snippet(messages_fts, 0, '', '', '…', 20) AS snippet,
+        m.content                              AS content,
+        LENGTH(m.content)                      AS content_len,
+        snippet(messages_fts, 0, '', '', '…', 64) AS snippet,
         bm25(messages_fts)                     AS score
       FROM messages_fts
       JOIN messages m      ON m.id = messages_fts.message_id
@@ -207,17 +228,44 @@ function find({ query, limit } = {}) {
     return { error: `The search failed: ${err.message}` };
   }
 
+  // A HIT CARRIES ENOUGH TEXT TO QUOTE FROM. This is the round-killer.
+  //
+  // v1 returned a 20-token snippet, which is a locator and nothing more — so
+  // every hit worth quoting cost a history_read, and every read cost a round,
+  // and a round on this engine costs tens of seconds. The dogs question spent
+  // four rounds and 122 seconds to end up quoting seven messages, none of them
+  // longer than 650 characters. All seven could have come back in the first
+  // call.
+  //
+  // So a message shorter than snippetChars comes back WHOLE and is marked
+  // `complete`, which means it can be quoted directly with no second call. A
+  // longer one comes back as the match-centred FTS snippet (64 tokens is that
+  // function's hard maximum) and is marked incomplete, which is the signal to
+  // read it properly before quoting — an excerpt has elision in it, and a quote
+  // that spans an elision is a quote that fails verification, correctly.
+  //
+  // The cost of being generous is prefill, which is milliseconds. The cost of
+  // being stingy is a round, which is not.
   return {
     searched: match,
     returned: rows.length,
-    hits: rows.map(r => ({
-      message_id: r.message_id,
-      conversation_id: r.conversation_id,
-      conversation_title: squash(r.conversation_title) || '(untitled)',
-      role: r.role,
-      timestamp: r.timestamp,
-      snippet: squash(r.snippet)
-    }))
+    hits: rows.map(r => {
+      const whole = r.content_len <= c.snippetChars;
+      return {
+        message_id: r.message_id,
+        conversation_id: r.conversation_id,
+        conversation_title: squash(r.conversation_title) || '(untitled)',
+        role: r.role,
+        timestamp: r.timestamp,
+        // Whitespace-squashed, exactly as verifyQuote squashes the stored
+        // content before comparing — so text copied from here verifies.
+        text: whole ? squash(r.content) : squash(r.snippet),
+        complete: whole,
+        quotable: whole
+          ? 'This is the whole message. Quote from it directly; no history_read needed.'
+          : `Excerpt of a ${r.content_len}-character message. Call history_read before quoting.`
+      };
+    })
   };
 }
 
@@ -546,46 +594,49 @@ function renderDigest({ question, summary, quotes, gaps, stats, dropped }) {
 // The run
 // ---------------------------------------------------------------------------
 
+/**
+ * The run's instructions. SHORT ON PURPOSE.
+ *
+ * v1's prompt was ~2,400 characters of careful argument about honesty, and it
+ * worked — the first live run produced a clean, correctly-quoted digest. It
+ * also took 192 seconds, and 74% of what it generated was reasoning. A long
+ * prompt full of considerations invites a model to consider them, one at a
+ * time, out loud, before doing a job that is: search, read what is marked as an
+ * excerpt, copy sentences, emit JSON.
+ *
+ * So the argument moved into the code, where it belongs and where it cannot be
+ * reasoned around. The quotes are checked whatever this prompt says; the
+ * references are written by the harness whether or not it is told not to write
+ * them; a digest with no surviving quote loses its summary automatically. What
+ * is left here is the operating procedure plus the two facts the model needs in
+ * order to behave sensibly rather than defensively: that quotes are verified,
+ * and that nothing-found is an accepted answer.
+ *
+ * The contract did not get weaker. It got moved somewhere a shorter prompt
+ * cannot erode.
+ */
 function runPrompt(question) {
   const c = cfg();
   return (
-    `You are running one background lookup in your own conversation history, on behalf of yourself in a ` +
-    `conversation that is happening right now. Nobody is in the room with you. Your entire output is a ` +
-    `JSON object, and something else turns it into what you will read back in that conversation.\n\n` +
-    `THE QUESTION:\n"${question}"\n\n` +
-    `YOUR TOOLS. history_find(query, limit) searches every message you have ever exchanged with Ellie and ` +
-    `returns ranked hits with message ids. history_read(message_id, before, after) returns the messages ` +
-    `around one hit so you can see the exchange it sits in.\n\n` +
-    `HOW TO WORK, in this order:\n` +
-    `1. SEARCH. Call history_find with the distinctive words from the question — names, project names, ` +
-    `technical terms. Not the filler. If the first search is thin, try different words; a name may have ` +
-    `been written a different way.\n` +
-    `2. READ. Take the hits that look relevant and call history_read on them. A snippet is not enough to ` +
-    `quote from and not enough to understand — read the exchange.\n` +
-    `3. QUOTE. Pick the passages that actually answer the question and copy them EXACTLY, character for ` +
-    `character, from the text history_read gave you.\n\n` +
-    `THE RULE THAT MATTERS MOST. Every quote you return is checked against the database before it is ` +
-    `shown to you. A passage that is not literally in the message you attribute it to is thrown away, and ` +
-    `if every quote you give is thrown away the whole answer is discarded and reported as nothing found. ` +
-    `So do not tidy a quote, do not join two passages into one, do not translate it into what it meant, ` +
-    `and never write down what a conversation must have said. Copy, or leave it out.\n\n` +
-    `FINDING NOTHING IS A REAL ANSWER AND YOU ARE EXPECTED TO GIVE IT. If the searches come back empty, ` +
-    `or come back full of things that do not answer this, return found=false and no quotes. That is a ` +
-    `useful result: it tells the conversation there is no record, which is a fact about the store. ` +
-    `Guessing at what a conversation probably said is the one outcome that is worse than nothing, ` +
-    `because it will be repeated as something that was checked.\n\n` +
-    `DO NOT WRITE THE REFERENCES. You return the message_id and the quote; the conversation title, the ` +
-    `timestamp and the speaker are read from the row itself. Never invent a date or a title.\n\n` +
-    `YOUR OUTPUT — a single JSON object, nothing before or after it:\n` +
-    `{\n` +
-    `  "found": true or false,\n` +
-    `  "summary": "at most ${c.summaryChars} characters framing what the quotes show. Plain prose. It may ` +
-    `describe and connect the quotes; it may not add anything that is not in them. Empty when found=false.",\n` +
-    `  "quotes": [ { "message_id": "the id exactly as a tool gave it to you", "quote": "the exact words, ` +
-    `at most ${c.quoteChars} characters" } ],\n` +
-    `  "gaps": "one line on what you looked for and could not find, or empty"\n` +
-    `}\n` +
-    `At most ${c.maxQuotes} quotes, best first. Fewer good ones beat more weak ones.`
+    `You look things up in your own conversation history with Ellie. This is an errand, not a problem to ` +
+    `solve. Work fast and do not deliberate.\n\n` +
+    `QUESTION: "${question}"\n\n` +
+    `1. SEARCH. history_find(query) with the distinctive words — names, projects, terms. Skip the filler.\n` +
+    `2. READ. Most hits come back COMPLETE and say so: quote straight from those, no second call. Only a ` +
+    `hit marked as an excerpt needs history_read before you quote it.\n` +
+    `3. QUOTE. Copy the passages that answer the question exactly, character for character, and emit the ` +
+    `JSON below. Usually one search is enough. Stop as soon as you have what answers the question.\n\n` +
+    `Every quote is checked against the database. One that is not literally in the message you attribute ` +
+    `it to is thrown away, and if all of them are, the whole answer is discarded. Copy; never tidy, join ` +
+    `or paraphrase inside a quote.\n\n` +
+    `FINDING NOTHING IS A REAL ANSWER. Empty searches, or hits that do not answer this — return ` +
+    `found=false with no quotes. Never write what a conversation probably said.\n\n` +
+    `DO NOT WRITE THE REFERENCES. Titles, timestamps and speakers are read from the row. You give ids.\n\n` +
+    `Output ONE JSON object, nothing else:\n` +
+    `{"found":true|false,"summary":"<=${c.summaryChars} chars framing the quotes, or empty",` +
+    `"quotes":[{"message_id":"id exactly as given","quote":"exact words, <=${c.quoteChars} chars"}],` +
+    `"gaps":"one line on what you could not find, or empty"}\n` +
+    `At most ${c.maxQuotes} quotes, best first.`
   );
 }
 
@@ -608,7 +659,15 @@ function noteRead(caller, { hits = 0, messages = 0 } = {}) {
   s.messagesRead += messages;
 }
 
-/** Waiters on in-flight runs, so the tool call can return the digest itself. */
+/**
+ * Waiters on in-flight runs, so a tool call can return the digest itself.
+ *
+ * A SET PER JOB, not one callback per job. v1.1 lets a second ask JOIN a run
+ * this conversation already has (see inFlightFor), and with a single-callback
+ * map the joiner overwrote the original waiter — the first caller's promise
+ * would then never settle and its turn would hang until its own timeout, which
+ * is the orphaning bug reappearing one layer down.
+ */
 const waiting = new Map();
 
 /**
@@ -626,6 +685,7 @@ async function runDispatched(job) {
   scopes.set(caller, scope);
 
   let outcome;
+  let metrics = null;
   try {
     const mm = memoryManager();
     const MCPClient = require('../mcp/mcp-client');
@@ -642,11 +702,27 @@ async function runDispatched(job) {
       maxRounds: c.maxRounds
     });
 
+    const startedMs = Date.now();
     const res = await mm.callLLM(runPrompt(job.task), job.task, {
       maxTokens: c.answerTokens,
       thinkingTokens: c.thinkingTokens,
       toolSession: session
     });
+
+    // WHERE THE TIME WENT, kept on the row. The v1 autopsy had to be
+    // reconstructed from journalctl because nothing here recorded it; a
+    // capability whose whole problem is latency must carry its own numbers.
+    metrics = {
+      totalMs: Date.now() - startedMs,
+      roundMs: (res && res.roundMs) || [],
+      reasoningChars: (res && res.reasoningChars) || 0,
+      answerChars: String((res && res.content) || '').length,
+      thinkingCap: c.thinkingTokens,
+      toolCalls: scope.calls,
+      hits: scope.hits,
+      messagesRead: scope.messagesRead,
+      budget: (res && res.budget) || session.summary()
+    };
 
     const parsed = parseRunOutput(res && res.content);
     if (!parsed) {
@@ -705,8 +781,14 @@ async function runDispatched(job) {
     scopes.delete(caller);
   }
 
-  const w = waiting.get(job.id);
-  if (w) { waiting.delete(job.id); w(outcome); }
+  // Every waiter, not just the first — a joined ask is waiting on this same run.
+  const ws = waiting.get(job.id);
+  if (ws) {
+    waiting.delete(job.id);
+    for (const fn of ws) {
+      try { fn(outcome); } catch (err) { console.error('[HistorySearch] waiter threw:', err.message); }
+    }
+  }
 
   return {
     status: outcome.status,
@@ -715,6 +797,7 @@ async function runDispatched(job) {
     resultText: outcome.digest,
     error: outcome.error || null,
     toolCalls: scope.calls,
+    metrics,
     digest: outcome.digest
   };
 }
@@ -722,6 +805,122 @@ async function runDispatched(job) {
 // ---------------------------------------------------------------------------
 // The chat-side entry point
 // ---------------------------------------------------------------------------
+
+/** Wait for a run to settle, or give up at `ms`. Shared by the new and joined paths. */
+function waitFor(jobId, ms) {
+  return new Promise(resolve => {
+    let done = false;
+    const drop = () => {
+      const set = waiting.get(jobId);
+      if (!set) return;
+      set.delete(fn);
+      if (!set.size) waiting.delete(jobId);
+    };
+    const fn = (outcome) => {
+      if (done) return;
+      done = true; clearTimeout(timer); drop(); resolve(outcome);
+    };
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true; drop(); resolve(null);
+    }, ms);
+    const set = waiting.get(jobId) || new Set();
+    set.add(fn);
+    waiting.set(jobId, set);
+  });
+}
+
+/**
+ * The "not yet" answer — and it now says what happens next, which v1 could not.
+ *
+ * v1 told him to "offer to ask again", and asking again started a second run.
+ * The digest is delivered on its own now: either he asks again and gets THIS
+ * job's result (inFlightFor), or the announcement block hands it to him at the
+ * start of a later turn. Both are true whatever he decides to say here, so he
+ * is told them rather than left to invent a plan.
+ */
+function stillRunning(jobId, question, c) {
+  return {
+    ok: true,
+    job_id: jobId,
+    short_id: jobId.slice(0, 8),
+    status: 'still-running',
+    digest:
+      `Conversation-history search — "${clip(question, 160)}"\n\n` +
+      `STILL RUNNING after ${Math.round(c.waitMs / 1000)}s, so there is no digest yet.\n\n` +
+      `You do not have an answer and must not describe one. Tell her the lookup is taking longer than the ` +
+      `turn allows and say what you already know from what is in front of you.\n` +
+      `IT IS NOT LOST: it will be handed to you when it finishes — either at the start of a later reply, ` +
+      `or immediately if you call history_search again in this conversation, which joins this same lookup ` +
+      `rather than starting another. So promising to come back to her is a promise you can keep.`
+  };
+}
+
+/**
+ * Stamp a digest as having reached the conversation that asked for it.
+ *
+ * Called on every path that hands a digest to the entity — the inline return,
+ * and the repeat-ask that collects a finished one. What it turns off is the
+ * late-delivery channel: a digest delivered here must never come back a second
+ * time through the announcement block, which would have him report the same
+ * lookup twice as though it were news.
+ */
+function markDelivered(jobId) {
+  const db = getSqliteDb();
+  if (!db || !jobId) return false;
+  try {
+    return db.prepare(
+      'UPDATE agent_jobs SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL'
+    ).run(new Date().toISOString(), jobId).changes > 0;
+  } catch (err) {
+    console.error('[HistorySearch] markDelivered failed:', err.message);
+    return false;
+  }
+}
+
+/**
+ * The history lookup this conversation already has in play, if any.
+ *
+ * ONE RUNNING LOOKUP PER CONVERSATION, and the reason is the failure it
+ * prevents rather than the resource it saves. v1's "still running" reply handed
+ * back a job_id and then had nothing that could use it: asking again started a
+ * SECOND run over the same store for the same question, so the natural thing to
+ * do next — she asks again, he tries again — doubled the load and left two
+ * digests where nobody could see either.
+ *
+ * Two states count as "in play":
+ *   running  — attach to it and wait, rather than racing it.
+ *   finished but never delivered, within the grace window — that IS the answer.
+ *              Hand it over now. This is the case that was orphaned.
+ *
+ * Scoped to the conversation, not global: two conversations asking about
+ * different things are two questions, and a global lock would make one wait on
+ * the other for no reason. A null conversationId (a script, a test) gets no
+ * dedupe at all — there is no conversation to scope to, and quietly sharing one
+ * lookup between unrelated callers is worse than running two.
+ */
+function inFlightFor(conversationId) {
+  const db = getSqliteDb();
+  if (!db || !conversationId) return null;
+  const live = db.prepare(`
+    SELECT * FROM agent_jobs
+    WHERE source = ? AND conversation_id = ? AND status IN ('queued','running')
+    ORDER BY datetime(created_at) DESC LIMIT 1
+  `).get(SOURCE, conversationId);
+  if (live) return { kind: 'running', row: live };
+
+  const graceMs = cfg().undeliveredGraceMinutes * 60 * 1000;
+  if (!graceMs) return null;
+  const since = new Date(Date.now() - graceMs).toISOString();
+  const undelivered = db.prepare(`
+    SELECT * FROM agent_jobs
+    WHERE source = ? AND conversation_id = ? AND delivered_at IS NULL
+      AND result_text IS NOT NULL
+      AND finished_at IS NOT NULL AND datetime(finished_at) > datetime(?)
+    ORDER BY datetime(finished_at) DESC LIMIT 1
+  `).get(SOURCE, conversationId, since);
+  return undelivered ? { kind: 'undelivered', row: undelivered } : null;
+}
 
 /**
  * Ask the archive a question and wait for the digest.
@@ -747,6 +946,38 @@ async function ask({ question, conversationId = null, messageId = null } = {}) {
     return { ok: false, error: 'Give the search an actual question about your past conversations.' };
   }
 
+  // CHECK BEFORE STARTING. See inFlightFor() — a repeat ask must join the
+  // lookup this conversation already has, never open a second one.
+  const existing = inFlightFor(conversationId);
+  if (existing && existing.kind === 'undelivered') {
+    markDelivered(existing.row.id);
+    console.log(`[HistorySearch] handed back the undelivered digest from ${existing.row.id.slice(0, 8)} instead of starting a new run`);
+    return {
+      ok: true,
+      job_id: existing.row.id,
+      short_id: existing.row.id.slice(0, 8),
+      status: 'recovered',
+      reused: true,
+      digest:
+        `[This is the lookup you started earlier and were told was still running. It finished; here it ` +
+        `is. It answers: "${clip(squash(existing.row.task), 160)}" — say so if the conversation has moved ` +
+        `on since.]\n\n${existing.row.result_text}`
+    };
+  }
+  if (existing && existing.kind === 'running') {
+    const joined = await waitFor(existing.row.id, c.waitMs);
+    if (joined) {
+      markDelivered(existing.row.id);
+      return {
+        ok: true, job_id: existing.row.id, short_id: existing.row.id.slice(0, 8),
+        status: joined.status, reused: true,
+        verified: joined.verified ?? 0, rejected: joined.rejected ?? 0,
+        digest: joined.digest
+      };
+    }
+    return stillRunning(existing.row.id, squash(existing.row.task), c);
+  }
+
   const jobs = agentJobs();
   const started = jobs.enqueue({
     title: `history: ${clip(q, 60)}`,
@@ -764,29 +995,15 @@ async function ask({ question, conversationId = null, messageId = null } = {}) {
   if (!started.ok) return { ok: false, error: started.error };
 
   const id = started.id;
-  const settled = await new Promise(resolve => {
-    const timer = setTimeout(() => {
-      if (waiting.get(id)) { waiting.delete(id); resolve(null); }
-    }, c.waitMs);
-    waiting.set(id, (outcome) => { clearTimeout(timer); resolve(outcome); });
-  });
+  const settled = await waitFor(id, c.waitMs);
 
   if (!settled) {
     // Honest, and specifically NOT a result. The run may still be going; what
     // it finds is not knowable from here and must not be described.
-    return {
-      ok: true,
-      job_id: id,
-      short_id: id.slice(0, 8),
-      status: 'still-running',
-      digest:
-        `Conversation-history search — "${clip(q, 160)}"\n\n` +
-        `STILL RUNNING after ${Math.round(c.waitMs / 1000)}s, so there is no digest yet.\n\n` +
-        `You do not have an answer and must not describe one. Tell her the lookup is taking longer than ` +
-        `the turn allows, say what you already know from what is in front of you, and offer to ask again.`
-    };
+    return stillRunning(id, q, c);
   }
 
+  markDelivered(id);
   return {
     ok: true,
     job_id: id,
@@ -800,6 +1017,8 @@ async function ask({ question, conversationId = null, messageId = null } = {}) {
 
 module.exports = {
   SOURCE,
+  markDelivered,
+  inFlightFor,
   RUN_TOOLS,
   cfg,
   find,
