@@ -39,6 +39,20 @@ const HOUR_MS = 60 * 60 * 1000;
 const INSPECT_TOOLS = ['memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections'];
 
 /**
+ * What the shared hourly read budget actually counts.
+ *
+ * INSPECT_TOOLS is the set this module DISPATCHES; this is the set it BILLS,
+ * and they stopped being the same list on 2026-08-27 when history_search
+ * shipped. That tool lives in its own module and runs a background agent, but
+ * what it is — from the budget's point of view — is the entity spending a turn
+ * rummaging in its own records, which is the exact quantity this cap bounds. A
+ * second counter for it would be a second budget, and the reason this one is
+ * shared across five tools in the first place is that separate budgets let a
+ * loop spend the sum of them while each looked healthy.
+ */
+const CAP_TOOLS = [...INSPECT_TOOLS, 'history_search'];
+
+/**
  * Result-discipline caps. Deliberately split from the tool's on/off + rate cap
  * (which live in `tools.memoryInspect`, matching create_cron_job and
  * write_memory so the registry and the drift-check read one place per tool).
@@ -84,12 +98,12 @@ function checkCap() {
   if (!db) return { ok: false, reason: 'database unavailable' };
   const { maxCallsPerHour } = toolCfg();
   const sinceIso = new Date(Date.now() - HOUR_MS).toISOString();
-  const placeholders = INSPECT_TOOLS.map(() => '?').join(',');
+  const placeholders = CAP_TOOLS.map(() => '?').join(',');
   const recent = db.prepare(
     `SELECT COUNT(*) AS n FROM tool_call_log
      WHERE tool IN (${placeholders}) AND outcome != 'rejected-cap'
        AND datetime(created_at) > datetime(?)`
-  ).get(...INSPECT_TOOLS, sinceIso).n;
+  ).get(...CAP_TOOLS, sinceIso).n;
 
   if (recent >= maxCallsPerHour) {
     return { ok: false, reason: `memory inspection rate cap reached (${recent}/${maxCallsPerHour} lookups in the last hour)` };
@@ -896,5 +910,5 @@ async function run(tool, args = {}, context = {}) {
 module.exports = {
   run, search, list, count, get, corrections,
   checkCap, capStatus, limits, toolCfg,
-  INSPECT_TOOLS
+  INSPECT_TOOLS, CAP_TOOLS
 };

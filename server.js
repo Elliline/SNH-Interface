@@ -107,6 +107,22 @@ function formatToolResult(fnName, result, sink) {
     const n = addSource(sink, { title: result.title || result.url, url: result.url });
     return `FETCHED PAGE [S${n}] — ${result.url}\n${result.content || ''}`;
   }
+  // A history digest goes through AS TEXT, not as JSON.
+  //
+  // It is built line by line — a reference line, then the quote indented under
+  // it — and JSON.stringify turns every one of those newlines into a literal
+  // \n, so what reaches the model is one long escaped ribbon in which a quote
+  // is no longer visually separable from the framing around it. That matters
+  // more here than it would for another tool: the whole contract is that the
+  // quoted lines are the record and everything else is not, and a format that
+  // blurs the two invites exactly the blurring the digest exists to prevent.
+  //
+  // It also costs real budget. Escaping inflates the payload while the
+  // 4000-character cap is measured on the digest itself, so the cap would
+  // quietly bind at something larger than the number it claims.
+  if (fnName === 'history_search' && result && result.digest) {
+    return `${result.digest}\n\n${result.how_to_use || ''}`.trim();
+  }
   return typeof result === 'string' ? result : JSON.stringify(result);
 }
 

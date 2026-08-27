@@ -275,9 +275,16 @@ const part = (kind, tokens) => ({ kind, label: kind, text: 'x'.repeat(tokens * 4
       squeezed.compactedIds.length === squeezed.compacted &&
       squeezed.compactedNames.every(n => squeezed.text.includes(`- ${n}\n`) || squeezed.text.includes(`- ${n}(`) || squeezed.text.includes(`- ${n}`)),
       JSON.stringify(squeezed.compactedNames));
+    // DERIVED, NOT PINNED. This used to assert the literal id 'job-documents',
+    // which was the newest entry the day it was written — so it started failing
+    // the moment anything shipped after it, and went on failing while the
+    // property it guards (shedding runs from the tail, which is ship order, so
+    // the oldest entries keep their descriptions longest) was perfectly intact.
+    // A stale fixture that fails for being old teaches everyone to ignore it.
+    const newest = capabilityManifest.getAll().slice(-1)[0];
     check('…the newest capability is the one that goes first',
-      squeezed.compactedIds[0] === 'job-documents',
-      JSON.stringify(squeezed.compactedIds));
+      squeezed.compactedIds[0] === newest.id,
+      `shed ${JSON.stringify(squeezed.compactedIds[0])} first, newest is ${JSON.stringify(newest.id)}`);
 
     // The words themselves — one report, shared by the boot warning and the
     // bell, so the two can never say different things about the same loss.

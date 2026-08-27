@@ -1060,6 +1060,31 @@ function initDatabase() {
       console.log("Migration: added initiated_by to conversations (existing rows set to 'user')");
     }
 
+    // A conversation that must never be READ BACK — the exclusion `history_search`
+    // is built on (2026-08-27).
+    //
+    // WHY A FLAG AND NOT JUST DELETION. The standing rule is that verification
+    // turns are temporary and their residue is deleted (CLAUDE.md, "Verification
+    // turns are temporary by default"), and that rule stands — this does not
+    // replace it. But deletion is a thing a person remembers to do at the end of
+    // a session, and `history_search` is a thing the entity can call at any
+    // moment in between. Between the test turn and the cleanup there is a window
+    // where a synthetic conversation is indistinguishable, to a search, from a
+    // real one; before this column there was no way to close it, because nothing
+    // in the schema recorded that a conversation was not hers.
+    //
+    // DEFAULT 0 means every existing row stays visible, which is correct: the
+    // live store's conversations are real. Marking one is a deliberate act — see
+    // setConversationHidden() — and the flag is the ONLY thing history search
+    // consults, so "is this row hers" never becomes a judgement made by reading
+    // the content.
+    const convCols2 = sqliteDb.prepare('PRAGMA table_info(conversations)').all();
+    if (!convCols2.some(c => c.name === 'hidden')) {
+      sqliteDb.exec('ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0');
+      console.log('Migration: added hidden to conversations (existing rows visible; test/clone turns get 1)');
+    }
+    sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON conversations(hidden)');
+
     console.log('SQLite database initialized successfully');
 
     // Backfill FTS table with existing messages
@@ -1251,6 +1276,37 @@ function updateConversationTitle(id, title) {
     stmt.run(title, id);
   } catch (error) {
     console.error('Error updating conversation title:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Mark a conversation hidden, or put it back.
+ *
+ * A hidden conversation is still a row and still readable in the UI — nothing is
+ * deleted here. What it stops is the conversation being SEARCHABLE: it is the
+ * one filter `history_search` applies, so a verification turn, a clone artifact
+ * or anything else that is not really hers cannot come back to the entity as
+ * evidence about its own past.
+ *
+ * Deliberately not exposed as a tool. Marking a conversation as not-real is a
+ * statement about the record, and the entity deciding which of its own memories
+ * count is the failure this flag exists to prevent, not a power to hand it.
+ *
+ * @param {string} id - conversation id
+ * @param {boolean} [hidden=true]
+ * @returns {boolean} whether a row was changed
+ */
+function setConversationHidden(id, hidden = true) {
+  try {
+    if (!sqliteDb) {
+      throw new Error('Database not initialized. Call initDatabase() first.');
+    }
+    const info = sqliteDb.prepare('UPDATE conversations SET hidden = ? WHERE id = ?')
+      .run(hidden ? 1 : 0, id);
+    return info.changes > 0;
+  } catch (error) {
+    console.error('Error setting conversation hidden flag:', error.message);
     throw error;
   }
 }
@@ -1957,6 +2013,7 @@ module.exports = {
   createConversation,
   deleteConversation,
   updateConversationTitle,
+  setConversationHidden,
   addMessage,
   updateConversationTimestamp,
 

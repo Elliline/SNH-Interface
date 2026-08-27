@@ -116,6 +116,26 @@ const JOB_TOOLS = [
 const TERMINAL = ['ok', 'partial', 'failed', 'interrupted', 'cancelled'];
 
 /**
+ * Sources whose rows are a RECORD, not a result for Ellie.
+ *
+ * ROBOT, NOT BELL is the rule this file is bent around, and this is the line
+ * underneath it: the panel is for work the entity handed off and walked away
+ * from, which she reads when she is ready. A history_search run is not that. It
+ * happens inside a turn, its answer goes straight back into the conversation,
+ * and by the time she could see a card the entity has already told her what it
+ * found. A card per lookup would be up to forty a day of "here is something you
+ * have already read", which is how a panel stops being worth opening.
+ *
+ * SO THE ROW STILL EXISTS — every one of them, with its digest, sweepable on
+ * restart and queryable forever. What it does not do is claim her attention.
+ * The lookup's Ellie-facing record is its tool_call_log entry, in the Thinking
+ * tab, which is where tool calls belong.
+ */
+const IN_TURN_SOURCES = ['history-search'];
+const inTurnSql = (col = 'source') =>
+  `(${col} IS NULL OR ${col} NOT IN (${IN_TURN_SOURCES.map(x => `'${x}'`).join(',')}))`;
+
+/**
  * A config key that MOVED must not go quiet where it used to live.
  *
  * agentJobs.maxOutputTokens became generation.agentJobResponseTokens on
@@ -212,7 +232,9 @@ function startsLastHour() {
   const db = getSqliteDb();
   if (!db) return 0;
   const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  return db.prepare('SELECT COUNT(*) n FROM agent_jobs WHERE datetime(created_at) > datetime(?)').get(since).n;
+  return db.prepare(
+    `SELECT COUNT(*) n FROM agent_jobs WHERE datetime(created_at) > datetime(?) AND ${inTurnSql()}`
+  ).get(since).n;
 }
 
 /**
@@ -258,7 +280,8 @@ function refuse(outcome, error, { conversationId = null } = {}) {
  *
  * @returns {{ok: true, id: string} | {ok: false, error: string}}
  */
-function enqueue({ title, task, why = null, conversationId = null, messageId = null, source = 'chat-handoff' } = {}) {
+function enqueue({ title, task, why = null, conversationId = null, messageId = null, source = 'chat-handoff',
+                   countsAgainstStarts = true } = {}) {
   const db = getSqliteDb();
   if (!db) return { ok: false, error: 'The job queue is unavailable (no database handle).' };
 
@@ -275,9 +298,19 @@ function enqueue({ title, task, why = null, conversationId = null, messageId = n
   if (active >= c.maxQueued) {
     return refuse('refused-cap', `There are already ${active} jobs queued or running, which is the limit (${c.maxQueued}). Nothing was started — say so, and offer to do this once some of them finish.`, { conversationId });
   }
-  const recent = startsLastHour();
-  if (recent >= c.maxStartsPerHour) {
-    return refuse('refused-cap', `You have already started ${recent} background jobs in the last hour, which is the limit (${c.maxStartsPerHour}). Nothing was started — say so plainly rather than implying it is running.`, { conversationId });
+  // THE START BUDGET IS FOR HANDOFFS, and `countsAgainstStarts: false` is how a
+  // caller says it is not one. It exists for exactly one case today
+  // (history_search) and the case is not a loophole: that tool is a READ inside
+  // a turn, it is already charged to the shared read budget the memory-inspect
+  // tools spend, and charging it here as well would put two counters on one
+  // action — which is how they come to disagree, and how the tighter one
+  // silently becomes the only one that matters. The queue-depth cap above is
+  // NOT waived: that one bounds the machine, not the entity's allowance.
+  if (countsAgainstStarts) {
+    const recent = startsLastHour();
+    if (recent >= c.maxStartsPerHour) {
+      return refuse('refused-cap', `You have already started ${recent} background jobs in the last hour, which is the limit (${c.maxStartsPerHour}). Nothing was started — say so plainly rather than implying it is running.`, { conversationId });
+    }
   }
 
   const id = randomUUID();
@@ -388,6 +421,11 @@ async function attachArtifact(id, { note = null } = {}) {
   if (!db) return null;
   const job = getJob(id);
   if (!job) return null;
+  // An in-turn read produces no document. A history search's result is a few
+  // hundred tokens that have already been read in the conversation; filing one
+  // in her documents folder per lookup would bury the reports she actually
+  // asked for under forty transcripts of things she was told out loud.
+  if (IN_TURN_SOURCES.includes(job.source)) return job;
 
   let made;
   try {
@@ -658,6 +696,34 @@ async function runJob(id) {
     "UPDATE agent_jobs SET status = 'running', started_at = ?, attempts = COALESCE(attempts, 0) + 1 WHERE id = ?"
   ).run(startedAt.toISOString(), id);
 
+  // A history search is an agent run, but not THIS one. It has its own system
+  // prompt (search, read, quote, and say so when there is nothing), its own two
+  // read tools, and — the part that makes it a separate runner rather than a
+  // different task string — a verification pass over what the model returns
+  // before any of it is allowed to reach the conversation. Same row, same pool,
+  // same restart sweep; different contract. See db/history-search.js.
+  if (job.source === require('./history-search').SOURCE) {
+    let outcome;
+    try {
+      outcome = await require('./history-search').runDispatched(job);
+    } catch (err) {
+      // runDispatched is written not to throw. If it ever does, the waiting
+      // chat turn must still be answered, and answered with nothing rather
+      // than with silence it might fill in.
+      outcome = {
+        status: 'failed',
+        resultText: `The history search failed before it could report: ${err.message}. You have nothing from your history — say so.`,
+        error: err.message
+      };
+    }
+    return finish(id, {
+      status: outcome.status,
+      resultText: outcome.resultText,
+      error: outcome.error || null,
+      toolCalls: outcome.toolCalls || 0
+    });
+  }
+
   // A dispatched coding job is not an agent run. It has no tool loop here,
   // no JOB_TOOLS, and no model call in this process: squatch-code has its
   // own agentic loop and its own model, and this hands it a brief rather
@@ -842,7 +908,15 @@ function sweepInterrupted({ now = new Date() } = {}) {
     // committed a restore point; running the brief again would apply it on top
     // of its own half-finished work.
     const writesToDisk = j.source === require('./coding-jobs').SOURCE;
-    const retryable = !writesToDisk && (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
+    // AND NEVER RE-RUN A READ WHOSE READER HAS GONE. An in-turn lookup exists
+    // to answer a conversation that was happening when it started; the restart
+    // that killed it also killed the turn waiting on it, so a retry would spend
+    // a model call producing a digest with nobody on the other end. It is
+    // closed with the reason, like everything else here — a row that vanishes
+    // is the failure this whole function exists to refuse — and the entity has
+    // already been told, in the turn itself, that the lookup did not come back.
+    const inTurn = IN_TURN_SOURCES.includes(j.source);
+    const retryable = !writesToDisk && !inTurn && (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
 
     if (retryable) {
       db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL WHERE id = ?").run(j.id);
@@ -851,7 +925,9 @@ function sweepInterrupted({ now = new Date() } = {}) {
       console.warn(`[AgentJobs] ${line}`);
       opsLog(line);
     } else {
-      const why = writesToDisk
+      const why = inTurn
+        ? 'interrupted by a restart. It was NOT run again: it was a lookup answering a conversation that the same restart ended, so there is nobody left to hand the answer to'
+        : writesToDisk
         ? 'interrupted by a restart. It was NOT run again, because it can write files and re-running the brief could apply it twice. Anything it had already changed is still changed - check git status in the project; it commits a restore point before it starts'
         : (j.attempts || 0) >= c.maxAttempts
         ? 'interrupted by a restart, and it had already been retried once — it was not run again'
@@ -978,7 +1054,7 @@ function feed({ limit = 50 } = {}) {
   const lim = Math.min(Math.max(1, limit), 200);
 
   const jobs = db.prepare(
-    'SELECT * FROM agent_jobs ORDER BY datetime(created_at) DESC LIMIT ?'
+    `SELECT * FROM agent_jobs WHERE ${inTurnSql()} ORDER BY datetime(created_at) DESC LIMIT ?`
   ).all(lim).map(j => ({
     kind: 'handoff',
     id: j.id,
@@ -1056,13 +1132,21 @@ function counts() {
   const db = getSqliteDb();
   if (!db) return { unseen: 0, active: 0, total: 0 };
   const unseenJobs = db.prepare(
-    `SELECT COUNT(*) n FROM agent_jobs WHERE seen_at IS NULL AND status IN (${TERMINAL.map(() => '?').join(',')})`
+    `SELECT COUNT(*) n FROM agent_jobs WHERE seen_at IS NULL AND status IN (${TERMINAL.map(() => '?').join(',')})
+       AND ${inTurnSql()}`
   ).get(...TERMINAL).n;
   const RS3 = runResultStatuses();
   const unseenRuns = db.prepare(
     `SELECT COUNT(*) n FROM job_runs WHERE seen_at IS NULL AND status IN (${RS3.map(() => '?').join(',')})`
   ).get(...RS3).n;
-  const active = activeCount();
+  // Counted here rather than via activeCount(), which deliberately still counts
+  // EVERYTHING: that one bounds the machine (the queue-depth cap), and an
+  // in-turn read occupies the machine like anything else. This one feeds the
+  // badge beside a panel that does not list them, and a badge promising a card
+  // that is not there is worse than no badge.
+  const active = db.prepare(
+    `SELECT COUNT(*) n FROM agent_jobs WHERE status IN ('queued','running') AND ${inTurnSql()}`
+  ).get().n;
   return { unseen: unseenJobs + unseenRuns, active, total: unseenJobs + unseenRuns + active };
 }
 
@@ -1089,6 +1173,7 @@ function pendingAnnouncements({ limit = 3 } = {}) {
            artifact_kind, artifact_name, summary_text
     FROM agent_jobs
     WHERE announced_at IS NULL AND status IN (${TERMINAL.map(() => '?').join(',')})
+      AND ${inTurnSql()}
     ORDER BY datetime(finished_at) DESC LIMIT ?
   `).all(...TERMINAL, lim).map(j => ({
     kind: 'handoff', id: j.id, title: j.title, status: j.status,
@@ -1143,7 +1228,8 @@ function renderActiveJobsBlock() {
   const db = getSqliteDb();
   if (!db) return null;
   const rows = db.prepare(
-    "SELECT id, title, status, created_at, started_at FROM agent_jobs WHERE status IN ('queued','running') ORDER BY datetime(created_at) ASC"
+    `SELECT id, title, status, created_at, started_at FROM agent_jobs
+     WHERE status IN ('queued','running') AND ${inTurnSql()} ORDER BY datetime(created_at) ASC`
   ).all();
   if (!rows.length) return null;
 
@@ -1257,6 +1343,7 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
 module.exports = {
   JOB_TOOLS,
   TERMINAL,
+  IN_TURN_SOURCES,
   // Exported for test: the two halves of "a job always writes something" are
   // pure functions, and the floor especially must be provable without a model.
   describeStop,

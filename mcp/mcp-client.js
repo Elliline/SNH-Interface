@@ -18,6 +18,9 @@ const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
 const { MemoryJobsTool } = require('./tools/jobs-inspect');
+const {
+  HistorySearchTool, HistoryFindTool, HistoryReadTool
+} = require('./tools/history-search');
 // Read config THROUGH THE MODULE OBJECT rather than destructuring at load time —
 // the rule db/agent-jobs.js and mcp/tools/web-search.js already follow. Two
 // reasons, both live: the config seen here is always the one the process holds
@@ -57,6 +60,11 @@ const BACKGROUND_TOOLS = [
   // appearance of the search stack, so a box with no provider simply has them
   // dropped by the registry intersection.
   'web_search', 'web_fetch',
+  // 2026-08-27, for history_search: the two tools its background run digs with.
+  // They are here because a background step is the ONLY thing that may have
+  // them — see the backgroundOnly flag on both, which keeps them out of every
+  // chat schema. Reads, like everything else on this list above the corrector.
+  'history_find', 'history_read',
   // Phase 2c: the corrector's write actions. Background-only — see
   // BACKGROUND_WRITE_TOOLS below and the backgroundOnly flag on each tool.
   'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
@@ -236,6 +244,46 @@ const TOOL_CATALOGUE = [
     fields: id === 'memory_search'
       ? [{ path: 'tools.memoryInspect.maxCallsPerHour', label: 'Lookups per hour (shared by all six)', type: 'number', min: 1, max: 500 }]
       : []
+  })),
+
+  {
+    id: 'history_search',
+    title: 'Search his own past conversations',
+    Tool: HistorySearchTool,
+    card: 'memoryInspect',
+    // Gated on its OWN switch, not on the memory-inspect set's. It shares that
+    // set's hourly budget — the thing being bounded is rummaging, and there is
+    // one counter for it — but it is a different capability over a different
+    // store, and folding the switches would mean turning off fact lookups to
+    // turn off transcript lookups.
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.historySearch) || {}).enabled !== false,
+    gateWhy: () => 'conversation-history search is turned off here',
+    toggle: 'tools.historySearch.enabled',
+    toggleNote: 'Spends the same hourly budget as the memory-reading tools above — one counter for both, because what it bounds is how much of a turn goes into looking things up.',
+    fields: [
+      { path: 'tools.historySearch.digestChars', label: 'Digest size cap (characters)', type: 'number', min: 500, max: 20000,
+        hint: 'The most a single history search may put into his context. Roughly four characters to a token, so the shipped 4000 is about a thousand tokens. Whole quotes are dropped to fit, never truncated — raising this buys more quotes per search, at the cost of the window the answer is written in.' },
+      { path: 'tools.historySearch.waitMs', label: 'How long a turn waits for it (ms)', type: 'number', min: 5000, max: 300000,
+        hint: 'The conversation blocks while the background run searches. Past this it gives up waiting and says so — honestly, with no result. The run itself is stopped by its own shorter clock, so this only binds when the queue was busy.' }
+    ]
+  },
+  ...[
+    ['history_find', 'Search the message index (background)', HistoryFindTool],
+    ['history_read', 'Read around a hit (background)', HistoryReadTool]
+  ].map(([id, title, Tool]) => ({
+    id,
+    title,
+    Tool,
+    card: 'memoryInspect',
+    // Registered with the capability they serve, and unreachable from chat by
+    // the backgroundOnly flag rather than by a gate — the same call the
+    // corrector's tools make, for the same reason: a tool that exists and is
+    // structurally unreachable is easier to reason about than one that vanishes
+    // from the registry and takes the manifest's drift check with it.
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.historySearch) || {}).enabled !== false,
+    gateWhy: () => 'conversation-history search is turned off here',
+    toggle: null,
+    toggleNote: 'Comes with conversation-history search, and is never offered in a conversation — the digging happens in the background run, which is the whole point of it.'
   })),
 
   // The corrector's three write actions. Registered UNCONDITIONALLY and marked

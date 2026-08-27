@@ -987,6 +987,44 @@ const DEFAULTS = {
       enabled: true,
       maxCallsPerHour: 40
     },
+    // history_search — the conversation archive, read by a background agent.
+    //
+    // NO RATE CAP OF ITS OWN, deliberately: it spends memoryInspect's, because
+    // what that budget bounds is how much of a turn goes into rummaging and
+    // this is rummaging. See CAP_TOOLS in db/memory-inspect.js.
+    //
+    // The two numbers worth knowing here:
+    //
+    //   digestChars  THE SIZE CAP. The most one search may put into his
+    //                context — 4000 characters, roughly 1000 tokens, sized
+    //                against the 600-token budget the whole capability
+    //                manifest gets in the same window. Whole quotes are
+    //                dropped to fit; a quote is never truncated to make it
+    //                fit, because a cut quote is no longer verbatim and
+    //                verbatim is the only promise the digest makes.
+    //   waitMs       How long the CONVERSATION blocks. Safe to be this long
+    //                because chat's deadlines measure gaps between tokens on
+    //                an engine call and this sits between two of them; bounded
+    //                because past it the tool says "still running" and returns
+    //                no result at all. maxWallClockMs is the run's own,
+    //                shorter clock, so a run that stops cleanly is still
+    //                reported rather than timed out.
+    historySearch: {
+      enabled: true,
+      maxHits: 12,             // FTS rows one history_find call may return
+      windowBefore: 1,         // messages before a hit that history_read shows
+      windowAfter: 2,          // and after — an answer usually follows the question
+      maxWindow: 4,
+      messageChars: 1200,      // per-message text in a read window
+      maxQuotes: 6,
+      quoteChars: 400,
+      summaryChars: 700,
+      digestChars: 4000,
+      maxToolCalls: 8,
+      maxRounds: 4,
+      maxWallClockMs: 75000,
+      waitMs: 90000
+    },
     // start_background_job — the async handoff tool. Starts work and returns a
     // job id immediately; the turn ends normally. Its rate cap lives in
     // agentJobs.maxStartsPerHour rather than here, because the queue enforces it

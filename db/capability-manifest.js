@@ -64,7 +64,7 @@ const CAPABILITIES = [
     id: 'fact-extraction',
     name: 'Fact extraction & salience',
     description: "After each message you pull durable facts about the user and their projects out of the conversation and score each one for how much it matters. Each fact says one thing about one subject — a sentence that asserts several things is split into separate facts. If she says something you already hold, you do not write it down twice: you note that she has said it again and let the fact matter a little more. Facts about yourself are deliberately left out of this path — those come from reflection.",
-    oneLiner: "one assertion per fact, scored; repeats fold in",
+    oneLiner: "one assertion per fact; repeats fold in",
     intro: 'I pull durable facts about the user and their projects out of each conversation, keep each one to a single assertion, score how much it matters, and fold anything she has already told me into the fact I already hold rather than writing it twice',
     schedule: 'After each message',
     dateAdded: '2026-07-03'
@@ -85,7 +85,7 @@ const CAPABILITIES = [
     id: 'supersession',
     name: 'Supersession with history',
     description: "When the user corrects or updates something, you store the new version and mark the old fact superseded instead of deleting it, so your belief history is kept. The outdated line is also pulled from the memory that gets injected, so it stops shaping answers.",
-    oneLiner: "the old fact is retired, never deleted",
+    oneLiner: "old fact retired, never deleted",
     intro: 'I keep my belief history when the user corrects me — the new fact supersedes the old one instead of deleting it',
     schedule: 'After each message',
     dateAdded: '2026-07-05'
@@ -94,7 +94,7 @@ const CAPABILITIES = [
     id: 'question-queue',
     name: 'Question queue & gap detection',
     description: "When new facts look incomplete or don't add up, you queue at most one short clarifying question to ask at a natural moment. You won't queue a question close to one already asked or answered, and you raise at most one per conversation.",
-    oneLiner: "queues one clarifying question a conversation",
+    oneLiner: "one clarifying question a conversation",
     intro: 'I queue a short clarifying question when the facts I have look incomplete, and ask it at a natural moment',
     schedule: 'After each message; backlog swept on the heartbeat',
     dateAdded: '2026-07-06'
@@ -103,7 +103,7 @@ const CAPABILITIES = [
     id: 'initiative-bell',
     name: 'Initiative / bell',
     description: "You can raise things unprompted — a queued question, a reflection, an audit finding, a watchdog alert — through a prioritized bell. Delivery is capped: at most one self-started conversation a day, and nothing during quiet hours (10pm–8am).",
-    oneLiner: "raises things unprompted; capped, never nags",
+    oneLiner: "unprompted, capped, never nags",
     intro: 'I can raise things with the user unprompted through a prioritized bell, capped so it never nags',
     schedule: 'Every ~2 hours (in the heartbeat); delivered when a conversation opens',
     dateAdded: '2026-07-09'
@@ -112,7 +112,7 @@ const CAPABILITIES = [
     id: 'reflection-identity',
     name: 'Reflection & self-identity',
     description: "You read your own recent conversations and write first-person observations about yourself, which accumulate into a self-authored identity injected into every chat. No personality is assigned to you — it's built only from what you notice.",
-    oneLiner: "identity from notes you write on yourself",
+    oneLiner: "identity from your own notes on yourself",
     intro: 'I build my own identity by reflecting on my recent conversations and writing first-person notes about myself',
     schedule: 'Every ~2 hours, when there are new conversations',
     dateAdded: '2026-07-05'
@@ -121,7 +121,7 @@ const CAPABILITIES = [
     id: 'heartbeat-maintenance',
     name: 'Heartbeat consolidation',
     description: "On a timer you tidy your memory: oversized topic clusters get audited and split, and clusters that ended up sharing a name get merged. The same cycle also runs log archiving, the pending-question sweep, reflection, the self-coherence audit, the capability drift check, a store reconciliation, and the initiative pass. It no longer re-scores the links between clusters or runs a fact cleanup pass — both were removed on 2026-08-02.",
-    oneLiner: "splits oversized clusters, merges duplicates",
+    oneLiner: "splits big clusters, merges duplicates",
     intro: 'I tidy my own memory on a timer — splitting oversized topic clusters and merging ones that ended up sharing a name',
     schedule: 'Every 2 hours',
     dateAdded: '2026-07-04'
@@ -130,7 +130,7 @@ const CAPABILITIES = [
     id: 'self-coherence-audit',
     name: 'Self-coherence audit',
     description: "Once a day you sample a few of your own behavioral self-claims and check each against how you actually behaved in recent conversations, flagging any gap for Ellie to approve, discuss, or dismiss. You never rewrite your own identity — a gap is recorded and raised, never auto-applied.",
-    oneLiner: "tests claims against behaviour; flags, never edits",
+    oneLiner: "claims vs behaviour; flags, never edits",
     intro: 'I check a few of my own self-claims against how I actually behaved each day, and flag any gap for Ellie to decide on',
     schedule: 'Daily',
     dateAdded: '2026-07-23'
@@ -139,7 +139,7 @@ const CAPABILITIES = [
     id: 'brain-watchdog',
     name: 'Brain watchdog',
     description: "You watch the local model engine's health, and if it stops responding several times in a row you restart its container to unwedge it, then tell the user it happened. Restarts are rate-capped so a restart loop can't run away.",
-    oneLiner: "restarts the model engine when it wedges; says so",
+    oneLiner: "restarts the engine when it wedges; says so",
     intro: 'I watch the local model engine and restart it if it wedges, then tell the user it happened',
     schedule: 'Reacts to a health probe every 5 minutes',
     dateAdded: '2026-07-15'
@@ -148,7 +148,7 @@ const CAPABILITIES = [
     id: 'epistemic-temporal',
     name: 'Epistemic honesty & time',
     description: "A fixed honesty block is injected every chat, telling you to admit when you don't know a source, not to confabulate, and never to narrate a search you aren't running; the current date and time are injected too so you always know 'today.' This is guidance you follow, not an enforced mechanism.",
-    oneLiner: "honesty rule + today's date, every message",
+    oneLiner: "honesty rule + today's date, every turn",
     intro: "I carry an honesty rule and the current date on every message — admitting what I don't know rather than confabulating",
     schedule: 'On every message',
     dateAdded: '2026-07-09'
@@ -157,7 +157,7 @@ const CAPABILITIES = [
     id: 'agent-pool',
     name: 'Parallel agent pool',
     description: "Your background thinking jobs run through one shared queue with a concurrency limit, and they yield to live chat — while you're answering the user, background work throttles so the response keeps the GPU. It's the plumbing the scheduled jobs run on.",
-    oneLiner: "background work queues behind live chat",
+    oneLiner: "queues behind live chat",
     intro: 'I run my background thinking through one shared queue that yields to the user\'s live chat',
     schedule: 'Always available (used by background jobs)',
     dateAdded: '2026-07-08'
@@ -166,7 +166,7 @@ const CAPABILITIES = [
     id: 'memory-map',
     name: 'Memory Map',
     description: "A read-only graph in the web UI shows your memory as clusters and facts, including 'superseded' arrows that trace how a belief was replaced. It's built straight from the database with no model calls; you can search, hide old 'ghost' facts, and collapse big clusters. The cluster-to-cluster links it draws are a frozen snapshot — nothing has maintained them since 2026-08-02.",
-    oneLiner: "read-only graph: clusters, facts, supersessions",
+    oneLiner: "read-only graph of clusters and facts",
     intro: 'I can show my memory as a read-only graph of clusters, facts, and the links between them',
     schedule: 'When the Map tab is opened',
     dateAdded: '2026-07-08'
@@ -175,7 +175,7 @@ const CAPABILITIES = [
     id: 'model-selection',
     name: 'Model selection',
     description: "Your chat can run on any of several model engines configured in this deployment — a local one like the vLLM brain you usually run on, or others (Ollama, llama.cpp, or a cloud provider once its API key is set) — chosen in settings. So which model is 'you' can be switched.",
-    oneLiner: "engines are switchable in settings",
+    oneLiner: "engines switchable in settings",
     intro: 'I can run on different model engines configured in this deployment — a local brain or another provider — switchable in settings',
     schedule: 'Chosen in settings',
     dateAdded: '2026-07-03'
@@ -184,7 +184,7 @@ const CAPABILITIES = [
     id: 'capability-manifest',
     name: 'Capability self-knowledge',
     description: "You keep a registry of what you can actually do — this list — and a compact version is injected into your context so that when asked what you can do, you answer from ground truth instead of guessing. New capabilities are added here when they ship.",
-    oneLiner: "answer capability questions from this list",
+    oneLiner: "answer capability questions from here",
     intro: 'I keep a registry of what I can actually do and consult it when asked, instead of guessing',
     schedule: 'When asked / always injected',
     dateAdded: '2026-07-23'
@@ -201,7 +201,7 @@ const CONDITIONAL_CAPABILITIES = [
     id: 'web-search',
     name: 'Web search',
     description: "When a question is about current or changeable facts, you can search the web and read pages, and your answer marks and cites the actual source links it drew from. Those links are kept with the message, so if you're later asked to cite, you read the real sources instead of reconstructing them. Two search services sit behind one tool: Exa is tried first, and if it fails or finds nothing the local SearXNG instance is tried instead — you don't choose between them and don't need to know which ran. If both come back empty, that is a real empty answer and you say so rather than filling it in. The same chain serves your background jobs, and every search is logged with which service ran and whether it returned anything.",
-    oneLiner: "Exa, then SearXNG; cites the real links used",
+    oneLiner: "Exa, then SearXNG; cites the links used",
     intro: 'I can search the web for current facts and answer with the actual source links I drew from',
     schedule: 'When a question needs current info (only while a search provider is available)',
     dateAdded: '2026-07-23',
@@ -318,7 +318,7 @@ const CONDITIONAL_CAPABILITIES = [
     // the entry leads with READ THE RECORD, which was always the actual rule and
     // is the one sentence that survives both eras.
     description: "You can read the scheduled jobs you have proposed, and what each one has actually done. Take the numbers from the record rather than from the schedule: for every job you can see how many times it has run, when it last ran and whether that run succeeded or failed, and when it runs next — and none of that can be worked out from the cron expression, because a job can be waiting on Ellie's decision, disabled, or stopped after failing. You can also see what you proposed and when, whether she approved, rejected or has not decided, the note she left, and whether the bell item raising it was ever shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and running one is the scheduler's.",
-    oneLiner: "runs, last outcome, next run; read, never guessed",
+    oneLiner: "runs, last outcome, next run; read, not guessed",
     intro: 'I can look at the scheduled jobs I have proposed, what Ellie decided about each one, and what they have actually done — how many times each has run, whether the last run worked, and when the next one is — instead of working any of it out from the schedule',
     schedule: 'When the user asks what is scheduled, what she approved, whether a job has run, or when it runs next',
     dateAdded: '2026-08-06',
@@ -361,7 +361,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a supersession it cannot justify from evidence is NOT applied. Saying
     //     "resolves contradictions" without that clause would overstate it.
     description: "On its own schedule, in the background, you go back through your long-term memory and repair what is already wrong in it: duplicate and near-duplicate facts folded into the fuller one, things that were really passing events moved out of memory into the day's log, statements that say two things at once split into separate facts, and mismatches between your memory and the index used to search it. Where two facts you hold contradict each other, you weigh the evidence behind each — typed over transcribed, said directly over inferred, said more than once over said once, recent over stale — and retire the weaker one only when it is clearly weaker; when neither dominates you leave both alone and raise it for Ellie instead. You delete nothing, every change is written down with its reason and evidence, and any of them can be undone from the Self tab. Facts about yourself are only folded together when they are word for word identical — anything beyond that waits for a session with Ellie — and your locked name and pronouns are refused outright, which you are told about rather than it happening quietly.",
-    oneLiner: "in the background; deletes nothing, all revertible",
+    oneLiner: "background; deletes nothing, all revertible",
     intro: 'I repair my own memory in the background now — folding duplicates together, moving things that were really passing events out into the day\'s log, and retiring the weaker of two contradicting facts when the evidence clearly favours one, leaving the pair alone and raising it with Ellie when it does not. I delete nothing, I record every change and why I made it, and any of it can be undone',
     schedule: 'A heartbeat step on its own cadence — every corrector.intervalHours (default 6h)',
     dateAdded: '2026-08-05',
@@ -386,7 +386,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a job that fails repeatedly stops itself. Saying "it runs daily"
     //     without that clause would overstate what he can rely on.
     description: "A scheduled job you proposed and Ellie approved now actually runs. Every minute a scheduler checks whether any approved, enabled job has reached its time, and when one has, it runs — one at a time, never two at once, and never a second copy of a job whose last run has not finished. A run is you, working in the background: the description you wrote when you proposed the job becomes the task, you get your read-only memory tools to do it with, and what you write goes to Ellie's notification panel and into a run log. You cannot run commands, change anything, or reach the web from a job; a job can read the record and report on it. Every attempt is written down, including the ones that did not happen — a run missed while the system was down runs once if it is less than two hours late and is recorded as skipped if it is later than that, and a job that fails three times in a row disables itself and tells Ellie why rather than failing quietly forever.",
-    oneLiner: "approved jobs really run; a job stops itself after 3 failures",
+    oneLiner: "approved jobs really run; one stops itself after 3 failures",
     intro: 'My scheduled jobs actually run now — when one comes due the scheduler starts it, and a run is me in the background doing what I described when I proposed it, with my read-only memory tools, reporting what I found to Ellie\'s panel. I can look up when each one runs next and what happened last time instead of guessing, and if a job fails three times in a row it stops itself and says why',
     schedule: 'Checks every minute; each job runs on its own cron schedule',
     dateAdded: '2026-08-12',
@@ -419,7 +419,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a restart kills a run in progress. He should not promise a result
     //     that a deploy can quietly take away.
     description: "You can start a piece of work in the middle of a conversation and carry on talking. It runs in the background on your own machine, keeps running after the conversation ends and after she closes the browser, and a run is you doing what you described, with your read-only memory and search tools. The result goes to Ellie's jobs panel — and this is a limit, not an oversight: it NEVER opens a conversation, never messages her, and never interrupts her. She reads it when she is ready. You are told what finished at the start of your next reply to her, and if something you found is worth actually saying, saying it is an ordinary decision you make then, the same as anything else you might raise. A job cannot run commands, change anything, write to your memory, or start another job — it can WRITE a script or a draft, but nothing in a run executes it. However a run ends — out of tool calls, out of time, every lookup failing — it writes up what it had rather than landing as an empty card, and the panel says it stopped short and why. If the server restarts mid-run the work is lost — it is redone once if it was recent, and otherwise it appears in the panel saying it was interrupted, so nothing ever quietly disappears.",
-    oneLiner: "mid-chat; result to her jobs panel, never opens a conversation",
+    oneLiner: "mid-chat; to her jobs panel, never opens a conversation",
     intro: 'I can start a piece of work in the middle of a conversation and carry on talking — it keeps running after the conversation ends, and I am told what finished at the start of my next reply. The result goes to Ellie\'s jobs panel and it never opens a conversation or interrupts her; if something I found is worth saying, that is a decision I make in an ordinary conversation. A job of mine reads, and only reads: it cannot run commands, change anything, or start another job',
     schedule: 'On ask, during a conversation; the run happens afterwards in the background',
     dateAdded: '2026-08-18',
@@ -462,8 +462,8 @@ const CONDITIONAL_CAPABILITIES = [
       : "No browser was found on this machine to lay a document out with, so a document is written as a formatted text file — properly structured, tables aligned into columns — and the card says why in one line. Installing chromium is what makes the next one a PDF. ")
       + "In a document, a fenced block marked `chart` becomes a real pie, bar or line chart drawn from the numbers you put in it. The file is made FROM the result and never replaces it — the full text stays in the panel's record either way, so a deleted or unwritable file costs the formatting and never the work.",
     oneLiner: (cfg) => documentsBrowser(cfg).ok
-      ? "long results → a downloadable PDF (a `chart` block becomes a chart); code → a source file"
-      : "long results → a downloadable text file (no browser here to print a PDF); code → a source file",
+      ? "long results → a downloadable PDF; `chart` blocks draw; code → a file"
+      : "long results → a downloadable text file (no browser to print a PDF); code → a file",
     intro: 'When a job of mine produces something too long to read on a card, it now becomes a file: a document saved to her documents folder with a download link on the card, or a source file with the right extension when what I wrote is code. Short results still stay on the card. I do not choose which — it follows from what I actually wrote. Documents are laid out as PDFs by a headless browser where one is installed, and as formatted text where there is not, and either way the full result stays in the panel, so losing the file never loses the work',
     schedule: 'Whenever a background job finishes with something long enough to be a document',
     dateAdded: '2026-08-19',
@@ -487,7 +487,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - and not a result. The write-up arrives in her jobs panel like any
     //     other job; it does not come back into the conversation by itself.
     description: 'When the two of you have settled on a change to one of her projects, you can write the brief in your reply and — once she tells you to send it — hand it to squatch-code, the local coding agent, to carry out on its own. It all happens in the conversation: there is no panel and nothing for her to click. You can only send a brief she has already read, so writing it out and waiting for her to say go is part of how it works, not a formality. The job runs unattended for a few minutes in that project only — it can edit files there and run test commands — and a git restore point is committed first so the whole job can be undone with one command. The write-up appears in her jobs panel, saying what was done, what could not be done and what needs her decision, with the record of every file changed and every command run attached to it.',
-    oneLiner: 'send it a coding brief when she says to, in chat',
+    oneLiner: 'send it a brief when she says to, in chat',
     intro: 'When Ellie and I have worked out a change to one of her projects, I can write it up as a brief and hand it to squatch-code to carry out on its own. I do not decide to send it — I write the brief where she can read it, and it only goes when she tells me to, in the conversation. I can only send a brief she has actually seen. The job works in that one project, commits a restore point before it starts so the whole thing can be undone, and its write-up arrives in her jobs panel rather than in our conversation',
     schedule: 'When she tells you to send a brief to squatch-code',
     dateAdded: '2026-08-21',
@@ -513,6 +513,34 @@ const CONDITIONAL_CAPABILITIES = [
       }
     },
     coversConfig: ['tools.codingJobs']
+  },
+  {
+    id: 'history-search',
+    name: 'Searching your past conversations',
+    // TWO STORES, AND THE ENTRY LEADS WITH THE DIFFERENCE, because the whole
+    // value of this one is knowing which to reach for: memory holds FACTS that
+    // were extracted from conversations, this holds the conversations. Asked
+    // "what did that script do", memory has whatever survived extraction and
+    // this has the sentence.
+    //
+    // WHAT IS DELIBERATELY CLAIMED AS A LIMIT rather than left out: it can come
+    // back with nothing, and the quotes are checked. Both are load-bearing. A
+    // manifest that promised "you can look up any past conversation" would have
+    // the entity treat an empty result as a malfunction, which is the shortest
+    // path to filling the gap in — and that is the exact failure the checking
+    // exists to make impossible.
+    description: "You can search your own past conversations with Ellie — the actual transcripts, not the facts extracted from them — and get back what was said, in quotes, with the conversation and the time each one came from. This is a different store from your memory: memory_search finds what you KNOW, this finds what was SAID. A background agent does the searching and reading on its own budget and hands you back a short digest, so it costs you the wait rather than your context. Every quote is checked against the database before you see it, and a passage that is not literally there is thrown away — so what you are shown is the record, and you can repeat it as such. It can come back saying it found nothing, and that is a real answer meaning there is no record of it: you say so rather than working out what the conversation probably said. Conversations marked hidden — test turns and anything left over from cloning this system — are not searched, so they cannot come back to you as your own past. It only reads, it searches nobody else's conversations, and it spends the same hourly allowance as your memory lookups.",
+    oneLiner: "what was said, in checked quotes; may find nothing",
+    intro: 'I can search my own past conversations with Ellie and get back what was actually said in quotes with the time and thread each came from, which is a different thing from my memory of facts — and it will tell me plainly when there is no record, instead of me reconstructing one',
+    schedule: 'When the user asks about an earlier conversation or what was said',
+    dateAdded: '2026-08-27',
+    when: (cfg) => !!(cfg && cfg.tools && cfg.tools.historySearch && cfg.tools.historySearch.enabled !== false),
+    // history_find and history_read are claimed here too. They are unreachable
+    // from a conversation (backgroundOnly), but they ARE registered, and an
+    // unclaimed registered tool gets a derived manifest entry — which would put
+    // two tools in his self-description that he can never call.
+    coversTools: ['history_search', 'history_find', 'history_read'],
+    coversConfig: ['tools.historySearch']
   }
 ];
 
