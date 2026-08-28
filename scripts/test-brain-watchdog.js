@@ -5,6 +5,28 @@
  * no real time. Run: node scripts/test-brain-watchdog.js
  */
 
+// ---- This suite must NOT be run with SNH_DATA_DIR ---------------------------
+//
+// Most suites in this repo need `SNH_DATA_DIR=$(mktemp -d)` to avoid the live
+// store. This one is the exception, and it is the only one: the watchdog reads
+// that variable at module load and disables itself when it is set, because a
+// disposable instance may not restart the shared container. Scenarios A–D need
+// it ENABLED, so the parent process must run without the variable; Scenario E
+// sets it in a child on purpose to prove the guard holds.
+//
+// Run with it set and the watchdog never fires, `dockerCalls` stays empty, and
+// the suite used to die on `dockerCalls[0].args` — a TypeError that reads like a
+// broken watchdog rather than a broken invocation. It is safe without it: this
+// file requires db/database only for a path join, and nothing here opens the DB.
+if (process.env.SNH_DATA_DIR) {
+  console.error(
+    'test-brain-watchdog must run WITHOUT SNH_DATA_DIR — it is the one suite that does.\n' +
+    `Got SNH_DATA_DIR=${process.env.SNH_DATA_DIR}, which disables the watchdog under test.\n` +
+    'Run: node scripts/test-brain-watchdog.js'
+  );
+  process.exit(2);
+}
+
 // ---- Install mocks BEFORE requiring the module under test -------------------
 // The module destructures execFile + getConfig at load, so patch first.
 const path = require('path');
@@ -66,7 +88,13 @@ function opsMatch(re) { return opsLines.some(l => re.test(l)); }
   check(dockerCalls[0].args[0] === 'restart' && dockerCalls[0].args[1] === 'test-brain', 'docker restart test-brain issued');
   check(wd._getState().consecutiveFailures === 0, 'counter reset after restart');
   check(wd._getState().awaitingRecovery === true, 'awaiting recovery');
-  check(opsMatch(/consecutive liveness failures.*restarting test-brain \(restart 1\/2/), 'fire logged to ops');
+  // Loose on HOW the restart is described, strict on WHAT it says: the target
+  // and the attempt counter. 2a47c71 reworded this line from `restarting
+  // <container>` to `restarting via \`<label>\`` so a box whose engine is a
+  // systemd unit reports the command it actually ran — and this assertion, pinned
+  // to the old wording, has been failing ever since. The label is config-shaped,
+  // so matching it literally would only re-arm the same trap.
+  check(opsMatch(/consecutive liveness failures.*restarting.*\btest-brain\b.*\(restart 1\/2/), 'fire logged to ops');
   check(opsMatch(/docker restart test-brain.* completed/), 'restart success logged to ops');
 
   advance(1); await failProbe();             // still reloading, inside 5min cooldown
