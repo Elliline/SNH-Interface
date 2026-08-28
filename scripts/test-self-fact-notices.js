@@ -154,7 +154,11 @@ function check(name, ok, detail) {
     check('…it quotes the belief that changed', n.content.includes('cannot send myself a reminder'), n.content.slice(0, 160));
     check('…names what replaced it', n.content.includes('I can send myself a reminder now'), n.content.slice(0, 220));
     check('…says where the change came from', /a new capability being introduced to you/.test(n.content), n.content);
-    check('…and that nothing was deleted', /Nothing was deleted/.test(n.content));
+    // The promise that closes every notice is fact-store's sentence, read from
+    // fact-store. It is the reason a notice is survivable to read, and it is the
+    // half most likely to be reworded — so this check must move with it.
+    check('…and that nothing was deleted', n.content.endsWith(factStore.NOTICE_PROMISE.superseded),
+      n.content.slice(-140));
     check('…it is unseen, so it survives until he actually reads it', n.seen_at === null);
     check('…and it is not marked as a test notice', n.is_test === 0);
   }
@@ -201,10 +205,18 @@ function check(name, ok, detail) {
   await factStore.retire(toRetire, { reason: 'no longer true of me' });
   const rn = noticeFor(toRetire);
   check('retire() raises a notice', !!rn);
+  // THE SENTENCE COMES FROM fact-store, which writes it. What is asserted is
+  // WHICH of its two notices a retirement gets — the one that says nothing took
+  // the belief's place — and that the caller's reason is carried into it. The
+  // reason is this suite's own string, so that half stays a literal; the notice
+  // around it is not, so it is read from the module.
   check('…saying it was retired with nothing in its place',
-    rn && /no longer part of what you believe/.test(rn.content) && /retired/.test(rn.content), rn && rn.content.slice(0, 160));
+    rn && rn.content === factStore.selfChangeNotice(
+      { content: 'I always answer in exactly three sentences.' },
+      { operation: 'retired', why: ' The reason recorded was: no longer true of me.' }),
+    rn && rn.content.slice(0, 160));
   check('…and carrying the reason the caller gave',
-    rn && /no longer true of me/.test(rn.content), rn && rn.content);
+    rn && rn.content.includes('no longer true of me'), rn && rn.content);
 
   const toExpire = await seed('I am finding today unusually quiet.');
   await factStore.expire(toExpire);

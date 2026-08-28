@@ -133,13 +133,18 @@ const priorityOf = (id) => db.prepare('SELECT priority FROM initiatives WHERE id
     warnings.slice(0, 2).join(' | '));
   check('the per-item warning says what it kept instead',
     warnings.some(w => /keeping priority 6/.test(w)), warnings.slice(0, 2).join(' | '));
+  // THE SUMMARY IS COMPARED TO THE ONE THE ENGINE BUILDS, not to a copy of its
+  // wording kept here. It names the counts and the answer budget, and those are
+  // what the assertions are for — but the sentence carrying them belongs to the
+  // engine, so a reword moves both sides at once or neither.
+  const expectedSummary = engine.unscoredSummaryLine(4, 4, 4);
   check('one summary line for the pass, not one per item',
-    warnings.filter(w => /could not read a score for/.test(w)).length === 1,
-    String(warnings.filter(w => /could not read a score for/.test(w)).length));
+    warnings.filter(w => w.includes(expectedSummary)).length === 1,
+    warnings.filter(w => w.includes(expectedSummary)).length + ' of ' + warnings.length);
   check('the summary names the budget, which is the actionable half',
-    warnings.some(w => /TRUNCATED at the 32-token answer budget/.test(w)));
+    expectedSummary.includes(`${engine.SCORE_ANSWER_TOKENS}-token answer budget`), expectedSummary);
   check('and it reaches the ops log, not just a console nobody is reading',
-    /could not read a score for 4 of 4/.test(opsFile()), opsFile().slice(-200));
+    opsFile().includes(expectedSummary), opsFile().slice(-240));
 
   // =========================================================================
   console.log('\n── An unparseable score that was NOT truncated is reported too ──');
@@ -153,7 +158,8 @@ const priorityOf = (id) => db.prepare('SELECT priority FROM initiatives WHERE id
     nodigitRun.truncatedScores === 0, JSON.stringify(nodigitRun));
   check('the priority is still preserved', ids2.every(id => priorityOf(id) === 6));
   check('and it still says so out loud',
-    warnings.some(w => /could not read a score for 2 of 2/.test(w)));
+    warnings.some(w => w.includes(engine.unscoredSummaryLine(2, 2, 0))),
+    warnings.join(' | '));
   check('without claiming a truncation that did not happen',
     !warnings.some(w => /TRUNCATED/.test(w)), warnings.join(' | '));
 
@@ -165,8 +171,11 @@ const priorityOf = (id) => db.prepare('SELECT priority FROM initiatives WHERE id
   warnings.length = 0;
   const quiet = await engine.prioritize();
   check('no unscored items', quiet.unscored === 0);
+  // A pass that scored everything says NOTHING — asserted as an absence of any
+  // warning at all, which is both stronger than matching a phrase and immune to
+  // the phrase changing.
   check('and no warning — telemetry reports CHANGE, not state',
-    !warnings.some(w => /could not read a score/.test(w)), warnings.join(' | '));
+    warnings.length === 0, warnings.join(' | '));
 
   console.warn = realWarn;
   console.log(`\n=== ${pass} passed, ${fail} failed ===\n`);

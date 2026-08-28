@@ -222,8 +222,20 @@ function seedVector(text) {
   const competing = identityLock.checkNewFact('My name is Bob.', 'self');
   check(competing.ok === false && competing.blocked === true,
     'a competing name is refused BEFORE storage', JSON.stringify(competing));
-  check(/locked/i.test(competing.message || '') && /did not change (it|them)/i.test(competing.message || ''),
-    'that refusal is also written to be said out loud', competing.message);
+  // refusalMessage is already exported; the refusal the guard returns is compared
+  // against the one the module builds, rather than against a copy of its wording
+  // kept here. A reword then moves both at once — and a guard that returned some
+  // OTHER refusal, which the old `/locked/i` match would have accepted, no longer
+  // passes.
+  check(competing.message === identityLock.refusalMessage(competing.existing, 'replace'),
+    'the refusal is the module\'s own, not merely refusal-shaped', competing.message);
+  // A property, not a phrase: whatever the refusal says, it has to name the fact
+  // being defended and the slot it occupies, because a refusal he cannot repeat
+  // specifically is one he will paraphrase into an apology.
+  check((competing.message || '').includes(competing.existing.content)
+    && (competing.message || '').includes(competing.category),
+    'and it names the held fact and the locked slot, so he can repeat it',
+    competing.message);
 
   const dup = identityLock.checkNewFact(target.content, 'self');
   check(dup.ok === false && dup.duplicate === true,

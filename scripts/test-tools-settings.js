@@ -290,9 +290,12 @@ function callRoute(method, routePath, body) {
   const tool = new WebSearchTool();
   const out = await tool.execute({ query: 'anything at all' }, { caller: 'test' });
   check('a search with no provider is an ERROR, not an empty result', !!out.error, JSON.stringify(out));
-  check('it says no provider is available', /No search provider is available/.test(out.error), out.error);
+  // The refusal is the tool's own sentence, and the half that matters — the ban
+  // on answering as though a search had happened — is read from the tool rather
+  // than copied here. `!!out.error` above already carries "it refused"; what is
+  // added is that the refusal still says the thing it exists to say.
   check('and forbids answering as though it had searched',
-    /rather than answering from memory/.test(out.error), out.error);
+    out.error.includes(WebSearchTool.HONESTY.NO_PROVIDER_WARNING), out.error);
   check('it claims nothing about the world', !Array.isArray(out.results) || out.results.length === 0);
 
   // =======================================================================

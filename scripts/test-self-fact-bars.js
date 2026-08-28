@@ -51,7 +51,12 @@ function check(name, ok, detail) {
   database.initDatabase();
   const db = database.getSqliteDb();
   const factExtractor = require(path.join(ROOT, 'db/fact-extractor'));
-  const { selfFactSupersessionBar, applySelfFactRaises } = factExtractor;
+  // THE SENTENCES COME FROM THE MODULE THAT WRITES THEM. What is under test
+  // below is that a raise is worded as a question he is asking and never as a
+  // system error — a property of the wording, so the wording is imported rather
+  // than restated. A restated copy fails on a reword that broke nothing, and
+  // stays green on a sentence that has drifted into error-speak.
+  const { selfFactSupersessionBar, applySelfFactRaises, selfFactRaiseContent } = factExtractor;
 
   const clusterId = randomUUID();
   db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?,?,?,?,?,?)')
@@ -177,9 +182,14 @@ function check(name, ok, detail) {
 
   console.log('\n── Worded as a question he is raising, never as a system error ──');
   const text = bells[0].content;
-  check('it says he could not TELL whether one contradicts the other',
-    /could not tell whether/i.test(text), text.slice(0, 120));
-  check('…and that he left both alone rather than guess', /left both in place/i.test(text));
+  check('it is the undecided wording, built around the two facts it is about',
+    text === selfFactRaiseContent(
+      { kind: 'undecided', newFact: raise1.newFact, oldContent: raise1.oldContent }, ''),
+    text.slice(0, 160));
+  // These two stay as properties rather than as text, because they are what the
+  // wording is FOR: a question, in his voice, with no machinery in it. They must
+  // hold for any future rewording, which is exactly what a template import
+  // cannot check.
   check('…and it asks her something', /\?/.test(text));
   check('…and it never mentions a judge, a call, an error or a failure',
     !/judge|call failed|error|exception|LLM|circuit/i.test(text), text);
@@ -226,8 +236,11 @@ function check(name, ok, detail) {
     detail: 'it is something you said about yourself rather than something observed of you'
   }], { source: 'capability-intro', dailyDir: DAILY });
   const protectedBell = initiatives()[0].content;
-  check('a protected raise says he did not want to drop the older one on his own',
-    /did not want to drop the older one on my own/.test(protectedBell), protectedBell.slice(0, 130));
+  check('a protected raise gets the protected wording, not the undecided one',
+    protectedBell === selfFactRaiseContent({
+      kind: 'protected', newFact: intro.content, oldContent: declaration.content,
+      detail: 'it is something you said about yourself rather than something observed of you'
+    }, ''), protectedBell.slice(0, 130));
   check('…and quotes both facts', protectedBell.includes(intro.content) && protectedBell.includes(declaration.content));
 
   db.prepare("DELETE FROM initiatives").run();
@@ -238,8 +251,11 @@ function check(name, ok, detail) {
     detail: 'the evidence behind them is evenly matched, and nothing but which came second separates them'
   }], { source: 'reflection', dailyDir: DAILY });
   const tiedBell = initiatives()[0].content;
-  check('a tied raise says both cannot be true and he could not tell which gives way',
-    /cannot both be true/.test(tiedBell) && /left both alone/.test(tiedBell), tiedBell.slice(0, 140));
+  check('a tied raise gets the tied wording — three kinds, three sentences',
+    tiedBell === selfFactRaiseContent({
+      kind: 'tied', newFact: newerOrdinary.content, oldContent: ordinary.content,
+      detail: 'the evidence behind them is evenly matched, and nothing but which came second separates them'
+    }, ''), tiedBell.slice(0, 140));
 
   console.log('\n── Nothing a raise touches is ever changed ──');
   check('both facts are still active after all of that',

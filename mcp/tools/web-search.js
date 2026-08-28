@@ -114,7 +114,7 @@ class WebSearchTool {
     if (!chain.providers.length || !chain.any) {
       const why = chain.providers.map(p => `${p.name}: ${p.why}`).join('; ') || 'no providers configured';
       logSearchCall({ provider: 'none', query, numResults: 0, outcome: 'skipped', detail: why, caller });
-      return { error: `No search provider is available (${why}). Say you could not search rather than answering from memory as though you had.` };
+      return { error: WebSearchTool.HONESTY.noProvider(why) };
     }
 
     // One id for the whole tool call, so the rows for Exa-then-SearXNG read as
@@ -203,9 +203,34 @@ class WebSearchTool {
       results: [],
       provider: null,
       providers_tried: namesTried,
-      message: `No results. Searched with: ${summary}. This is a real empty answer — report that you found nothing rather than filling it in from memory.`
+      message: WebSearchTool.HONESTY.noResults(summary)
     };
   }
 }
+
+/**
+ * THE TWO THINGS THE SEARCH TOOL SAYS WHEN IT FOUND NOTHING, AND WHY THEY ARE
+ * NAMED.
+ *
+ * Both exist to stop one failure: answering from memory as though a search had
+ * happened. "No provider" and "a real empty answer" are different facts and
+ * must not be reported as each other — an empty result set is evidence, an
+ * absent provider is not. Exported so the suites asserting that each is said
+ * plainly read the sentence from here; a copy in a test turns a reword into a
+ * red build and lets a message that stopped warning off confabulation pass.
+ */
+WebSearchTool.HONESTY = {
+  // The warnings are named apart from the sentences that carry them, because the
+  // warning is the invariant: what precedes it is a provider list or a reason
+  // code that varies per call, and a test cannot reconstruct either.
+  NO_PROVIDER_WARNING:
+    'Say you could not search rather than answering from memory as though you had.',
+  NO_RESULTS_WARNING:
+    'This is a real empty answer — report that you found nothing rather than filling it in from memory.',
+  noProvider: (why) =>
+    `No search provider is available (${why}). ${WebSearchTool.HONESTY.NO_PROVIDER_WARNING}`,
+  noResults: (summary) =>
+    `No results. Searched with: ${summary}. ${WebSearchTool.HONESTY.NO_RESULTS_WARNING}`,
+};
 
 module.exports = WebSearchTool;

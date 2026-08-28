@@ -71,6 +71,25 @@ async function failProbe(err = 'timeout after 8000ms') { await wd.onProbeResult(
 async function okProbe(ms = 120) { await wd.onProbeResult({ ok: true, ms }); }
 function advance(min) { NOW += min * MIN; }
 function opsMatch(re) { return opsLines.some(l => re.test(l)); }
+// ---- Ops lines are matched on their VALUES, never on their sentences --------
+//
+// The ops log is the watchdog's only observable for "it acted, and it said so",
+// so these checks cannot be moved off the rendered text entirely. What they CAN
+// stop doing is reading the prose. Every assertion below names the facts a line
+// has to carry — the container this suite configured, the counters from its own
+// config, the error text its own mock produced — and says nothing about the
+// words joining them.
+//
+// This is not a style point. 2a47c71 reworded the fire line from `restarting
+// <container>` to `restarting via \`<label>\`` so a box whose engine is a systemd
+// unit reports the command it actually ran; every assertion pinned to the old
+// sentence went red for days with nothing broken. And `docker restart
+// <container>` is itself config-shaped — `watchdog.restartCommand` replaces it
+// outright — so matching it literally pins the test to one deployment's config.
+function opsCarrying(...values) {
+  return opsLines.filter(l => values.every(v => l.includes(String(v))));
+}
+function opsAboutTarget() { return opsCarrying(watchdogCfg.container); }
 
 (async () => {
   // ===== Scenario A: threshold → restart → cooldown → recovery → initiative ==
@@ -88,21 +107,30 @@ function opsMatch(re) { return opsLines.some(l => re.test(l)); }
   check(dockerCalls[0].args[0] === 'restart' && dockerCalls[0].args[1] === 'test-brain', 'docker restart test-brain issued');
   check(wd._getState().consecutiveFailures === 0, 'counter reset after restart');
   check(wd._getState().awaitingRecovery === true, 'awaiting recovery');
-  // Loose on HOW the restart is described, strict on WHAT it says: the target
-  // and the attempt counter. 2a47c71 reworded this line from `restarting
-  // <container>` to `restarting via \`<label>\`` so a box whose engine is a
-  // systemd unit reports the command it actually ran — and this assertion, pinned
-  // to the old wording, has been failing ever since. The label is config-shaped,
-  // so matching it literally would only re-arm the same trap.
-  check(opsMatch(/consecutive liveness failures.*restarting.*\btest-brain\b.*\(restart 1\/2/), 'fire logged to ops');
-  check(opsMatch(/docker restart test-brain.* completed/), 'restart success logged to ops');
+  // The fire line has to carry three facts: which engine, what tripped it, and
+  // which attempt this is against the cap. All three come from this suite's own
+  // config, so a reword moves nothing and a wrong target fails immediately.
+  check(opsCarrying(watchdogCfg.container, watchdogCfg.failureThreshold,
+    `1/${watchdogCfg.maxRestartsPerHour}`).length === 1,
+    'the fire names its target, what tripped it, and which attempt it is',
+    opsAboutTarget().join(' || '));
+  // The OUTCOME is logged, and logged truthfully. `completed` and `FAILED` are
+  // wording; the error text is the fact — this mock succeeds, so no line about
+  // this target may carry one. Scenario C asserts the mirror image.
+  check(opsAboutTarget().length === 2, 'the restart and its outcome are both logged',
+    `${opsAboutTarget().length} line(s)`);
+  check(opsCarrying('permission denied').length === 0,
+    'and a restart that worked is not reported as one that failed');
 
   advance(1); await failProbe();             // still reloading, inside 5min cooldown
   check(dockerCalls.length === 1, 'cooldown honored — no re-trigger during reload');
 
   advance(2); await okProbe(140);            // model back
   check(wd._getState().awaitingRecovery === false, 'recovery cleared awaiting flag');
-  check(opsMatch(/Brain recovered after watchdog restart/), 'recovery logged to ops');
+  // Recovery is logged with the probe that proved it — 140ms is this suite's
+  // number, so the assertion is on the evidence in the line, not on the line.
+  check(opsCarrying('140ms').length === 1, 'recovery is logged with the probe that proved it',
+    opsLines.slice(-2).join(' || '));
   check(queuedInitiatives.length === 1, 'exactly one recovery initiative queued');
   check(queuedInitiatives[0] && queuedInitiatives[0].type === 'alert', 'initiative type = alert');
   check(queuedInitiatives[0] && queuedInitiatives[0].priority === 7, 'initiative priority = 7 (surfaces in greeting)');
@@ -122,12 +150,17 @@ function opsMatch(re) { return opsLines.some(l => re.test(l)); }
   // Cooldown then cap should block restart #3
   advance(6); await failProbe(); advance(5); await failProbe(); advance(5); await failProbe();
   check(dockerCalls.length === 2, 'restart #3 BLOCKED by 2/hour cap');
-  check(opsMatch(/CRITICAL: Brain still wedged.*NOT restarting again/), 'CRITICAL logged when cap hit');
-  const critCount = opsLines.filter(l => /CRITICAL/.test(l)).length;
+  // The cap line is identified by the cap it is reporting — `cap 2/hr` here —
+  // which comes from this suite's config and appears in no other line.
+  const capMark = `${watchdogCfg.maxRestartsPerHour}/hr`;
+  check(opsCarrying(capMark).length === 1, 'hitting the cap is logged, naming the cap',
+    opsLines.join(' || ').slice(-200));
+  const critCount = opsCarrying(capMark).length;
   // keep failing — CRITICAL must not re-log every probe
   advance(5); await failProbe(); advance(5); await failProbe();
   check(dockerCalls.length === 2, 'still no restart past cap');
-  check(opsLines.filter(l => /CRITICAL/.test(l)).length === critCount, 'CRITICAL logged once, not spamming');
+  check(opsCarrying(capMark).length === critCount, 'the cap is announced once, not once per probe',
+    `${opsCarrying(capMark).length} line(s)`);
   check(queuedInitiatives.length === 0, 'no recovery initiative while still dead');
 
   // Cap window rolls over (>1h since restart #1) → a restart is allowed again
@@ -141,7 +174,12 @@ function opsMatch(re) { return opsLines.some(l => re.test(l)); }
   await failProbe(); advance(5); await failProbe(); advance(5); await failProbe();
   check(dockerCalls.length === 1, 'restart attempted');
   check(wd._getState().awaitingRecovery === false, 'not awaiting recovery after failed restart');
-  check(opsMatch(/docker restart test-brain.* FAILED/), 'restart failure logged to ops');
+  // The mirror of scenario A: the outcome line for this target must carry the
+  // reason the mock gave, because a failed restart reported without its reason
+  // is the failure this whole ops line exists to prevent.
+  check(opsCarrying(watchdogCfg.container, 'permission denied').length === 1,
+    'the failed restart is logged against its target, with the reason it failed',
+    opsAboutTarget().join(' || '));
   check(wd._getState().restartTimes.length === 1, 'failed attempt counts toward cap (prevents infinite retry)');
 
   // ===== Scenario D: disabled =============================================

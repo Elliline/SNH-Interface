@@ -391,10 +391,10 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
   // Re-entrancy, both halves. In-memory covers the same process; the run log
   // covers a run that outlived one.
   if (runningJobId) {
-    return recordDeferral(job, scheduledFor, `another job (${runningJobId.slice(0, 8)}) was still running`);
+    return recordDeferral(job, scheduledFor, DEFERRAL.otherJobRunning(runningJobId));
   }
   if (hasUnfinishedRun(job.id)) {
-    return recordDeferral(job, scheduledFor, 'its own previous run has not finished');
+    return recordDeferral(job, scheduledFor, DEFERRAL.OWN_RUN_OPEN);
   }
 
   const runId = randomUUID();
@@ -505,6 +505,22 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
 }
 
 /**
+ * WHY A DUE JOB DID NOT RUN, in the words the row carries.
+ *
+ * A deferral is only useful if it says which of the two reasons it was — the
+ * scheduler was busy with someone else's job, or this job's own last run never
+ * closed. They call for different fixes, and "deferred" alone calls for none.
+ * Named and exported so the suite asserting WHICH reason was recorded compares
+ * against these rather than against a copy of the sentence.
+ */
+const DEFERRAL = {
+  OWN_RUN_OPEN: 'its own previous run has not finished',
+  otherJobRunning: (id) => `another job (${String(id).slice(0, 8)}) was still running`,
+  /** The reason as it is stored on the run row, prefix and all. */
+  onRunRow: (why) => `deferred to the next tick — ${why}`,
+};
+
+/**
  * A due job that could not start. Recorded once per due-time, not once per tick:
  * a job that waits twenty minutes behind a long-running one should leave one
  * line saying it waited, not twenty identical ones. Same reasoning as the
@@ -522,7 +538,7 @@ function recordDeferral(job, scheduledFor, why) {
   const runId = recordRun({
     jobId: job.id, scheduledFor, startedAt: now, finishedAt: now,
     status: 'deferred', durationMs: 0, trigger: 'schedule',
-    error: `deferred to the next tick — ${why}`
+    error: DEFERRAL.onRunRow(why)
   });
   const line = `Scheduled job ${job.id.slice(0, 8)} came due at ${scheduledFor} but ${why}. Deferred to the next tick.`;
   console.log(`[Scheduler] ${line}`);
@@ -676,7 +692,7 @@ async function tick({ now = new Date() } = {}) {
   if (!due.length) return { due: 0, ran: 0 };
 
   if (runningJobId) {
-    for (const job of due) recordDeferral(job, job.next_run_at, `another job (${runningJobId.slice(0, 8)}) was still running`);
+    for (const job of due) recordDeferral(job, job.next_run_at, DEFERRAL.otherJobRunning(runningJobId));
     return { due: due.length, ran: 0, deferred: due.length };
   }
 
@@ -788,6 +804,7 @@ function schedulerState() {
 module.exports = {
   JOB_TOOLS,
   RESULT_STATUSES,
+  DEFERRAL,
   tick,
   runJob,
   runNow,

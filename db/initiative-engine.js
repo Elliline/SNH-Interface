@@ -627,6 +627,28 @@ Respond with ONLY the integer.`;
 }
 
 /**
+ * THE ONE LINE A SCORING PASS SAYS WHEN IT COULD NOT SCORE.
+ *
+ * Exported because it is asserted four ways — that it exists, that it names the
+ * counts, that it names the token budget when truncation is the cause, and that
+ * a clean pass does not emit it at all — and a test carrying its own copy of the
+ * sentence tests the copy. It says the counts and the budget because those are
+ * the actionable halves: "the scorer is not scoring" is only useful next to how
+ * much of the pass it ate.
+ *
+ * @param {number} unscored          items whose score could not be read
+ * @param {number} total             items the pass looked at
+ * @param {number} truncatedScores   how many of those were cut off mid-answer
+ */
+function unscoredSummaryLine(unscored, total, truncatedScores) {
+  return (
+    `Initiative scoring could not read a score for ${unscored} of ${total} item(s)` +
+    `${truncatedScores ? `, ${truncatedScores} of them TRUNCATED at the ${SCORE_ANSWER_TOKENS}-token answer budget` : ''}` +
+    ` — those kept the priority they already had. If this is most of the pass, the scorer is not scoring.`
+  );
+}
+
+/**
  * Review pending initiatives: expire stale ones, re-score priority with a pooled
  * agent, and cap the pending pool so it never becomes a nag queue.
  * @returns {Promise<{expired:number, rescored:number, capped:number, pending:number}>}
@@ -701,10 +723,7 @@ async function prioritize() {
       // every item of every pass, and seventeen identical lines is the wallpaper
       // that buried this in the first place. Said only when it happened.
       if (unscored > 0) {
-        const line =
-          `Initiative scoring could not read a score for ${unscored} of ${pending.length} item(s)` +
-          `${truncatedScores ? `, ${truncatedScores} of them TRUNCATED at the ${SCORE_ANSWER_TOKENS}-token answer budget` : ''}` +
-          ` — those kept the priority they already had. If this is most of the pass, the scorer is not scoring.`;
+        const line = unscoredSummaryLine(unscored, pending.length, truncatedScores);
         console.warn(`[Initiatives] ${line}`);
         opsLog(line);
       }
@@ -900,6 +919,7 @@ module.exports = {
   prioritize,
   prioritizerSystemPrompt,
   SCORE_ANSWER_TOKENS,
+  unscoredSummaryLine,
   deliverUnprompted,
   startDiscussion,
   inQuietHours,

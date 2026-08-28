@@ -2188,6 +2188,29 @@ function cfgIdentity() {
 }
 
 /**
+ * WHAT HE SAYS WHEN HE COULD NOT SETTLE SOMETHING ABOUT HIMSELF.
+ *
+ * HIS VOICE, AND A QUESTION — never "a judge call failed". What he is reporting
+ * is that he could not settle something about himself, which is a thing he would
+ * say, not an error code. That is a property of these three sentences and of
+ * nothing else in the path, so the suite that guards it has to read them from
+ * here: a copy in the test turns a reword into a red build, and lets a sentence
+ * that HAS drifted into error-speak stay green as long as the copy drifted too.
+ *
+ * @param {{kind: string, newFact: string, oldContent: string, detail?: string}} lead
+ * @param {string} extra  trailing "and there were N more" clause, or ''
+ */
+function selfFactRaiseContent(lead, extra = '') {
+  if (lead.kind === 'undecided') {
+    return `I noticed something about myself I could not settle. I could not tell whether "${lead.newFact}" contradicts what I already hold — "${lead.oldContent}" — so I have left both in place rather than guess.${extra} Could we look at it together?`;
+  }
+  if (lead.kind === 'protected') {
+    return `Something I noticed about myself seems to contradict something I already hold, and I did not want to drop the older one on my own. The new observation is "${lead.newFact}"; what it runs against is "${lead.oldContent}", and ${lead.detail}. Both are still there.${extra} What do you think?`;
+  }
+  return `Two things I hold about myself cannot both be true, and I could not tell which should give way: "${lead.newFact}" against "${lead.oldContent}" — ${lead.detail}. I have left both alone.${extra} Could you help me decide?`;
+}
+
+/**
  * A self-fact question he could not settle — recorded three ways, because a row
  * nobody reads is not the same as being told.
  *
@@ -2313,14 +2336,7 @@ async function applySelfFactRaises(raises, { source = 'reflection', dailyDir = n
       ? ` This has come up ${totalSince} times since I last mentioned it.`
       : (raises.length > 1 ? ` There were ${raises.length} of these in the same pass.` : '');
 
-    // HIS VOICE, AND A QUESTION — never "a judge call failed". What he is
-    // reporting is that he could not settle something about himself, which is a
-    // thing he would say, not an error code.
-    const content = lead.kind === 'undecided'
-      ? `I noticed something about myself I could not settle. I could not tell whether "${lead.newFact}" contradicts what I already hold — "${lead.oldContent}" — so I have left both in place rather than guess.${extra} Could we look at it together?`
-      : lead.kind === 'protected'
-        ? `Something I noticed about myself seems to contradict something I already hold, and I did not want to drop the older one on my own. The new observation is "${lead.newFact}"; what it runs against is "${lead.oldContent}", and ${lead.detail}. Both are still there.${extra} What do you think?`
-        : `Two things I hold about myself cannot both be true, and I could not tell which should give way: "${lead.newFact}" against "${lead.oldContent}" — ${lead.detail}. I have left both alone.${extra} Could you help me decide?`;
+    const content = selfFactRaiseContent(lead, extra);
 
     const initiatives = require('./initiatives');
     const id = await initiatives.addInitiative({
@@ -2843,6 +2859,7 @@ module.exports = {
   describeRecall,
   selfFactSupersessionBar,
   applySelfFactRaises,
+  selfFactRaiseContent,
   judgeSameAssertion,
   judgeSubsumption,
   judgeStripTheTimestamp,

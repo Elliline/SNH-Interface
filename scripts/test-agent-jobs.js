@@ -246,10 +246,18 @@ async function settle(id, ms = 3000) {
 
   // What HE is told has to match what is on her card.
   const partialBlock = agentJobs.renderAnnouncementBlock({ limit: 5 });
+  // BOTH SENTENCES COME FROM agent-jobs ITSELF. The property under test is which
+  // of the two announcements a partial run gets, and that is a property of the
+  // words — so the words are read from the module that writes them. Restated
+  // here, a reword would fail this while the choice was still right, and a run
+  // announced under the wrong one would pass as soon as the wording drifted.
+  const { ANNOUNCEMENT } = agentJobs;
   check('a partial job is announced with its text, not as "produced no result"',
     /two of the three suppliers|nothing on the cars themselves/.test(partialBlock.text)
-    && !/^It did not produce a result/m.test(partialBlock.text), partialBlock.text.slice(0, 300));
-  check('and it is marked as having stopped short', /stopped short of finishing/.test(partialBlock.text));
+    && !partialBlock.text.includes(ANNOUNCEMENT.noResult(cutDone.error)), partialBlock.text.slice(0, 300));
+  check('and it is marked as having stopped short',
+    partialBlock.text.includes(ANNOUNCEMENT.stoppedShort('', cutDone.error).trim()),
+    partialBlock.text.slice(0, 300));
 
   // =========================================================================
   // A truncated result USED TO LAND AS `ok`. runToolLoop returned `truncated` off
@@ -333,9 +341,14 @@ async function settle(id, ms = 3000) {
   check('every open row was closed out', swept.closed === 3, String(swept.closed));
   check('the young one is re-queued for one more go', job(young).status === 'queued', job(young).status);
   check('the old one is left interrupted rather than redone', job(old).status === 'interrupted', job(old).status);
-  check('and it says why, in words', /too old to be worth redoing/.test(job(old).error || ''), job(old).error);
+  // WHICH of the four reasons, compared against agent-jobs' own constants. They
+  // are not interchangeable — one of them means files may be half-written on
+  // disk — so "it says something about being old" is not the property under test.
+  check('and it says why, in words, and it is the right one of the four',
+    job(old).error === agentJobs.NOT_RERUN.tooOld(jobCfg.retryGraceMinutes), job(old).error);
   check('the already-retried one is not retried again', job(retried).status === 'interrupted', job(retried).status);
-  check('and it says that it had already been retried', /already been retried/.test(job(retried).error || ''), job(retried).error);
+  check('and it says that it had already been retried',
+    job(retried).error === agentJobs.NOT_RERUN.ALREADY_RETRIED, job(retried).error);
   check('nothing was deleted — all three rows are still there',
     db.prepare('SELECT COUNT(*) n FROM agent_jobs WHERE id IN (?,?,?)').get(young, old, retried).n === 3);
 
@@ -381,10 +394,14 @@ async function settle(id, ms = 3000) {
   check('the block renders', !!block && block.text.includes('=== Background Work That Finished ==='));
   check('it is capped to three items', block.items.length <= 3, String(block.items.length));
   check('it fits the token cap', block.tokens <= 400 + 120, String(block.tokens));
-  check('it tells him she has probably NOT read them', /assume she has NOT/.test(block.text));
-  check('it tells him he is not obliged to report them', /not\s+obliged to report them/.test(block.text));
+  check('it tells him she has probably NOT read them', block.text.includes(ANNOUNCEMENT.HEADER.trim()));
+  check('it tells him he is not obliged to report them', block.text.includes(ANNOUNCEMENT.FOOTER.trim()));
+  // Identity, not prose: WHICH jobs failed is a field, and each failed one has
+  // to appear under the no-result sentence carrying its own recorded reason.
+  const failedItems = block.items.filter(i => i.status !== 'ok' && !String(i.text || '').trim());
   check('a failed job is announced as a failure, with the reason',
-    /did not produce a result/.test(block.text) || block.items.every(i => i.status === 'ok'));
+    failedItems.every(i => block.text.includes(ANNOUNCEMENT.noResult(i.error))),
+    `${failedItems.length} failed item(s)`);
 
   check('rendering alone does NOT stamp them (the block might still be trimmed)',
     agentJobs.pendingAnnouncements({ limit: 10 }).length === pendingBefore.length);

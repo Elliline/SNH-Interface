@@ -211,7 +211,13 @@ const minutesAgo = (n) => new Date(Date.now() - n * 60_000).toISOString();
   check('a job whose previous run is still open is not started again', callCount === callsBefore2);
   const deferrals = runs(busy).filter(r => r.status === 'deferred');
   check('…the deferral is recorded rather than silently dropped', deferrals.length === 1, `${deferrals.length}`);
-  check('…naming why', /its own previous run has not finished/.test(deferrals[0].error || ''), deferrals[0].error);
+  // WHICH deferral reason, compared against the scheduler's own constant. The
+  // two reasons call for different fixes, so recording the wrong one is a real
+  // fault — and a copy of the sentence here could not tell them apart after a
+  // reword.
+  check('…naming why, and naming the right one of the two',
+    deferrals[0].error === scheduler.DEFERRAL.onRunRow(scheduler.DEFERRAL.OWN_RUN_OPEN),
+    deferrals[0].error);
   await scheduler.tick();
   await scheduler.tick();
   check('…and three ticks of waiting leave ONE line, not three',

@@ -257,6 +257,14 @@ function applyTotalCeiling({ parts = [], fixedTokens = 0, totalTokens = 6000, tr
 }
 
 /**
+ * What a shortened fact says about itself. Exported because the test asserting
+ * that a trimmed fact ADMITS it was trimmed must read the marker from here
+ * rather than carry its own copy of the sentence — a copy makes a reword read
+ * as a broken guard, and leaves a guard that stopped marking looking fine.
+ */
+const FACT_SHORTENED_MARKER = '… (shortened here; the full fact is in your memory)';
+
+/**
  * Cap one self-fact's rendered length.
  *
  * The identity block budgets self-facts by COUNT (identity.maxSelfFacts), which
@@ -271,7 +279,7 @@ function budgetFact(content, budgetTokens) {
   let slice = text.slice(0, maxChars);
   const lastSpace = slice.lastIndexOf(' ');
   if (lastSpace > maxChars * 0.6) slice = slice.slice(0, lastSpace);
-  return slice.trimEnd() + '… (shortened here; the full fact is in your memory)';
+  return slice.trimEnd() + FACT_SHORTENED_MARKER;
 }
 
 /**
@@ -352,7 +360,7 @@ function memoryFraming(toolsAvailable) {
 module.exports = {
   estTokens, splitDailyBlocks, entryHeadline, blockIsFromConversation,
   budgetDailyLogs, budgetText,
-  applyTotalCeiling, budgetFact,
+  applyTotalCeiling, budgetFact, FACT_SHORTENED_MARKER,
   MEMORY_EXCERPT_FRAMING_WITH_TOOLS, MEMORY_EXCERPT_FRAMING_NO_TOOLS,
   MEMORY_LOOKUP_HONESTY, memoryFraming
 };

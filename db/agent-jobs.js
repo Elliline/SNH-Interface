@@ -879,6 +879,27 @@ async function runJob(id) {
 // ---------------------------------------------------------------------------
 
 /**
+ * THE FOUR REASONS AN INTERRUPTED JOB IS NOT RUN AGAIN.
+ *
+ * Each is a different decision with a different consequence for her — one of
+ * them ("it can write files") means work may be half-applied on disk right now —
+ * so recording the wrong one is a real fault, not a cosmetic one. Named and
+ * exported because the suite's job is to assert WHICH reason a row got, and a
+ * substring copied into the test cannot tell two of these apart once either is
+ * reworded.
+ */
+const NOT_RERUN = {
+  ANSWERS_NOBODY:
+    'interrupted by a restart. It was NOT run again: it was a lookup answering a conversation that the same restart ended, so there is nobody left to hand the answer to',
+  WRITES_TO_DISK:
+    'interrupted by a restart. It was NOT run again, because it can write files and re-running the brief could apply it twice. Anything it had already changed is still changed - check git status in the project; it commits a restore point before it starts',
+  ALREADY_RETRIED:
+    'interrupted by a restart, and it had already been retried once — it was not run again',
+  tooOld: (graceMinutes) =>
+    `interrupted by a restart, and by the time the server came back it was too old to be worth redoing (older than ${graceMinutes} minutes) — it was not run again`,
+};
+
+/**
  * Close out runs a restart interrupted, and redo the ones still worth redoing.
  *
  * A `running` row can never legitimately survive a process. Left alone it would
@@ -931,12 +952,12 @@ function sweepInterrupted({ now = new Date() } = {}) {
       opsLog(line);
     } else {
       const why = inTurn
-        ? 'interrupted by a restart. It was NOT run again: it was a lookup answering a conversation that the same restart ended, so there is nobody left to hand the answer to'
+        ? NOT_RERUN.ANSWERS_NOBODY
         : writesToDisk
-        ? 'interrupted by a restart. It was NOT run again, because it can write files and re-running the brief could apply it twice. Anything it had already changed is still changed - check git status in the project; it commits a restore point before it starts'
+        ? NOT_RERUN.WRITES_TO_DISK
         : (j.attempts || 0) >= c.maxAttempts
-        ? 'interrupted by a restart, and it had already been retried once — it was not run again'
-        : `interrupted by a restart, and by the time the server came back it was too old to be worth redoing (older than ${c.retryGraceMinutes} minutes) — it was not run again`;
+        ? NOT_RERUN.ALREADY_RETRIED
+        : NOT_RERUN.tooOld(c.retryGraceMinutes);
       finish(j.id, { status: 'interrupted', error: why, toolCalls: j.tool_calls || 0 });
       const line = `Background job ${j.id.slice(0, 8)} ("${j.title}"): ${why}.`;
       console.warn(`[AgentJobs] ${line}`);
@@ -1319,6 +1340,33 @@ function markAnnounced(items = []) {
 }
 
 /**
+ * THE WORDING OF THE ANNOUNCEMENT, IN ONE PLACE.
+ *
+ * These sentences are the whole mechanism of two rules: that he is told a job's
+ * results are UNREAD, and that a job which stopped short is announced as having
+ * stopped short rather than as having produced nothing. Both are properties of
+ * the words, so the tests have to read the words — and a test that keeps its own
+ * copy of them tests the copy. Rewording here changes the test in the same edit,
+ * or changes neither.
+ */
+const ANNOUNCEMENT = {
+  HEADER:
+    '=== Background Work That Finished ===\n' +
+    'These are your own jobs — work you handed off, or a scheduled job of yours — that finished since you ' +
+    'last spoke with her. They landed in her jobs panel, which does not notify her, so assume she has NOT ' +
+    'read them.\n',
+  FOOTER:
+    '\nIf one of these is worth leading with, say it in your own words — what you found, not that a job ran. ' +
+    'If none of it matters to what she just said, let it go; they are already recorded and you are not ' +
+    'obliged to report them. Do not claim a result you cannot see here.',
+  /** A run that finished with nothing to show. */
+  noResult: (error) => `It did not produce a result. What went wrong: ${error || 'unrecorded'}.`,
+  /** A run that produced something and then ran out — the text, and the fact it is partial. */
+  stoppedShort: (text, error) =>
+    `${text}\n  (This one stopped short of finishing: ${error || 'reason unrecorded'}. What is above is what it had.)`,
+};
+
+/**
  * Render the announcement block for injection.
  *
  * Says what happened and, explicitly, what it is NOT: a result is not a message
@@ -1334,15 +1382,8 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
   const items = pendingAnnouncements({ limit });
   if (!items.length) return null;
 
-  const header =
-    '=== Background Work That Finished ===\n' +
-    'These are your own jobs — work you handed off, or a scheduled job of yours — that finished since you ' +
-    'last spoke with her. They landed in her jobs panel, which does not notify her, so assume she has NOT ' +
-    'read them.\n';
-  const footer =
-    '\nIf one of these is worth leading with, say it in your own words — what you found, not that a job ran. ' +
-    'If none of it matters to what she just said, let it go; they are already recorded and you are not ' +
-    'obliged to report them. Do not claim a result you cannot see here.';
+  const header = ANNOUNCEMENT.HEADER;
+  const footer = ANNOUNCEMENT.FOOTER;
 
   // A LATE DIGEST IS NOT "BACKGROUND WORK THAT FINISHED", and telling him it is
   // would be wrong in both directions: the header above says it landed in her
@@ -1384,9 +1425,7 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
     const text = String(it.text || '').trim();
     const body = it.status === 'ok'
       ? text
-      : (text
-        ? `${text}\n  (This one stopped short of finishing: ${it.error || 'reason unrecorded'}. What is above is what it had.)`
-        : `It did not produce a result. What went wrong: ${it.error || 'unrecorded'}.`);
+      : (text ? ANNOUNCEMENT.stoppedShort(text, it.error) : ANNOUNCEMENT.noResult(it.error));
     const label = it.kind === 'scheduled' ? 'scheduled job' : 'job you started';
     // A result that became a file is announced AS a file. Without this he would
     // be told the text and, asked where it went, would have to guess — and the
@@ -1440,6 +1479,8 @@ module.exports = {
   renderActiveJobsBlock,
   jobsStartedInTurn,
   renderAnnouncementBlock,
+  ANNOUNCEMENT,
+  NOT_RERUN,
   activeCount,
   startsLastHour,
   _inFlight: inFlight

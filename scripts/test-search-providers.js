@@ -197,7 +197,11 @@ function rowsFor(query) {
   check('no results', Array.isArray(out.results) && out.results.length === 0);
   check('no provider is claimed to have served it', out.provider === null);
   check('the message names both providers tried', /exa/.test(out.message) && /searxng/.test(out.message), out.message);
-  check('and tells him not to fill it in from memory', /rather than filling it in from memory/i.test(out.message), out.message);
+  // The warning against filling an empty answer in from memory is the point of
+  // this message and belongs to the tool, so it is read from there rather than
+  // restated — a reword then moves both sides at once, or neither.
+  check('and tells him not to fill it in from memory',
+    out.message.includes(WebSearchTool.HONESTY.NO_RESULTS_WARNING), out.message);
   rows = rowsFor('nobody knows');
   check('both attempts are on the record', rows.length === 2 && rows.every(r => r.outcome === 'empty'));
   check('neither is marked as serving', rows.every(r => r.served === 0));

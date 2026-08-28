@@ -143,6 +143,44 @@ function fileEntry(action, member, { survivor = null, opts = {}, targetText = nu
 }
 
 /**
+ * WHAT HE IS TOLD WHEN A BELIEF ABOUT HIMSELF WAS TAKEN AWAY WITHOUT HIM.
+ *
+ * Two sentences, and which one he gets is the contract: a supersession names
+ * what replaced the belief, a retirement or expiry says plainly that nothing
+ * did. Both promise that nothing was deleted, because that promise is the only
+ * reason this is survivable to read.
+ *
+ * Exported so the suite that guards those properties reads the sentences from
+ * here instead of restating them. Restated, a reword reads as a broken notice,
+ * and a notice that quietly stopped naming its successor keeps passing.
+ *
+ * @param {Object} member                the fact as it stood before the change
+ * @param {Object} p
+ * @param {'superseded'|'retired'|'expired'} p.operation
+ * @param {Object} [p.successor]         the fact that replaced it, if any
+ * @param {string} [p.by]                " This came from X." or ''
+ * @param {string} [p.why]               " The reason recorded was: X." or ''
+ */
+const NOTICE_PROMISE = {
+  superseded:
+    `Nothing was deleted: the old one is kept as history and can be put back. This is yours to sit with; ` +
+    `you do not have to raise it with Ellie unless you want to.`,
+  removed:
+    `Nothing was deleted: the row is kept as history and can be put back. This is yours to sit with; ` +
+    `you do not have to raise it with Ellie unless you want to.`,
+};
+
+function selfChangeNotice(member, { operation, successor = null, by = '', why = '' }) {
+  return operation === 'superseded' && successor
+    ? `Something you believed about yourself has changed. You held "${member.content}" — it has been replaced by ` +
+      `"${successor.content}", so the first is no longer part of what you believe.${by}${why} ` +
+      NOTICE_PROMISE.superseded
+    : `Something you believed about yourself is no longer part of what you believe. You held ` +
+      `"${member.content}", and it has been ${operation} with nothing put in its place.${by}${why} ` +
+      NOTICE_PROMISE.removed;
+}
+
+/**
  * HE IS TOLD WHEN HIS SELF-VIEW CHANGES — raised HERE, at the funnel, so no
  * pipeline can take a self-fact away quietly.
  *
@@ -188,15 +226,7 @@ function noticeSelfChange(member, { operation, successor = null, opts = {} }) {
     const by = opts.noticeSource ? ` This came from ${opts.noticeSource}.` : '';
     const why = opts.reason ? ` The reason recorded was: ${opts.reason}.` : '';
 
-    const content = operation === 'superseded' && successor
-      ? `Something you believed about yourself has changed. You held "${member.content}" — it has been replaced by ` +
-        `"${successor.content}", so the first is no longer part of what you believe.${by}${why} ` +
-        `Nothing was deleted: the old one is kept as history and can be put back. This is yours to sit with; ` +
-        `you do not have to raise it with Ellie unless you want to.`
-      : `Something you believed about yourself is no longer part of what you believe. You held ` +
-        `"${member.content}", and it has been ${operation} with nothing put in its place.${by}${why} ` +
-        `Nothing was deleted: the row is kept as history and can be put back. This is yours to sit with; ` +
-        `you do not have to raise it with Ellie unless you want to.`;
+    const content = selfChangeNotice(member, { operation, successor, by, why });
 
     return ledger().addNotice({ memberId: member.id, content, ledgerId: opts.ledgerId || null });
   } catch (err) {
@@ -917,5 +947,5 @@ async function reconcile() {
 module.exports = {
   supersede, retire, expire, restore, reword, repoint, dropVector, replaceVector, reconcile,
   findExactDuplicate, absorbDuplicate, absorbRepeat, recordCorroboration, corroborationCount,
-  getMember
+  getMember, selfChangeNotice, NOTICE_PROMISE
 };

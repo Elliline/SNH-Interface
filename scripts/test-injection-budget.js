@@ -150,8 +150,12 @@ const part = (kind, tokens) => ({ kind, label: kind, text: 'x'.repeat(tokens * 4
     const block = identity.buildIdentityBlock();
     const line = block.text.split('\n').find(l => l.includes('ramble on and on'));
     check('a very long self-fact is shortened in the render', line && line.length < 400, line && `${line.length} chars`);
+    // The marker is READ FROM the module that writes it, not restated here.
+    // Restated, a reword of the sentence fails this check while the guard is
+    // fine, and a guard that stops marking passes it as long as the words
+    // survive somewhere else in the block.
     check('…and says it was shortened rather than just stopping',
-      /shortened here; the full fact is in your memory/.test(block.text));
+      line && line.includes(injectionBudget.FACT_SHORTENED_MARKER), line);
     check('…while the STORED fact is untouched',
       db.prepare('SELECT content FROM cluster_members WHERE id = ?').get(longId).content.length > 700);
     const lockedLine = block.text.split('\n').find(l => l.includes('My name is Testly'));
