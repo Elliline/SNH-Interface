@@ -114,8 +114,21 @@ function check(cond, label) {
   if (cond) { console.log(`  ✅ ${label}`); }
   else { console.log(`  ❌ ${label}`); failures++; }
 }
-async function failProbe(err = 'timeout after 8000ms') { await wd.onProbeResult({ ok: false, ms: 8000, error: err }); }
-async function okProbe(ms = 120) { await wd.onProbeResult({ ok: true, ms }); }
+// A FAILED PROBE NOW CARRIES A VERDICT, and the verdict is what the watchdog
+// acts on. `failProbe` is the unambiguous case — nothing listening — because
+// that is what the scenarios below are about: the conditions a restart fixes.
+async function failProbe(err = 'timeout after 8000ms') {
+  await wd.onProbeResult({ ok: false, ms: 8000, error: err, verdict: 'unreachable', engine: null });
+}
+async function stalledProbe() {
+  await wd.onProbeResult({ ok: false, ms: 8000, error: 'timeout after 8000ms', verdict: 'stalled',
+    engine: { reachable: true, running: 3, waiting: 0, generating: false } });
+}
+async function saturatedProbe(running = 16, waiting = 10) {
+  await wd.onProbeResult({ ok: false, ms: 8000, error: 'timeout after 8000ms', verdict: 'saturated',
+    engine: { reachable: true, running, waiting, generating: true } });
+}
+async function okProbe(ms = 120) { await wd.onProbeResult({ ok: true, ms, verdict: 'ok' }); }
 function advance(min) { NOW += min * MIN; }
 function opsMatch(re) { return opsLines.some(l => re.test(l)); }
 // ---- Ops lines are matched on their VALUES, never on their sentences --------
@@ -275,6 +288,50 @@ function opsAboutTarget() { return opsCarrying(watchdogCfg.container); }
   check(childResult !== null, `child produced a result (${childOut.trim().slice(0, 120)})`);
   check(childResult && childResult.restarts === 0, 'disposable instance never restarts the shared container');
   check(childResult && childResult.spoke === true, 'the refusal is SPOKEN to the ops log, not silent');
+
+  // ===== Scenario F: a SATURATED engine is never restarted =================
+  //
+  // 2026-08-27, and the reason this verdict exists. The engine was generating at
+  // 79.8 tok/s with 16 running and 10 queued; the probe timed out because it
+  // queued behind them, and the watchdog restarted a working engine, discarding
+  // sixteen requests in flight.
+  console.log('\n── Scenario F: saturation is not a wedge ──');
+  wd._reset(); dockerCalls.length = 0; queuedInitiatives.length = 0; opsLines.length = 0; dockerShouldFail = false;
+
+  for (let i = 0; i < 10; i++) { advance(1); await saturatedProbe(); }
+  check(dockerCalls.length === 0, 'ten saturated probes in a row never restart the engine',
+    `${dockerCalls.length} restart(s)`);
+  check(wd._getState().consecutiveFailures === 0,
+    'and they leave no strikes behind — a busy engine is evidence of life',
+    String(wd._getState().consecutiveFailures));
+
+  // The dangerous middle case: saturation must not merely be skipped, or two
+  // unrelated busy minutes either side of it would still add up to a restart.
+  console.log('\n── …and it CLEARS a strike rather than stepping over it ──');
+  wd._reset(); dockerCalls.length = 0;
+  await failProbe();
+  check(wd._getState().consecutiveFailures === 1, 'one real strike lands');
+  advance(1); await saturatedProbe();
+  check(wd._getState().consecutiveFailures === 0, 'the saturated probe resets it');
+  advance(1); await failProbe();
+  check(dockerCalls.length === 0, 'so the next real failure is strike 1 again, not strike 2',
+    `${dockerCalls.length} restart(s)`);
+
+  // ===== Scenario G: a STALLED engine still restarts, promptly ==============
+  //
+  // The other half. Holding work and producing nothing is the 8/21-8/23
+  // signature, and it is exactly what a restart is for. The new verdict must not
+  // have bought saturation's safety at the price of catching this.
+  console.log('\n── Scenario G: holding work, producing nothing → restart ──');
+  wd._reset(); dockerCalls.length = 0; queuedInitiatives.length = 0; opsLines.length = 0;
+  await stalledProbe();
+  advance(1); await stalledProbe();
+  check(dockerCalls.length === 0, `no restart below the threshold (${watchdogCfg.failureThreshold})`,
+    `${dockerCalls.length} restart(s)`);
+  advance(1); await stalledProbe();
+  check(dockerCalls.length === 1, 'a stalled engine is restarted at the threshold',
+    `${dockerCalls.length} restart(s)`);
+  check(wd._getState().awaitingRecovery === true, 'and it is watching for recovery');
 
   // ===== The standing property, checked rather than assumed ================
   console.log('\n── No database was opened at any point in this run ──');

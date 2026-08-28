@@ -472,6 +472,17 @@
       "timeoutSeconds": 900
     },
     {
+      "suite": "test-probe-verdict",
+      "expectedFailures": 0,
+      "reason": "The liveness probe's slow-vs-dead adjudicator. Uses local stub HTTP servers for the engine — no GPU, no live engine, deterministic.",
+      "verifiedAt": "ae17e19",
+      "subjects": [
+        "db/memory-manager.js",
+        "db/brain-watchdog.js"
+      ],
+      "dataDir": "required"
+    },
+    {
       "suite": "test-run-limits-exposed",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",

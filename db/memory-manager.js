@@ -27,6 +27,9 @@ const agentPool = require('./agent-pool');
 const initiativeEngine = require('./initiative-engine');
 const selfAudit = require('./self-audit');
 const brainWatchdog = require('./brain-watchdog');
+// Shared so the probe's ops line and the watchdog's alert cannot describe the
+// same engine state in two different ways.
+const { describeQueue } = brainWatchdog;
 
 const MEMORY_DIR = require('./database').getMemoryDir();
 const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
@@ -976,18 +979,112 @@ async function probeBrainLiveness(timeoutMs = 8000) {
       signal: AbortSignal.timeout(timeoutMs)
     });
     if (!response.ok) {
-      return { ok: false, ms: Date.now() - started, error: `HTTP ${response.status}` };
+      // The engine answered and said no. It is reachable and it is not stuck;
+      // it is refusing, which is a different problem from either.
+      return { ok: false, ms: Date.now() - started, error: `HTTP ${response.status}`, kind: 'slow' };
     }
     // A 200 means the engine answered; the body may be empty at max_tokens 1,
     // which is still a live response.
     await response.json().catch(() => ({}));
-    return { ok: true, ms: Date.now() - started };
+    return { ok: true, ms: Date.now() - started, kind: 'ok' };
   } catch (err) {
-    const error = (err.name === 'TimeoutError' || err.name === 'AbortError')
-      ? `timeout after ${timeoutMs}ms`
-      : err.message;
-    return { ok: false, ms: Date.now() - started, error };
+    // WHICH KIND OF FAILURE. A deadline expiring and a socket refusing are not
+    // the same fact and must not be counted the same way: the probe is an
+    // ordinary completion, so it queues, and a timeout under load measures the
+    // queue rather than the engine. A connection error measures the engine.
+    //
+    // The record bears this out. During the REAL outage on 2026-08-27 (08:25 to
+    // 08:29, while the container was down) every probe read "fetch failed" at
+    // 1-3ms. During the saturation that triggered that restart, they read
+    // "timeout after 8000ms" — interleaved with successes at 4149ms and 5081ms.
+    // Two distinguishable signatures that the old shape flattened into one.
+    const timedOut = err.name === 'TimeoutError' || err.name === 'AbortError';
+    const error = timedOut ? `timeout after ${timeoutMs}ms` : err.message;
+    return { ok: false, ms: Date.now() - started, error, kind: timedOut ? 'slow' : 'unreachable' };
   }
+}
+
+/**
+ * Read the engine's own view of itself: how much work it is holding, and
+ * whether it is making progress on any of it.
+ *
+ * WHY THIS ENDPOINT. /metrics is served by the HTTP layer, not by the scheduler,
+ * so it answers in both of the states a completion cannot distinguish — while
+ * the scheduler is BUSY, and while it is STUCK. That is the whole discriminator.
+ *
+ * Progress is measured as a delta across two samples a moment apart rather than
+ * against the previous minute's reading, because "was it producing tokens 60
+ * seconds ago" does not answer "is it producing tokens now". Prompt tokens count
+ * as progress as well as generated ones: an engine deep in prefill is working.
+ *
+ * @returns {Promise<{reachable: boolean, running: number|null, waiting: number|null,
+ *                    generating: boolean|null, error?: string}>}
+ */
+async function readEngineState(timeoutMs = 2000) {
+  const config = getConfig();
+  const hb = config.models.heartbeat;
+  const inst = getProviderInstance(hb.provider, hb.instance);
+  const host = inst ? inst.host : 'http://localhost:11434';
+
+  const sample = async () => {
+    const res = await fetch(`${host}/metrics`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    const num = (metric) => {
+      const m = text.match(new RegExp(`^${metric}\\{[^}]*\\}\\s+([0-9.eE+-]+)`, 'm'));
+      return m ? Number(m[1]) : null;
+    };
+    return {
+      running: num('vllm:num_requests_running'),
+      waiting: num('vllm:num_requests_waiting'),
+      tokens: (num('vllm:generation_tokens_total') || 0) + (num('vllm:prompt_tokens_total') || 0)
+    };
+  };
+
+  try {
+    const a = await sample();
+    await new Promise(r => setTimeout(r, 750));
+    const b = await sample();
+    return {
+      reachable: true,
+      running: b.running,
+      waiting: b.waiting,
+      // Any forward motion at all. Strictly greater: a counter that has not moved
+      // across the gap while requests are held is the stall signature.
+      generating: b.tokens > a.tokens
+    };
+  } catch (err) {
+    // The metrics endpoint is the LAST thing to go. If it cannot be read either,
+    // this is not a busy engine — it is an absent one.
+    return { reachable: false, running: null, waiting: null, generating: null, error: err.message };
+  }
+}
+
+/**
+ * Turn a failed probe into a verdict, using the engine's own state as evidence.
+ *
+ * Four outcomes, and only two of them are the engine's fault:
+ *
+ *   ok           it answered inside the deadline
+ *   unreachable  nothing is listening, or the metrics endpoint is gone too
+ *   saturated    it is holding work AND making progress — the probe queued
+ *   stalled      it is holding work and NOT making progress, or it is idle and
+ *                still did not answer. This is the 8/21-8/23 signature, and it
+ *                is the one a flat deadline only ever caught by accident.
+ *
+ * `saturated` is the verdict that did not exist on 2026-08-27, which is why a
+ * healthy engine was restarted.
+ */
+async function adjudicateProbe(probe, { metricsTimeoutMs = 2000 } = {}) {
+  if (probe.ok) return { ...probe, verdict: 'ok', engine: null };
+  if (probe.kind === 'unreachable') return { ...probe, verdict: 'unreachable', engine: null };
+
+  const engine = await readEngineState(metricsTimeoutMs);
+  if (!engine.reachable) return { ...probe, verdict: 'unreachable', engine };
+
+  const holding = (engine.running || 0) > 0 || (engine.waiting || 0) > 0;
+  const verdict = (holding && engine.generating) ? 'saturated' : 'stalled';
+  return { ...probe, verdict, engine };
 }
 
 /**
@@ -1700,10 +1797,17 @@ function recordLivenessProbe(probe, retentionDays) {
   try {
     const db = getSqliteDb();
     if (!db) return;
+    const eng = probe.engine || {};
     db.prepare(
-      'INSERT INTO liveness_probes (id, created_at, ok, latency_ms, error) VALUES (?, ?, ?, ?, ?)'
+      `INSERT INTO liveness_probes
+         (id, created_at, ok, latency_ms, error, verdict, engine_running, engine_waiting, engine_generating)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(randomUUID(), new Date().toISOString(), probe.ok ? 1 : 0,
-          Number.isFinite(probe.ms) ? probe.ms : null, probe.ok ? null : (probe.error || 'unknown'));
+          Number.isFinite(probe.ms) ? probe.ms : null, probe.ok ? null : (probe.error || 'unknown'),
+          probe.verdict || null,
+          Number.isFinite(eng.running) ? eng.running : null,
+          Number.isFinite(eng.waiting) ? eng.waiting : null,
+          typeof eng.generating === 'boolean' ? (eng.generating ? 1 : 0) : null);
     // Prune inline. The table is small and created_at is indexed, so this is
     // cheaper than carrying a separate cleanup schedule for one table.
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
@@ -2802,20 +2906,50 @@ function startLivenessProbe() {
   }
   const intervalMs = Math.max(5, lp.intervalSeconds || 60) * 1000;
   const timeoutMs = lp.timeoutMs || 8000;
+  const metricsTimeoutMs = lp.metricsTimeoutMs || 2000;
+  const saturatedNoticeAt = Math.max(2, lp.saturatedProbesBeforeNotice || 5);
+  let saturatedRun = 0;
   console.log(`[Liveness] Probing brain every ${intervalMs / 1000}s (timeout ${timeoutMs}ms)`);
 
   const retentionDays = Math.max(1, lp.retentionDays ?? 14);
 
   livenessTimer = setInterval(async () => {
     try {
-      const probe = await probeBrainLiveness(timeoutMs);
+      const raw = await probeBrainLiveness(timeoutMs);
+      // ADJUDICATE BEFORE ACTING. A failed probe is not yet a fact about the
+      // engine — it is a fact about one request. What kind of failure it was is
+      // decided against the engine's own metrics, and everything downstream
+      // (the ops line, the row, the watchdog) reads the verdict rather than the
+      // latency. This costs a second, and only on a probe that already failed.
+      const probe = await adjudicateProbe(raw, { metricsTimeoutMs });
       // Record EVERY probe. Previously only state transitions were logged, so a
       // probe that ran and passed left no trace and "when did this last run"
       // had no answer. Pruned to the retention window on each write.
       recordLivenessProbe(probe, retentionDays);
-      if (!probe.ok && lastLivenessOk) {
+
+      // SATURATION IS NOT A FAILURE, and must not be announced as one. It is the
+      // engine doing its job with more work than it has slots for; the probe
+      // simply waited its turn. Said once when it starts and once if it persists,
+      // never every minute — telemetry reports CHANGE.
+      if (probe.verdict === 'saturated') {
+        saturatedRun++;
+        if (saturatedRun === 1 || saturatedRun === saturatedNoticeAt) {
+          const q = describeQueue(probe.engine);
+          const msg = saturatedRun === 1
+            ? `Brain liveness probe exceeded ${timeoutMs}ms, but the engine is BUSY, not wedged — ${q}. No restart: it is working through its queue.`
+            : `Brain has been saturated for ${saturatedRun} consecutive probes (~${saturatedRun} min) — ${q}. Still not restarting; a restart would only discard the work in flight. Worth knowing what is driving the load.`;
+          console.warn(`[Liveness] ${msg}`);
+          try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
+        }
+      } else {
+        saturatedRun = 0;
+      }
+
+      if (!probe.ok && probe.verdict !== 'saturated' && lastLivenessOk) {
         lastLivenessOk = false;
-        const msg = `⚠️ Brain liveness probe FAILED: ${probe.error} — engine may be wedged`;
+        const msg = probe.verdict === 'unreachable'
+          ? `⚠️ Brain liveness probe FAILED: ${probe.error} — nothing is answering at the engine`
+          : `⚠️ Brain liveness probe FAILED: ${probe.error} — engine is holding work but not progressing (${describeQueue(probe.engine)})`;
         console.warn(`[Liveness] ${msg}`);
         try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
       } else if (probe.ok && !lastLivenessOk) {
@@ -2928,7 +3062,7 @@ function stopHeartbeat() {
   console.log('[Heartbeat] Stopped');
 }
 
-module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
+module.exports = { runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, readEngineState, adjudicateProbe, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
   // Exported for test: streaming tool-call reassembly and the stall clock are
   // the two things in this file that cannot be proven from the outside.
   streamChat };

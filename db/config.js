@@ -624,7 +624,28 @@ const DEFAULTS = {
   // intervalSeconds replaces intervalMinutes (retired, warn-once) because the
   // useful range is now below a minute and a knob that cannot express it is a
   // knob that has to be replaced again next time.
-  livenessProbe: { enabled: true, intervalSeconds: 60, timeoutMs: 8000, retentionDays: 14 },
+  // A SLOW PROBE AND A DEAD ENGINE ARE DIFFERENT FACTS, and `timeoutMs` alone
+  // cannot tell them apart. The probe is an ordinary /v1/chat/completions, so it
+  // queues behind whatever else the engine is doing; under load its latency is a
+  // measure of QUEUE DEPTH, not of health. Measured over 6,503 successful probes
+  // on this box: p50 150ms, p99 540ms, p99.9 4607ms, and a maximum SUCCESSFUL
+  // probe of 7940ms — 60ms under the cutoff. The deadline sits inside the live
+  // latency tail; there is no healthy/dead gap for a flat number to occupy, and
+  // on 2026-08-27 that restarted an engine generating at 79.8 tok/s.
+  //
+  // So a timed-out probe is now adjudicated against the engine's own metrics
+  // endpoint, which is served by the HTTP layer rather than the scheduler and
+  // therefore answers while the scheduler is busy OR stuck. `metricsTimeoutMs`
+  // bounds that second call; it must stay small, because it runs on the path
+  // where we already know the engine is not answering promptly.
+  //
+  // `saturatedProbesBeforeNotice` bounds the EXCUSE, not the action: a saturated
+  // engine is never restarted (it is working, and restarting destroys the work
+  // in flight), but sustained saturation is worth saying out loud once.
+  livenessProbe: {
+    enabled: true, intervalSeconds: 60, timeoutMs: 8000, retentionDays: 14,
+    metricsTimeoutMs: 2000, saturatedProbesBeforeNotice: 5
+  },
   // Brain watchdog: the self-healing ACTION for the vLLM wedge. Fed each liveness
   // probe result — after `failureThreshold` consecutive failures it runs
   // `docker restart <container>`. `cooldownMinutes` is grace while the model

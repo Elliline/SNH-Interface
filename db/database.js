@@ -627,7 +627,6 @@ function initDatabase() {
       )
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status)`);
-
     // Conversation-followup traces: every reflection cycle records what it
     // reviewed, which older memory clusters it pulled in, the follow-up
     // candidates it weighed, and what it generated or skipped (with reasoning).
@@ -738,6 +737,36 @@ function initDatabase() {
       )
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_liveness_probes_created ON liveness_probes(created_at)`);
+
+    // Migration: verdict + engine state (2026-08-28) — WHY a probe failed, not
+    // just that it did.
+    //
+    // On 8/27 the watchdog restarted an engine that was generating at 79.8 tok/s
+    // with 16 requests running and 10 queued. Every probe row said the same thing
+    // a dead engine says — ok=0, "timeout after 8000ms" — because a completion
+    // that queues behind a full scheduler is indistinguishable, at this table's
+    // resolution, from one that never gets looked at. The distinguishing facts
+    // were in the engine and nowhere in here.
+    //
+    // `verdict` is the classification the probe made (ok | unreachable |
+    // saturated | stalled); the three engine columns are the evidence it made it
+    // from, so a later autopsy reads what was true rather than re-deriving it
+    // from container logs that may have rotated out.
+    const lpCols = sqliteDb.prepare('PRAGMA table_info(liveness_probes)').all();
+    if (!lpCols.some(c => c.name === 'verdict')) {
+      sqliteDb.exec('ALTER TABLE liveness_probes ADD COLUMN verdict TEXT');
+      sqliteDb.exec('ALTER TABLE liveness_probes ADD COLUMN engine_running INTEGER');
+      sqliteDb.exec('ALTER TABLE liveness_probes ADD COLUMN engine_waiting INTEGER');
+      sqliteDb.exec('ALTER TABLE liveness_probes ADD COLUMN engine_generating INTEGER');
+      // Historical rows are backfilled only where the old data DETERMINES the
+      // answer: ok=1 was and is 'ok'. A historical ok=0 is exactly the ambiguity
+      // this column exists to resolve, so it stays NULL rather than being
+      // guessed — including the 8/27 rows, which are the reason for the column.
+      const n = sqliteDb.prepare(
+        "UPDATE liveness_probes SET verdict = 'ok' WHERE ok = 1 AND verdict IS NULL"
+      ).run().changes;
+      console.log(`Migration: added verdict + engine state to liveness_probes (${n} passing rows set to 'ok'; historical failures left NULL — the old row cannot say which kind it was)`);
+    }
 
     // Cron jobs proposed by the entity through the create_cron_job tool. PROPOSE
     // ONLY: a tool call lands here as status='proposed' and raises an initiative;

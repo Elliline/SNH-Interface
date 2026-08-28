@@ -51,6 +51,13 @@ let wedgeDetectedAt = 0;       // ms epoch of the first failure in the current s
 let wedgeDetectedAtBeforeRestart = 0; // wedge time preserved across the post-restart counter reset (for honest "down N min")
 let restartInFlight = false;   // a docker restart is currently executing
 let capCriticalLogged = false; // CRITICAL-once latch while blocked by the cap
+// What the engine last told us about itself, so the alert can say what actually
+// happened instead of assuming. Null when nothing has been adjudicated yet.
+let lastEngineState = null;
+let lastVerdict = null;
+let restartIssuedAt = 0;       // ms epoch the restart command went out — the moment
+                               // unavailability actually BEGINS, which is not the
+                               // moment the first probe timed out
 
 /** Lazy requires to avoid a require cycle (initiatives → memory-manager → watchdog). */
 function opsLog(msg) {
@@ -121,6 +128,28 @@ function cfg() {
   };
 }
 
+/**
+ * THE ONE NUMBER THAT SEPARATES A BUSY ENGINE FROM A STUCK ONE, in words.
+ *
+ * On 2026-08-27 the alert said "locked up ... wedged engine". The engine was
+ * generating at 79.8 tok/s with 16 requests running and 10 queued. Nothing in
+ * the alert carried the queue, so nothing in it could have said otherwise, and
+ * the wrong word was reported onward in good faith and set the whole
+ * investigation off in the wrong direction.
+ *
+ * Exported because both the probe loop and the alert have to say this, and a
+ * second copy of the phrasing is how the two drift apart.
+ */
+function describeQueue(engine) {
+  if (!engine || !engine.reachable) return 'the engine was not answering at all';
+  const running = engine.running ?? 0;
+  const waiting = engine.waiting ?? 0;
+  const progress = engine.generating === true ? 'and still producing tokens'
+    : engine.generating === false ? 'and producing nothing'
+    : 'with progress unknown';
+  return `${running} request(s) running, ${waiting} queued, ${progress}`;
+}
+
 /** How the restart reads in a log line — the real command, not an assumed one. */
 function restartLabel(c) {
   return c.restartArgv ? c.restartArgv.join(' ') : `docker restart ${c.container}`;
@@ -186,18 +215,53 @@ async function onProbeResult(probe) {
     if (awaitingRecovery) {
       awaitingRecovery = false;
       const wedgeAt = wedgeDetectedAtBeforeRestart || lastRestartAt || now;
-      const downMs = now - wedgeAt;
-      const downMin = Math.max(1, Math.round(downMs / 60000));
-      const msg = `✅ Brain recovered after watchdog restart — responded in ${probe.ms}ms (down ~${downMin} min from first failure). Engine healthy.`;
+      // Two different intervals, and conflating them is what made the 8/27 alert
+      // wrong. `unavailableMs` is from the restart command to this answer — the
+      // window nothing could be served. `wedgeAt` is when we first suspected,
+      // which is when to go looking in the logs, and is reported as a time
+      // rather than a duration.
+      const unavailableMs = now - (restartIssuedAt || lastRestartAt || wedgeAt);
+      const secs = Math.max(1, Math.round(unavailableMs / 1000));
+      const msg = `✅ Brain recovered after watchdog restart — responded in ${probe.ms}ms `
+        + `(unavailable ${secs}s from restart to first answer; first suspected at `
+        + `${formatLocalTime(wedgeAt, { style: 'time', fallback: 'an unclear time' })}, `
+        + `verdict then: ${lastVerdict || 'unclassified'}). Engine healthy.`;
       console.log(`[Watchdog] ${msg}`);
       opsLog(msg);
-      await queueRecoveryInitiative(wedgeAt, downMs);
+      await queueRecoveryInitiative(wedgeAt, unavailableMs);
     }
     return;
   }
 
+  // ---- A SATURATED ENGINE IS NEVER RESTARTED --------------------------------
+  //
+  // The probe is an ordinary completion, so under load it queues and its latency
+  // reports queue depth rather than health. `verdict === 'saturated'` means the
+  // adjudicator went and asked the engine directly and found it holding work AND
+  // making progress on it. That engine is working. Restarting it does not help;
+  // it discards every request in flight — sixteen of them, on 2026-08-27.
+  //
+  // The counter is RESET rather than merely skipped. A saturated probe is
+  // positive evidence that the engine is alive, which is exactly what a
+  // consecutive-failure counter is trying to rule out, so letting an earlier
+  // strike stand across it would let two unrelated busy minutes accumulate into
+  // a restart.
+  if (probe.verdict === 'saturated') {
+    consecutiveFailures = 0;
+    wedgeDetectedAt = 0;
+    lastEngineState = probe.engine || null;
+    return;
+  }
+
   // ---- Brain is not answering ----------------------------------------------
+  // Everything past here is 'unreachable' (nothing listening) or 'stalled'
+  // (holding work, producing nothing) — the two conditions a restart can fix.
+  // A probe with no verdict at all is treated as a strike: this runs on a path
+  // where the engine already failed to answer, and an unadjudicated failure is
+  // the old behaviour, which is the safe direction to fail in.
   consecutiveFailures++;
+  lastEngineState = probe.engine || null;
+  lastVerdict = probe.verdict || 'unclassified';
   if (consecutiveFailures === 1) wedgeDetectedAt = now;
 
   // Don't stack restarts or act while one is executing.
@@ -223,6 +287,11 @@ async function onProbeResult(probe) {
 
   // Fire the restart.
   restartInFlight = true;
+  // UNAVAILABILITY STARTS HERE, not at the first failed probe. On 2026-08-27 the
+  // alert said "unresponsive for ~7 min" measured from the first timeout — but
+  // the engine answered twice inside that window, at 4149ms and 5081ms. The only
+  // interval it was genuinely unreachable was the one this restart opened.
+  restartIssuedAt = Date.now();
   wedgeDetectedAtBeforeRestart = wedgeDetectedAt; // preserve original wedge time across the counter reset
   const attemptNum = restartTimes.length + 1;
   // THE CARD SAYS WHICH POLICY FIRED. Reading "3 consecutive failures" tells
@@ -359,6 +428,9 @@ function _reset() {
   wedgeDetectedAtBeforeRestart = 0;
   restartInFlight = false;
   capCriticalLogged = false;
+  lastEngineState = null;
+  lastVerdict = null;
+  restartIssuedAt = 0;
 }
 
-module.exports = { onProbeResult, brainStatus, describeBrainState, _getState, _reset };
+module.exports = { onProbeResult, brainStatus, describeBrainState, describeQueue, _getState, _reset };
