@@ -627,6 +627,30 @@ function initDatabase() {
       )
     `);
     sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status)`);
+
+    // Migration: health_class (2026-08-28) — this item is the system reporting on
+    // ITSELF, and may not be scored into silence.
+    //
+    // The watchdog queued its 8/27 restart alert at priority 7, the bar for
+    // reaching a greeting. The prioritiser re-scored it to 1 — "trivial; probably
+    // not worth interrupting for" — and it sat pending for 25 hours, which is why
+    // Athena could not say what had happened until the next day. The scorer was
+    // not wrong by its own lights: judged as conversational interest, a container
+    // restart IS dull. It is not queued for its interest.
+    //
+    // Set to a short marker ('engine', 'delivery', ...) rather than a boolean, so
+    // the floor can differ by kind later without another migration.
+    const initCols = sqliteDb.prepare('PRAGMA table_info(initiatives)').all();
+    if (!initCols.some(c => c.name === 'health_class')) {
+      sqliteDb.exec('ALTER TABLE initiatives ADD COLUMN health_class TEXT');
+      // Backfill the ones already on the record: watchdog items are health items
+      // by definition, and the stuck 8/27 alert is one of them.
+      const n = sqliteDb.prepare(
+        "UPDATE initiatives SET health_class = 'engine' WHERE source_kind = 'watchdog' AND health_class IS NULL"
+      ).run().changes;
+      console.log(`Migration: added health_class to initiatives (${n} historical watchdog alert(s) marked 'engine')`);
+    }
+
     // Conversation-followup traces: every reflection cycle records what it
     // reviewed, which older memory clusters it pulled in, the follow-up
     // candidates it weighed, and what it generated or skipped (with reasoning).

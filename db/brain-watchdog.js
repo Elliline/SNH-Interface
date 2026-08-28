@@ -179,19 +179,48 @@ function restartBrain(c) {
  * about it conversationally on next contact. Best-effort; needs the brain (now
  * recovered) for greeting delivery, which is fine by the time this runs.
  */
-async function queueRecoveryInitiative(wedgeAt, downMs) {
+function recoveryAlertContent({ detectedAt, unavailableMs, verdict, engine, clock }) {
+  const secs = Math.max(1, Math.round(unavailableMs / 1000));
+  const howLong = secs < 90 ? `${secs} seconds` : `${Math.round(secs / 60)} minutes`;
+  const what = verdict === 'unreachable'
+    ? 'it had stopped answering entirely'
+    : verdict === 'stalled'
+      ? `it was holding work without getting through any of it (${describeQueue(engine)})`
+      : `it stopped answering me (${describeQueue(engine)})`;
+  return `Heads up — around ${clock} my engine needed restarting: ${what}, so I restarted it myself. `
+    + `It was actually unavailable for ${howLong}, from when the restart went out to when it answered again. `
+    + `Everything's back to normal now; no action needed on your end.`;
+}
+
+/**
+ * Queue the honest account of a restart so Ellie learns about it conversationally.
+ *
+ * WHAT THIS SAYS AND WHY IT CHANGED. The old text said "my brain locked up
+ * (wedged engine, unresponsive for ~7 min)". On 2026-08-27 all three claims were
+ * wrong: the engine was generating at 79.8 tok/s with 16 running and 10 queued;
+ * it answered twice inside that window at 4149ms and 5081ms; and the 7 minutes
+ * was measured from the first failed probe rather than from the restart that
+ * actually took it away — real unavailability was 5m42s, and self-inflicted.
+ * Athena repeated all of it in good faith and it aimed the whole investigation
+ * at a GPU fault that had not happened.
+ *
+ * So the alert now carries the VERDICT and the QUEUE, which are the facts that
+ * distinguish the cases, and measures unavailability from the restart.
+ */
+async function queueRecoveryInitiative(wedgeAt, unavailableMs, { verdict = null, engine = null } = {}) {
   try {
     const initiatives = require('./initiatives');
     // Was pinned to America/Los_Angeles. It reads the instance clock now, so a
     // box that is not in Oregon tells its own person the right time.
     const clock = formatLocalTime(wedgeAt, { style: 'time', fallback: 'an unclear time' });
-    const downMin = Math.max(1, Math.round(downMs / 60000));
     await initiatives.addInitiative({
       type: 'alert',
-      content: `Heads up — my brain locked up around ${clock} (wedged engine, unresponsive for ~${downMin} min) and I restarted it myself. Everything's back to normal now; no action needed on your end.`,
+      content: recoveryAlertContent({ detectedAt: wedgeAt, unavailableMs, verdict, engine, clock }),
       sourceKind: 'watchdog',
       sourceRef: `brain-restart:${new Date(wedgeAt).toISOString()}`,
-      priority: 7
+      priority: 7,
+      // SYSTEM HEALTH — exempt from prioritiser downscoring. See db/initiatives.js.
+      healthClass: 'engine'
     });
   } catch (e) {
     console.error('[Watchdog] Failed to queue recovery initiative:', e.message);
@@ -228,7 +257,7 @@ async function onProbeResult(probe) {
         + `verdict then: ${lastVerdict || 'unclassified'}). Engine healthy.`;
       console.log(`[Watchdog] ${msg}`);
       opsLog(msg);
-      await queueRecoveryInitiative(wedgeAt, unavailableMs);
+      await queueRecoveryInitiative(wedgeAt, unavailableMs, { verdict: lastVerdict, engine: lastEngineState });
     }
     return;
   }
@@ -433,4 +462,4 @@ function _reset() {
   restartIssuedAt = 0;
 }
 
-module.exports = { onProbeResult, brainStatus, describeBrainState, describeQueue, _getState, _reset };
+module.exports = { onProbeResult, brainStatus, describeBrainState, describeQueue, recoveryAlertContent, _getState, _reset };

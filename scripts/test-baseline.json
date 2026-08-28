@@ -293,6 +293,17 @@
       "timeoutSeconds": 900
     },
     {
+      "suite": "test-health-alerts",
+      "expectedFailures": 0,
+      "reason": "The floor that stops the prioritiser scoring a self-health alert into silence, and the fields the watchdog's alert must carry. Pure — no engine, no network.",
+      "verifiedAt": "a5194c6",
+      "subjects": [
+        "db/initiatives.js",
+        "db/brain-watchdog.js"
+      ],
+      "dataDir": "required"
+    },
+    {
       "suite": "test-history-coexists",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",

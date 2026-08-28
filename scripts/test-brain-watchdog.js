@@ -194,7 +194,14 @@ function opsAboutTarget() { return opsCarrying(watchdogCfg.container); }
   check(queuedInitiatives.length === 1, 'exactly one recovery initiative queued');
   check(queuedInitiatives[0] && queuedInitiatives[0].type === 'alert', 'initiative type = alert');
   check(queuedInitiatives[0] && queuedInitiatives[0].priority === 7, 'initiative priority = 7 (surfaces in greeting)');
-  check(/locked up/.test(queuedInitiatives[0] && queuedInitiatives[0].content || ''), 'initiative reports the seizure honestly');
+  // WAS: /locked up/. That wording was not merely brittle, it was FALSE — on
+  // 2026-08-27 it described an engine generating at 79.8 tok/s. What the alert
+  // owes Ellie is the verdict it acted on and how long she was actually without
+  // it; scenario A's probes are 'unreachable', so that is what it must say.
+  check(/stopped answering entirely/.test(queuedInitiatives[0] && queuedInitiatives[0].content || ''),
+    'the initiative reports the verdict it acted on', queuedInitiatives[0] && queuedInitiatives[0].content);
+  check((queuedInitiatives[0] || {}).healthClass === 'engine',
+    '…and is marked a health item so it cannot be scored into silence');
   check(dockerCalls.length === 1, 'total 1 restart across scenario A');
 
   // ===== Scenario B: persistently dead → cap → CRITICAL, stop restarting =====
@@ -332,6 +339,32 @@ function opsAboutTarget() { return opsCarrying(watchdogCfg.container); }
   check(dockerCalls.length === 1, 'a stalled engine is restarted at the threshold',
     `${dockerCalls.length} restart(s)`);
   check(wd._getState().awaitingRecovery === true, 'and it is watching for recovery');
+
+  // ===== Scenario H: what the alert says =====================================
+  //
+  // The 8/27 alert said "locked up", "wedged engine", "unresponsive for ~7 min".
+  // All three were wrong, and Athena repeated them in good faith. These assert
+  // the FACTS the alert must carry, not the sentence carrying them.
+  console.log('\n── Scenario H: the alert describes what happened ──');
+  advance(4); await okProbe(300);
+  const alert = queuedInitiatives[queuedInitiatives.length - 1];
+  check(!!alert, 'a recovery alert was queued');
+  check(alert && alert.healthClass === 'engine',
+    'it is marked as a health item, so the prioritiser cannot score it into silence',
+    alert && String(alert.healthClass));
+  check(alert && alert.priority === 7, 'and queued at the greeting bar', alert && String(alert.priority));
+  // The queue depth is the one number that separates saturation from a stall,
+  // and it is now in the sentence Ellie reads.
+  check(alert && alert.content.includes('3 request(s) running, 0 queued'),
+    'it carries the engine state it acted on', alert && alert.content.slice(0, 200));
+  check(alert && !/locked up|wedged/i.test(alert.content),
+    'and it no longer claims a lock-up it cannot know about', alert && alert.content);
+  // Unavailability is measured from the restart, not from the first failed probe.
+  // Here: restart at T, recovery 4 minutes later, so ~4 minutes — NOT the 5 that
+  // counting from the first failure would give.
+  check(alert && /unavailable for 4 minutes/.test(alert.content),
+    'and it times the outage from the restart, not from the first suspicion',
+    alert && alert.content);
 
   // ===== The standing property, checked rather than assumed ================
   console.log('\n── No database was opened at any point in this run ──');

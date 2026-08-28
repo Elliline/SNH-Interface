@@ -71,7 +71,7 @@ function getDedupThreshold() {
  *      them.
  * @returns {Promise<string|null>} id (existing match or new), or null on failure
  */
-async function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5, dedupe = true }) {
+async function addInitiative({ type, content, sourceKind = null, sourceRef = null, priority = 5, dedupe = true, healthClass = null }) {
   try {
     const db = getSqliteDb();
     if (!db || !content || !content.trim()) return null;
@@ -125,9 +125,10 @@ async function addInitiative({ type, content, sourceKind = null, sourceRef = nul
 
     const id = randomUUID();
     db.prepare(`
-      INSERT INTO initiatives (id, type, content, source_kind, source_ref, priority, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(id, safeType, text, sourceKind, sourceRef, clampPriority(priority), new Date().toISOString());
+      INSERT INTO initiatives (id, type, content, source_kind, source_ref, priority, status, created_at, health_class)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(id, safeType, text, sourceKind, sourceRef, clampPriority(priority), new Date().toISOString(),
+           healthClass || null);
     console.log(`[Initiatives] Queued ${safeType} (priority ${clampPriority(priority)}): "${text.slice(0, 80)}"`);
     return id;
   } catch (error) {
@@ -359,12 +360,50 @@ function expire(id) {
   }
 }
 
+/**
+ * The floor a health item may not be scored below.
+ *
+ * Derived from greetingThreshold rather than configured separately, because the
+ * property wanted is "it still reaches her", and that IS the greeting bar. Two
+ * numbers would let the bar move and the floor stay put, which is the failure
+ * with the quiet symptom: the item stops being delivered and nothing says so.
+ */
+function healthFloor() {
+  const cfg = (getConfig().initiative) || {};
+  return clampPriority(cfg.greetingThreshold ?? 7);
+}
+
+/**
+ * Set a pending initiative's priority — THE ONE PLACE priority is written after
+ * creation, and therefore where the health floor is enforced.
+ *
+ * WHY HERE AND NOT IN THE PRIORITISER. The prioritiser is one caller; a floor
+ * living inside it protects against that caller only, and the next thing that
+ * re-scores in bulk would walk straight around it. Enforced at the write, a
+ * health item cannot be lowered below the delivery bar by anything, which is the
+ * same reasoning that puts the identity lock in fact-store rather than in each
+ * pipeline that calls it.
+ *
+ * A refused downscore is LOGGED. A guard that silently declines reproduces the
+ * failure it is preventing — an item that quietly does not do what was asked.
+ */
 function updatePriority(id, priority) {
   try {
     const db = getSqliteDb();
     if (!db) return false;
+    const row = db.prepare("SELECT health_class, priority FROM initiatives WHERE id = ?").get(id);
+    let next = clampPriority(priority);
+    if (row && row.health_class) {
+      const floor = healthFloor();
+      if (next < floor) {
+        console.warn(`[Initiatives] Held health item ${id.slice(0, 8)} (${row.health_class}) at priority ${floor} — `
+          + `a re-score to ${next} would have dropped it below the delivery bar. The system reporting on itself is not `
+          + `scored on how interesting it is.`);
+        next = floor;
+      }
+    }
     const info = db.prepare("UPDATE initiatives SET priority = ? WHERE id = ? AND status = 'pending'")
-      .run(clampPriority(priority), id);
+      .run(next, id);
     return info.changes > 0;
   } catch (error) {
     console.error('[Initiatives] updatePriority error:', error.message);
@@ -543,6 +582,7 @@ module.exports = {
   dismissForSource,
   expire,
   updatePriority,
+  healthFloor,
   countUnpromptedDeliveredToday,
   recordFollowupTrace,
   listFollowupTraces,
