@@ -22,6 +22,7 @@ if (!process.env.SNH_DATA_DIR) {
 }
 
 const codingJobs = require('../db/coding-jobs');
+const { classifyDispatchClaim } = require('../db/dispatch-claims');
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -91,20 +92,18 @@ test('dispatch refuses before writing a row', () => {
 // ── the phantom-claim vocabulary ──────────────────────────────────
 console.log('\nnarrating a dispatch that did not happen\n');
 
-function guards() {
-  const src = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const done = eval(src.match(/const claimedDone = (\/.*?\/i);/)[1]);
-  const cond = eval(src.match(/const conditional = (\/.*?\/i);/)[1]);
-  const targetLine = src.match(/const target = '(.*?)';/)[1];
-  const inflight = new RegExp(
-    '\\b(?:sending|dispatching|handing|passing|queuing|queueing|kicking off|launching|re-?running)\\b'
-    + '[^.!?\\n]{0,60}\\b' + targetLine + '\\b'
-    + '|\\bi(?:\'ll| will) (?:re-?run|run|send|dispatch|kick off|launch)\\b[^.!?\\n]{0,40}\\b'
-    + targetLine + '\\b[^.!?\\n]{0,20}\\bnow\\b', 'i');
-  return (t) => (done.test(t) || inflight.test(t)) && !cond.test(t);
-}
-
-const claims = guards();
+// THIS USED TO READ server.js AS TEXT and eval the regex literals out of it —
+// `src.match(/const claimedDone = (\/.*?\/i);/)` — then rebuild the in-flight
+// pattern from a third scraped constant. dbea44c moved all three into
+// db/dispatch-claims.js and exported classifyDispatchClaim, so the match returned
+// null and this suite has died on `[1]` of null ever since: a TypeError that
+// reads like a broken guard and is a broken test.
+//
+// It is the same fault as every other one closed in this pass, in its most
+// literal form — an assertion pinned to how the code under test is WRITTEN
+// rather than to what it does. Scraping source cannot survive the code moving,
+// and it cannot notice the code being wrong.
+const claims = (t) => classifyDispatchClaim(t).claims;
 
 const SHOULD_FIRE = [
   ['Sending the directive to squatch-code now...', 'what she actually saw'],
