@@ -652,6 +652,26 @@ const DEFAULTS = {
   // reloads (no re-trigger). `maxRestartsPerHour` is a hard cap: past it the
   // watchdog stops restarting, logs CRITICAL, and leaves the circuit breaker as
   // the fallback (a restart loop that isn't healing means something worse).
+  //
+  // WHY failureThreshold IS 2, AND WHAT CHANGED UNDER IT. 484f1c2 lowered it
+  // from 3 and raised the probe rate to 60s, on this reasoning:
+  //
+  //     "a healthy probe answers in milliseconds ... so a failed check is not
+  //      'busy', it is the engine already gone"
+  //
+  // That is false, and 2026-08-27 is the counter-example: the engine was
+  // generating at 79.8 tok/s with 16 running and 10 queued, and the probe failed
+  // because it queued behind them. Measured since: ten probes have SUCCEEDED
+  // above 4s and the slowest successful one took 7940ms. A failed check very
+  // much can be "busy".
+  //
+  // 2 is kept, because what feeds this counter changed rather than the number.
+  // A strike is now only an 'unreachable' or 'stalled' verdict — nothing
+  // listening, or holding work and producing none — and both of those really are
+  // "already gone". Saturation no longer reaches the counter at all, so the
+  // detection speed 484f1c2 wanted is bought without the false positive it
+  // brought with it. Do not raise this as a way of tolerating load; that is what
+  // the verdict is for, and a higher number would only slow down the real case.
   watchdog: { enabled: true, container: 'sparky-brain', failureThreshold: 2, cooldownMinutes: 5, maxRestartsPerHour: 2 },
   // Self-identity: a deliberately minimal seed. We do NOT define the AI's
   // personality — it develops one through its own accumulated self-observations

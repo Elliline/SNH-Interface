@@ -675,6 +675,33 @@ decides 502-vs-500, `chatFailureBody` picks the words. **One predicate decides b
 the status and whether she gets an explanation**, so a future upstream flag cannot
 get the code right and the words wrong.
 
+- **And the LIVENESS PROBE learned it on 2026-08-27, which is the third time.**
+  The probe is an ordinary `/v1/chat/completions` with `max_tokens: 1`, so it
+  queues behind whatever else the engine is doing: under load its latency
+  measures QUEUE DEPTH, not health. Over 6,503 successful probes on this box —
+  p50 150ms, p99 540ms, p99.9 4607ms, **maximum successful 7940ms**, 60ms under
+  the 8000ms cutoff. The deadline sat inside the live latency tail, so it
+  restarted an engine generating at 79.8 tok/s with 16 running and 10 queued,
+  discarding all sixteen. A failed probe is now adjudicated against the engine's
+  own `/metrics` — served by the HTTP layer, so it answers while the scheduler is
+  BUSY *or* STUCK — into four verdicts: `ok`, `unreachable` (nothing listening),
+  `saturated` (holding work and making progress), `stalled` (holding work,
+  producing nothing). Only the last two are strikes. **A saturated probe RESETS
+  the strike counter** rather than being skipped: it is positive evidence of
+  life, and skipping would let two unrelated busy minutes add up to a restart.
+  Progress is a token-counter delta across two samples 750ms apart, because "was
+  it producing tokens 60 seconds ago" does not answer "is it producing now".
+  Verify with `node scripts/test-probe-verdict.js` (stub engines, no GPU).
+
+- **`NVRM ... NV_ERR_NO_MEMORY` IS NOT A WEDGE MARKER.** It reads like one and it
+  was treated as one through six incidents. Paired against container starts it
+  trails the restart by **3m31s to 4m05s in all eight** occurrences on record —
+  it is an allocation failure during MODEL RELOAD, and it appears *because* the
+  watchdog fired, not before it. It cannot confirm a wedge and its absence cannot
+  rule one out. On a GB10 the GPU shares host memory and `nvidia-smi` reports no
+  GPU memory figures at all, which is why load-time allocation is where this
+  surfaces. The queue depth is the number that tells you what was happening.
+
 - **The watchdog's silence is not evidence of health.** It needs
   `failureThreshold` consecutive probes and its counters live in the server
   process, so there is a multi-minute window where the engine is wedged and
