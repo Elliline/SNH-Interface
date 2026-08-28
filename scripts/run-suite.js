@@ -71,6 +71,7 @@ const INCLUDE_INSTANCE = flags.has('--include-instance');
 const INCLUDE_LIVE_CORPUS = flags.has('--include-live-corpus');
 
 const baseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8'));
+const staleUnderRecord = [];
 
 function git(args) {
   try {
@@ -228,9 +229,14 @@ function runSuite(entry) {
       why: `no verified count in the baseline — observed ${observed}. ${entry.reason || ''}`.trim() };
   }
 
+  // --record is the one mode that may ignore rule 2, because re-recording is how
+  // a stale entry gets un-staled — but it says so at the end of the run rather
+  // than quietly returning matches. A rule that can be switched off without
+  // saying it was switched off is the failure this whole file is about.
   const stale = stalenessOf(entry, suiteFile);
-  if (stale.stale && !RECORD) {
-    return { ...base, observed, kind: UNKNOWN, why: `STALE entry — ${stale.why}` };
+  if (stale.stale) {
+    if (!RECORD) return { ...base, observed, kind: UNKNOWN, why: `STALE entry — ${stale.why}` };
+    staleUnderRecord.push(`${entry.suite}: ${stale.why}`);
   }
 
   if (observed === entry.expectedFailures) return { ...base, observed, kind: OK };
@@ -260,6 +266,12 @@ function runSuite(entry) {
   }
 
   if (RECORD) {
+    if (staleUnderRecord.length) {
+      console.log(`\n!!! --record IGNORED THE STALENESS RULE for ${staleUnderRecord.length} entr(ies). ` +
+        'Their counts below are freshly measured; move their verifiedAt forward, or they stay UNKNOWN ' +
+        'on the next ordinary run:');
+      for (const l of staleUnderRecord) console.log(`      ${l}`);
+    }
     console.log('\n--- observed, for curating into scripts/test-baseline.json ---');
     console.log(JSON.stringify(results.map(r => ({
       suite: r.entry.suite, exit: r.code, observedFailures: r.observed ?? null, kind: r.kind,
