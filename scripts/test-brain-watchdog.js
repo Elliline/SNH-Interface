@@ -27,6 +27,53 @@ if (process.env.SNH_DATA_DIR) {
   process.exit(2);
 }
 
+// ---- …and the reason that is safe is CHECKED, not remembered ---------------
+//
+// Running without SNH_DATA_DIR is only safe while this file opens no database:
+// with the variable unset, db/database resolves at the LIVE store, so a DB touch
+// added here later would run against Ellie's real corpus with nothing objecting.
+// That reasoning was written down in a comment above and enforced by nothing —
+// which is the exact shape CLAUDE.md records three times under "a mechanism is
+// only safe in the context that made it safe". The comment cannot notice a new
+// `require('../db/database').getSqliteDb()` three months from now.
+//
+// So the drivers are replaced before anything is loaded. Both halves matter: the
+// throw stops the open, and the ledger survives a caller that swallows it —
+// db/brain-watchdog.js wraps its ops write in try/catch, so a future DB touch
+// inside one would otherwise open a handle and report success, which is the
+// silent-degradation failure mode this codebase keeps paying for.
+//
+// This is the same guard scenario E drives in a child, in the same file, for the
+// same reason: a throwaway instance once ran `docker restart sparky-brain`
+// against the live engine five times in one day.
+const dbOpens = [];
+function sealDatabaseDrivers() {
+  // A `function`, never an arrow: db/database opens SQLite with `new Database(…)`,
+  // and an arrow is not constructible — so `new` would throw "Database is not a
+  // constructor" BEFORE the body ran, leaving dbOpens empty. Loud at the call
+  // site, silent in the ledger, and invisible to a caller that swallows. That is
+  // the bug this guard exists to catch, and the first draft of the guard had it.
+  const refuse = (what) => function (...args) {
+    const target = String(args[0] ?? '');
+    dbOpens.push(`${what}(${target})`);
+    throw new Error(
+      `test-brain-watchdog opened a database: ${what}(${target}).\n` +
+      'This suite runs WITHOUT SNH_DATA_DIR, so that handle is the LIVE store. ' +
+      'It is allowed to run that way only because it opens nothing — if this file ' +
+      'now needs the database, it needs the redirect too, and the watchdog it is ' +
+      'testing switches itself off under the redirect. Resolve that before proceeding.'
+    );
+  };
+  const sqlite = require.cache[require.resolve('better-sqlite3')];
+  if (sqlite) sqlite.exports = refuse('new better-sqlite3.Database');
+  const lancedb = require('vectordb');
+  lancedb.connect = refuse('lancedb.connect');
+}
+// better-sqlite3 has to be in the cache before its entry can be replaced; this
+// only loads the driver, which opens nothing on its own.
+require('better-sqlite3');
+sealDatabaseDrivers();
+
 // ---- Install mocks BEFORE requiring the module under test -------------------
 // The module destructures execFile + getConfig at load, so patch first.
 const path = require('path');
@@ -228,6 +275,12 @@ function opsAboutTarget() { return opsCarrying(watchdogCfg.container); }
   check(childResult !== null, `child produced a result (${childOut.trim().slice(0, 120)})`);
   check(childResult && childResult.restarts === 0, 'disposable instance never restarts the shared container');
   check(childResult && childResult.spoke === true, 'the refusal is SPOKEN to the ops log, not silent');
+
+  // ===== The standing property, checked rather than assumed ================
+  console.log('\n── No database was opened at any point in this run ──');
+  check(dbOpens.length === 0,
+    'the suite that runs without SNH_DATA_DIR opened no database handle',
+    dbOpens.join(', ') || 'none');
 
   Date.now = realNow;
   console.log(`\n${failures === 0 ? '✅ ALL PASSED' : `❌ ${failures} CHECK(S) FAILED`}`);
