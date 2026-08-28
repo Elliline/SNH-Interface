@@ -276,7 +276,13 @@ async function runOnce(question = 'What did the script for Lincoln City Animal C
     check('…with the conversation it came from',
       d.includes('Lincoln City Animal Clinic script') && d.includes(convReal.slice(0, 8)));
     check('…and the message id, so it can be re-checked', d.includes(mAsstA.slice(0, 8)));
-    check('…and a timestamp', /\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(d));
+    // ON THE INSTANCE CLOCK, WITH ITS ZONE. The hour is `numeric`, not padded,
+    // so this must accept "6:38 AM" as well as "10:38 AM" — the old
+    // \d{2}:\d{2} form only matched between 10am and 12pm and passed or failed
+    // by the hour the suite happened to run at. The zone label is asserted
+    // because a bare clock time is indistinguishable from an unconverted one.
+    check('…and a timestamp, on the instance clock and saying which',
+      /\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} (?:AM|PM) [A-Z]{2,5}/.test(d), d.slice(0, 300));
     check('the framing paraphrase is there too, around the quotes',
       d.includes('You described the clinic script to her'));
     check('and it says which part is the record',
