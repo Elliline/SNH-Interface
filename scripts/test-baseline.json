@@ -22,7 +22,7 @@
       "suite": "test-agent-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js"
@@ -34,7 +34,7 @@
       "suite": "test-agent-pool-lanes",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/agent-pool.js"
       ],
@@ -44,7 +44,7 @@
       "suite": "test-approval-trigger",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/approval-classifier.js",
         "db/coding-jobs.js",
@@ -57,7 +57,7 @@
       "suite": "test-archiver-subject",
       "expectedFailures": 3,
       "reason": "Three of ten checks on the archiver subject guard. Pre-existing and never investigated; may be stale fixtures rather than a live fault.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js"
       ],
@@ -68,7 +68,7 @@
       "suite": "test-brain-status",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/brain-watchdog.js",
         "db/chat-failure.js"
@@ -79,7 +79,7 @@
       "suite": "test-brain-watchdog",
       "expectedFailures": 0,
       "reason": "THE ONE SUITE THAT MUST RUN WITHOUT SNH_DATA_DIR. The watchdog reads that variable at module load and disables itself, because a disposable instance may not restart the shared container — so with it set the restart never fires. It is safe without the redirect because it opens no database, and since this pass that is asserted at the end of the run rather than promised in a comment.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/initiatives.js",
         "db/fact-extractor.js",
@@ -91,7 +91,7 @@
       "suite": "test-brief-shown",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/brief-shown.js"
       ],
@@ -101,7 +101,7 @@
       "suite": "test-chat-timeouts",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/chat-failure.js",
         "db/memory-manager.js"
@@ -113,7 +113,7 @@
       "suite": "test-cluster-audit-quiet",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-clusters.js",
         "db/memory-manager.js"
@@ -124,7 +124,7 @@
       "suite": "test-coding-job-limits",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/coding-jobs.js"
       ],
@@ -134,7 +134,7 @@
       "suite": "test-coding-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/coding-jobs.js",
         "db/agent-jobs.js"
@@ -145,7 +145,7 @@
       "suite": "test-compound-safety",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required"
     },
@@ -153,7 +153,7 @@
       "suite": "test-correction-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/tool-routing.js"
       ],
@@ -163,7 +163,7 @@
       "suite": "test-correction-supersession",
       "expectedFailures": 2,
       "reason": "Reads the real Bernice transcripts out of the live `messages` table. Under SNH_DATA_DIR those rows do not exist, so it fails 2 — the invocation, not the code, the same shape as the watchdog crash. Its true contract is live-corpus read-only (it contains no INSERT/UPDATE/DELETE); skipped by default so the runner never touches the live store on its own.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/fact-extractor.js"
       ],
@@ -175,7 +175,7 @@
       "suite": "test-corrector-pool",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/agent-pool.js",
         "db/memory-clusters.js",
@@ -189,7 +189,7 @@
       "suite": "test-cron-eval",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/cron-eval.js"
       ],
@@ -199,7 +199,7 @@
       "suite": "test-daily-log-echo",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/injection-budget.js",
         "db/fact-extractor.js"
@@ -211,7 +211,7 @@
       "suite": "test-data-dir-redirect",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required"
     },
@@ -219,7 +219,7 @@
       "suite": "test-dispatch-claims",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/dispatch-claims.js"
       ],
@@ -229,7 +229,7 @@
       "suite": "test-dispatch-guards",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/coding-jobs.js"
       ],
@@ -239,7 +239,7 @@
       "suite": "test-display-time",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/datetime.js",
@@ -252,7 +252,7 @@
       "suite": "test-empty-reply-retry",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/empty-reply-retry.js",
         "db/memory-manager.js"
@@ -263,7 +263,7 @@
       "suite": "test-flush-early-content",
       "expectedFailures": 3,
       "reason": "The flush summary is built from the kept tail rather than the dropped head, so the early and middle details are not carried. Three failures; pre-existing and not investigated.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-flush.js",
         "db/model-context.js"
@@ -275,7 +275,7 @@
       "suite": "test-fold-shape",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required",
       "timeoutSeconds": 600
@@ -284,7 +284,7 @@
       "suite": "test-handoff-dispatch",
       "expectedFailures": 5,
       "reason": "Five failing. Model-dependent assertions about tool calls; pre-existing and not investigated.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/tool-routing.js",
         "db/memory-manager.js"
@@ -296,7 +296,7 @@
       "suite": "test-health-alerts",
       "expectedFailures": 0,
       "reason": "The floor that stops the prioritiser scoring a self-health alert into silence, and the fields the watchdog's alert must carry. Pure — no engine, no network.",
-      "verifiedAt": "a5194c6",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/initiatives.js",
         "db/brain-watchdog.js"
@@ -307,7 +307,7 @@
       "suite": "test-history-coexists",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required"
     },
@@ -315,7 +315,7 @@
       "suite": "test-history-search",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js",
@@ -329,7 +329,7 @@
       "suite": "test-identity-intake",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/identity-lock.js",
         "db/memory-write.js",
@@ -344,7 +344,7 @@
       "suite": "test-identity-lock",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/identity-lock.js",
         "db/fact-store.js",
@@ -358,7 +358,7 @@
       "suite": "test-initiative-scoring",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/initiatives.js",
@@ -371,7 +371,7 @@
       "suite": "test-injection-budget",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/injection-budget.js",
         "db/memory-clusters.js",
@@ -387,7 +387,7 @@
       "suite": "test-intake-content-preserved",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-write.js"
       ],
@@ -397,7 +397,7 @@
       "suite": "test-job-artifacts",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/markdown.js",
         "db/charts.js",
@@ -412,7 +412,7 @@
       "suite": "test-job-status-line",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/coding-jobs.js"
       ],
@@ -422,7 +422,7 @@
       "suite": "test-jobs-regression",
       "expectedFailures": null,
       "reason": "NEVER RUN BY THIS RUNNER. It posts real chat to POST /api/chat/memory, and on this box port 3000 is the live instance — the one thing CLAUDE.md forbids outright. To run it, stand up a throwaway (SNH_DATA_DIR=$(mktemp -d) PORT=3999 node server.js) and pass PORT plus --include-instance. A hand-written note recorded 3 failures; this runner has never verified that, so it records no count.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/tool-artifacts.js"
       ],
@@ -433,7 +433,7 @@
       "suite": "test-ledger-funnel",
       "expectedFailures": null,
       "reason": "ENGINE-DEPENDENT, found by this runner on 2026-08-28 and on nobody's flaky list before. Observed at 46/0 and 44/2 on the SAME tree, roughly one failing run in five. The two failing checks both assert that memory_supersede_fact files exactly one ledger entry; sometimes it files two, because the call can take the union-merge path and that files a reword entry alongside the supersede. Which path it takes is a model judgement, so the count is not a property of the code. Worth deciding whether two entries is correct there and the assertion is stale, or the funnel is double-filing — until then no count is recorded. Run alone: --include-flaky.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/fact-store.js",
         "db/corrections-ledger.js",
@@ -446,7 +446,7 @@
       "suite": "test-log-followup",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/daily-log-reader.js",
         "db/memory-manager.js",
@@ -461,7 +461,7 @@
       "suite": "test-memory-tool-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/tool-routing.js"
       ],
@@ -472,7 +472,7 @@
       "suite": "test-merge-union",
       "expectedFailures": null,
       "reason": "Engine-dependent: makes real LLM calls and has been seen at 0, 3, 4, 6 and 20 failures on identical code when back-to-back runs starve the shared vLLM engine. A count here would be fiction. Run it ALONE with the engine idle and compare by hand: --include-flaky.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/fact-store.js",
         "db/fact-merge.js",
@@ -486,7 +486,7 @@
       "suite": "test-probe-verdict",
       "expectedFailures": 0,
       "reason": "The liveness probe's slow-vs-dead adjudicator. Uses local stub HTTP servers for the engine — no GPU, no live engine, deterministic.",
-      "verifiedAt": "ae17e19",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/brain-watchdog.js"
@@ -497,7 +497,7 @@
       "suite": "test-run-limits-exposed",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required"
     },
@@ -505,7 +505,7 @@
       "suite": "test-scheduler",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js",
         "db/scheduler.js",
@@ -520,7 +520,7 @@
       "suite": "test-search-providers",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/search-log.js",
         "db/memory-manager.js"
@@ -531,7 +531,7 @@
       "suite": "test-self-fact-bars",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/fact-extractor.js"
       ],
@@ -542,7 +542,7 @@
       "suite": "test-self-fact-notices",
       "expectedFailures": null,
       "reason": "Engine-dependent, same as test-merge-union — real LLM calls, varies in both directions run to run. No count is recorded because none would be true. Run alone with an idle engine: --include-flaky.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/fact-store.js",
         "db/fact-extractor.js",
@@ -557,7 +557,7 @@
       "suite": "test-selffact-dedup-perf",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-clusters.js",
         "db/fact-extractor.js"
@@ -569,7 +569,7 @@
       "suite": "test-stream-stall",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/memory-manager.js"
       ],
@@ -579,7 +579,7 @@
       "suite": "test-tool-artifacts",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [],
       "dataDir": "required"
     },
@@ -587,7 +587,7 @@
       "suite": "test-tool-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/tool-routing.js"
       ],
@@ -597,7 +597,7 @@
       "suite": "test-tools-settings",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/secrets.js"
       ],
@@ -607,7 +607,7 @@
       "suite": "test-watchdog-realdocker",
       "expectedFailures": null,
       "reason": "NOT AN ASSERTION SUITE. It drives a REAL `docker restart` against whatever container it is given, and it has no checks and always exits 0. Listed so it is accounted for; never run by the runner.",
-      "verifiedAt": "44ecdc7",
+      "verifiedAt": "90a9c43",
       "subjects": [
         "db/initiatives.js",
         "db/fact-extractor.js",
