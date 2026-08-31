@@ -79,7 +79,7 @@
       "suite": "test-brain-watchdog",
       "expectedFailures": 0,
       "reason": "THE ONE SUITE THAT MUST RUN WITHOUT SNH_DATA_DIR. The watchdog reads that variable at module load and disables itself, because a disposable instance may not restart the shared container — so with it set the restart never fires. It is safe without the redirect because it opens no database, and since this pass that is asserted at the end of the run rather than promised in a comment.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/initiatives.js",
         "db/fact-extractor.js",
@@ -163,7 +163,7 @@
       "suite": "test-correction-supersession",
       "expectedFailures": 2,
       "reason": "Reads the real Bernice transcripts out of the live `messages` table. Under SNH_DATA_DIR those rows do not exist, so it fails 2 — the invocation, not the code, the same shape as the watchdog crash. Its true contract is live-corpus read-only (it contains no INSERT/UPDATE/DELETE); skipped by default so the runner never touches the live store on its own.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/fact-extractor.js"
       ],
@@ -175,7 +175,7 @@
       "suite": "test-corrector-pool",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/agent-pool.js",
         "db/memory-clusters.js",
@@ -199,7 +199,7 @@
       "suite": "test-daily-log-echo",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/injection-budget.js",
         "db/fact-extractor.js"
@@ -329,7 +329,7 @@
       "suite": "test-identity-intake",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/identity-lock.js",
         "db/memory-write.js",
@@ -343,8 +343,8 @@
     {
       "suite": "test-identity-lock",
       "expectedFailures": 0,
-      "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "reason": "Green at the verified commit; nothing expected to fail. Section 3c stores a self-fact through the real pipeline, so this suite reaches the engine — hence the timeout.",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/identity-lock.js",
         "db/fact-store.js",
@@ -352,7 +352,8 @@
         "db/memory-clusters.js",
         "db/fact-extractor.js"
       ],
-      "dataDir": "required"
+      "dataDir": "required",
+      "timeoutSeconds": 600
     },
     {
       "suite": "test-initiative-scoring",
@@ -371,7 +372,7 @@
       "suite": "test-injection-budget",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/injection-budget.js",
         "db/memory-clusters.js",
@@ -387,7 +388,7 @@
       "suite": "test-intake-content-preserved",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/memory-write.js"
       ],
@@ -531,7 +532,7 @@
       "suite": "test-self-fact-bars",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/fact-extractor.js"
       ],
@@ -557,7 +558,7 @@
       "suite": "test-selffact-dedup-perf",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "84d86e0",
       "subjects": [
         "db/memory-clusters.js",
         "db/fact-extractor.js"
