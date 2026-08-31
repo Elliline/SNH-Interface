@@ -94,8 +94,22 @@ const UNRELATED_TYPED = 'Go for it, run your test.';
     const blocked = identityLock.checkNewFact('I am Juno, Ellie\'s AI sister.', 'self');
     check(blocked.blocked === true, 'and refuses a DIFFERENT name against the locked one', JSON.stringify(blocked));
     check(blocked.claimedName === 'Juno' && blocked.heldName === 'Athena', 'naming both names in the refusal');
+    // The SAME name is not a violation. It is also not, on its own, grounds to
+    // throw the sentence away — those were one assertion here until 2026-08-31,
+    // when the duplicate branch turned out to be discarding whole paragraphs for
+    // the redundant clause at the front of them and returning ok for the
+    // discard. "Not a violation" is the part that mattered and it still holds;
+    // what the fact does NEXT decides whether it is written.
     const same = identityLock.checkNewFact('I am Athena, the name Ellie chose for me.', 'self');
-    check(same.duplicate === true, 'while the SAME name in new words is a restatement, not a violation', JSON.stringify(same));
+    check(same.blocked !== true,
+      'the SAME name in new words is not a violation', JSON.stringify(same));
+    check(same.ok === true && same.nameRedundant === true,
+      '  ...and because it also says where the name came from, it is written, not dropped',
+      JSON.stringify(same));
+    const bare = identityLock.checkNewFact('I am Athena.', 'self');
+    check(bare.duplicate === true,
+      'while a fact that is the held name and NOTHING else is still a quiet discard',
+      JSON.stringify(bare));
     const other = identityLock.checkNewFact("User's AI sister is named Juno.", 'user');
     check(other.ok === true, 'and a fact about someone else is not the lock\'s business');
   }

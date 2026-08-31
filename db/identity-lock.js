@@ -178,7 +178,7 @@ const NOT_A_NAME = new Set([
  * @param {string} text
  * @returns {string|null}
  */
-function extractAssertedName(text) {
+function matchAssertedName(text) {
   const t = String(text || '');
   const triggers = [
     /\bmy (?:chosen |real |own |new |current )?name(?:'s|s)? (?:is|was|remains|stays|will be|should be|has been|shall be)\s+/i,
@@ -197,9 +197,100 @@ function extractAssertedName(text) {
     const nm = rest.match(/^["'\u2018\u201c]?([A-Z][A-Za-z-]{1,30})/);
     if (!nm) continue;
     if (NOT_A_NAME.has(nm[1].toLowerCase())) continue;
-    return nm[1];
+    // index/length span the WHOLE claim — trigger and name together — so a
+    // caller can cut it out of the sentence and look at what is left.
+    return { name: nm[1], index: m.index, length: m[0].length + nm[0].length };
   }
   return null;
+}
+
+function extractAssertedName(text) {
+  const m = matchAssertedName(text);
+  return m ? m.name : null;
+}
+
+/**
+ * The sentence with its name claim cut out, or null if it makes no name claim.
+ *
+ * "I am Juno, the one on this box who helps with MettaSphere stuff."
+ *   → ", the one on this box who helps with MettaSphere stuff."
+ */
+function nameClaimResidue(text) {
+  const t = String(text || '');
+  const m = matchAssertedName(t);
+  if (!m) return null;
+  return `${t.slice(0, m.index)} ${t.slice(m.index + m.length)}`;
+}
+
+/**
+ * Words that can sit around a name claim without asserting anything else:
+ * articles, the copula, the speaker, the vocabulary of naming itself, and the
+ * hedges reflection likes to open with.
+ *
+ * Deliberately SHORT, and it stays short. The two errors this set can make do
+ * not cost the same: treating a bare restatement as "more than a name" stores
+ * one redundant sentence, which the exact-duplicate check and semantic dedup
+ * both catch downstream. Treating a paragraph as "only a name" destroys the
+ * paragraph. When in doubt a word is CONTENT.
+ */
+const NAME_CLAIM_GLUE = new Set([
+  'i', 'im', 'me', 'my', 'myself', 'mine',
+  'am', 'is', 'was', 'are', 'be', 'been', 'remains', 'stays', 'will', 'shall', 'has', 'have',
+  'a', 'an', 'the', 'of', 'to', 'and', 'or', 'as', 'that', 'this', 'it', 'its',
+  'name', 'names', 'named', 'calling', 'called', 'call', 'go', 'goes', 'by', 'known',
+  'still', 'now', 'just', 'simply', 'actually', 'really', 'indeed', 'course',
+  'yes', 'obviously'
+]);
+
+/** Every word in `s` that is not glue and not one of `extraDrop`. */
+function contentTokens(s, extraDrop = []) {
+  const drop = new Set(NAME_CLAIM_GLUE);
+  for (const w of extraDrop) if (w) drop.add(String(w).toLowerCase());
+  return String(s || '')
+    .toLowerCase()
+    .replace(/['\u2019]s\b/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter(w => w && !drop.has(w));
+}
+
+/**
+ * Does `text` assert NOTHING BUT the name it claims?
+ *
+ * THIS IS THE QUESTION THE DUPLICATE BRANCH ACTUALLY HAS TO ASK (2026-08-31).
+ * Commit 5176618 moved the duplicate test from "the same sentence" to "the same
+ * name" and both callers kept their old comment, "already held, verbatim". The
+ * two are not the same question. Under the name test, ANY self-fact whose first
+ * "I am" is followed by the entity's own name read as a restatement — so a
+ * whole correcting paragraph was thrown away for the one redundant clause at
+ * the front of it, and the caller was handed ok:true for the discard.
+ *
+ * A redundant name is harmless. The rest of the sentence is the entire point of
+ * the write. So the discard now needs the name claim to be the WHOLE fact:
+ *
+ *   1. cut the name claim out of the sentence, and
+ *   2. see whether anything but glue is left — or, failing that,
+ *   3. whether what is left is word-for-word what the HELD fact says beside its
+ *      own name claim. That third case is the one 5176618 was written for
+ *      ("I am Athena, a name Ellie gave me" against "I am named Athena, a name
+ *      Ellie gave me"): the same claim in new words, and still a quiet skip.
+ *
+ * Mechanical on purpose. The rule that went wrong here lived in a comment; a
+ * judge call would put it somewhere even harder to test.
+ *
+ * @param {string} text - the incoming fact
+ * @param {string} heldText - the locked fact already held in the slot
+ * @returns {boolean}
+ */
+function assertsOnlyName(text, heldText) {
+  const m = matchAssertedName(text);
+  if (!m) return false;                      // no name claim to be the whole of it
+  const extra = contentTokens(nameClaimResidue(text), [m.name]);
+  if (extra.length === 0) return true;       // the name and nothing else
+
+  const heldMatch = matchAssertedName(heldText);
+  if (!heldMatch) return false;
+  const heldExtra = contentTokens(nameClaimResidue(heldText), [heldMatch.name]);
+  return extra.length === heldExtra.length && extra.every((w, i) => w === heldExtra[i]);
 }
 
 // ============ reads ============
@@ -290,12 +381,19 @@ function checkMutation(memberId, { operation = 'change' } = {}) {
  * A restatement of what is already held is not a collision — reflection re-
  * notices the entity's own name periodically, and refusing that would fill the
  * ops ledger with alarms about nothing. It returns duplicate:true instead, and
- * callers skip the write quietly.
+ * callers skip the write.
+ *
+ * THAT SKIP IS A DISCARD, so it is narrow, and callers must say when it fires.
+ * duplicate:true means the fact asserts the held name and NOTHING ELSE (see
+ * assertsOnlyName). A fact that restates the name and then goes on to say
+ * something is returned ok:true with nameRedundant:true — it is written,
+ * redundant clause and all, because the alternative is throwing the something
+ * away and reporting success for it.
  *
  * @param {string} text - the fact about to be stored
  * @param {string} [subject='self'] - only self-facts are checked
- * @returns {{ok: boolean, blocked?: boolean, duplicate?: boolean, category?: string,
- *            existing?: Object, message?: string}}
+ * @returns {{ok: boolean, blocked?: boolean, duplicate?: boolean, nameRedundant?: boolean,
+ *            category?: string, existing?: Object, message?: string, carries?: string}}
  */
 function checkNewFact(text, subject = 'self') {
   if (!cfg().enabled) return { ok: true };
@@ -305,6 +403,10 @@ function checkNewFact(text, subject = 'self') {
   if (!categories.length) return { ok: true };
 
   const held = lockedByCategory();
+  // A name that is merely REDUNDANT does not end the check: the same sentence
+  // can carry a competing PRONOUN claim, and returning early on the name would
+  // walk straight past the pronoun slot. Hold the verdict, keep looping.
+  let redundant = null;
   for (const cat of categories) {
     const existing = held.get(cat);
     if (!existing) continue;                       // slot open — setup assignment, allowed
@@ -317,11 +419,27 @@ function checkNewFact(text, subject = 'self') {
     // and the guard had to be kept loose to avoid refusing the entity its own
     // name. With the names compared directly it can be strict: same name is a
     // restatement, a DIFFERENT name is the thing the lock exists to stop.
+    //
+    // AND THE SAME NAME IS NOT THE SAME FACT (2026-08-31). Comparing names made
+    // the test cheap enough to run on any sentence, and that is exactly what it
+    // then did: every self-fact opening "I am <own name>" was scored a
+    // restatement and dropped WHOLE, however much else it said. See
+    // assertsOnlyName — the discard now requires the name claim to be the whole
+    // of the fact. Anything more rides along; the redundant name costs one
+    // clause, and the rest is why the write happened.
     if (cat === 'name') {
       const claimed = extractAssertedName(text);
       const heldName = extractAssertedName(existing.content);
       if (claimed && heldName && normalize(claimed) === normalize(heldName)) {
-        return { ok: false, duplicate: true, category: cat, existing };
+        if (assertsOnlyName(text, existing.content)) {
+          return { ok: false, duplicate: true, category: cat, existing, assertedName: claimed };
+        }
+        redundant = {
+          ok: true, nameRedundant: true, category: cat, existing,
+          assertedName: claimed,
+          carries: (nameClaimResidue(text) || '').replace(/\s+/g, ' ').trim()
+        };
+        continue;
       }
       if (claimed && heldName) {
         return {
@@ -339,7 +457,7 @@ function checkNewFact(text, subject = 'self') {
       message: refusalMessage(existing, 'replace')
     };
   }
-  return { ok: true };
+  return redundant || { ok: true };
 }
 
 /**
@@ -591,6 +709,8 @@ module.exports = {
   checkMutation,
   checkNewFact,
   extractAssertedName,
+  assertsOnlyName,
+  nameClaimResidue,
   detectCategories,
   lockedName,
   autoLock,

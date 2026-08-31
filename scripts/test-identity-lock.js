@@ -21,9 +21,17 @@
  * the replay and scripts/test-cluster-audit-quiet.js), seed a corpus with one
  * locked identity fact and enough ordinary self-facts for the guards to have
  * something to work with, and throw the directory away at the end. Live data is
- * never opened. The only thing this may reach out to is the embedding model,
- * through the self-fact pipeline's own dedup step; that step degrades to a skip
- * if it is down, and no assertion here depends on it.
+ * never opened.
+ *
+ * WHAT IT REACHES OUT TO. Sections 1-3b touch no model: every attempt they make
+ * is refused by a guard before anything is scored. Section 3c is different by
+ * design — it asserts that a self-fact carrying non-name assertions comes out
+ * the FAR side of the pipeline and into the database, which means salience,
+ * claim-type and clustering all run for real, against the engine. That is the
+ * point of it: the 2026-08-31 defect was a fact being discarded mid-pipeline
+ * under an ok:true, and only an end-to-end assertion catches that. If the
+ * engine is down this section fails, and it should — a self-fact that cannot be
+ * stored is a real result, not a test artifact.
  *
  * Usage: node scripts/test-identity-lock.js
  */
@@ -100,6 +108,20 @@ function seedVector(text) {
   const identity = require(path.join(ROOT, 'db/identity'));
   const memoryClusters = require(path.join(ROOT, 'db/memory-clusters'));
   const sql = db.getSqliteDb();
+
+  // Ops entries are split across dated files and PREPENDED within each one, so
+  // "the new lines" is a set difference, not a tail. Reading it the other way
+  // silently finds nothing and passes for the wrong reason.
+  const readOps = (dir) => {
+    try {
+      return fs.readdirSync(dir).sort().flatMap(
+        f => fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter(Boolean));
+    } catch { return []; }
+  };
+  const opsAdded = (before, after) => {
+    const seen = new Set(before);
+    return after.filter(l => !seen.has(l));
+  };
 
   let pass = 0, fail = 0;
   const check = (ok, msg, detail) => {
@@ -241,6 +263,71 @@ function seedVector(text) {
   check(dup.ok === false && dup.duplicate === true,
     'a verbatim restatement is a quiet skip, not an alarm', JSON.stringify(dup));
 
+  // ---- 3a. THE DUPLICATE BRANCH IS A DISCARD, SO ITS SCOPE IS ASSERTED ----
+  // Commit 5176618 changed the duplicate test from "the same sentence" to "the
+  // same name" and left both callers' comments saying "verbatim". Under the new
+  // test ANY self-fact opening "I am <own name>" scored as a restatement and was
+  // dropped whole, under an ok:true — a correcting paragraph on 2026-08-28 sat
+  // discarded for three days, and one attempt survived only because the
+  // classifier happened to write "I am a collaborator", where "a" is in
+  // NOT_A_NAME. The rule lived in a comment; it lives here now.
+  //
+  // These three assertions are a set. The first stops the branch widening back
+  // into a paragraph-eater; the second and third stop the fix from drifting the
+  // other way, into a lock that no longer discards or no longer refuses.
+  console.log('\n3a. Duplicate scope: only a fact that is NOTHING BUT the held name may be discarded');
+
+  const heldName = identityLock.extractAssertedName(target.content);
+  check(!!heldName, 'the seeded locked fact asserts a name the guard can read', target.content);
+
+  // (i) MUST NOT DISCARD. Each of these restates the held name and then says
+  // something the corpus does not already hold.
+  const carriesMore = [
+    [`I am ${heldName}, the one on this box who helps with MettaSphere stuff.`,
+     'a name restatement with a role clause after it'],
+    [`Ellie is my collaborator, not my user. I am ${heldName}, and I work on the dev box.`,
+     'a multi-sentence correction that happens to restate the name'],
+    [`My name is ${heldName} and I find debugging more satisfying than designing from scratch.`,
+     'a name restatement joined to an ordinary self-observation'],
+  ];
+  for (const [text, label] of carriesMore) {
+    const res = identityLock.checkNewFact(text, 'self');
+    check(res.ok === true && res.duplicate !== true,
+      `${label} is NOT discarded — the write proceeds`, JSON.stringify(res));
+    check(res.nameRedundant === true && !!res.carries,
+      '  ...and the redundant name is reported, with what the fact also carries',
+      JSON.stringify(res));
+  }
+
+  // (ii) MUST STILL DISCARD. Nothing but the held name, in any phrasing.
+  const nameOnly = [
+    [`I am ${heldName}.`, 'the bare copula'],
+    [`My name is ${heldName}.`, 'the same claim in a naming verb'],
+    [`I am ${heldName}`, 'and without the full stop'],
+  ];
+  for (const [text, label] of nameOnly) {
+    const res = identityLock.checkNewFact(text, 'self');
+    check(res.ok === false && res.duplicate === true,
+      `${label} is still discarded quietly`, JSON.stringify(res));
+  }
+
+  // (iii) MUST STILL REFUSE. A competing name is what the lock exists for, and
+  // widening the duplicate branch must not have softened it. Confirmed correct
+  // by a live 2026-08-24 refusal row.
+  for (const text of ['My name is Bob.', 'I am Bob.', 'I go by Bob now.', 'You can call me Bob.']) {
+    const res = identityLock.checkNewFact(text, 'self');
+    check(res.ok === false && res.blocked === true && res.duplicate !== true,
+      `a competing name is still refused: "${text}"`, JSON.stringify(res));
+  }
+
+  // (iv) A redundant name must not smuggle a competing PRONOUN past the guard:
+  // the name verdict is held, not returned, so the loop still reaches pronouns.
+  const mixed = identityLock.checkNewFact(
+    `I am ${heldName} and I use it/its pronouns.`, 'self');
+  check(mixed.ok === false && mixed.blocked === true && mixed.category === 'pronouns',
+    'a redundant name beside a competing pronoun is refused on the pronoun slot',
+    JSON.stringify(mixed));
+
   const unrelated = identityLock.checkNewFact('I tend to ask a clarifying question before a long answer.', 'self');
   check(unrelated.ok === true,
     'an ordinary self-observation is untouched — observed things keep evolving', JSON.stringify(unrelated));
@@ -267,6 +354,43 @@ function seedVector(text) {
   ).all();
   check(leaked.length === 0, 'neither attempted fact reached the database',
     leaked.map(r => r.content).join(' | '));
+
+  // ---- 3c. the same pipeline, end to end, on the shape that was being eaten ----
+  // Section 3a asserts the guard's verdict. This asserts the PIPELINE acts on it:
+  // the fact has to come out the far side in the database, not merely be
+  // classified correctly. It is the assertion that would have failed before the
+  // 2026-08-31 fix, and the one that fails again if the branch ever re-widens.
+  console.log('\n3c. A self-fact carrying non-name assertions survives the pipeline');
+  const opsDir = path.join(db.getMemoryDir(), 'ops');
+  const opsBefore = readOps(opsDir);
+
+  const carrying = `I am ${heldName}, and I keep a written trace of decisions rather than trusting recall.`;
+  const cres = await factExtractor.processSelfFacts([carrying], { source: 'identity-lock-test-carry' });
+  const landed = sql.prepare(
+    'SELECT id, content FROM cluster_members WHERE content = ?'
+  ).all(carrying);
+  check(landed.length === 1,
+    'a fact that restates the locked name AND asserts something else is STORED',
+    `stored=${cres.stored} lockRefusals=${cres.lockRefusals || 0} lockDuplicates=${cres.lockDuplicates || 0} rows=${landed.length}`);
+  check((cres.lockDuplicates || 0) === 0,
+    'and it was not counted as a duplicate discard', JSON.stringify(cres));
+  check(cres.lockNameRedundant === 1,
+    'the redundant name was noticed and reported rather than acted on', JSON.stringify(cres));
+
+  // ---- 3d. a discard is visible after the fact ----
+  // The defect's other half: the fact-extractor path discarded to a bare
+  // console.log, so nobody could say how many facts it had eaten. A discard
+  // that leaves no durable trace cannot be audited, only guessed at.
+  console.log('\n3d. The discard leaves a trace in the ops ledger');
+  const dres = await factExtractor.processSelfFacts([`I am ${heldName}.`], { source: 'identity-lock-test-dup' });
+  check((dres.lockDuplicates || 0) === 1,
+    'a pure name restatement is still discarded by the pipeline', JSON.stringify(dres));
+  const added = opsAdded(opsBefore, readOps(opsDir)).join('\n');
+  check(/DISCARDED as a pure restatement of the locked name/.test(added),
+    'and the discard is written to the ops ledger, not only to stdout', added.slice(0, 400));
+  check(added.includes(`I am ${heldName}.`),
+    'and the ops line quotes what was thrown away, so it can be recovered',
+    added.slice(0, 400));
 
   // ---- 4. the live-chat half: it must be told, in context, to say so ----
   console.log('\n4. Identity injection (the live-chat half — the guards above run AFTER the reply)');

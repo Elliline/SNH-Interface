@@ -2595,9 +2595,43 @@ async function processSelfFacts(rawSelfFacts, opts = {}) {
       const kept = [];
       for (const fact of facts) {
         const check = identityLock.checkNewFact(fact, 'self');
-        if (check.ok) { kept.push(fact); continue; }
+        if (check.ok) {
+          if (check.nameRedundant) {
+            // Restates the locked name AND asserts something else. Kept. Said
+            // out loud because this is the exact shape that used to be dropped.
+            result.lockNameRedundant = (result.lockNameRedundant || 0) + 1;
+            try {
+              appendToOpsLog(
+                `Self-fact restates the locked ${check.category} ("${check.assertedName}") but also asserts ` +
+                `"${String(check.carries).slice(0, 160)}" — stored rather than dropped (source: ${source}).`,
+                path.join(memoryDir, 'ops')
+              );
+            } catch (_) { /* best-effort */ }
+          }
+          kept.push(fact);
+          continue;
+        }
         if (check.duplicate) {
-          console.log(`[SelfFacts] Identity fact already held verbatim, skipping: "${fact.slice(0, 70)}"`);
+          // THE FACT ASSERTS THE HELD NAME AND NOTHING ELSE. Not "verbatim" —
+          // that comment was written 2026-08-05 against a whole-text equality
+          // test, commit 5176618 changed the test to compare NAMES, and the
+          // comment stayed. Under the name test this branch ate entire
+          // paragraphs whose only sin was opening with the entity's own name,
+          // and it ate them into a bare console.log: no ops line, no daily
+          // line, no ledger row, so there is no way to say how many.
+          //
+          // A discard on the passive/reflection path cannot be spoken in the
+          // turn, so it goes where a refusal from this path goes.
+          result.lockDuplicates = (result.lockDuplicates || 0) + 1;
+          console.log(`[SelfFacts] Identity fact asserts only the held ${check.category}, discarding: "${fact.slice(0, 70)}"`);
+          try {
+            appendToOpsLog(
+              `Self-fact DISCARDED as a pure restatement of the locked ${check.category} — nothing stored ` +
+              `(source: ${source}). Attempted: "${String(fact).slice(0, 200)}" | ` +
+              `held: "${String(check.existing && check.existing.content).slice(0, 200)}"`,
+              path.join(memoryDir, 'ops')
+            );
+          } catch (_) { /* best-effort */ }
           continue;
         }
         identityLock.recordRefusal({

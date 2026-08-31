@@ -645,12 +645,33 @@ async function write({ statement, context = '', conversationId = null, userMessa
     return { ok: false, locked: true, category: lockCheck.category, error: lockCheck.message };
   }
   if (!lockCheck.ok && lockCheck.duplicate) {
-    // Already held, verbatim. Not a violation and not worth an alarm.
+    // THE FACT ASSERTS THE HELD NAME AND NOTHING ELSE, so there is nothing to
+    // store. Not "verbatim" — that word was true of the 2026-08-05 check and
+    // survived commit 5176618, which moved the test to the NAME, and the stale
+    // comment is most of why nobody noticed that whole paragraphs opening
+    // "I am <own name>" were being dropped here under an ok:true.
+    //
+    // This branch DISCARDS and reports success, which is the one combination
+    // the entity cannot detect from the return value. So it says so on the way
+    // out: a discard that leaves no trace cannot be counted afterwards.
     log('ok', `identity fact already held (${lockCheck.category}), nothing to write`, lockCheck.existing.id);
+    opsLog(
+      `write_memory discarded a self-fact as a pure restatement of the locked ${lockCheck.category} — ` +
+      `nothing was stored and ok was returned. Attempted: "${String(fact).slice(0, 200)}" | ` +
+      `held: "${String(lockCheck.existing.content).slice(0, 200)}"`
+    );
     return {
       ok: true, memberId: lockCheck.existing.id, subject: 'self', fact: lockCheck.existing.content,
       salience: lockCheck.existing.salience ?? 10, cluster: null, superseded: null, unchanged: true
     };
+  }
+  if (lockCheck.ok && lockCheck.nameRedundant) {
+    // Restates the locked name AND says something else. The write proceeds —
+    // the redundant clause is cheap, the rest is the reason the write happened.
+    opsLog(
+      `write_memory: self-fact restates the locked ${lockCheck.category} ("${lockCheck.assertedName}") ` +
+      `but also asserts "${String(lockCheck.carries).slice(0, 160)}" — storing it rather than dropping it.`
+    );
   }
 
   // --- 2. salience ---
