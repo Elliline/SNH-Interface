@@ -211,11 +211,16 @@ ${getCurrentDateTimeString()}. Use the current date only to make an EVENT's word
 
   } catch (error) {
     if (error.name === 'AbortError') {
-      console.error('[FactExtractor] Extraction timeout after 30s');
-    } else {
-      console.error('[FactExtractor] Error extracting candidates:', error.message);
+      // The number is READ, not written into the string. It said "30s" whatever
+      // the deadline actually was, so a box running 37350 still reported 30 and
+      // the log could not be used to tell a tuned box from an untuned one.
+      const ms = Number.isFinite(getConfig().generation?.extractionTimeoutMs)
+        ? getConfig().generation.extractionTimeoutMs : 30000;
+      console.error(`[FactExtractor] Extraction timeout after ${Math.round(ms / 1000)}s — NO FACTS WERE EXTRACTED FROM THIS TURN`);
+      return { facts: [], events: [], timedOut: true, timeoutMs: ms };
     }
-    return { facts: [], events: [] };
+    console.error('[FactExtractor] Error extracting candidates:', error.message);
+    return { facts: [], events: [], failed: true, error: error.message };
   }
 }
 
@@ -1513,6 +1518,14 @@ async function planExtraction({
     userMessage, assistantMessage, extractionProvider, extractionModel,
     extractionApiKey(extractionProvider), extractionHost
   );
+  // A TIMED-OUT EXTRACTION IS NOT AN EMPTY ONE. Both produce zero facts, and
+  // until this they were indistinguishable everywhere except one journal line —
+  // so a turn whose facts were silently dropped looked exactly like a turn that
+  // had nothing to file. On Athena that was 27% of turns for over a week.
+  plan.extractionTimedOut = !!extracted.timedOut;
+  plan.extractionTimeoutMs = extracted.timeoutMs || null;
+  plan.extractionFailed = !!extracted.failed;
+  plan.extractionError = extracted.error || null;
   plan.proposed.facts = extracted.facts.map(f => ({ text: f.text, corrects: f.corrects }));
   plan.proposed.events = extracted.events.map(e => e.text);
 
@@ -1885,6 +1898,19 @@ async function applyExtraction(plan, opts = {}) {
   const src = plan.conversationId
     ? ` [conversation ${String(plan.conversationId).slice(0, 8)}${plan.messageId ? `, message ${String(plan.messageId).slice(0, 8)}` : ''}, ${plan.inputModality}]`
     : '';
+
+  // ---- a dropped extraction is announced, never inferred from a zero ----
+  if (plan.extractionTimedOut) {
+    const secs = Math.round((plan.extractionTimeoutMs || 30000) / 1000);
+    appendToOpsLog(
+      `EXTRACTION TIMED OUT after ${secs}s — this turn produced NO facts, and that is a dropped turn rather than a quiet one. ` +
+      `Raise generation.extractionTimeoutMs, or look at why the extraction model is running long.`, opsDir);
+    logDaily(`I could not finish reading that exchange for facts before the ${secs}s deadline, so nothing from it was written down.${src}`);
+    result.extractionTimedOut = true;
+  } else if (plan.extractionFailed) {
+    appendToOpsLog(`EXTRACTION FAILED (${plan.extractionError}) — this turn produced no facts.`, opsDir);
+    result.extractionFailed = true;
+  }
 
   // ---- events → the day's log, never the fact store ----
   for (const e of plan.events) {
