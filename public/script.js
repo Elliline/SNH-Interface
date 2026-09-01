@@ -2605,6 +2605,9 @@ async function loadSettingsBrainTab() {
       { key: 'initiative.unpromptedThreshold', label: 'Unprompted threshold', type: 'number', min: 1, max: 10, step: '1',
         value: init.unpromptedThreshold,
         desc: 'How important something must be (1–10) before SNH opens a conversation about it on its own.' },
+      { key: 'initiative.backlogThreshold', label: 'Message backlog before the bell says so', type: 'number', min: 1, max: 50, step: '1',
+        value: init.backlogThreshold,
+        desc: 'How many of SNH\'s messages may sit unanswered before the bell raises it. The messages view carries its own unread count; this is where a backlog becomes worth telling you about.' },
       { key: 'initiative.maxUnpromptedPerDay', label: 'Max unprompted per day', type: 'number', min: 0, max: 24, step: '1',
         value: init.maxUnpromptedPerDay,
         desc: 'The most conversations SNH may start on its own in a single day.' },
@@ -4005,7 +4008,7 @@ async function loadInitiativeList() {
     const data = await res.json();
     const items = data.initiatives || [];
     if (items.length === 0) {
-      container.innerHTML = '<div class="memory-empty">Nothing on SNH\'s mind right now.</div>';
+      container.innerHTML = '<div class="memory-empty">Nothing needs you right now.</div>';
       return;
     }
     container.innerHTML = items.map(it => {

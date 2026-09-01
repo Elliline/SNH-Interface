@@ -428,11 +428,16 @@ router.get('/initiatives', (req, res) => {
   try {
     const cfg = getConfig().initiative || {};
     const threshold = Number.isFinite(cfg.greetingThreshold) ? cfg.greetingThreshold : 7;
-    // includeRecords: the panel is where a scheduled job's output is READ, so it
-    // is the one reader that must see record types. Everything else that selects
-    // pending items is choosing something to raise, and a job result is not a
-    // candidate to raise — see initiatives.listPending.
-    const pending = initiatives.listPending({ limit: 100, includeRecords: true });
+    // JOB RESULTS WERE STILL LEAKING IN HERE. This passed includeRecords:true
+    // on the reasoning that the panel was where a scheduled job's output is
+    // read — true until 2026-08-18, when results moved to the robot queue. The
+    // flag outlived the reason and kept ringing them.
+    //
+    // THE BELL, and only the bell: notifications with her name on them. The
+    // rest of the pending pool still exists and is still what the greeting path
+    // may raise in conversation — it simply does not ring. No limit: a
+    // notification queue that drops notifications is worse than a long one.
+    const pending = initiatives.listPendingForBell();
     res.json({
       initiatives: pending,
       threshold,

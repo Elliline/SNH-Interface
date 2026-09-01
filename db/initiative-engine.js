@@ -68,8 +68,7 @@ function initiativeConfig() {
     quietHours: { start: 22, end: 8 },
     questionAgeDays: 3,
     logFollowupDays: 3,
-    staleDays: 7,
-    maxPending: 10
+    staleDays: 7
   }, cfg.initiative || {});
 }
 
@@ -182,19 +181,21 @@ async function noticeFromAudit(auditResults = []) {
       }
       if (r.coherent === false && Array.isArray(r.splits) && r.splits.length > 0) {
         const into = r.splits.map(s => `"${s.newClusterName}"`).join(', ');
-        if (await initiatives.addInitiative({
-          type: 'observation',
-          content: `Heads up — I noticed my "${r.clusterName}" memories had drifted into a couple of different topics (${into}), so I reorganized them into separate clusters.`,
-          sourceKind: 'cluster',
-          sourceRef: r.clusterId,
-          priority: 5
-        })) added++;
+        // HOUSEKEEPING IS A LOG ENTRY, NOT A NOTIFICATION. This reorganisation
+        // has already happened; there is nothing for her to decide and nothing
+        // has degraded. It rang the bell for a year because there was nowhere
+        // else to put it — a done thing belongs in the activity log.
+        opsLog(`Cluster reorganisation: "${r.clusterName}" had drifted into separate topics (${into}) and was split.`);
+        added++;
       }
     }
   } catch (err) {
     console.error('[Initiatives] noticeFromAudit error:', err.message);
   }
-  if (added) console.log(`[Initiatives] noticeFromAudit added ${added} candidate(s)`);
+  // "candidate" was true when these rang; they are log entries now, and a line
+  // that still calls them candidates is the kind of stale wording that makes a
+  // reader think the bell is still involved.
+  if (added) console.log(`[Initiatives] noticeFromAudit logged ${added} housekeeping note(s) to the activity log`);
   return added;
 }
 
@@ -202,16 +203,34 @@ async function noticeFromAudit(auditResults = []) {
  * Record a reflection insight the model flagged as worth sharing.
  * Called from runReflection. type = 'reflection-insight'.
  */
+/**
+ * A reflection insight is the entity THINKING OUT LOUD, and it goes to the
+ * Reflections section rather than the bell.
+ *
+ * It was ringing because reflections.jsonl held the reflection PASS and not the
+ * one-line insight the pass produced — so the bell was the only place the
+ * sentence existed, and pulling it out without a destination would have deleted
+ * it. It is written to the reflections record here, which is what the Self tab
+ * already renders.
+ */
 async function noticeReflectionInsight(text, priority = 6) {
-  if (!text || !text.trim()) return null;
-  return initiatives.addInitiative({
-    type: 'reflection-insight',
-    content: text.trim(),
-    sourceKind: 'reflection',
-    sourceRef: `reflection:${new Date().toISOString().slice(0, 10)}`,
-    priority
-  });
+  const clean = String(text || '').trim();
+  if (!clean) return null;
+  try {
+    require('./memory-manager').appendReflectionRecord({
+      at: new Date().toISOString(),
+      kind: 'insight',
+      insight: clean,
+      source: 'reflection'
+    });
+    opsLog(`Reflection insight recorded (was a bell item): "${clean.slice(0, 90)}"`);
+    return null;
+  } catch (err) {
+    console.error('[Initiatives] could not record reflection insight:', err.message);
+    return null;
+  }
 }
+
 
 /**
  * Parse the follow-up review response into { candidates, followup, reasoning }.
@@ -677,7 +696,11 @@ async function prioritize() {
     for (const s of stale) if (initiatives.expire(s.id)) result.expired++;
 
     // 2. Re-score remaining pending initiatives concurrently through the pool.
-    let pending = initiatives.listPending({ limit: 100 });
+    // An APPROVAL's priority is structural, not editorial — it is waiting on her
+    // whatever a scorer thinks of the wording, and letting a model re-rank it
+    // is how a decision drifts below a threshold and stops being offered.
+    let pending = initiatives.listPending({ limit: 1000 })
+      .filter(it => !initiatives.UNDISMISSABLE_TYPES.has(it.type));
     if (pending.length > 0) {
       const { callLLM } = require('./memory-manager');
       // A SCORE THAT DID NOT PARSE IS NOT A SCORE. Falling back to the priority
@@ -729,12 +752,20 @@ async function prioritize() {
       }
     }
 
-    // 3. Cap the pool — keep the top maxPending by priority, expire the rest.
-    pending = initiatives.listPending({ limit: 1000 });
-    if (pending.length > cfg.maxPending) {
-      const excess = pending.slice(cfg.maxPending); // listPending is priority DESC
-      for (const it of excess) if (initiatives.expire(it.id)) result.capped++;
-    }
+    // 3. THE CAP IS GONE, AND ON PURPOSE.
+    //
+    // This used to keep the top `maxPending` by priority and EXPIRE the rest,
+    // which meant an alert could be expired to make room for another alert —
+    // a notification queue quietly dropping notifications, which is the one
+    // thing it must never do. 223 of 390 items ever raised ended as `expired`,
+    // and this is part of why.
+    //
+    // WHAT THE SCORER IS FOR NOW, since the cap was one of its two jobs. It is
+    // NOT dead: the score still gates whether something is worth INTERRUPTING
+    // her with — greetingThreshold, followupThreshold and unpromptedThreshold
+    // all read it, and healthFloor() pins health items above it. So it keeps
+    // deciding what gets SAID and no longer decides what gets KEPT. If it is
+    // ever removed, those three thresholds are what has to move with it.
 
     result.pending = initiatives.countPending();
     console.log(`[Initiatives] prioritize: expired ${result.expired} stale, re-scored ${result.rescored}, capped ${result.capped}; ${result.pending} pending`);
@@ -872,6 +903,40 @@ async function openInitiativeConversation(it, channel) {
  *
  * @param {{kind: string, id: string, message: string, detail?: string}} m
  */
+/**
+ * BACKLOG — the seam, deliberately not wired.
+ *
+ * The bell should say "you have unanswered messages piling up", not "a message
+ * arrived": the messages view will carry its own unread count, and duplicating
+ * it here would be a second badge saying the same thing. So this fires on a
+ * THRESHOLD she sets, and only on the crossing.
+ *
+ * The messages system does not exist yet and is NOT being built here. This is
+ * the whole of the seam: pass it an unread count and it does the rest. Until
+ * something calls it, it is inert — there is no poller, no table read and no
+ * guess at where the count will live, because guessing that is how a seam turns
+ * into a thing that has to be unpicked later.
+ *
+ * @param {number} unreadCount  unanswered messages, from the messages system
+ * @returns the initiative id, or null when the threshold is not crossed
+ */
+async function raiseMessageBacklog(unreadCount) {
+  const n = Number(unreadCount);
+  if (!Number.isFinite(n)) return null;
+  const cfg = initiativeConfig();
+  const threshold = Number.isFinite(cfg.backlogThreshold) ? cfg.backlogThreshold : 3;
+  if (n < threshold) return null;
+  return initiatives.addInitiative({
+    type: 'backlog',
+    content: `You have ${n} message${n === 1 ? '' : 's'} from me waiting for a reply.`,
+    sourceKind: 'messages',
+    // One row per backlog level, so crossing the threshold again after she has
+    // read some does not stack a second identical item on the first.
+    sourceRef: `backlog:${n}`,
+    priority: 6
+  });
+}
+
 async function raiseCapabilityDrift(m) {
   if (!m || !m.message) return null;
   const initiatives = require('./initiatives');
@@ -914,6 +979,7 @@ module.exports = {
   raiseCapabilityDrift,
   raiseMemoryDrift,
   noticeReflectionInsight,
+  raiseMessageBacklog,
   generateConversationFollowup,
   generateLogFollowup,
   prioritize,

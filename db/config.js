@@ -726,7 +726,11 @@ const DEFAULTS = {
     // window cannot outlive the window that justified it.
     logFollowupDays: 3,
     staleDays: 7,               // pending initiatives older than this expire
-    maxPending: 10,             // cap on the pending pool so it never nags
+    // maxPending IS RETIRED. It capped the pending pool and EXPIRED the excess,
+    // so an alert could be dropped to make room for another alert. 223 of 390
+    // items ever raised ended `expired` and this is part of why. The bell holds
+    // as many notifications as it has; she can scroll.
+    backlogThreshold: 3,        // unanswered messages before the bell says so
     dedupThreshold: 0.85        // skip a new initiative this cosine-similar to a pending one of the same type
   },
   // Self-coherence audit: SNH testing its stored self-CLAIMS ("I value X", "I am

@@ -29,7 +29,38 @@ const { getConfig } = require('./config');
 // schedule Ellie approved, so every one of those passes would be destroying
 // evidence rather than tidying a queue. Exempted at each of them, by name, and
 // each exemption says why.
-const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit', 'proposal', 'job-result']);
+const VALID_TYPES = new Set(['question', 'observation', 'alert', 'reflection-insight', 'followup', 'audit', 'proposal', 'job-result', 'backlog']);
+
+/**
+ * WHAT RINGS, AND WHAT MERELY EXISTS.
+ *
+ * The bell was where things went to expire: 390 items raised, 223 expired, and
+ * the one proposal ever routed through it was dismissed. Ellie's reading is
+ * that the channel was not broken, it was MISCATEGORISED — audits, reflections,
+ * follow-up musings, job results and housekeeping notes are the entity
+ * THINKING, and they were ringing as though the entity were addressing her.
+ *
+ * So the bell carries notifications and nothing else — things with her name on
+ * them:
+ *
+ *   alert     something degraded and she should know
+ *   proposal  something is waiting on her decision
+ *   followup  she was asked a question in conversation and never answered it
+ *   backlog   unanswered messages have piled past her threshold
+ *
+ * EVERYTHING ELSE STILL EXISTS. This table is two things at once — the bell,
+ * and the queue of what the entity might raise when a conversation opens — and
+ * only the first of those is being narrowed. A `question` still waits here to
+ * be asked at the next greeting; it simply stops ringing while it waits. That
+ * is why this is a display/routing predicate and not a validation rule:
+ * refusing the non-bell types outright would silence the greeting path too.
+ */
+const BELL_TYPES = new Set(['alert', 'proposal', 'followup', 'backlog']);
+
+/** Types that may not be dismissed — a decision is not a thing you can wave off. */
+const UNDISMISSABLE_TYPES = new Set(['proposal']);
+
+function isBellType(type) { return BELL_TYPES.has(String(type)); }
 
 /** Types that record what happened rather than propose what might be raised. */
 const RECORD_TYPES = new Set(['job-result']);
@@ -230,6 +261,39 @@ function listPending({ minPriority = 0, limit = 100, includeRecords = false } = 
  * @param {number} [opts.limit=200]
  * @returns {Array}
  */
+/**
+ * What the bell shows. NO CAP AND NO LIMIT: the old pool was trimmed to ten by
+ * the prioritizer, which meant an alert could be expired to make room for
+ * another alert. A notification queue that drops notifications is worse than a
+ * long one — she can scroll.
+ */
+function listPendingForBell() {
+  const db = getSqliteDb();
+  if (!db) return [];
+  const types = [...BELL_TYPES];
+  try {
+    return db.prepare(
+      `SELECT * FROM initiatives WHERE status = 'pending'
+       AND type IN (${types.map(() => '?').join(',')})
+       ORDER BY priority DESC, created_at ASC`
+    ).all(...types);
+  } catch (err) {
+    console.error('[Initiatives] listPendingForBell failed:', err.message);
+    return [];
+  }
+}
+
+function countPendingForBell() {
+  const db = getSqliteDb();
+  if (!db) return 0;
+  const types = [...BELL_TYPES];
+  try {
+    return db.prepare(
+      `SELECT COUNT(*) n FROM initiatives WHERE status='pending' AND type IN (${types.map(() => '?').join(',')})`
+    ).get(...types).n;
+  } catch { return 0; }
+}
+
 function listAll({ limit = 200 } = {}) {
   try {
     const db = getSqliteDb();
@@ -317,6 +381,15 @@ function dismiss(id) {
   try {
     const db = getSqliteDb();
     if (!db) return false;
+    // AN APPROVAL CANNOT BE DISMISSED, ONLY DECIDED. Dismiss means "seen, and
+    // nothing to do" — which is a true thing to say about an alert and a false
+    // one about a request waiting on her answer. Letting the two share a button
+    // is how the one proposal ever raised got waved off instead of answered.
+    const row = db.prepare('SELECT type, status FROM initiatives WHERE id = ?').get(id);
+    if (row && UNDISMISSABLE_TYPES.has(row.type)) {
+      console.warn(`[Initiatives] refused to dismiss ${String(id).slice(0, 8)} — a ${row.type} is decided, not dismissed`);
+      return false;
+    }
     const info = db.prepare(
       "UPDATE initiatives SET status = 'dismissed' WHERE id = ? AND status = 'pending'"
     ).run(id);
@@ -567,6 +640,7 @@ function listLogFollowupTraces({ limit = 20 } = {}) {
 }
 
 module.exports = {
+  BELL_TYPES, UNDISMISSABLE_TYPES, isBellType, listPendingForBell, countPendingForBell,
   VALID_TYPES,
   RECORD_TYPES,
   addInitiative,

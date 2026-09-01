@@ -65,6 +65,20 @@
       "timeoutSeconds": 900
     },
     {
+      "suite": "test-bell-routing",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; deterministic, no engine — the bell's routing is a type predicate, not a judgement.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/initiatives.js",
+        "db/initiative-engine.js",
+        "db/self-audit.js",
+        "routes/memory.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-brain-status",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",

@@ -317,6 +317,47 @@ async function writeDissonanceFact({ claimText, claimDate, finding, evidenceRefs
 }
 
 /**
+ * A COHERENCE FINDING IS A RAISE, AND A RAISE BELONGS IN THE CORRECTIONS LEDGER.
+ *
+ * These used to ring the bell. They are the entity noticing a tension in its own
+ * self-description — thinking, not a notification with her name on it — so under
+ * the bell rework they move to the Corrections section of the Self tab, which
+ * already renders unresolved raises.
+ *
+ * The shape is the one db/fact-extractor.js already uses for self-fact raises:
+ * a ledger row with `reversible = 0` and an `unresolved` flag, so anything
+ * rendering the ledger says NOTHING CHANGED rather than claiming an edit. Plus
+ * the ops line, which these always had.
+ *
+ * WHAT THIS COSTS, said plainly: these findings are phrased as questions
+ * ("want me to retire it?"), and Corrections is a record, not an inbox — there
+ * is no approve button there. She sees them; she cannot action them in one
+ * click the way the bell pretended to offer. That is a real loss and the right
+ * trade only because the bell's version was never actioned either: of 390 items
+ * ever raised, the only proposal was dismissed.
+ */
+function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = null }) {
+  try {
+    const ledger = require('./corrections-ledger');
+    const id = ledger.record({
+      tier: 'semantic',
+      action: 'supersede',
+      subject: 'self',
+      targetId: memberId,
+      targetText: content,
+      reason: content,
+      evidence: { unresolved: true, reason_code: reasonCode, source_ref: sourceRef, raised_by: 'self-coherence-audit' },
+      reversible: false
+    });
+    logOps(`${label} — recorded in corrections (${id ? id.slice(0, 8) : 'unfiled'}); nothing was changed`);
+    return id;
+  } catch (err) {
+    console.error('[SelfAudit] could not record the raise:', err.message);
+    return null;
+  }
+}
+
+/**
  * Raise an 'audit' initiative proposing the revision for Ellie to approve /
  * discuss / dismiss. Exact-deduped by (sourceKind, sourceRef) inside
  * addInitiative, so the same claim is never re-raised across runs.
@@ -325,14 +366,10 @@ async function raiseRevisionInitiative({ proposal, finding, sourceRef, claimText
   const content = (proposal && proposal.trim())
     ? proposal.trim()
     : `${finding} Want me to revise that self-claim, talk it over, or leave it as-is?`;
-  const id = await initiatives.addInitiative({
-    type: 'audit',
-    content,
-    sourceKind: 'self-fact',
-    sourceRef,
-    priority: 6
+  const id = raiseToCorrections({
+    content, sourceRef, reasonCode: 'self-audit-revision',
+    label: `revision proposed for "${claimText.slice(0, 60)}"`
   });
-  if (id) logOps(`raised revision initiative for "${claimText.slice(0, 60)}" (${id})`);
   return id;
 }
 
@@ -525,14 +562,13 @@ async function runIdentityCoherence() {
     try {
       // Deduped on (sourceKind, sourceRef) inside addInitiative, so a standing
       // incoherence is raised once and not re-raised every pass.
-      const id = await initiatives.addInitiative({
-        type: 'audit',
-        content: `${f.finding} Nothing has been changed — retiring or keeping either one is your call. Want me to retire it, talk it over, or leave it?`,
-        sourceKind: 'identity-coherence',
+      const id = raiseToCorrections({
+        content: `${f.finding} Nothing has been changed — retiring or keeping either one is your call.`,
         sourceRef: f.b ? [f.a.id, f.b.id].sort().join(':') : f.a.id,
-        priority: 9
+        reasonCode: `identity-coherence:${f.kind}`,
+        label: `identity-coherence (${f.kind})`,
+        memberId: f.a.id
       });
-      if (id) logOps(`raised identity-coherence initiative (${f.kind}) ${id}`);
     } catch (err) {
       logOps(`identity coherence: could not raise an initiative — ${err.message}`);
     }
