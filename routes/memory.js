@@ -173,6 +173,58 @@ router.get('/clusters', (req, res) => {
 });
 
 /**
+ * GET /api/memory/entities
+ *
+ * The entity registry, for DISPLAY. Read-only: it creates nothing, resolves
+ * nothing and assigns nothing — the UI needs to turn a fact's
+ * subject_entity_id into a name, and until now there was no way to do that
+ * from the browser, so every fact on screen said "user fact" whoever it was
+ * actually about.
+ *
+ * Counts come with it because the grouped view needs them and a second
+ * round-trip per entity would be silly. An entity row still holds no
+ * knowledge — the counts are computed from cluster_members, not stored here.
+ */
+router.get('/entities', (req, res) => {
+  try {
+    const entities = require('../db/entities');
+    const db = require('../db/database').getSqliteDb();
+    const rows = entities.list({ includeMerged: req.query.includeMerged === '1' });
+    const countFor = (id, status) => {
+      try {
+        return db.prepare('SELECT COUNT(*) n FROM cluster_members WHERE subject_entity_id = ? AND status = ?')
+          .get(id, status).n;
+      } catch { return 0; }
+    };
+    const pointers = {};
+    try {
+      for (const p of db.prepare('SELECT kind, entity_id, locked FROM entity_pointers').all()) {
+        pointers[p.kind] = { entityId: p.entity_id, locked: !!p.locked };
+      }
+    } catch { /* pre-migration store */ }
+
+    res.json({
+      entities: rows.map(e => ({
+        id: e.id,
+        name: e.name,
+        type: e.type,
+        relationship: e.relationship || null,
+        aliases: entities.aliasesOf(e),
+        status: e.status,
+        mergedInto: e.merged_into || null,
+        activeFacts: countFor(e.id, 'active'),
+        flaggedFacts: countFor(e.id, 'flagged-unverified-subject'),
+        locks: (() => { try { return entities.entityLocks(e.id).map(l => l.category); } catch { return []; } })()
+      })),
+      pointers
+    });
+  } catch (error) {
+    console.error('[MemoryAPI] Error loading entities:', error.message);
+    res.status(500).json({ error: 'Failed to load entities' });
+  }
+});
+
+/**
  * GET /api/memory/self
  * Read-only self-identity view: the injected identity block (seed + active
  * self-facts), superseded self-facts as history, and recent reflections.
@@ -890,11 +942,12 @@ router.get('/graph', (req, res) => {
     if (!sqliteDb) return res.status(503).json({ error: 'Database not ready' });
 
     const clusterRows = sqliteDb.prepare(
-      'SELECT id, name, subject, description FROM memory_clusters'
+      'SELECT id, name, subject, subject_entity_id, description FROM memory_clusters'
     ).all();
 
     const memberRows = sqliteDb.prepare(`
       SELECT id, cluster_id, content, salience, importance, status, subject,
+             subject_entity_id,
              superseded_by, inactive_reason, successor_id, source, created_at, updated_at
       FROM cluster_members
     `).all();
@@ -935,6 +988,7 @@ router.get('/graph', (req, res) => {
         status: m.status || 'active',
         inactiveReason: m.inactive_reason || null,
         subject: m.subject || 'user',
+        entityId: m.subject_entity_id || null,
         supersededBy: m.successor_id || m.superseded_by || null,
         source: m.source || null,
         createdAt: m.created_at || null,
@@ -959,6 +1013,7 @@ router.get('/graph', (req, res) => {
         id: c.id,
         name: c.name,
         subject: c.subject || 'user',
+        entityId: c.subject_entity_id || null,
         description: c.description || null,
         total: cc.total,
         active: cc.active,

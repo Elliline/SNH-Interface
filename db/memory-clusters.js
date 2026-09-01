@@ -1379,7 +1379,7 @@ function getSelfFacts({ status = 'active', limit = null, claimType = null, exclu
 
     let sql = `
       SELECT cm.id, cm.content, cm.salience, cm.status, cm.superseded_by,
-             cm.inactive_reason, cm.successor_id,
+             cm.inactive_reason, cm.successor_id, cm.subject_entity_id,
              cm.created_at, cm.updated_at, cm.cluster_id, cm.source, cm.claim_type,
              cm.locked, cm.locked_at, cm.lock_category,
              cm.conversation_id, cm.message_id, cm.verbatim_source_text,

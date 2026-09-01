@@ -3636,3 +3636,171 @@ body.coder-working { padding-top: 1.9rem; }
 .tool-rail-row.done { color: #6a8f5f; opacity: 0.7; }
 @keyframes toolDots { 0%{content:""} 25%{content:"."} 50%{content:".."} 75%{content:"..."} }
 .tool-rail-row.failed { color: #b4544a; opacity: 0.85; }
+
+/* ============================================================
+   ENTITIES IN THE UI (2026-09-01)
+
+   A fact points at an entity through subject_entity_id. Until now the panel
+   rendered the legacy `subject` column, so every fact read "user fact"
+   whoever it was actually about — which is the misattribution Ellie needs to
+   be able to see for herself. Palette follows the Map legend: user blue,
+   self purple, everything else neutral, so the badge and the graph agree.
+   ============================================================ */
+
+.memory-facts-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.memory-facts-entity-select {
+  background: var(--surface-color);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  max-width: 60%;
+}
+.memory-facts-entity-select:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.memory-fact-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.memory-entity-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.18);
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+.memory-entity-badge.type-user   { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
+.memory-entity-badge.type-self   { background: rgba(168, 85, 247, 0.18); color: #d8b4fe; }
+.memory-entity-badge.type-org    { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
+.memory-entity-badge.type-person { background: rgba(236, 72, 153, 0.18); color: #f9a8d4; }
+.memory-entity-badge.type-device { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+/* A fact with no entity says so rather than being labelled with a guess. */
+.memory-entity-badge.unassigned {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+}
+
+/* Grouped view: one heading per entity. Nearly pointless with two entities,
+   which is the point — it is the view that matters at twenty clients. */
+.memory-facts-group { margin-bottom: 16px; }
+.memory-facts-group-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-color);
+  margin: 0 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* HELD BACK, NOT RETIRED. A fact that failed the write-time subject check is
+   not history and must not look like it: history is struck through and faded,
+   this is amber and legible, because it is a question waiting on an answer. */
+.memory-facts-flagged { margin-top: 18px; }
+.memory-facts-flagged-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fcd34d;
+  margin: 0 0 6px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(245, 158, 11, 0.35);
+}
+.memory-facts-flagged-note {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.memory-fact-item.flagged {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.06);
+}
+.memory-fact-item.flagged:hover { border-color: rgba(245, 158, 11, 0.9); }
+.memory-fact-flag {
+  display: inline-block;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.18);
+  color: #fcd34d;
+  white-space: nowrap;
+}
+
+/* Map detail panel */
+.mmd-entity { margin-bottom: 10px; }
+.mmd-flag {
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: var(--border-radius);
+  padding: 6px 8px;
+  margin-bottom: 10px;
+}
+
+/* ============================================================
+   SELF TAB — five sections, reachable without scrolling.
+
+   Same gesture as the memory panel's own tab row, one level in, rather than a
+   new pattern. Section CONTENT is unchanged; only how it is reached.
+   ============================================================ */
+
+.memory-self-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 12px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+.memory-self-tabs::-webkit-scrollbar { height: 3px; }
+.memory-self-tabs::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.memory-self-tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 7px 10px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: color 0.2s ease, background-color 0.2s ease;
+}
+.memory-self-tab:hover {
+  color: var(--text-color);
+  background-color: rgba(158, 127, 255, 0.1);
+}
+.memory-self-tab.active {
+  color: var(--primary-color);
+  border-bottom-color: var(--primary-color);
+}
+
+.memory-self-pane { display: none; }
+.memory-self-pane.active { display: block; }
+/* The pane already provides the spacing the stacked layout got from the
+   section's own top margin. */
+.memory-self-pane > .memory-self-section { margin-top: 0; }

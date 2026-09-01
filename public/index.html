@@ -94,6 +94,12 @@
           <input type="text" id="memoryAddFactInput" placeholder="Add a fact..." />
           <button id="memoryAddFactBtn">+</button>
         </div>
+        <div class="memory-facts-toolbar">
+          <select id="memoryFactsEntity" class="memory-facts-entity-select" title="Show facts about one entity">
+            <option value="all">All entities</option>
+          </select>
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryFactsGroup" /> Group by entity</label>
+        </div>
         <div id="memoryFactsList" class="memory-facts-list">
           <div class="memory-loading">Loading facts...</div>
         </div>
