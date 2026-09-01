@@ -30,6 +30,13 @@ const DATA_DIR = process.env.SNH_DATA_DIR
 const SQLITE_PATH = path.join(DATA_DIR, 'chat.db');
 const LANCEDB_PATH = path.join(DATA_DIR, 'lancedb');
 
+/**
+ * What the last entities migration did, so it can be REPORTED rather than
+ * assumed. Set by initDatabase(); read by scripts/migrate-entities-report.js.
+ */
+let lastEntityMigration = null;
+function getLastEntityMigration() { return lastEntityMigration; }
+
 /** Where this process's store lives. The replay uses it to find its memory dir. */
 function getDataDir() { return DATA_DIR; }
 
@@ -1152,6 +1159,26 @@ function initDatabase() {
     }
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON conversations(hidden)');
 
+    // ENTITIES — the third subject (2026-09-01). Last, because it repoints rows
+    // in cluster_members and memory_clusters and so needs every column above it
+    // to exist first. Idempotent: re-running finds the founding entities already
+    // there and repoints nothing. See db/entities.js for the invariant that an
+    // entity row is a handle, not a profile.
+    try {
+      const entitySummary = require('./entities').initSchema(sqliteDb);
+      const repointed = Object.values(entitySummary.repointed || {}).reduce((a, b) => a + b, 0);
+      if (repointed > 0 || entitySummary.createdColumns.length) {
+        console.log(
+          `Migration: entities — ${entitySummary.foundingEntities.map(e => `${e.kind}="${e.name}"`).join(', ')}; ` +
+          `${repointed} fact(s) repointed, ${entitySummary.unrepointed} unrepointed, ` +
+          `${entitySummary.locksMigrated} lock(s) carried onto the self entity`);
+      }
+      lastEntityMigration = entitySummary;
+    } catch (e) {
+      console.error('Migration: entities FAILED —', e.message);
+      throw e;
+    }
+
     console.log('SQLite database initialized successfully');
 
     // Backfill FTS table with existing messages
@@ -2067,6 +2094,7 @@ async function resetClusterEmbeddingsTable() {
 module.exports = {
   // Initialization
   initDatabase,
+  getLastEntityMigration,
   initVectorStore,
   getDataDir,
   getMemoryDir,

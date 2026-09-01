@@ -536,6 +536,21 @@ function lock(memberId, categories, { actor = 'cli' } = {}) {
   db.prepare('UPDATE cluster_members SET locked = 1, locked_at = ?, lock_category = ?, updated_at = ? WHERE id = ?')
     .run(now, cats.join(','), now, memberId);
 
+  // PER-ENTITY LOCKS (2026-09-01). The identity lock is the SELF ENTITY'S case,
+  // not a special mechanism — Athena's requirement, so that "if the Juno entity
+  // ever merges with anything, my lock on Athena is untouched, because locks
+  // attach to the entity instance and are preserved, not re-derived." The
+  // member-level columns above stay authoritative for the guards in
+  // db/fact-store.js; this records the same lock against the entity so it
+  // survives merge/split/repoint.
+  try {
+    const entities = require('./entities');
+    const selfEnt = entities.selfEntity();
+    if (selfEnt) for (const c of cats) entities.lockEntity(selfEnt.id, c, memberId);
+  } catch (e) {
+    console.error('[IdentityLock] could not record the entity-level lock:', e.message);
+  }
+
   const line = `Identity lock SET on ${cats.join(' + ')} by ${actor}: "${row.content.slice(0, 140)}"`;
   opsLog(line);
   dailyLog(line);

@@ -480,7 +480,7 @@ async function renameAllClusters(options = {}) {
  * @param {string} source - Source of the fact
  * @returns {Promise<Object>} - {clusterId, clusterName, isNew}
  */
-async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user', claimType = null, provenance = null) {
+async function assignToCluster(fact, provider, model, apiKey, host, source = 'conversation', salience = 5, subject = 'user', claimType = null, provenance = null, opts = {}) {
   try {
     const config = getConfig();
     const db = getSqliteDb();
@@ -635,9 +635,15 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
         const now = new Date().toISOString();
 
         db.prepare(`
-          INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject)
-          VALUES (?, ?, '', ?, ?, ?)
-        `).run(clusterId, clusterName, now, now, subject);
+          INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject, subject_entity_id)
+          VALUES (?, ?, '', ?, ?, ?, ?)
+        `).run(clusterId, clusterName, now, now, subject, (() => {
+          try {
+            const entities = require('./entities');
+            const ptr = subject === 'self' ? entities.selfEntity() : entities.userEntity();
+            return ptr ? ptr.id : null;
+          } catch { return null; }
+        })());
 
         isNew = true;
         console.log(`[Clusters] Created ${subject} cluster: ${clusterName}`);
@@ -660,6 +666,23 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     // nothing writes explicit nulls instead of silently inheriting a default.
     // 'unknown' modality is a real answer ("we don't know how this arrived"),
     // distinct from null ("this fact predates provenance").
+    // THE THIRD SUBJECT. subject_entity_id is authoritative; `subject` is its
+    // shadow, kept in step so existing SQL keeps working. A caller that knows
+    // the entity passes it; otherwise it is derived from the old subject string
+    // through the locked pointers, so no write can leave it null.
+    let subjectEntityId = opts.subjectEntityId || null;
+    if (!subjectEntityId) {
+      try {
+        const entities = require('./entities');
+        const ptr = subject === 'self' ? entities.selfEntity() : entities.userEntity();
+        subjectEntityId = ptr ? ptr.id : null;
+      } catch { subjectEntityId = null; }
+    }
+    // A fact that failed the write-time subject check is STORED, not dropped —
+    // that is the whole point of flagged-unverified-subject — but it is not
+    // active, so it never reaches retrieval or injection.
+    const memberStatus = opts.status || 'active';
+
     const prov = provenance || {};
     const p = {
       conversationId: prov.conversationId ?? null,
@@ -671,19 +694,23 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
     db.prepare(`
       INSERT INTO cluster_members (
         id, cluster_id, content, source, importance, created_at, updated_at,
-        salience, subject, claim_type, status,
+        salience, subject, subject_entity_id, claim_type, status,
         conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale
       )
-      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, claimType,
+      memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, subjectEntityId,
+      claimType, memberStatus,
       p.conversationId, p.messageId, p.verbatimSourceText, p.inputModality, p.salienceRationale
     );
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
 
-    // Add embedding to LanceDB
-    if (clusterTable) {
+    // Add embedding to LanceDB — ACTIVE ROWS ONLY. A flagged-unverified-subject
+    // fact is inactive by construction, and giving it a vector would put an
+    // unverified claim straight back into semantic retrieval, which is the
+    // never-re-add-a-vector rule from the other direction.
+    if (clusterTable && memberStatus === 'active') {
       // Convert Float32Array to regular array for LanceDB compatibility
       const vectorForStorage = Array.from(embedding);
       await clusterTable.add([{

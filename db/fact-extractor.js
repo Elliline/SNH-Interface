@@ -1496,6 +1496,7 @@ async function planExtraction({
     splits: [],      // {from, into[]}
     routedToLog: [], // {text, why, marker}
     refusals: [],    // {text, rule, detail}
+    flaggedSubject: [], // {text, reason, detail, quote} — stored, but not active
     repeats: [],     // {text, existingId, existingContent, similarity, detectedBy, reasoning}
     facts: [],       // {text, corrects, salience, salienceRationale}
     recall: [],      // {fact, diagnostics, judged[]}
@@ -1555,6 +1556,38 @@ async function planExtraction({
           : 'does not name the user, so it cannot be filed as a fact about her'
       });
       continue;
+    }
+
+    // WRITE-TIME SUBJECT CHECK — Athena's requirement, and the door Juno's two
+    // bad facts have to die at. Given this candidate and the subject it would be
+    // filed under, can we point at a quote in the source that attributes the
+    // claim to that entity? If not, the fact is not refused — it is STORED as
+    // flagged-unverified-subject, because a silent hole is the failure mode she
+    // named ("nothing lost becomes nothing noticed").
+    //
+    // It fires only on candidates carrying attributable specifics: an email, a
+    // phone, a street address, a named org or person. A preference asserts
+    // nothing a quote could attribute, and gating those would flag the corpus
+    // and teach everyone to ignore the flag.
+    try {
+      const entities = require('./entities');
+      const subjectCheck = require('./subject-check');
+      const userEnt = entities.userEntity();
+      if (userEnt) {
+        const verdict = subjectCheck.check(
+          c.text, subjectCheck.forEntity(userEnt), userMessage,
+          { knownEntities: entities.list().map(subjectCheck.forEntity), sourceIsUserMessage: true }
+        );
+        if (!verdict.verified) {
+          c.subjectVerdict = verdict;
+          plan.flaggedSubject.push({
+            text: c.text, reason: verdict.reason, detail: verdict.detail, quote: verdict.quote || null
+          });
+        }
+      }
+    } catch (e) {
+      // A check that cannot run must not silently pass everything, so it says so.
+      console.error('[FactExtractor] write-time subject check failed:', e.message);
     }
 
     // IDENTITY ANCHOR — F1. A name, pronoun or core-relationship fact from a
@@ -1754,6 +1787,7 @@ async function planExtraction({
       // log as prose and then be thrown away, so nothing could later answer
       // "why is this a 10?".
       salienceRationale: scored ? scored.reasoning : 'default (scoring failed)',
+      subjectVerdict: f.subjectVerdict || null,
       provenance
     });
   }
@@ -1897,14 +1931,24 @@ async function applyExtraction(plan, opts = {}) {
   for (const f of plan.facts) {
     logDaily(`Scored fact salience ${f.salience}/10: "${f.text}" — ${f.salienceRationale}`);
     try {
+      const flagged = f.subjectVerdict && !f.subjectVerdict.verified;
       const res = await memoryClusters.assignToCluster(
         f.text, extractionProvider, extractionModel, extractionApiKey(extractionProvider), extractionHost,
         'fact-extraction', f.salience, 'user', null,
-        { ...f.provenance, salienceRationale: f.salienceRationale }
+        { ...f.provenance, salienceRationale: f.salienceRationale },
+        flagged ? { status: require('./subject-check').FLAGGED_STATUS } : {}
       );
       if (res && res.memberId) {
         factToMemberId.set(f.text, res.memberId);
-        result.stored++;
+        if (flagged) {
+          result.flaggedSubject = (result.flaggedSubject || 0) + 1;
+          logDaily(`I could not confirm who this was about, so I have held it rather than filing it as known: ` +
+            `"${f.text}" — ${f.subjectVerdict.detail}.${src}`);
+          appendToOpsLog(`Write-time subject check (${f.subjectVerdict.reason}) held ` +
+            `${String(res.memberId).slice(0, 8)} as flagged-unverified-subject: ${f.subjectVerdict.detail}`, opsDir);
+        } else {
+          result.stored++;
+        }
       }
       if (res && res.clusterId) factToClusterId.set(f.text, res.clusterId);
     } catch (clusterError) {

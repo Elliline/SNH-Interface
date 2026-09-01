@@ -260,6 +260,20 @@
       "dataDir": "required"
     },
     {
+      "suite": "test-entity-subject",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; deterministic, no engine calls, so a red result is a real regression.",
+      "verifiedAt": "22b9a7a",
+      "subjects": [
+        "db/entities.js",
+        "db/subject-check.js",
+        "db/memory-clusters.js",
+        "db/fact-extractor.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-flush-early-content",
       "expectedFailures": 3,
       "reason": "The flush summary is built from the kept tail rather than the dropped head, so the early and middle details are not carried. Three failures; pre-existing and not investigated.",
