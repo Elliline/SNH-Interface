@@ -1159,6 +1159,17 @@ function initDatabase() {
     }
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON conversations(hidden)');
 
+    // MESSAGES — the channel where the entity talks to her (2026-09-01). Its own
+    // tables on purpose: the initiatives table is already doing two jobs (the
+    // bell, and the greeting queue) and a third would make all three harder to
+    // reason about.
+    try {
+      require('./messages').initSchema(sqliteDb);
+    } catch (e) {
+      console.error('Migration: messages FAILED —', e.message);
+      throw e;
+    }
+
     // ENTITIES — the third subject (2026-09-01). Last, because it repoints rows
     // in cluster_members and memory_clusters and so needs every column above it
     // to exist first. Idempotent: re-running finds the founding entities already

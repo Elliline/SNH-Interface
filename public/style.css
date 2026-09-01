@@ -3811,3 +3811,63 @@ body.coder-working { padding-top: 1.9rem; }
   color: var(--text-secondary);
   margin: -4px 0 8px;
 }
+
+/* ============================================================
+   MESSAGES — threads, not items. Reuses the initiative panel's
+   frame; what differs is that nothing here can be dismissed.
+   ============================================================ */
+.message-thread { cursor: pointer; }
+.message-thread:hover { border-color: var(--primary-color); }
+
+.message-unread {
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.22);
+  color: #93c5fd;
+  white-space: nowrap;
+}
+
+.message-preview {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.message-back {
+  background: none;
+  border: none;
+  color: var(--primary-color);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 4px 0 10px;
+}
+
+.message-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+
+.message-bubble {
+  padding: 9px 11px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+/* Hers and its are told apart by side and tint, the way a person expects. */
+.message-bubble.from-snh  { background: var(--surface-color); margin-right: 14%; }
+.message-bubble.from-user { background: rgba(158, 127, 255, 0.10); margin-left: 14%; }
+
+.message-meta { font-size: 0.68rem; color: var(--text-secondary); margin-bottom: 4px; }
+.message-body { white-space: pre-wrap; }
+
+.message-reply textarea {
+  width: 100%;
+  background: var(--surface-color);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 8px;
+  font-size: 0.85rem;
+  font-family: inherit;
+  resize: vertical;
+}
+.message-reply textarea:focus { outline: none; border-color: var(--primary-color); }

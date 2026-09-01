@@ -15,6 +15,7 @@ const {
   MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
 } = require('./tools/memory-inspect');
 const { EntityListTool, EntityGetTool } = require('./tools/entity-registry');
+const { MessageThreadsTool, MessageSendTool, MessageRequestRetireTool } = require('./tools/messages');
 const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
@@ -266,6 +267,34 @@ const TOOL_CATALOGUE = [
     gateWhy: () => 'the memory-reading set is turned off here',
     toggle: 'tools.memoryInspect.enabled',
     toggleNote: 'Shares the memory-reading switch and rate cap.',
+    fields: []
+  })),
+
+  // The message channel. `message_threads` is a read and rides on the memory
+  // read switch; the two writes are their own capability with their own switch,
+  // because being able to SEND her something is a different decision from being
+  // able to look at what you already sent.
+  {
+    id: 'message_threads',
+    title: 'List his message threads with her',
+    Tool: MessageThreadsTool,
+    card: 'messages',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.messages) || {}).enabled !== false,
+    gateWhy: () => 'the message channel is turned off here',
+    toggle: 'tools.messages.enabled',
+    toggleNote: 'The message channel — his threads with her. Turning it off stops him opening or adding to threads; existing ones stay readable.',
+    fields: [{ path: 'tools.messages.maxSendsPerHour', label: 'Messages per hour', type: 'number', min: 1, max: 60,
+      hint: 'How many messages he may send in an hour. This is a rate limit, not a quality bar — nothing here decides for her which of his messages are worth reading.' }]
+  },
+  ...[
+    ['message_send', 'Send her a message', MessageSendTool],
+    ['message_request_retire', 'Ask her to close a thread', MessageRequestRetireTool]
+  ].map(([id, title, Tool]) => ({
+    id, title, Tool, card: 'messages',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.messages) || {}).enabled !== false,
+    gateWhy: () => 'the message channel is turned off here',
+    toggle: 'tools.messages.enabled',
+    toggleNote: 'Shares the message-channel switch.',
     fields: []
   })),
 

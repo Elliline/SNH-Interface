@@ -3914,6 +3914,147 @@ document.querySelectorAll('.memory-tab').forEach(tab => {
 // tab builds its toolbar lazily.
 wireFactsControls();
 
+
+// ---- Messages: the channel where SNH talks to her ----
+//
+// Threads, not items. A subject stays in one place, and nothing here expires:
+// unread is only ever "she has not got to it", never a verdict on what was
+// sent. That is why there is no dismiss button in this panel — the only way a
+// message stops being unread is that she reads it.
+const messagesBtn = document.getElementById('messagesBtn');
+const messagesBadge = document.getElementById('messagesBadge');
+const messagesPanel = document.getElementById('messagesPanel');
+const messagesPanelOverlay = document.getElementById('messagesPanelOverlay');
+const messagesPanelClose = document.getElementById('messagesPanelClose');
+let openThreadId = null;
+
+async function refreshMessagesBadge() {
+  if (!messagesBadge) return;
+  try {
+    const res = await fetch('/api/messages');
+    if (!res.ok) return;
+    const data = await res.json();
+    const n = data.unread || 0;
+    messagesBadge.textContent = n;
+    messagesBadge.style.display = n > 0 ? 'inline-flex' : 'none';
+  } catch { /* the badge is not worth a console line every poll */ }
+}
+
+function threadRow(t) {
+  const who = t.last_sender === 'self' ? 'SNH' : 'You';
+  return `
+    <div class="initiative-item message-thread" data-thread="${t.id}">
+      <div class="initiative-item-head">
+        <span class="initiative-type initiative-type-${t.status === 'active' ? 'followup' : 'observation'}">${escapeHtml(t.status)}</span>
+        ${t.unread > 0 ? `<span class="message-unread">${t.unread} unread</span>` : ''}
+        <span class="initiative-time">${escapeHtml(formatInitiativeTime(t.updated_at))}</span>
+      </div>
+      <div class="initiative-content"><strong>${escapeHtml(t.subject)}</strong></div>
+      <div class="message-preview">${escapeHtml(who)}: ${escapeHtml(String(t.last_body || '').slice(0, 120))}</div>
+      ${t.retire_requested_at && t.status === 'active'
+        ? '<div class="initiative-note">SNH has asked to close this one — the request is on the bell.</div>' : ''}
+      ${t.supersedes_thread_id ? '<div class="initiative-note">Follows an earlier thread on this subject.</div>' : ''}
+    </div>`;
+}
+
+async function loadMessagesList() {
+  const body = document.getElementById('messagesBody');
+  const title = document.getElementById('messagesTitle');
+  if (!body) return;
+  openThreadId = null;
+  body.innerHTML = '<div class="memory-loading">Loading…</div>';
+  try {
+    const res = await fetch('/api/messages');
+    const data = await res.json();
+    const threads = data.threads || [];
+    if (title) title.textContent = data.unread ? `Messages (${data.unread} unread)` : 'Messages';
+    if (!threads.length) {
+      body.innerHTML = '<div class="memory-empty">No messages yet.</div>';
+      return;
+    }
+    body.innerHTML = threads.map(threadRow).join('');
+    body.querySelectorAll('.message-thread').forEach(el =>
+      el.addEventListener('click', () => openThread(el.dataset.thread)));
+  } catch (e) {
+    body.innerHTML = '<div class="memory-empty">Failed to load messages</div>';
+  }
+}
+
+async function openThread(id) {
+  const body = document.getElementById('messagesBody');
+  const title = document.getElementById('messagesTitle');
+  if (!body) return;
+  body.innerHTML = '<div class="memory-loading">Opening…</div>';
+  try {
+    // Opening IS reading — this is the one place unread ever changes.
+    const res = await fetch(`/api/messages/${id}`);
+    const data = await res.json();
+    const t = data.thread;
+    openThreadId = t.id;
+    if (title) title.textContent = t.subject;
+    const retired = t.status === 'retired';
+    body.innerHTML = `
+      <button class="message-back">← All threads</button>
+      ${t.supersedes_thread_id ? '<div class="initiative-note">This follows an earlier thread on the same subject.</div>' : ''}
+      <div class="message-list">
+        ${t.messages.map(m => `
+          <div class="message-bubble ${m.sender === 'self' ? 'from-snh' : 'from-user'}">
+            <div class="message-meta">${m.sender === 'self' ? 'SNH' : 'You'} · ${escapeHtml(formatInitiativeTime(m.created_at))}</div>
+            <div class="message-body">${escapeHtml(m.body)}</div>
+          </div>`).join('')}
+      </div>
+      ${retired
+        ? '<div class="initiative-note">This thread is closed. Neither of you can add to it; you can both still read it.</div>'
+        : `<div class="message-reply">
+             <textarea id="messageReplyBox" rows="3" placeholder="Reply to SNH…"></textarea>
+             <div class="initiative-actions">
+               <button class="initiative-approve" id="messageSendBtn">Reply</button>
+               <button class="initiative-reject" id="messageRetireBtn">Close thread</button>
+             </div>
+           </div>`}`;
+    body.querySelector('.message-back').addEventListener('click', loadMessagesList);
+    const sendBtn = document.getElementById('messageSendBtn');
+    if (sendBtn) sendBtn.addEventListener('click', async () => {
+      const box = document.getElementById('messageReplyBox');
+      const text = (box.value || '').trim();
+      if (!text) return;
+      sendBtn.disabled = true;
+      await fetch(`/api/messages/${t.id}/reply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: text })
+      });
+      openThread(t.id);
+    });
+    const retireBtn = document.getElementById('messageRetireBtn');
+    if (retireBtn) retireBtn.addEventListener('click', async () => {
+      if (!confirm(`Close "${t.subject}"?\n\nNeither of you will be able to add to it again. You will both still be able to read it.`)) return;
+      retireBtn.disabled = true;
+      await fetch(`/api/messages/${t.id}/retire`, { method: 'POST' });
+      openThread(t.id);
+    });
+    refreshMessagesBadge();
+  } catch (e) {
+    body.innerHTML = '<div class="memory-empty">Failed to open the thread</div>';
+  }
+}
+
+if (messagesBtn) {
+  messagesBtn.addEventListener('click', () => {
+    messagesPanel.classList.add('open');
+    messagesPanelOverlay.classList.add('visible');
+    loadMessagesList();
+  });
+  const closeMessages = () => {
+    messagesPanel.classList.remove('open');
+    messagesPanelOverlay.classList.remove('visible');
+    refreshMessagesBadge();
+  };
+  messagesPanelClose?.addEventListener('click', closeMessages);
+  messagesPanelOverlay?.addEventListener('click', closeMessages);
+  refreshMessagesBadge();
+  setInterval(refreshMessagesBadge, 60_000);
+}
+
 // ---- Initiative bell + panel (things SNH wants to raise) ----
 const initiativeBtn = document.getElementById('initiativeBtn');
 const initiativeBadge = document.getElementById('initiativeBadge');
@@ -4016,7 +4157,14 @@ async function loadInitiativeList() {
       // Approve/Reject instead of Discuss/Dismiss. source_ref is the cron_jobs
       // row the decision applies to.
       const isProposal = it.type === 'proposal' && it.source_kind === 'cron-proposal' && it.source_ref;
-      const actions = isProposal
+      // A retirement request is an approval too, and it decides a THREAD rather
+      // than a cron job — so it gets its own pair of buttons rather than being
+      // squeezed through the cron path.
+      const isRetire = it.type === 'proposal' && it.source_kind === 'thread-retire' && it.source_ref;
+      const actions = isRetire
+        ? `<button class="thread-retire-approve" data-thread="${escapeHtml(it.source_ref)}" data-id="${it.id}">Close it</button>
+           <button class="thread-retire-keep" data-id="${it.id}">Keep it open</button>`
+        : isProposal
         ? `<button class="initiative-approve" data-cron-id="${escapeHtml(it.source_ref)}">Approve</button>
            <button class="initiative-reject" data-cron-id="${escapeHtml(it.source_ref)}">Reject</button>`
         : `<button class="initiative-discuss" data-id="${it.id}">Discuss</button>
@@ -4056,6 +4204,22 @@ async function loadInitiativeList() {
         actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = false));
       }
     };
+    container.querySelectorAll('.thread-retire-approve').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        await fetch(`/api/messages/${btn.dataset.thread}/retire`, { method: 'POST' });
+        loadInitiativeList(); refreshInitiativeBadge(); refreshMessagesBadge();
+      });
+    });
+    container.querySelectorAll('.thread-retire-keep').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        // Keeping it open is a DECISION, not a dismissal — the thread stays,
+        // and the request is marked answered rather than waved off.
+        btn.disabled = true;
+        await fetch(`/api/memory/initiatives/${btn.dataset.id}/discuss`, { method: 'POST' }).catch(() => {});
+        loadInitiativeList(); refreshInitiativeBadge();
+      });
+    });
     container.querySelectorAll('.initiative-approve').forEach(btn =>
       btn.addEventListener('click', decide(btn, 'approve')));
     container.querySelectorAll('.initiative-reject').forEach(btn =>

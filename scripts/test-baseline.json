@@ -526,6 +526,20 @@
       "timeoutSeconds": 900
     },
     {
+      "suite": "test-messages",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; deterministic, no engine. The load-bearing assertions are the negative ones — that nothing expires a message and a retired thread refuses both of them.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/messages.js",
+        "db/initiative-engine.js",
+        "routes/messages.js",
+        "mcp/tools/messages.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-probe-verdict",
       "expectedFailures": 0,
       "reason": "The liveness probe's slow-vs-dead adjudicator. Uses local stub HTTP servers for the engine — no GPU, no live engine, deterministic.",

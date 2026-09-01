@@ -48,6 +48,7 @@ const conversationsRouter = require('./routes/conversations');
 const memoryRouter = require('./routes/memory');
 const jobsRouter = require('./routes/jobs');
 const toolsRouter = require('./routes/tools');
+const messagesRouter = require('./routes/messages');
 
 const app = express();
 
@@ -402,6 +403,7 @@ app.use('/api/conversations', conversationsRouter);
 
 // Mount memory routes
 app.use('/api/memory', memoryRouter);
+app.use('/api/messages', messagesRouter);
 
 // Mount the jobs routes — the ROBOT channel. Its own prefix, not a corner of
 // /api/memory, because job results are not initiatives and must not be served

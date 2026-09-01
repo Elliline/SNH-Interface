@@ -84,6 +84,38 @@ function daysAgoIso(days) {
  *  - contradiction uncertainties (they block a memory decision) — no age wait
  * @returns {number} candidates added
  */
+
+/**
+ * Put something into the MESSAGE CHANNEL rather than the bell.
+ *
+ * Appends to an active thread on the same subject when one exists, because the
+ * whole point of threads is that a subject stays in one place — and opens a new
+ * one pointing at the last retired thread on that subject when it does not, so
+ * the entity can see it raised this before.
+ */
+async function sayToEllie({ subject, body, sourceKind = null, sourceRef = null }) {
+  const messages = require('./messages');
+  try {
+    const prior = messages.findPriorThreads(subject, { limit: 5 });
+    const active = prior.find(t => t.status === 'active');
+    if (active) {
+      messages.addMessage(active.id, body, 'self');
+      opsLog(`Added to message thread "${subject}" rather than opening a second one.`);
+      return { threadId: active.id, appended: true };
+    }
+    const retired = prior.find(t => t.status === 'retired') || null;
+    const t = messages.openThread({
+      subject, body, sourceKind, sourceRef,
+      supersedesThreadId: retired ? retired.id : null
+    });
+    opsLog(`Opened message thread "${subject}"${retired ? ' (the subject came back — it points at the closed one)' : ''}.`);
+    return { threadId: t.id, appended: false };
+  } catch (err) {
+    console.error('[Messages] could not raise a thread:', err.message);
+    return null;
+  }
+}
+
 async function noticeFromQuestions() {
   const sql = getSqliteDb();
   if (!sql) return 0;
@@ -126,12 +158,14 @@ async function noticeFromQuestions() {
       // nudged up for having gone unanswered.
       if ((q.salience ?? 5) < 6) continue;
       const priority = Math.min(10, (q.salience ?? 5) + 1);
-      if (await initiatives.addInitiative({
-        type: 'question',
-        content: q.question,
+      // A QUESTION IS THE ENTITY WANTING TO ASK HER SOMETHING, which is a
+      // message, not a notification. The bell rework left this type
+      // pending-but-silent because it had nowhere else to be; now it does.
+      if (await sayToEllie({
+        subject: q.question.slice(0, 80),
+        body: q.question,
         sourceKind: 'question',
-        sourceRef: q.id,
-        priority
+        sourceRef: q.id
       })) added++;
     }
 
@@ -368,16 +402,14 @@ Return ONLY a JSON object, nothing else:
       trace.skipped = false;
       // Queue above followupThreshold so it clears the lower greeting bar, but
       // below the unprompted bar unless the prioritizer later promotes it.
-      const priority = Math.min(10, Math.max(cfg.followupThreshold, 5) + 1);
-      const id = await initiatives.addInitiative({
-        type: 'followup',
-        content: parsed.followup,
+      const res = await sayToEllie({
+        subject: parsed.followup.slice(0, 80),
+        body: parsed.followup,
         sourceKind: 'reflection',
-        sourceRef: `followup:${trace.at}`,
-        priority
+        sourceRef: `followup:${trace.at}`
       });
-      trace.initiativeId = id;
-      console.log(`[Initiatives] Follow-up generated (priority ${priority}): "${parsed.followup.slice(0, 80)}"`);
+      trace.threadId = res ? res.threadId : null;
+      console.log(`[Messages] Follow-up sent to the message channel: "${parsed.followup.slice(0, 80)}"`);
     } else {
       console.log(`[Initiatives] No follow-up this cycle — ${trace.reasoning}`);
     }
@@ -585,6 +617,22 @@ Return ONLY a JSON object, nothing else:
       trace.generated = parsed.followup;
       trace.skipped = false;
       trace.sourceEntryId = sourceEntry ? sourceEntry.id : null;
+      // THE DAILY-LOG FOLLOW-UP STAYS ON THE INITIATIVE QUEUE, and this is a
+      // deliberate exception to "follow-ups route to messages" — flagged for
+      // Ellie rather than decided here.
+      //
+      // This path has a RELEASE VALVE with a measurement behind it: an entry
+      // whose follow-up expired UNREAD comes back into view, because that
+      // follow-up was never read by anyone and the entry is still actionable.
+      // Filtering on source alone "eats the corpus" — measured at 18 -> 15
+      // entries over seven passes. Messages deliberately never expire, so
+      // routing this here would consume a log entry permanently on the first
+      // follow-up ever raised about it, and the valve would have nothing to
+      // release. That is a real trade about how her daily log is spent, not an
+      // implementation detail, so it is hers to make.
+      //
+      // The conversation follow-up above HAS moved, because it is the kind that
+      // was sitting in the bell under "no conversation needed".
       const priority = Math.min(10, Math.max(cfg.followupThreshold, 5) + 1);
       const id = await initiatives.addInitiative({
         type: 'followup',
@@ -766,6 +814,16 @@ async function prioritize() {
     // all read it, and healthFloor() pins health items above it. So it keeps
     // deciding what gets SAID and no longer decides what gets KEPT. If it is
     // ever removed, those three thresholds are what has to move with it.
+
+    // THE BACKLOG SEAM, NOW WIRED. It reads the real unread count from the
+    // message channel and fires only on the threshold crossing — the messages
+    // view carries its own count, so the bell's job is the pile-up, not the
+    // arrival.
+    try {
+      await raiseMessageBacklog(require('./messages').unreadCount());
+    } catch (e) {
+      console.error('[Initiatives] backlog check failed:', e.message);
+    }
 
     result.pending = initiatives.countPending();
     console.log(`[Initiatives] prioritize: expired ${result.expired} stale, re-scored ${result.rescored}, capped ${result.capped}; ${result.pending} pending`);
@@ -980,6 +1038,7 @@ module.exports = {
   raiseMemoryDrift,
   noticeReflectionInsight,
   raiseMessageBacklog,
+  sayToEllie,
   generateConversationFollowup,
   generateLogFollowup,
   prioritize,

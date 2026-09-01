@@ -336,7 +336,7 @@ async function writeDissonanceFact({ claimText, claimDate, finding, evidenceRefs
  * trade only because the bell's version was never actioned either: of 390 items
  * ever raised, the only proposal was dismissed.
  */
-function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = null }) {
+function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = null, asksHer = true }) {
   try {
     const ledger = require('./corrections-ledger');
     const id = ledger.record({
@@ -350,6 +350,27 @@ function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = 
       reversible: false
     });
     logOps(`${label} — recorded in corrections (${id ? id.slice(0, 8) : 'unfiled'}); nothing was changed`);
+
+    // THE RECORD AND THE ASK ARE TWO DIFFERENT THINGS. Corrections is the
+    // record — what was noticed, and that nothing was changed. But these
+    // findings END IN A QUESTION ("want me to retire it, or leave it?"), and a
+    // question needs somewhere she can answer it. The bell rework moved them
+    // out of the bell and Corrections has no reply box, so the ask goes to the
+    // message channel and the record stays here. Neither one is sufficient
+    // alone: the record without the ask is unanswerable, the ask without the
+    // record is unauditable.
+    if (asksHer) {
+      try {
+        require('./initiative-engine').sayToEllie({
+          subject: `Something in my self-description does not sit right: ${String(content).slice(0, 60)}`,
+          body: content,
+          sourceKind: 'self-coherence',
+          sourceRef
+        });
+      } catch (err) {
+        console.error('[SelfAudit] could not open a thread for the ask:', err.message);
+      }
+    }
     return id;
   } catch (err) {
     console.error('[SelfAudit] could not record the raise:', err.message);
