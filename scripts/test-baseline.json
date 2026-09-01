@@ -68,7 +68,7 @@
       "suite": "test-bell-routing",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine — the bell's routing is a type predicate, not a judgement.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/initiatives.js",
         "db/initiative-engine.js",
@@ -203,7 +203,7 @@
       "suite": "test-cron-eval",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/cron-eval.js"
       ],
@@ -338,7 +338,7 @@
       "suite": "test-health-alerts",
       "expectedFailures": 0,
       "reason": "The floor that stops the prioritiser scoring a self-health alert into silence, and the fields the watchdog's alert must carry. Pure — no engine, no network.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/initiatives.js",
         "db/brain-watchdog.js"
@@ -401,7 +401,7 @@
       "suite": "test-initiative-scoring",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/memory-manager.js",
         "db/initiatives.js",
@@ -489,7 +489,7 @@
       "suite": "test-log-followup",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/daily-log-reader.js",
         "db/memory-manager.js",
@@ -529,7 +529,7 @@
       "suite": "test-messages",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine. The load-bearing assertions are the negative ones — that nothing expires a message and a retired thread refuses both of them.",
-      "verifiedAt": "PENDING",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/messages.js",
         "db/initiative-engine.js",
@@ -562,7 +562,7 @@
       "suite": "test-scheduler",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "1040824",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/memory-manager.js",
         "db/scheduler.js",
@@ -654,7 +654,7 @@
       "suite": "test-tools-settings",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "4ad9481",
+      "verifiedAt": "aff8f16",
       "subjects": [
         "db/secrets.js"
       ],
