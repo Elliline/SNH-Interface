@@ -224,11 +224,24 @@ email: lcac2009@live.com`;
   ok('containment is a clear match', entities.resolve('Inn at Spanish Head').tier === 'clear');
   ok('an unknown name is new', entities.resolve('Newport Dental').tier === 'new');
 
-  entities.create({ name: 'Bob', type: 'person', relationship: 'client contact' });
-  entities.create({ name: 'Bobby Chen', type: 'person', relationship: 'vendor' });
+  // TWO PEOPLE WHO ACTUALLY ANSWER TO THE NAME. This used to seed "Bob" and
+  // "Bobby Chen" and assert ambiguity, which passed for the wrong reason: the
+  // candidate set was every person in the registry, so ANY second person made
+  // a first name ambiguous and asking about "Juno" offered "Bob Chen" as an
+  // alternative. Bobby is not Bob. One Bob is a clear match; two are the
+  // blast-radius case Athena asked for.
+  entities.create({ name: 'Bob Chen', type: 'person', relationship: 'client contact' });
+  const oneBob = entities.resolve('Bob');
+  ok('one person answering to a first name is a clear match', oneBob.tier === 'clear',
+     `${oneBob.tier}: ${oneBob.why}`);
+
+  entities.create({ name: 'Bob Marley', type: 'person', relationship: 'neighbour' });
   const bob = entities.resolve('Bob');
-  ok('a bare first name with other people known is AMBIGUOUS (blast radius)',
+  ok('a bare first name with TWO people who answer to it is AMBIGUOUS (blast radius)',
      bob.tier === 'ambiguous', `${bob.tier}: ${bob.why}`);
+  ok('…and the candidates are only the people who answer to it',
+     bob.candidates.every(c => /bob/i.test(c.name)),
+     JSON.stringify(bob.candidates.map(c => c.name)));
 
   // ----------------------------------------------------------- 7. entity ops
   section('7. Merge is union-preserving and ledgered');

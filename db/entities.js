@@ -360,7 +360,14 @@ function resolve(mention, { type = null } = {}) {
   const exact = all.filter(e => namesOf(e).includes(needle) && (!type || e.type === type));
   if (exact.length === 1) {
     if (isBareFirstName(m) && exact[0].type === 'person') {
-      const others = all.filter(e => e.type === 'person' && e.id !== exact[0].id);
+      // Only people who ACTUALLY answer to that first name are candidates. The
+      // first version took every other person in the registry, so asking about
+      // "Juno" offered "Bob Chen" as an alternative — a question that reads as
+      // a malfunction and teaches her to ignore the next one. One Bob is not
+      // ambiguous; two are.
+      const others = all.filter(e =>
+        e.type === 'person' && e.id !== exact[0].id &&
+        namesOf(e).some(n => n.split(/\s+/).includes(needle)));
       if (others.length) {
         return {
           tier: 'ambiguous', candidates: [exact[0], ...others], mention: m,

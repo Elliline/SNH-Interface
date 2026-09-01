@@ -536,7 +536,29 @@ const NON_SUBJECT_WORDS = new Set([
   // "My", and the type noun right behind it made it an animal called My.
   'my', 'our', 'his', 'her', 'their', 'its', 'your',
   'this', 'that', 'these', 'those', 'there', 'here',
-  'im', 'ive', 'id', 'ill', 'and', 'but', 'so', 'if', 'when', 'then', 'also'
+  'im', 'ive', 'id', 'ill', 'and', 'but', 'so', 'if', 'when', 'then', 'also',
+  // Email and message headers. "From me, for your store:" made an organisation
+  // called "From" — the header word was capitalised, sat at the start of a
+  // line, and had a cue word further down the sentence.
+  'from', 'to', 'subject', 're', 'cc', 'bcc', 'date', 'sent', 'fwd', 'fw', 'reply',
+  'at', 'in', 'on', 'for', 'with', 'by', 'of',
+  // Quantifiers, numerals and discourse markers. Sentence-initial capitalisation
+  // says nothing about namehood, so "Both now sit in the store", "Um why would
+  // any of my dogs", "Four paws marching" and "Good morning my friend" each
+  // produced an entity out of the first word of a sentence.
+  //
+  // This IS an enumeration, and it is defensible where the place-name stoplist
+  // was not, because these are CLOSED CLASSES — English does not acquire new
+  // quantifiers or new numerals. A stoplist of cities can always be beaten by
+  // the next city; a stoplist of determiners cannot.
+  'both', 'all', 'each', 'every', 'some', 'any', 'few', 'many', 'most', 'several', 'none',
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'first', 'second', 'third', 'next', 'last', 'another', 'other', 'such',
+  'um', 'uh', 'oh', 'ah', 'well', 'hmm', 'yeah', 'yep', 'nope', 'sure', 'please', 'sorry',
+  'good', 'great', 'nice', 'cool', 'right', 'exactly', 'actually', 'honestly', 'anyway',
+  'maybe', 'perhaps', 'just', 'still', 'even', 'only', 'once', 'again', 'always', 'never',
+  'everything', 'something', 'nothing', 'anything', 'everyone', 'someone', 'nobody', 'anybody',
+  'what', 'why', 'how', 'where', 'who', 'which', 'because', 'since', 'while', 'after', 'before'
 ]);
 
 /**
@@ -557,17 +579,40 @@ function typeFromCueWord(word) {
   return null;
 }
 
-/** Words before the name, stopping at the previous capitalised name so a cue
- *  can never be read across a different subject. */
+/**
+ * Words before the name, for reading its type out of "my dog Cece".
+ *
+ * Stops at the previous capitalised name, so a cue can never be read across a
+ * different subject — and ALSO at punctuation, for the same reason the
+ * after-scan does. "Eric, your mom, your dad, Athena" is a LIST: reading back
+ * across the comma took "dad" as Athena's type. A cue only describes the name
+ * it is actually attached to.
+ */
 function cueWordsBefore(before) {
-  const cut = before.replace(/^[\s\S]*[A-Z][A-Za-z0-9'&.\-]*/, '');
+  const cut = before
+    .replace(/^[\s\S]*[A-Z][A-Za-z0-9'&.\-]*/, '')
+    .split(/[,;:—\n]/).pop();
   return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(-3);
 }
 
-/** Words after the name, stopping at the next capitalised name for the same
- *  reason — "Sarah ... at Newport Dental Clinic" must not make Sarah a clinic. */
+/**
+ * Words after the name, for reading its type out of "X is my contact".
+ *
+ * THREE STOPS, and each one is a bug that got through without it:
+ *
+ *  - The next CAPITALISED name. "Sarah ... at Newport Dental Clinic" must not
+ *    make Sarah a clinic.
+ *  - PUNCTUATION. "From me, for your store:" reached across a comma and a
+ *    preposition to "store" and made an organisation out of an email header.
+ *  - A POSSESSIVE. "Juno's store" describes the STORE, not Juno — reading past
+ *    the apostrophe turned a person into an organisation. A possessive is the
+ *    one construction where the following noun is guaranteed NOT to be the
+ *    type of the name in front of it, which is the mirror image of why the
+ *    possessive makes a good subject cue for the possessor.
+ */
 function cueWordsAfter(after) {
-  const cut = after.split(/[A-Z]/)[0];
+  if (/^\s*'s\b/i.test(after)) return [];
+  const cut = after.split(/[A-Z]/)[0].split(/[,;:—\n]/)[0];
   return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(0, 6);
 }
 
@@ -616,6 +661,15 @@ function entityMentions(text) {
     if (seen.has(key)) continue;
     if (NON_SUBJECT_WORDS.has(key)) continue;
     if (raw.split(/\s+/).every(w => NON_SUBJECT_WORDS.has(w.toLowerCase()))) continue;
+    // A WORD THAT SAYS WHAT KIND OF THING SOMETHING IS CANNOT BE ITS NAME.
+    // "It's an MSP on the Oregon coast" registered an organisation called MSP,
+    // because the same word that proves a subject exists was read as the
+    // subject. A name made ENTIRELY of cue and filler words is a description.
+    // "Newport Dental Clinic" survives — only one of its three words is a cue.
+    if (raw.split(/\s+/).every(w => {
+      const lw = w.toLowerCase().replace(/[^a-z]/g, '');
+      return !lw || typeFromCueWord(lw) || NON_SUBJECT_WORDS.has(lw);
+    })) continue;
     // No sentence-initial length guard. One was tried and it ate "Bob's house"
     // — three letters, first word, and the possessive right behind it. The cue
     // requirement below already drops the capitalised-because-it-starts-a-
@@ -630,7 +684,15 @@ function entityMentions(text) {
     // load-bearing: "my contact at Newport Dental Clinic" has "contact" sitting
     // before the organisation, and reading before-first types the clinic as a
     // person.
-    const inName = raw.toLowerCase().split(/\s+/).map(typeFromCueWord).find(Boolean);
+    // The cue may not be the FIRST word of a multi-word name. English puts the
+    // head of a compound name last — "Newport Dental Clinic", "Lincoln City
+    // Animal Clinic" — so a type word in front is a modifier, not the head:
+    // "the 4 Dog Army" (a song lyric) registered an animal called Dog Army.
+    // A head-first name like "Inn at Spanish Head" therefore comes out
+    // type-unknown and is ASKED about rather than guessed at, which is the
+    // right trade — it asks once and is registered thereafter.
+    const nameWords = raw.toLowerCase().split(/\s+/);
+    const inName = nameWords.map((w, i) => (i === 0 && nameWords.length > 1 ? null : typeFromCueWord(w))).find(Boolean);
     if (inName) { type = inName; cue = raw; cueKind = 'type-noun-in-name'; }
 
     // CUE B — a type noun immediately before: "my dog Cece", "our client X".
@@ -643,7 +705,13 @@ function entityMentions(text) {
     }
 
     // CUE C — a type noun just after: "Sarah Whitfield is my contact at ...".
-    if (!type) {
+    //
+    // NEVER after a possessive. "Juno's store" describes the store, not Juno,
+    // and reading across the apostrophe typed a person as an organisation. The
+    // guard is the `possessive` flag rather than a look at `after`, because the
+    // 's has already been consumed into the match by the time we get here —
+    // which is exactly why the first version of this guard silently did nothing.
+    if (!type && !possessive) {
       for (const w of cueWordsAfter(after)) {
         const t = typeFromCueWord(w);
         if (t) { type = t; cue = w; cueKind = 'type-noun-after'; break; }
@@ -658,6 +726,11 @@ function entityMentions(text) {
     if (!cue) {
       if (/^\s+(called|emailed|phoned|asked|said|wants|needs|reported|sent|replied)\b/i.test(after)) {
         cue = after.trim().split(/\s+/)[0]; cueKind = 'relational-verb';
+      } else if (/\b(?:own|owns|owned|run|runs|manage|manages|hired|bought|acquired)\s+$/i.test(before)) {
+        // "I own MettaSphere" — a possession verb makes what follows a party.
+        // Without this the real subject of that sentence was missed entirely
+        // while "From" and "MSP" got through, which is the worst of both.
+        cue = before.trim().split(/\s+/).pop(); cueKind = 'possession-verb';
       } else if (/\b(?:at|for|with)\s+$/i.test(before) && /\s/.test(raw)) {
         // Multi-word only: "at ISH" is a party, "at Lincoln" is probably a place.
         cue = 'preposition'; cueKind = 'party-preposition';

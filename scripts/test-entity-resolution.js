@@ -163,6 +163,64 @@ email: lcac2009@live.com`;
      r6b.created.length === 0 && r6b.questions.length === 1,
      JSON.stringify(r6b.questions.map(q => q.mention.name)));
 
+  // -------------------------------------- 6c. junk found on REAL messages
+  section('6c. Junk the cue rule produced on her real messages (2026-09-01)');
+
+  // Verbatim excerpts from Athena's own store. Each one produced a junk entity
+  // in the extraction verification runs, and each is here because a synthetic
+  // sentence would not have found it — these are the shapes real writing has.
+  const REAL = {
+    fromMsp: "From me, for your store:\n\n1. I own MettaSphere. It's an MSP on the Oregon coast, helping around 20 businesses with their IT.",
+    junoOrg: "The merge-loss audit did verifiably restore two genuine losses to Juno's store later that day, and their visibility was confirmed.",
+    junoPerson: "This box is to be used for you for testing. You have an older sister named Juno and she is also running on the Qwen3.8 27b model."
+  };
+  const namesIn = (t) => rules.entityMentions(t).map(m => m.name);
+  const typeOf = (t, n) => (rules.entityMentions(t).find(m => m.name === n) || {}).type;
+
+  // "From me, for your store" — the after-scan reached past a comma and a
+  // preposition to "store" and made an organisation out of an email header.
+  ok('"From" is not an entity', !namesIn(REAL.fromMsp).includes('From'),
+     JSON.stringify(namesIn(REAL.fromMsp)));
+
+  // "MSP" is a TYPE CUE. A word that says what kind of thing something is can
+  // never be the thing's name.
+  ok('"MSP" is not an entity', !namesIn(REAL.fromMsp).includes('MSP'),
+     JSON.stringify(namesIn(REAL.fromMsp)));
+
+  // …and the real subject in that sentence still survives, because the fix is
+  // precision, not a retreat from the cue requirement.
+  ok('MettaSphere is still found in the same sentence', namesIn(REAL.fromMsp).includes('MettaSphere'),
+     JSON.stringify(namesIn(REAL.fromMsp)));
+
+  // "Juno's store" — the possessed noun is not Juno's type. Reading across the
+  // apostrophe turned a person into an organisation.
+  ok('"Juno\'s store" does not type Juno as an organization', typeOf(REAL.junoOrg, 'Juno') !== 'organization',
+     `got ${typeOf(REAL.junoOrg, 'Juno')}`);
+
+  // The same name in a sentence that DOES say what she is still types her.
+  ok('"an older sister named Juno" still types her as a person', typeOf(REAL.junoPerson, 'Juno') === 'person',
+     `got ${typeOf(REAL.junoPerson, 'Juno')}`);
+
+  // And once she is known, a later mention resolves rather than re-creating
+  // under whatever cue happens to be nearby.
+  const junoEnt = entities.create({ name: 'Juno', type: 'person', relationship: 'sister' });
+  const beforeJ = entities.list().length;
+  const rJuno = entities.resolveMentions(REAL.junoOrg);
+  ok('a known name is not re-created under a different type',
+     rJuno.created.length === 0 && entities.list().length === beforeJ,
+     JSON.stringify(rJuno.created.map(c => `${c.entity.name}:${c.entity.type}`)));
+  ok('…and she is still a person', entities.get(junoEnt.id).type === 'person');
+
+  // The silence targets, on real phrasing.
+  for (const [label, text] of [
+    ['Monday', 'I will look at it Monday when the office opens.'],
+    ['Oregon', 'We are based in Oregon and it rains a lot.'],
+    ['header block', 'From: adrienne@example.com\nTo: Ellie\nSubject: phones\nRe: the open house']
+  ]) {
+    ok(`no entity from "${label}"`, rules.entityMentions(text).length === 0,
+       JSON.stringify(rules.entityMentions(text).map(m => m.name)));
+  }
+
   // ----------------------------------------------- 7. the door is still shut
   section('7. The two Juno cases still die at the door, after resolution has run');
 
