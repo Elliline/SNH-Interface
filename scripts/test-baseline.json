@@ -260,6 +260,20 @@
       "dataDir": "required"
     },
     {
+      "suite": "test-entity-resolution",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; deterministic — resolution is rules plus registry lookups, so a red result is a real regression and never a slow GPU.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/entities.js",
+        "db/extraction-rules.js",
+        "db/fact-extractor.js",
+        "mcp/tools/entity-registry.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-entity-subject",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine calls, so a red result is a real regression.",

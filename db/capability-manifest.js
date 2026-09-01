@@ -306,7 +306,16 @@ const CONDITIONAL_CAPABILITIES = [
     schedule: 'When the user asks about what you remember, know, or believe',
     dateAdded: '2026-08-03',
     when: (cfg) => !!(cfg && cfg.tools && cfg.tools.memoryInspect && cfg.tools.memoryInspect.enabled !== false),
-    coversTools: ['memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections'],
+    // entity_list / entity_get are CLAIMED here rather than described separately.
+    // They are the same act on the same switch and the same allowance — looking
+    // something up in the record — and an unclaimed registered tool mints a
+    // DERIVED manifest entry, which is not free: measured, the two of them took
+    // the injected list from 684/700 to a render that shed FIVE one-liners.
+    // Five capabilities reaching her as bare names to describe two lookups is a
+    // bad trade, and shedding runs newest-first so what goes is whatever just
+    // shipped.
+    coversTools: ['memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections',
+      'entity_list', 'entity_get'],
     coversConfig: ['tools.memoryInspect']
   },
   {

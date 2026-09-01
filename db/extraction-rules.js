@@ -470,6 +470,227 @@ function historyCoexists(a, b) {
   };
 }
 
+
+// ============ 8. ENTITY MENTIONS — the creation rule, as rules ============
+
+/**
+ * WHICH THINGS GET AN ENTITY OF THEIR OWN.
+ *
+ * The rule Ellie and Athena settled on: a thing gets its own entity when it is
+ * a SUBJECT IN ITS OWN RIGHT — something that accumulates facts of its own.
+ * Clients, client contacts, household members, her pets, specific devices. An
+ * ATTRIBUTE of a subject does not: "Bob's house" is a fact about Bob.
+ *
+ * That is easy to say and hard to encode, and the shape of the difficulty is
+ * worth writing down because the first two attempts were both wrong.
+ *
+ * ATTEMPT 1 — "a proper noun is an entity." Over-creates wildly. Every message
+ * carries capitalised things that are not subjects: Monday, Oregon, Lincoln
+ * City, Shift4, the first word of every sentence. Registering those buries the
+ * twenty real clients in noise, and asking about them is worse than silence.
+ *
+ * ATTEMPT 2 — "a proper noun that is not on a stoplist." A stoplist is an
+ * enumeration of an open set. It fails on the first unlisted city.
+ *
+ * WHAT ACTUALLY WORKS is to require a SUBJECT CUE — a construction in the
+ * sentence that shows the thing is being treated as a subject rather than as a
+ * property of one. And the useful accident is that THE CUE THAT PROVES IT IS A
+ * SUBJECT ALSO SAYS WHAT KIND IT IS: "my dog Cece" proves Cece is a subject and
+ * says she is an animal; "our client Newport Dental" does both for an
+ * organization. Type inference and subject detection are the same read.
+ *
+ * A mention with no cue is not refused, it is simply NOT A CANDIDATE — nothing
+ * is created and nothing is asked. Silence is the right default for "Monday".
+ *
+ * WHAT THIS DELIBERATELY CANNOT DO. It cannot see that a house which has
+ * started accumulating its own facts should be promoted to a subject. That is
+ * promotion, and by design promotion is something the entity ASKS about rather
+ * than decides — there is no rule here that will ever fire for it.
+ */
+
+/** The starting type set. Extensible: `type` is a free string in the schema, so
+ *  a new kind needs a cue row here and no migration. */
+const ENTITY_TYPE_CUES = {
+  organization: ['client', 'clients', 'customer', 'company', 'business', 'org', 'organisation', 'organization',
+    'clinic', 'inn', 'hotel', 'restaurant', 'practice', 'firm', 'agency', 'vendor', 'supplier',
+    'shop', 'store', 'school', 'church', 'nonprofit', 'msp', 'account'],
+  person: ['contact', 'manager', 'owner', 'director', 'receptionist', 'technician', 'tech', 'admin',
+    'friend', 'neighbor', 'neighbour', 'sister', 'brother', 'mother', 'father', 'mom', 'dad',
+    'son', 'daughter', 'husband', 'wife', 'partner', 'colleague', 'coworker', 'boss', 'employee',
+    'vet', 'doctor', 'nurse', 'guy', 'lady', 'woman', 'man'],
+  animal: ['dog', 'dogs', 'cat', 'cats', 'puppy', 'kitten', 'pet', 'pets', 'horse', 'bird', 'rabbit',
+    'goat', 'chicken', 'ferret', 'snake', 'lizard', 'fish'],
+  device: ['router', 'switch', 'firewall', 'ap', 'access point', 'server', 'nas', 'printer', 'camera',
+    'laptop', 'desktop', 'workstation', 'phone', 'tablet', 'box', 'appliance', 'ups', 'modem']
+};
+
+/** Words that look like names in a name slot but never denote a subject. */
+const NON_SUBJECT_WORDS = new Set([
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+  'september', 'october', 'november', 'december',
+  'today', 'tomorrow', 'yesterday', 'tonight', 'morning', 'afternoon', 'evening',
+  'user', 'i', 'we', 'you', 'she', 'he', 'they', 'it', 'the', 'a', 'an',
+  'ok', 'okay', 'yes', 'no', 'hi', 'hello', 'thanks', 'thank',
+  // Determiners and pronouns. A sentence opening "My dog Cece…" capitalises
+  // "My", and the type noun right behind it made it an animal called My.
+  'my', 'our', 'his', 'her', 'their', 'its', 'your',
+  'this', 'that', 'these', 'those', 'there', 'here',
+  'im', 'ive', 'id', 'ill', 'and', 'but', 'so', 'if', 'when', 'then', 'also'
+]);
+
+/**
+ * A proper-name shape.
+ *
+ * JOINERS ARE "of / the / de / von / van" AND NOTHING ELSE. The first cut also
+ * allowed "at" and "and", and both join two DIFFERENT subjects into one
+ * imaginary third: "Sarah at Newport Dental" came out as a single name, and
+ * with it went both the person and the organisation.
+ */
+const NAME_RE = /\b([A-Z][A-Za-z0-9&.\-]*(?:'[A-Za-z]+)?(?:\s+(?:of|the|de|von|van)\s+)?(?:\s*[A-Z][A-Za-z0-9&.\-]*(?:'[A-Za-z]+)?)*)/g;
+
+function typeFromCueWord(word) {
+  const w = String(word || '').toLowerCase();
+  for (const [type, cues] of Object.entries(ENTITY_TYPE_CUES)) {
+    if (cues.includes(w)) return type;
+  }
+  return null;
+}
+
+/** Words before the name, stopping at the previous capitalised name so a cue
+ *  can never be read across a different subject. */
+function cueWordsBefore(before) {
+  const cut = before.replace(/^[\s\S]*[A-Z][A-Za-z0-9'&.\-]*/, '');
+  return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(-3);
+}
+
+/** Words after the name, stopping at the next capitalised name for the same
+ *  reason — "Sarah ... at Newport Dental Clinic" must not make Sarah a clinic. */
+function cueWordsAfter(after) {
+  const cut = after.split(/[A-Z]/)[0];
+  return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(0, 6);
+}
+
+/**
+ * Candidate entity mentions in a piece of text.
+ *
+ * @returns {Array<{name, type|null, cue, cueKind, possessive, index}>}
+ *   type is null when a cue proved it is a subject without saying what kind
+ *   (a relational verb: "Newport called"). The caller may then ask.
+ */
+function entityMentions(text) {
+  const src = String(text || '');
+  if (!src.trim()) return [];
+  const out = [];
+  const seen = new Set();
+
+  // SEGMENT FIRST. A name may not span a sentence boundary. Without this,
+  // "…a new client, Newport Dental Clinic. My dog Cece…" matched as the single
+  // name "Newport Dental Clinic. My", because a full stop is a legal character
+  // inside an abbreviation and the matcher happily walked through it into the
+  // next sentence. One imaginary entity, and the two real ones lost with it.
+  const segments = [];
+  {
+    const re = /[^.!?\n]+[.!?]*/g;
+    let seg;
+    while ((seg = re.exec(src)) !== null) {
+      if (seg[0].trim()) segments.push({ text: seg[0], offset: seg.index });
+    }
+  }
+
+  for (const segment of segments) {
+  const src2 = segment.text;
+  let m;
+  NAME_RE.lastIndex = 0;
+  while ((m = NAME_RE.exec(src2)) !== null) {
+    let raw = m[1].trim().replace(/[.,;:!?]+$/, '');
+    if (!raw) continue;
+
+    // POSSESSIVE. "Bob's house" — the name is Bob and the 's is the cue that
+    // makes him a subject. Absorbing it into the name loses both.
+    let possessive = false;
+    if (/'s$/i.test(raw)) { raw = raw.replace(/'s$/i, ''); possessive = true; }
+    if (!raw) continue;
+
+    const key = raw.toLowerCase();
+    if (seen.has(key)) continue;
+    if (NON_SUBJECT_WORDS.has(key)) continue;
+    if (raw.split(/\s+/).every(w => NON_SUBJECT_WORDS.has(w.toLowerCase()))) continue;
+    // No sentence-initial length guard. One was tried and it ate "Bob's house"
+    // — three letters, first word, and the possessive right behind it. The cue
+    // requirement below already drops the capitalised-because-it-starts-a-
+    // sentence case, because those words have no cue.
+
+    const before = src2.slice(Math.max(0, m.index - 80), m.index);
+    const after = src2.slice(m.index + m[1].length, m.index + m[1].length + 60);
+
+    let cue = null, cueKind = null, type = null;
+
+    // CUE A — a type noun INSIDE the name. Checked first, and that order is
+    // load-bearing: "my contact at Newport Dental Clinic" has "contact" sitting
+    // before the organisation, and reading before-first types the clinic as a
+    // person.
+    const inName = raw.toLowerCase().split(/\s+/).map(typeFromCueWord).find(Boolean);
+    if (inName) { type = inName; cue = raw; cueKind = 'type-noun-in-name'; }
+
+    // CUE B — a type noun immediately before: "my dog Cece", "our client X".
+    if (!type) {
+      const tail = cueWordsBefore(before);
+      for (let i = tail.length - 1; i >= 0; i--) {
+        const t = typeFromCueWord(tail[i]);
+        if (t) { type = t; cue = tail[i]; cueKind = 'type-noun-before'; break; }
+      }
+    }
+
+    // CUE C — a type noun just after: "Sarah Whitfield is my contact at ...".
+    if (!type) {
+      for (const w of cueWordsAfter(after)) {
+        const t = typeFromCueWord(w);
+        if (t) { type = t; cue = w; cueKind = 'type-noun-after'; break; }
+      }
+    }
+
+    // CUE D — POSSESSOR. Makes the possessor a subject and says nothing at all
+    // about the thing possessed, which is exactly the rule.
+    if (!cue && possessive) { cue = "'s"; cueKind = 'possessor'; }
+
+    // CUE E — treated as a party in its own right.
+    if (!cue) {
+      if (/^\s+(called|emailed|phoned|asked|said|wants|needs|reported|sent|replied)\b/i.test(after)) {
+        cue = after.trim().split(/\s+/)[0]; cueKind = 'relational-verb';
+      } else if (/\b(?:at|for|with)\s+$/i.test(before) && /\s/.test(raw)) {
+        // Multi-word only: "at ISH" is a party, "at Lincoln" is probably a place.
+        cue = 'preposition'; cueKind = 'party-preposition';
+      }
+    }
+
+    // NO CUE, NO CANDIDATE. This is the line that keeps Monday and Oregon out,
+    // and it fails SILENT on purpose: nothing created, nothing asked.
+    if (!cue) continue;
+
+    seen.add(key);
+    out.push({ name: raw, type, cue, cueKind, possessive, index: segment.offset + m.index });
+  }
+  }
+  return out;
+}
+
+/**
+ * Is this fact ABOUT the given mention, rather than merely mentioning it?
+ *
+ * Deliberately narrow: the mention has to be the grammatical subject — the
+ * fact opens with it, or with its possessive. "Newport Dental uses Shift4" is
+ * about Newport; "User works at ISH" is about the user, and reassigning it to
+ * ISH would be the same misattribution this whole line of work exists to stop.
+ */
+function factIsAbout(factText, mentionName) {
+  const t = String(factText || '').trim();
+  const n = String(mentionName || '').trim();
+  if (!t || !n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^(?:the\\s+)?${esc}(?:'s)?\\b`, 'i').test(t);
+}
+
 module.exports = {
   eventMarker,
   identityClassOf,
@@ -482,6 +703,11 @@ module.exports = {
   isCurrentState,
   historyCoexists,
   stripSubjectAnnotation,
+  entityMentions,
+  factIsAbout,
+  typeFromCueWord,
+  ENTITY_TYPE_CUES,
+  NON_SUBJECT_WORDS,
   RELATIONSHIP_TERMS,
   TEMPORAL_MARKERS,
   INPROGRESS_MARKERS,

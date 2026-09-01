@@ -1497,6 +1497,7 @@ async function planExtraction({
     routedToLog: [], // {text, why, marker}
     refusals: [],    // {text, rule, detail}
     flaggedSubject: [], // {text, reason, detail, quote} — stored, but not active
+    entityPlan: null,   // {assignments, created, questions} — REHEARSED, nothing written
     repeats: [],     // {text, existingId, existingContent, similarity, detectedBy, reasoning}
     facts: [],       // {text, corrects, salience, salienceRationale}
     recall: [],      // {fact, diagnostics, judged[]}
@@ -1527,6 +1528,15 @@ async function planExtraction({
     if (parts.length <= 1) { candidates.push(f); continue; }
     plan.splits.push({ from: f.text, into: parts, why: compound.why });
     for (const part of parts) candidates.push({ text: part, corrects: f.corrects });
+  }
+
+  // ENTITY RESOLUTION, rehearsed. resolveMentions with create:false only READS
+  // the registry, which keeps planExtraction's contract — it decides and writes
+  // nothing, so scripts/dryrun-extract.js can rehearse the real pipeline.
+  try {
+    plan.entityPlan = require('./entities').resolveMentions(userMessage, { create: false });
+  } catch (e) {
+    console.error('[FactExtractor] entity rehearsal failed:', e.message);
   }
 
   const eventTexts = [...plan.proposed.events];
@@ -1926,20 +1936,74 @@ async function applyExtraction(plan, opts = {}) {
   }
 
   // ---- facts: the only write path ----
+  // ENTITY RESOLUTION, for real. Runs BEFORE the facts are written so a fact
+  // can be filed against an entity created from the same message.
+  //
+  // Nothing here is silent, which is the part Athena asked for: a creation and
+  // an attach are both mentioned in passing, and an ambiguous mention becomes a
+  // question SHE IS ASKED IN THE REPLY. The channel is the correction-notice
+  // queue, drained through the injected identity block — the same path a
+  // self-fact change already takes, and deliberately not the bell, which is
+  // where things go to expire.
+  let entityAssignments = [];
+  try {
+    const entities = require('./entities');
+    const resolved = entities.resolveMentions(plan.userMessage || '', { create: true });
+    entityAssignments = resolved.assignments;
+    result.entitiesCreated = resolved.created.length;
+    result.entityQuestions = resolved.questions.length;
+    for (const c of resolved.created) {
+      logDaily(`Started keeping ${c.entity.name} as its own ${c.entity.type}${c.orgId ? `, at ${c.orgId.slice(0, 8)}` : ''} — first heard of in this message.${src}`);
+    }
+    // resolveMentions queues its own notices and questions — announcement is
+    // part of the write there, so queuing them again here would say everything
+    // twice.
+    for (const q of resolved.questions) {
+      appendToOpsLog(`Entity resolution asked rather than guessed (${q.why}): "${q.mention.name}"`, opsDir);
+      logDaily(`I did not file "${q.mention.name}" against anything — ${q.why}, so I asked instead.${src}`);
+    }
+  } catch (e) {
+    console.error('[FactExtractor] entity resolution failed:', e.message);
+  }
+
   const factToMemberId = new Map();
   const factToClusterId = new Map();
   for (const f of plan.facts) {
     logDaily(`Scored fact salience ${f.salience}/10: "${f.text}" — ${f.salienceRationale}`);
     try {
       const flagged = f.subjectVerdict && !f.subjectVerdict.verified;
+      // WHO IT IS ABOUT. Null leaves assignToCluster's default (the user
+      // entity) in place — a fact that merely mentions a client is still a fact
+      // about Ellie.
+      let subjectEntityId = null;
+      try { subjectEntityId = require('./entities').entityForFact(f.text, entityAssignments); } catch { /* leave default */ }
       const res = await memoryClusters.assignToCluster(
         f.text, extractionProvider, extractionModel, extractionApiKey(extractionProvider), extractionHost,
         'fact-extraction', f.salience, 'user', null,
         { ...f.provenance, salienceRationale: f.salienceRationale },
-        flagged ? { status: require('./subject-check').FLAGGED_STATUS } : {}
+        {
+          ...(flagged ? { status: require('./subject-check').FLAGGED_STATUS } : {}),
+          ...(subjectEntityId ? { subjectEntityId } : {})
+        }
       );
       if (res && res.memberId) {
         factToMemberId.set(f.text, res.memberId);
+        // NO SILENT ATTACH. Athena pushed back on exactly this: "clear match, no
+        // mention is the one place a wrong auto-decision can go uncaught." It
+        // fires when a fact is actually FILED against a third party, not on
+        // every mention of a known client, which would be noise every turn.
+        if (subjectEntityId && !flagged) {
+          try {
+            const ent = require('./entities').get(subjectEntityId);
+            const founding = ['self', 'user'].includes(ent && ent.type);
+            if (ent && !founding) {
+              require('./corrections-ledger').addNotice({
+                memberId: res.memberId,
+                content: `I filed that under ${ent.name} — "${f.text.slice(0, 90)}". Say if it belongs somewhere else.`
+              });
+            }
+          } catch { /* the fact is written; the mention is not worth throwing over */ }
+        }
         if (flagged) {
           result.flaggedSubject = (result.flaggedSubject || 0) + 1;
           logDaily(`I could not confirm who this was about, so I have held it rather than filing it as known: ` +

@@ -14,6 +14,7 @@ const WriteMemoryTool = require('./tools/write-memory');
 const {
   MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
 } = require('./tools/memory-inspect');
+const { EntityListTool, EntityGetTool } = require('./tools/entity-registry');
 const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
@@ -51,6 +52,9 @@ function getSearchConfig() { return require('../db/config').getSearchConfig(); }
 const BACKGROUND_TOOLS = [
   'memory_search', 'memory_list', 'memory_count', 'memory_get', 'memory_corrections',
   'memory_jobs',
+  // The registry reads. Reads only — a background job may need to know which
+  // client a name belongs to; it may not mint one.
+  'entity_list', 'entity_get',
   // 2026-08-18, for the agent-job queue: a handed-off job may look things up in
   // the world as well as in the record. Both are READS — they change nothing,
   // here or anywhere — and both remain per-step declarations, so nothing gains
@@ -240,10 +244,29 @@ const TOOL_CATALOGUE = [
     gate: ({ cfg }) => ((cfg.tools && cfg.tools.memoryInspect) || {}).enabled !== false,
     gateWhy: () => 'the memory-reading set is turned off here',
     toggle: 'tools.memoryInspect.enabled',
-    toggleNote: 'These six share one switch and one rate cap — turning one off turns off the set.',
+    toggleNote: 'This set shares one switch and one rate cap — turning one off turns off the set.',
     fields: id === 'memory_search'
-      ? [{ path: 'tools.memoryInspect.maxCallsPerHour', label: 'Lookups per hour (shared by all six)', type: 'number', min: 1, max: 500 }]
+      ? [{ path: 'tools.memoryInspect.maxCallsPerHour', label: 'Lookups per hour (shared by the whole read set)', type: 'number', min: 1, max: 500 }]
       : []
+  })),
+
+  // The registry reads. Same tier, same switch and same allowance as the memory
+  // reads — they are the same kind of act, and a second rate cap would only be
+  // a second number to tune. Registered as their own rows so the Tools page
+  // lists them, per the rule that a tool cannot exist without appearing there.
+  ...[
+    ['entity_list', 'List who and what he keeps facts about', EntityListTool],
+    ['entity_get', 'Open one entity and its facts', EntityGetTool]
+  ].map(([id, title, Tool]) => ({
+    id,
+    title,
+    Tool,
+    card: 'memoryInspect',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.memoryInspect) || {}).enabled !== false,
+    gateWhy: () => 'the memory-reading set is turned off here',
+    toggle: 'tools.memoryInspect.enabled',
+    toggleNote: 'Shares the memory-reading switch and rate cap.',
+    fields: []
   })),
 
   {

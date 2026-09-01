@@ -585,13 +585,187 @@ function identityAgrees() {
   };
 }
 
+
+// ------------------------------------------------- tiered resolution, applied
+
+/**
+ * The starting type set. EXTENSIBLE WITHOUT A SCHEMA CHANGE: `type` is a free
+ * TEXT column, so a new kind needs a cue row in db/extraction-rules.js
+ * (ENTITY_TYPE_CUES) and nothing else — no migration, no ALTER, no backfill.
+ * This list is what the UI colours and what the tools advertise.
+ */
+const TYPES = ['organization', 'person', 'animal', 'device'];
+
+/** The acronym of a multi-word name: "Newport Dental Clinic" -> "NDC". */
+function acronymOf(name) {
+  const words = String(name || '').split(/\s+/)
+    .filter(w => /^[A-Za-z]/.test(w) && !['of', 'the', 'de', 'von', 'van', 'and', 'at'].includes(w.toLowerCase()));
+  if (words.length < 2) return null;
+  return words.map(w => w[0].toUpperCase()).join('');
+}
+
+/**
+ * Create an entity from a mention, with the aliases that make the SECOND
+ * mention resolve.
+ *
+ * Aliases matter from the first write, not later: "the Inn", "ISH" and "Inn at
+ * Spanish Head" have to be one entity or the registry grows a duplicate every
+ * time she abbreviates. Two sources, both cheap and both reversible by hand:
+ * a parenthetical in the mention itself, and the acronym of a multi-word
+ * organisation name.
+ */
+function createFromMention(mention, { type, orgId = null, relationship = null } = {}) {
+  let name = String(mention || '').trim();
+  const aliases = [];
+
+  // "ISH (Inn At Spanish Head)" — the longer form is the name, the short one an
+  // alias, because the name is what she will see in a list.
+  const paren = name.match(/^(.+?)\s*\((.+?)\)\s*$/);
+  if (paren) {
+    const [, a, b] = paren;
+    if (b.trim().length > a.trim().length) { name = b.trim(); aliases.push(a.trim()); }
+    else { name = a.trim(); aliases.push(b.trim()); }
+  }
+  if (type === 'organization') {
+    const ac = acronymOf(name);
+    if (ac && ac.length >= 2 && ac.toLowerCase() !== name.toLowerCase()) aliases.push(ac);
+  }
+  return create({ name, type, aliases, relationship, orgId });
+}
+
+/**
+ * Resolve every candidate mention in a piece of text against the registry.
+ *
+ * TIERED CONFIDENCE, NO APPROVAL QUEUE:
+ *   clear     -> attach, and say so in passing
+ *   new       -> create, and say so in passing
+ *   ambiguous -> ASK, in the reply, after checking the candidates' own facts
+ *
+ * A cue-proven mention whose KIND is unknown ("Newport called" — plainly a
+ * party, but a person or a company?) is ambiguous rather than created. Guessing
+ * the type of a brand-new subject is the one guess with no evidence behind it
+ * at all, and the registry is the thing she reads to catch misattribution.
+ *
+ * @param opts.create  false to rehearse — resolve and report, write nothing.
+ * @returns {{ assignments, created, questions, notices }}
+ */
+function resolveMentions(text, { create: doCreate = true, source = 'conversation' } = {}) {
+  const rules = require('./extraction-rules');
+  const mentions = rules.entityMentions(text);
+  const out = { assignments: [], created: [], questions: [], notices: [] };
+  if (!mentions.length) return out;
+
+  const founding = new Set([selfEntity(), userEntity()].filter(Boolean).map(e => e.name.toLowerCase()));
+
+  // Organisations resolved in this same text, so a person mentioned alongside
+  // exactly one of them can be linked to it. More than one and it is not a
+  // link, it is a guess.
+  const orgsHere = [];
+
+  // ORGANISATIONS FIRST, whatever order they appear in. "Sarah Whitfield is my
+  // contact at Newport Dental Clinic" names the person before the company, and
+  // reading left to right created Sarah with nothing to link her to — the org
+  // link silently never happened, which is worse than not offering one.
+  const ordered = [...mentions].sort((a, b) => {
+    const rank = (m) => (m.type === 'organization' ? 0 : 1);
+    return rank(a) - rank(b) || a.index - b.index;
+  });
+
+  for (const men of ordered) {
+    if (founding.has(men.name.toLowerCase())) continue;    // Ellie and Athena are already entities
+    const r = resolve(men.name, { type: null });
+
+    if (r.tier === 'clear') {
+      out.assignments.push({ mention: men, entity: r.entity, tier: 'clear', why: r.why });
+      if (r.entity.type === 'organization') orgsHere.push(r.entity);
+      continue;
+    }
+
+    if (r.tier === 'ambiguous') {
+      out.questions.push({
+        mention: men,
+        candidates: r.candidates.map(c => ({ id: c.id, name: c.name, type: c.type })),
+        why: r.why,
+        ask: `I have more than one thing that answers to "${men.name}" — ${r.candidates.map(c => `${c.name} (${c.type})`).join(', ')}. Which did you mean?`
+      });
+      continue;
+    }
+
+    // tier === 'new'
+    if (!men.type) {
+      out.questions.push({
+        mention: men, candidates: [], why: 'a subject in its own right, but its kind is not stated',
+        ask: `I have not come across "${men.name}" before and I could not tell what kind of thing it is — a business, a person, an animal, a device? I would rather ask than file it under a guess.`
+      });
+      continue;
+    }
+    if (!doCreate) {
+      out.assignments.push({ mention: men, entity: null, tier: 'new', why: 'would be created' });
+      continue;
+    }
+
+    const orgId = (men.type === 'person' && orgsHere.length === 1) ? orgsHere[0].id : null;
+    const ent = createFromMention(men.name, {
+      type: men.type,
+      orgId,
+      relationship: men.cueKind === 'type-noun-before' || men.cueKind === 'type-noun-after' ? men.cue : null
+    });
+    if (ent.type === 'organization') orgsHere.push(ent);
+    out.created.push({ entity: ent, mention: men, orgId });
+    out.assignments.push({ mention: men, entity: ent, tier: 'new', why: `created as ${ent.type}` });
+    out.notices.push(
+      `I have started keeping ${ent.name} separately, as ${/^[aeiou]/i.test(ent.type) ? 'an' : 'a'} ${ent.type === 'organization' ? 'organisation' : ent.type}` +
+      `${orgId ? ` at ${get(orgId).name}` : ''} — say if that is not right.`
+    );
+  }
+
+  // ANNOUNCEMENT IS PART OF THE WRITE, not a courtesy the caller may forget.
+  //
+  // Same reasoning as the ledger funnel: "every caller remembers" is not an
+  // invariant, it is a hope, and it had already failed once here — the queuing
+  // lived in the intake path only, so every other caller of this function
+  // created entities in silence. Athena's requirement is that a clear match
+  // still surfaces "so a mis-fire is visible and correctable"; a CREATION going
+  // unmentioned is the same failure with more at stake. Queued here, so it
+  // cannot be separated from the thing it announces.
+  if (doCreate) {
+    const ledgerMod = require('./corrections-ledger');
+    for (const n of out.notices) ledgerMod.addNotice({ content: n });
+    for (const q of out.questions) ledgerMod.addNotice({ content: q.ask });
+  }
+  return out;
+}
+
+/**
+ * Which entity is a FACT about?
+ *
+ * Narrow on purpose: the entity has to be the fact's grammatical subject. A
+ * fact that merely mentions one is not about it — "User works at ISH" is about
+ * Ellie, and handing it to ISH would be the same misattribution the whole
+ * entity line exists to stop.
+ *
+ * @returns an entity id, or null to leave the caller's default in place.
+ */
+function entityForFact(factText, assignments) {
+  const rules = require('./extraction-rules');
+  for (const a of assignments || []) {
+    if (!a.entity) continue;
+    if (rules.factIsAbout(factText, a.mention.name)) return a.entity.id;
+    for (const alias of namesOf(a.entity)) {
+      if (rules.factIsAbout(factText, alias)) return a.entity.id;
+    }
+  }
+  return null;
+}
+
+
 module.exports = {
   ENTITY_COLUMNS, FORBIDDEN_COLUMN_HINTS,
   initSchema, assertIndexOnly,
   get, list, create, addAlias, aliasesOf, namesOf,
   selfEntity, userEntity, pointer, setPointer, identityAgrees,
   getFactsForEntity, factCount,
-  resolve, isBareFirstName,
+  resolve, isBareFirstName, resolveMentions, entityForFact, createFromMention, acronymOf, TYPES,
   merge, repointFact, syncSelfName,
   entityLocks, isEntityLocked, lockEntity
 };
