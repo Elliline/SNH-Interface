@@ -221,13 +221,70 @@ email: lcac2009@live.com`;
        JSON.stringify(rules.entityMentions(text).map(m => m.name)));
   }
 
+  // ------------------------------------------- 6d. products, makers and users
+  section('6d. Products: made-by is a column, uses is a table');
+
+  const rP = entities.resolveMentions('ISH is getting Opera from Oracle next month.');
+  const opera = entities.resolve('Opera').entity;
+  const oracle = entities.resolve('Oracle').entity;
+  ok('a maker cue creates the product', opera && opera.type === 'product', opera && opera.type);
+  ok('…and creates the maker as an organization', oracle && oracle.type === 'organization',
+     oracle && oracle.type);
+  ok('…and points the product at it (made by)', opera && opera.org_id === oracle.id);
+  ok('the org link on a product reads as "made by"', entities.orgLinkLabel('product') === 'made by');
+  ok('the maker link is ledgered',
+     !!sql.prepare("SELECT 1 FROM corrections_ledger WHERE action='entity-link' AND target_id=?").get(opera.id));
+
+  // A usage cue makes a LINK, and the product is not created twice.
+  const beforeUse = entities.list().length;
+  const ishOrg = entities.create({ name: 'Inn at Spanish Head', type: 'organization', aliases: ['ISH'] });
+  entities.resolveMentions('Inn at Spanish Head runs Opera for the front desk.');
+  ok('usage does not create a second Opera', entities.list().filter(e => e.name === 'Opera').length === 1,
+     JSON.stringify(entities.list().filter(e => /opera/i.test(e.name)).map(e => e.name)));
+  ok('the uses link exists', entities.usesOf(ishOrg.id).some(e => e.id === opera.id),
+     JSON.stringify(entities.usesOf(ishOrg.id).map(e => e.name)));
+  ok('…and reads from the other side too', entities.usersOf(opera.id).some(e => e.id === ishOrg.id));
+  ok('the uses link is ledgered',
+     !!sql.prepare("SELECT 1 FROM corrections_ledger WHERE action='entity-link' AND target_id=? AND survivor_id=?")
+       .get(ishOrg.id, opera.id));
+
+  // A SECOND client on the same product links to the same row.
+  const clinic2 = entities.create({ name: 'Lincoln City Animal Clinic', type: 'organization', aliases: ['LCAC'] });
+  entities.resolveMentions('Lincoln City Animal Clinic runs Opera as well.');
+  ok('a second client links to the SAME product row',
+     entities.usersOf(opera.id).length === 2 && entities.list().filter(e => e.name === 'Opera').length === 1,
+     JSON.stringify(entities.usersOf(opera.id).map(e => e.name)));
+  ok('and that client uses it', entities.usesOf(clinic2.id).some(e => e.id === opera.id));
+
+  // Repeating the sentence does not mint a second link.
+  const linkCount = () => sql.prepare("SELECT COUNT(*) n FROM entity_links WHERE status='active'").get().n;
+  const beforeRepeat = linkCount();
+  entities.resolveMentions('Lincoln City Animal Clinic runs Opera as well.');
+  ok('a repeated usage mention does not duplicate the link', linkCount() === beforeRepeat,
+     `${linkCount()} vs ${beforeRepeat}`);
+
+  // A product with NO maker cue gets no maker, and none is invented.
+  entities.resolveMentions('The clinic is on Covetrus Pulse now.');
+  const covetrus = entities.resolve('Covetrus Pulse').entity;
+  ok('a product with no maker cue is still created', covetrus && covetrus.type === 'product',
+     covetrus && covetrus.type);
+  ok('…with NO maker invented for it', covetrus && !covetrus.org_id, covetrus && covetrus.org_id);
+
+  // The link table is an index, like the entity table.
+  ok('entity_links is index-only', entities.assertIndexOnly() === true);
+  ok('relationsOf answers both edges',
+     entities.relationsOf(opera.id).usedBy.length === 2 &&
+     entities.relationsOf(opera.id).orgLink.entity.id === oracle.id &&
+     entities.relationsOf(oracle.id).products.some(pp => pp.id === opera.id));
+
   // ----------------------------------------------- 7. the door is still shut
   section('7. The two Juno cases still die at the door, after resolution has run');
 
   // Resolution runs over the clinic email first, exactly as intake would.
   const rJ = entities.resolveMentions(CLINIC_EMAIL_SOURCE);
-  const ish = entities.create({ name: 'Inn at Spanish Head', type: 'organization', aliases: ['ISH'] });
-  const lcac = entities.create({ name: 'Lincoln City Animal Clinic', type: 'organization', aliases: ['LCAC'] });
+  // These two already exist from 6d; reuse them rather than minting duplicates.
+  const ish = ishOrg;
+  const lcac = clinic2;
   const known = entities.list().map(subjectCheck.forEntity);
   const user = entities.userEntity();
 

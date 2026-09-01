@@ -214,6 +214,17 @@ router.get('/entities', (req, res) => {
         mergedInto: e.merged_into || null,
         activeFacts: countFor(e.id, 'active'),
         flaggedFacts: countFor(e.id, 'flagged-unverified-subject'),
+        // Both edges, so the panel can say "made by Oracle · run by 3" without
+        // a round trip per row.
+        orgLink: (() => {
+          try {
+            const r = entities.relationsOf(e.id);
+            return r && r.orgLink ? { label: r.orgLink.label, name: r.orgLink.entity.name, id: r.orgLink.entity.id } : null;
+          } catch { return null; }
+        })(),
+        uses: (() => { try { return entities.usesOf(e.id).map(x => ({ id: x.id, name: x.name, type: x.type })); } catch { return []; } })(),
+        usedBy: (() => { try { return entities.usersOf(e.id).map(x => ({ id: x.id, name: x.name, type: x.type })); } catch { return []; } })(),
+        products: (() => { try { return e.type === 'organization' ? entities.productsOf(e.id).map(x => ({ id: x.id, name: x.name })) : []; } catch { return []; } })(),
         locks: (() => { try { return entities.entityLocks(e.id).map(l => l.category); } catch { return []; } })()
       })),
       pointers

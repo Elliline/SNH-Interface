@@ -4815,6 +4815,26 @@ function entityBadge(entityId, entities, legacySubject) {
   return `<span class="memory-entity-badge ${cls}" title="${escapeHtml(tip)}">${escapeHtml(e.name)}</span>`;
 }
 
+/**
+ * The one-line answer to "how does this connect to anything else".
+ *
+ * Both edges, because they answer different questions and only one of them is
+ * on the entity's own row: a product's maker is its org_id, but the clients
+ * running it are rows in entity_links pointing the other way. "Which clients
+ * are on Exchange" is unanswerable from the product's own record alone.
+ */
+function entityRelationsLine(entityId, entities) {
+  const e = entities.byId[entityId];
+  if (!e) return '';
+  const bits = [];
+  if (e.orgLink && e.orgLink.name) bits.push(`${escapeHtml(e.orgLink.label)} ${escapeHtml(e.orgLink.name)}`);
+  if (e.products && e.products.length) bits.push(`makes ${e.products.map(p => escapeHtml(p.name)).join(', ')}`);
+  if (e.uses && e.uses.length) bits.push(`uses ${e.uses.map(u => escapeHtml(u.name)).join(', ')}`);
+  if (e.usedBy && e.usedBy.length) bits.push(`used by ${e.usedBy.map(u => escapeHtml(u.name)).join(', ')}`);
+  if (!bits.length) return '';
+  return `<div class="memory-entity-relations">${bits.join(' · ')}</div>`;
+}
+
 function entityNameOf(entityId, entities) {
   const e = entityId ? entities.byId[entityId] : null;
   return e ? e.name : 'No entity';
@@ -4955,6 +4975,7 @@ function renderFactsList() {
             ${key === '__none__' ? 'No entity' : escapeHtml(entityNameOf(key, entities))}
             <span class="memory-self-count">(${items.length})</span>
           </h3>
+          ${key === '__none__' ? '' : entityRelationsLine(key, entities)}
           ${items.map(liveItem).join('')}
         </div>`).join('');
   } else {

@@ -64,7 +64,11 @@ function summarise(e) {
     relationship: e.relationship || null,
     aliases: entities.aliasesOf(e),
     active_facts: entities.factCount(e.id, 'active'),
-    org: e.org_id ? (entities.get(e.org_id) || {}).name || null : null
+    // Labelled by TYPE, because the same column means "made by" on a product
+    // and "works at" on a person, and a bare `org` field reads as the wrong one
+    // half the time.
+    [e.type === 'product' ? 'made_by' : e.type === 'person' ? 'works_at' : 'org']:
+      e.org_id ? (entities.get(e.org_id) || {}).name || null : null
   };
 }
 
@@ -73,7 +77,7 @@ class EntityListTool extends BaseEntityTool {
     super();
     this.name = 'entity_list';
     this.description =
-      'List the people, organisations, animals and devices you keep facts about. ' +
+      'List the people, organisations, animals, devices and products you keep facts about. ' +
       'Call this when she mentions a client, a person, a pet or a device and you need to know whether you already know it, ' +
       'and before asking her which one she means — check what you hold first.';
     this.parameters = {
@@ -117,7 +121,8 @@ class EntityGetTool extends BaseEntityTool {
     this.name = 'entity_get';
     this.description =
       'Everything you hold about one person, organisation, animal or device — its details and its facts. ' +
-      'Call this before asking her to disambiguate a name: read the candidates first, and ask only if their own facts do not settle it.';
+      'Call this before asking her to disambiguate a name: read the candidates first, and ask only if their own facts do not settle it. ' +
+      'For a product it returns who makes it and which of her clients run it; for a client, what it runs. That is how "which clients are on Exchange" is answered.';
     this.parameters = {
       type: 'object',
       properties: {
@@ -157,9 +162,19 @@ class EntityGetTool extends BaseEntityTool {
     const facts = entities.getFactsForEntity(merged ? merged.id : row.id, { status: 'active', limit });
     const flagged = entities.getFactsForEntity(merged ? merged.id : row.id, { status: 'flagged-unverified-subject', limit: 10 });
 
+    // BOTH EDGES. "Which clients are on Exchange" is answerable only from the
+    // used_by side, and "what does ISH run" only from the uses side; they are
+    // the same links read in opposite directions.
+    const target = merged ? merged.id : row.id;
+    const rel = entities.relationsOf(target) || {};
     return {
       found: true,
       entity: summarise(row),
+      made_by: row.type === 'product' && rel.orgLink ? summarise(rel.orgLink.entity) : undefined,
+      works_at: row.type === 'person' && rel.orgLink ? summarise(rel.orgLink.entity) : undefined,
+      uses: (rel.uses || []).length ? rel.uses.map(summarise) : undefined,
+      used_by: (rel.usedBy || []).length ? rel.usedBy.map(summarise) : undefined,
+      products_made: (rel.products || []).length ? rel.products.map(summarise) : undefined,
       merged_into: merged ? summarise(merged) : null,
       locks: entities.entityLocks(row.id).map(l => l.category),
       facts: facts.map(f => ({ id: f.id, content: f.content, salience: f.salience, created_at: f.created_at })),

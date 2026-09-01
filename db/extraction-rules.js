@@ -521,8 +521,18 @@ const ENTITY_TYPE_CUES = {
   animal: ['dog', 'dogs', 'cat', 'cats', 'puppy', 'kitten', 'pet', 'pets', 'horse', 'bird', 'rabbit',
     'goat', 'chicken', 'ferret', 'snake', 'lizard', 'fish'],
   device: ['router', 'switch', 'firewall', 'ap', 'access point', 'server', 'nas', 'printer', 'camera',
-    'laptop', 'desktop', 'workstation', 'phone', 'tablet', 'box', 'appliance', 'ups', 'modem']
+    'laptop', 'desktop', 'workstation', 'phone', 'tablet', 'box', 'appliance', 'ups', 'modem'],
+  // Software her clients run. Deliberately WITHOUT 'system' and 'server' —
+  // both already mean a device here, and a word that means two types resolves
+  // to whichever list is declared first, which is a coin toss dressed as a rule.
+  product: ['software', 'app', 'application', 'platform', 'suite', 'product', 'program',
+    'portal', 'saas', 'pms', 'crm', 'erp', 'package', 'licence', 'license', 'subscription']
 };
+
+/** Verbs and prepositions that say one party USES another. */
+const USAGE_CONNECTIVE = /^(?:,?\s*(?:runs?|running|uses?|using|is\s+on|are\s+on|is\s+running|runs\s+on|host(?:s|ed)?\s+on|sits\s+on)\s*)$/i;
+/** Connectives that say one thing was MADE BY another. */
+const MAKER_CONNECTIVE = /^(?:,?\s*(?:from|by|made\s+by|built\s+by|developed\s+by|written\s+by)\s*)$/i;
 
 /** Words that look like names in a name slot but never denote a subject. */
 const NON_SUBJECT_WORDS = new Set([
@@ -569,7 +579,11 @@ const NON_SUBJECT_WORDS = new Set([
  * imaginary third: "Sarah at Newport Dental" came out as a single name, and
  * with it went both the person and the organisation.
  */
-const NAME_RE = /\b([A-Z][A-Za-z0-9&.\-]*(?:'[A-Za-z]+)?(?:\s+(?:of|the|de|von|van)\s+)?(?:\s*[A-Z][A-Za-z0-9&.\-]*(?:'[A-Za-z]+)?)*)/g;
+// A POSSESSIVE ENDS THE NAME. It used to be allowed on every token, so
+// "Oracle's Opera" matched as ONE name — the maker and the product fused into
+// a single imaginary organisation, and the relation between them vanished with
+// them. The 's is only legal at the very end now.
+const NAME_RE = /\b([A-Z][A-Za-z0-9&.\-]*(?:\s+(?:of|the|de|von|van)\s+)?(?:\s*[A-Z][A-Za-z0-9&.\-]*)*(?:'s)?)/g;
 
 function typeFromCueWord(word) {
   const w = String(word || '').toLowerCase();
@@ -591,7 +605,12 @@ function typeFromCueWord(word) {
 function cueWordsBefore(before) {
   const cut = before
     .replace(/^[\s\S]*[A-Z][A-Za-z0-9'&.\-]*/, '')
-    .split(/[,;:—\n]/).pop();
+    .split(/[,;:—\n]/).pop()
+    // …and at a CONNECTIVE, which separates two noun phrases exactly as a
+    // comma does. "The clinic is on Covetrus Pulse" read back over "is on" and
+    // typed the SOFTWARE as a clinic — the cue belonged to the subject on the
+    // other side of the verb.
+    .split(/\b(?:is on|are on|runs on|sits on|hosted on|runs|running|uses|using|use|from|by|made by|built by)\b/i).pop();
   return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(-3);
 }
 
@@ -704,6 +723,29 @@ function entityMentions(text) {
       }
     }
 
+    // CUE P1 — A MAKER FOLLOWS IT. "Opera from Oracle", "Opera by Oracle".
+    // The maker cue is what types the thing as a product: on its own "Opera"
+    // says nothing, and a name that something is FROM is a made thing.
+    if (!type && /^[\s,]*(?:from|by|made by|built by|developed by)\s+[A-Z]/.test(after)) {
+      type = 'product'; cue = 'from/by'; cueKind = 'maker-after';
+    }
+
+    // CUE P2 — A MAKER PRECEDES IT, possessively. "Oracle's Opera". Note this
+    // is the ONE place a possessive types the thing that FOLLOWS it, and it is
+    // safe only because both sides are capitalised: "Juno's store" has a
+    // lowercase head and never reaches here.
+    if (!type && /[A-Z][A-Za-z0-9&.\-]*'s\s+$/.test(before)) {
+      type = 'product'; cue = "maker's"; cueKind = 'maker-possessive';
+    }
+
+    // CUE P3 — SOMETHING RUNS IT. "ISH runs Opera", "the clinic is on Covetrus
+    // Pulse". What a business runs is software.
+    if (!type) {
+      const usageBefore = before.match(/(?:\brun|\bruns|\brunning|\buse|\buses|\busing|\bis on|\bare on|\bhosted on|\bsits on)\s+$/i);
+      if (usageBefore) { type = 'product'; cue = usageBefore[0].trim(); cueKind = 'usage-object'; }
+    }
+
+
     // CUE C — a type noun just after: "Sarah Whitfield is my contact at ...".
     //
     // NEVER after a possessive. "Juno's store" describes the store, not Juno,
@@ -716,6 +758,15 @@ function entityMentions(text) {
         const t = typeFromCueWord(w);
         if (t) { type = t; cue = w; cueKind = 'type-noun-after'; break; }
       }
+    }
+
+    // CUE P4 — IT IS THE MAKER. "Opera from Oracle" — Oracle is a party in its
+    // own right, but the sentence does not say what KIND, so the type is left
+    // open and resolveMentions settles it from the relation: the far side of a
+    // made-by is an organisation. Guessing here would type "an email from
+    // Adrienne" as a company.
+    if (!cue && /\b(?:from|by|made by|built by|developed by|written by)\s+$/i.test(before)) {
+      cue = 'maker'; cueKind = 'maker-object';
     }
 
     // CUE D — POSSESSOR. Makes the possessor a subject and says nothing at all
@@ -749,6 +800,54 @@ function entityMentions(text) {
 }
 
 /**
+ * RELATIONS BETWEEN TWO MENTIONS IN ONE SENTENCE.
+ *
+ * Read from the text BETWEEN two adjacent names, which is the only place a
+ * deterministic reader can find the verb that joins them. Pairs never cross a
+ * sentence boundary, for the same reason a name never does.
+ *
+ * THE PART THAT IS HARDER THAN IT SOUNDS is that the two relations point
+ * opposite ways through the same grammar. "Opera from Oracle" and "ISH runs
+ * Opera" are both <name> <connective> <name>, and in the first the SECOND name
+ * is the parent while in the second the FIRST name is. Getting that backwards
+ * files Oracle as a user of Opera and ISH as its manufacturer, and both read
+ * plausibly in a list. So direction is carried by the connective, never by
+ * position.
+ *
+ * @returns [{ kind: 'made-by'|'uses', from, to, cue }]
+ *   made-by: `from` is the product, `to` is the maker.
+ *   uses:    `from` is the user,    `to` is the thing used.
+ */
+function entityRelations(text, mentions = null) {
+  const src = String(text || '');
+  const ms = (mentions || entityMentions(src)).slice().sort((a, b) => a.index - b.index);
+  const out = [];
+  for (let i = 0; i < ms.length - 1; i++) {
+    const a = ms[i], b = ms[i + 1];
+    const start = a.index + a.name.length;
+    if (b.index <= start) continue;
+    const between = src.slice(start, b.index);
+    if (/[.!?\n]/.test(between)) continue;             // not the same sentence
+    if (between.replace(/[^A-Za-z]/g, '').length > 24) continue;  // too far apart to be joined
+
+    if (MAKER_CONNECTIVE.test(between)) {
+      out.push({ kind: 'made-by', from: a.name, to: b.name, cue: between.trim() });
+      continue;
+    }
+    if (USAGE_CONNECTIVE.test(between)) {
+      out.push({ kind: 'uses', from: a.name, to: b.name, cue: between.trim() });
+      continue;
+    }
+    // "Oracle's Opera" — the possessive sits ON the first name, so all that
+    // stands between them is the 's itself. The maker is the possessor.
+    if (a.possessive && !between.replace(/^\s*'s/i, '').trim()) {
+      out.push({ kind: 'made-by', from: b.name, to: a.name, cue: "'s" });
+    }
+  }
+  return out;
+}
+
+/**
  * Is this fact ABOUT the given mention, rather than merely mentioning it?
  *
  * Deliberately narrow: the mention has to be the grammatical subject — the
@@ -777,6 +876,7 @@ module.exports = {
   historyCoexists,
   stripSubjectAnnotation,
   entityMentions,
+  entityRelations,
   factIsAbout,
   typeFromCueWord,
   ENTITY_TYPE_CUES,

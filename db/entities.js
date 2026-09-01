@@ -55,6 +55,9 @@ const ENTITY_COLUMNS = [
   'merged_into'    // entity id, when this one was folded into another
 ];
 
+/** The complete column set of a link. Same rule as ENTITY_COLUMNS. */
+const LINK_COLUMNS = ['id', 'from_entity_id', 'to_entity_id', 'kind', 'created_at', 'updated_at', 'status'];
+
 /** Columns that would make the row a profile rather than a handle. */
 const FORBIDDEN_COLUMN_HINTS = [
   'address', 'phone', 'email', 'notes', 'description', 'summary',
@@ -134,7 +137,34 @@ function initSchema(db) {
       FOREIGN KEY (entity_id) REFERENCES entities(id)
     )
   `);
-  for (const t of ['entities', 'entity_pointers', 'entity_locks']) summary.createdTables.push(t);
+  // ENTITY LINKS — many-to-many, and the reason it is a table rather than a
+  // column. "Uses" has no single value on either side: Inn at Spanish Head runs
+  // Opera and Exchange and a SonicWall; Exchange is run by most of her clients.
+  // A column could hold one of those and would quietly lose the rest.
+  //
+  // INDEX ONLY, like the entity row it joins. A link says THAT two entities are
+  // related and how; anything known ABOUT the relationship — when it was
+  // installed, which version, who supports it — is a fact whose subject is one
+  // of the two entities. Putting a `notes` column here would rebuild the
+  // profile-shaped store that db/entities.js exists to refuse.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_links (
+      id TEXT PRIMARY KEY,
+      from_entity_id TEXT NOT NULL,
+      to_entity_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      status TEXT DEFAULT 'active',
+      UNIQUE(from_entity_id, to_entity_id, kind),
+      FOREIGN KEY (from_entity_id) REFERENCES entities(id),
+      FOREIGN KEY (to_entity_id) REFERENCES entities(id)
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_entity_links_from ON entity_links(from_entity_id, kind)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_entity_links_to ON entity_links(to_entity_id, kind)');
+
+  for (const t of ['entities', 'entity_pointers', 'entity_locks', 'entity_links']) summary.createdTables.push(t);
 
   // subject_entity_id on both facts and clusters. The legacy `subject` column
   // stays and is kept in step: a lot of live SQL still reads it, and a migration
@@ -273,6 +303,19 @@ function assertIndexOnly() {
   }
   const suspect = cols.filter(c => FORBIDDEN_COLUMN_HINTS.some(h => c.toLowerCase().includes(h)));
   if (suspect.length) throw new Error(`entities table has knowledge-shaped column(s): ${suspect.join(', ')}`);
+
+  // A link is an index row too, and it is the more tempting place to put a
+  // note — "uses Opera, since 2019, v5.6". That belongs in a fact about the
+  // client or the product, not on the edge between them.
+  const linkCols = db.prepare('PRAGMA table_info(entity_links)').all().map(c => c.name);
+  if (linkCols.length) {
+    const extraLink = linkCols.filter(c => !LINK_COLUMNS.includes(c));
+    if (extraLink.length) {
+      throw new Error(
+        `entity_links has non-index column(s): ${extraLink.join(', ')}. A link records THAT two ` +
+        'entities are related and how; what is known about the relationship is a fact.');
+    }
+  }
   return true;
 }
 
@@ -408,10 +451,16 @@ function create({ name, type = 'person', aliases = [], relationship = null, orgI
   db.prepare(`INSERT INTO entities (id, name, aliases, type, relationship, org_id, created_at, updated_at, status)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`)
     .run(id, clean, JSON.stringify(aliases || []), type, relationship, orgId, now, now);
+  const org = orgId ? get(orgId) : null;
   ledger().record({
     tier: 'entity', action: 'entity-create', subject: 'entity',
     targetId: id, targetText: clean,
-    reason: `A new entity was created from conversation: ${type} "${clean}".`,
+    survivorId: orgId || null, survivorText: org ? org.name : null,
+    // The org link set AT creation was invisible in the record — the entry said
+    // a product had been created and not who makes it, so the one column that
+    // carries the maker had no audit trail on the write that set it.
+    reason: `A new entity was created from conversation: ${type} "${clean}"` +
+      `${org ? `, ${orgLinkLabel(type)} ${org.name}` : ''}.`,
     reversible: true
   });
   return get(id);
@@ -479,6 +528,20 @@ function merge(loserId, survivorId, { reason = null, actor = 'entity-merge' } = 
       }
     }
 
+    // Links carry over too. A merge that kept the facts and dropped the edges
+    // would lose which clients use the absorbed product — union-preserving has
+    // to mean the whole row's worth of connections, not just its facts.
+    for (const l of db.prepare('SELECT * FROM entity_links WHERE from_entity_id = ? OR to_entity_id = ?').all(loserId, loserId)) {
+      const from = l.from_entity_id === loserId ? survivorId : l.from_entity_id;
+      const to = l.to_entity_id === loserId ? survivorId : l.to_entity_id;
+      if (from === to) { db.prepare("UPDATE entity_links SET status='inactive' WHERE id=?").run(l.id); continue; }
+      const clash = db.prepare('SELECT 1 FROM entity_links WHERE from_entity_id=? AND to_entity_id=? AND kind=?').get(from, to, l.kind);
+      if (clash) db.prepare("UPDATE entity_links SET status='inactive' WHERE id=?").run(l.id);
+      else db.prepare('UPDATE entity_links SET from_entity_id=?, to_entity_id=?, updated_at=? WHERE id=?').run(from, to, now, l.id);
+    }
+    // A product made by the absorbed organisation is now made by the survivor.
+    db.prepare("UPDATE entities SET org_id = ? WHERE org_id = ?").run(survivorId, loserId);
+
     db.prepare("UPDATE entities SET status = 'merged', merged_into = ?, updated_at = ? WHERE id = ?")
       .run(survivorId, now, loserId);
 
@@ -522,6 +585,121 @@ function repointFact(memberId, entityId, { reason = null } = {}) {
     });
   })();
   return db.prepare('SELECT * FROM cluster_members WHERE id = ?').get(memberId);
+}
+
+
+// ---------------------------------------------------------------- links
+
+/** The link kinds this registry understands. Extensible the same way types are. */
+const LINK_KINDS = ['uses'];
+
+/**
+ * Record that one entity uses another. Idempotent, and ledgered like any write.
+ *
+ * DIRECTION IS PART OF THE MEANING and it is not symmetric: ISH uses Opera,
+ * Opera does not use ISH. from = the user, to = the thing used.
+ */
+function linkEntities(fromId, toId, kind = 'uses', { reason = null } = {}) {
+  const db = sqlite();
+  const from = get(fromId), to = get(toId);
+  if (!from || !to) throw new Error('a link needs two existing entities');
+  if (fromId === toId) throw new Error('an entity cannot link to itself');
+  if (!LINK_KINDS.includes(kind)) throw new Error(`unknown link kind: ${kind}`);
+
+  const existing = db.prepare(
+    'SELECT * FROM entity_links WHERE from_entity_id = ? AND to_entity_id = ? AND kind = ?'
+  ).get(fromId, toId, kind);
+  const now = new Date().toISOString();
+  if (existing) {
+    // A repeat mention is not a second link. Reactivate a retired one rather
+    // than minting a duplicate — the UNIQUE constraint would refuse anyway, and
+    // silently swallowing that would look like the link was made twice.
+    if (existing.status !== 'active') {
+      db.prepare("UPDATE entity_links SET status='active', updated_at=? WHERE id=?").run(now, existing.id);
+      ledger().record({
+        tier: 'entity', action: 'entity-link', subject: 'entity',
+        targetId: fromId, targetText: from.name, survivorId: toId, survivorText: to.name,
+        reason: `The ${kind} link from ${from.name} to ${to.name} was restored.`, reversible: true
+      });
+    }
+    return db.prepare('SELECT * FROM entity_links WHERE id = ?').get(existing.id);
+  }
+
+  const id = randomUUID();
+  db.transaction(() => {
+    db.prepare(`INSERT INTO entity_links (id, from_entity_id, to_entity_id, kind, created_at, updated_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'active')`).run(id, fromId, toId, kind, now, now);
+    ledger().record({
+      tier: 'entity', action: 'entity-link', subject: 'entity',
+      targetId: fromId, targetText: from.name,
+      survivorId: toId, survivorText: to.name,
+      reason: reason || `${from.name} ${kind} ${to.name}.`,
+      evidence: { kind }, reversible: true
+    });
+  })();
+  return db.prepare('SELECT * FROM entity_links WHERE id = ?').get(id);
+}
+
+/** Retire a link. Never deleted — nothing here is deleted. */
+function unlinkEntities(fromId, toId, kind = 'uses', { reason = null } = {}) {
+  const db = sqlite();
+  const row = db.prepare('SELECT * FROM entity_links WHERE from_entity_id=? AND to_entity_id=? AND kind=?')
+    .get(fromId, toId, kind);
+  if (!row || row.status !== 'active') return null;
+  const from = get(fromId), to = get(toId);
+  db.transaction(() => {
+    db.prepare("UPDATE entity_links SET status='inactive', updated_at=? WHERE id=?")
+      .run(new Date().toISOString(), row.id);
+    ledger().record({
+      tier: 'entity', action: 'entity-unlink', subject: 'entity',
+      targetId: fromId, targetText: from ? from.name : fromId,
+      survivorId: toId, survivorText: to ? to.name : toId,
+      reason: reason || `${from ? from.name : 'it'} no longer ${kind} ${to ? to.name : 'it'}.`,
+      reversible: true
+    });
+  })();
+  return db.prepare('SELECT * FROM entity_links WHERE id = ?').get(row.id);
+}
+
+/** What this entity uses. */
+function usesOf(entityId, kind = 'uses') {
+  return sqlite().prepare(
+    `SELECT e.* FROM entity_links l JOIN entities e ON e.id = l.to_entity_id
+     WHERE l.from_entity_id = ? AND l.kind = ? AND l.status = 'active' ORDER BY e.name`
+  ).all(entityId, kind);
+}
+
+/** Who uses this entity — the answer to "which clients are on Exchange". */
+function usersOf(entityId, kind = 'uses') {
+  return sqlite().prepare(
+    `SELECT e.* FROM entity_links l JOIN entities e ON e.id = l.from_entity_id
+     WHERE l.to_entity_id = ? AND l.kind = ? AND l.status = 'active' ORDER BY e.name`
+  ).all(entityId, kind);
+}
+
+/** Products this organisation MADE — the other side of a product's org_id. */
+function productsOf(orgId) {
+  return sqlite().prepare(
+    "SELECT * FROM entities WHERE org_id = ? AND type = 'product' AND status = 'active' ORDER BY name"
+  ).all(orgId);
+}
+
+/** The maker of a product (or the employer of a person) — org_id, read by type. */
+function makerOf(entity) {
+  if (!entity || !entity.org_id) return null;
+  return get(entity.org_id);
+}
+
+/** Everything the registry knows about how one entity connects to others. */
+function relationsOf(entityId) {
+  const e = get(entityId);
+  if (!e) return null;
+  return {
+    orgLink: e.org_id ? { label: orgLinkLabel(e.type), entity: makerOf(e) } : null,
+    uses: usesOf(entityId),
+    usedBy: usersOf(entityId),
+    products: e.type === 'organization' ? productsOf(entityId) : []
+  };
 }
 
 // ---------------------------------------------------------------- locks
@@ -601,7 +779,23 @@ function identityAgrees() {
  * (ENTITY_TYPE_CUES) and nothing else — no migration, no ALTER, no backfill.
  * This list is what the UI colours and what the tools advertise.
  */
-const TYPES = ['organization', 'person', 'animal', 'device'];
+const TYPES = ['organization', 'person', 'animal', 'device', 'product'];
+
+/**
+ * WHAT org_id MEANS, AND IT MEANS TWO THINGS.
+ *
+ * On a PERSON it is where they work — Sarah at Newport Dental. On a PRODUCT it
+ * is who MADE it — Opera by Oracle. Same column, two readings, and the reading
+ * is decided by the type of the row it sits on. That is deliberate: a product's
+ * maker and a person's employer are both "the one organisation this thing
+ * belongs to", exactly one per row, and giving them separate columns would mean
+ * two nullable foreign keys that can never both be set.
+ *
+ * USES IS NOT THAT. A client uses many products and a product has many users,
+ * so it cannot live in a column at all — see entity_links.
+ */
+const ORG_LINK_MEANING = { product: 'made by', person: 'works at' };
+function orgLinkLabel(type) { return ORG_LINK_MEANING[type] || 'part of'; }
 
 /** The acronym of a multi-word name: "Newport Dental Clinic" -> "NDC". */
 function acronymOf(name) {
@@ -641,6 +835,39 @@ function createFromMention(mention, { type, orgId = null, relationship = null } 
 }
 
 /**
+ * Point a product at its maker (or a person at their employer). Ledgered.
+ * Never overwrites an existing link silently — a second, different maker is a
+ * disagreement, and it is raised rather than applied.
+ */
+function setOrgLink(entityId, orgId, { reason = null } = {}) {
+  const db = sqlite();
+  const e = get(entityId), org = get(orgId);
+  if (!e || !org) throw new Error('an org link needs two existing entities');
+  if (e.org_id === orgId) return e;
+  if (e.org_id && e.org_id !== orgId) {
+    ledger().record({
+      tier: 'entity', action: 'entity-link', subject: 'entity',
+      targetId: entityId, targetText: e.name, survivorId: orgId, survivorText: org.name,
+      reason: `${e.name} is already recorded as ${orgLinkLabel(e.type)} ${(get(e.org_id) || {}).name}, ` +
+        `and this says ${org.name}. NOTHING WAS CHANGED — raised for Ellie.`,
+      reversible: false
+    });
+    return e;
+  }
+  db.transaction(() => {
+    db.prepare('UPDATE entities SET org_id = ?, updated_at = ? WHERE id = ?')
+      .run(orgId, new Date().toISOString(), entityId);
+    ledger().record({
+      tier: 'entity', action: 'entity-link', subject: 'entity',
+      targetId: entityId, targetText: e.name, survivorId: orgId, survivorText: org.name,
+      reason: reason || `${e.name} is ${orgLinkLabel(e.type)} ${org.name}.`,
+      evidence: { orgLink: orgLinkLabel(e.type) }, reversible: true
+    });
+  })();
+  return get(entityId);
+}
+
+/**
  * Resolve every candidate mention in a piece of text against the registry.
  *
  * TIERED CONFIDENCE, NO APPROVAL QUEUE:
@@ -659,8 +886,27 @@ function createFromMention(mention, { type, orgId = null, relationship = null } 
 function resolveMentions(text, { create: doCreate = true, source = 'conversation' } = {}) {
   const rules = require('./extraction-rules');
   const mentions = rules.entityMentions(text);
-  const out = { assignments: [], created: [], questions: [], notices: [] };
+  const out = { assignments: [], created: [], questions: [], notices: [], links: [] };
   if (!mentions.length) return out;
+
+  // RELATIONS FIRST, because they carry type information the mention alone does
+  // not. "Opera from Oracle" says nothing about what Oracle is — until you read
+  // it as a maker, at which point it is an organisation. Without this the maker
+  // came out type-unknown and was ASKED about, which is a silly question when
+  // the sentence just said it makes software.
+  const relations = rules.entityRelations(text, mentions);
+  const typeHint = {};
+  for (const rel of relations) {
+    if (rel.kind === 'made-by') {
+      typeHint[rel.from.toLowerCase()] = typeHint[rel.from.toLowerCase()] || 'product';
+      typeHint[rel.to.toLowerCase()] = typeHint[rel.to.toLowerCase()] || 'organization';
+    } else if (rel.kind === 'uses') {
+      typeHint[rel.to.toLowerCase()] = typeHint[rel.to.toLowerCase()] || 'product';
+      // The USER is deliberately left un-hinted. A thing that runs software is
+      // usually a client, but it can be a person or a box, and the whole point
+      // of the cue discipline is not to guess when the sentence does not say.
+    }
+  }
 
   const founding = new Set([selfEntity(), userEntity()].filter(Boolean).map(e => e.name.toLowerCase()));
 
@@ -699,7 +945,8 @@ function resolveMentions(text, { create: doCreate = true, source = 'conversation
     }
 
     // tier === 'new'
-    if (!men.type) {
+    const inferred = men.type || typeHint[men.name.toLowerCase()] || null;
+    if (!inferred) {
       out.questions.push({
         mention: men, candidates: [], why: 'a subject in its own right, but its kind is not stated',
         ask: `I have not come across "${men.name}" before and I could not tell what kind of thing it is — a business, a person, an animal, a device? I would rather ask than file it under a guess.`
@@ -711,9 +958,9 @@ function resolveMentions(text, { create: doCreate = true, source = 'conversation
       continue;
     }
 
-    const orgId = (men.type === 'person' && orgsHere.length === 1) ? orgsHere[0].id : null;
+    const orgId = (inferred === 'person' && orgsHere.length === 1) ? orgsHere[0].id : null;
     const ent = createFromMention(men.name, {
-      type: men.type,
+      type: inferred,
       orgId,
       relationship: men.cueKind === 'type-noun-before' || men.cueKind === 'type-noun-after' ? men.cue : null
     });
@@ -724,6 +971,38 @@ function resolveMentions(text, { create: doCreate = true, source = 'conversation
       `I have started keeping ${ent.name} separately, as ${/^[aeiou]/i.test(ent.type) ? 'an' : 'a'} ${ent.type === 'organization' ? 'organisation' : ent.type}` +
       `${orgId ? ` at ${get(orgId).name}` : ''} — say if that is not right.`
     );
+  }
+
+  // APPLY THE RELATIONS, now that both ends have been resolved or created.
+  //
+  // DIRECTION IS THE WHOLE JOB HERE. made-by writes a COLUMN on the product and
+  // uses writes a ROW in the link table, and they are not two flavours of one
+  // thing: a product has exactly one maker, and a product has any number of
+  // users. Reading them as symmetric is the mistake that would file Oracle as a
+  // user of its own software.
+  const byName = {};
+  for (const a of out.assignments) if (a.entity) byName[a.mention.name.toLowerCase()] = a.entity;
+  if (doCreate) {
+    for (const rel of relations) {
+      const a = byName[rel.from.toLowerCase()], b = byName[rel.to.toLowerCase()];
+      if (!a || !b || a.id === b.id) continue;
+      try {
+        if (rel.kind === 'made-by') {
+          const before = a.org_id;
+          setOrgLink(a.id, b.id, { reason: `${a.name} is made by ${b.name}.` });
+          if (!before) out.notices.push(`I have noted that ${a.name} is made by ${b.name}.`);
+        } else if (rel.kind === 'uses') {
+          const fresh = !sqlite().prepare(
+            "SELECT 1 FROM entity_links WHERE from_entity_id=? AND to_entity_id=? AND kind='uses' AND status='active'"
+          ).get(a.id, b.id);
+          linkEntities(a.id, b.id, 'uses');
+          out.links.push({ from: a.name, to: b.name, kind: 'uses' });
+          if (fresh) out.notices.push(`I have noted that ${a.name} uses ${b.name}.`);
+        }
+      } catch (e) {
+        console.error('[Entities] relation failed:', e.message);
+      }
+    }
   }
 
   // ANNOUNCEMENT IS PART OF THE WRITE, not a courtesy the caller may forget.
@@ -773,6 +1052,7 @@ module.exports = {
   selfEntity, userEntity, pointer, setPointer, identityAgrees,
   getFactsForEntity, factCount,
   resolve, isBareFirstName, resolveMentions, entityForFact, createFromMention, acronymOf, TYPES,
-  merge, repointFact, syncSelfName,
+  merge, repointFact, syncSelfName, setOrgLink,
+  LINK_KINDS, linkEntities, unlinkEntities, usesOf, usersOf, productsOf, makerOf, relationsOf, orgLinkLabel,
   entityLocks, isEntityLocked, lockEntity
 };

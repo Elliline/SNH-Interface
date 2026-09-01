@@ -3804,3 +3804,10 @@ body.coder-working { padding-top: 1.9rem; }
 /* The pane already provides the spacing the stacked layout got from the
    section's own top margin. */
 .memory-self-pane > .memory-self-section { margin-top: 0; }
+
+/* Both edges of an entity's connections, on one line under its heading. */
+.memory-entity-relations {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin: -4px 0 8px;
+}
