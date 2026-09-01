@@ -113,7 +113,7 @@
       "suite": "test-cluster-audit-quiet",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "1f73da8",
       "subjects": [
         "db/memory-clusters.js",
         "db/memory-manager.js"
@@ -263,7 +263,7 @@
       "suite": "test-entity-subject",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine calls, so a red result is a real regression.",
-      "verifiedAt": "22b9a7a",
+      "verifiedAt": "1f73da8",
       "subjects": [
         "db/entities.js",
         "db/subject-check.js",
@@ -386,7 +386,7 @@
       "suite": "test-injection-budget",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "84d86e0",
+      "verifiedAt": "1f73da8",
       "subjects": [
         "db/injection-budget.js",
         "db/memory-clusters.js",
@@ -546,7 +546,7 @@
       "suite": "test-self-fact-bars",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "84d86e0",
+      "verifiedAt": "1f73da8",
       "subjects": [
         "db/fact-extractor.js"
       ],
