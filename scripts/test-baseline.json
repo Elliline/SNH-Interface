@@ -263,7 +263,7 @@
       "suite": "test-entity-resolution",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic — resolution is rules plus registry lookups, so a red result is a real regression and never a slow GPU.",
-      "verifiedAt": "5413ede",
+      "verifiedAt": "4ad9481",
       "subjects": [
         "db/entities.js",
         "db/extraction-rules.js",
@@ -277,7 +277,7 @@
       "suite": "test-entity-subject",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine calls, so a red result is a real regression.",
-      "verifiedAt": "5413ede",
+      "verifiedAt": "4ad9481",
       "subjects": [
         "db/entities.js",
         "db/subject-check.js",
@@ -400,7 +400,7 @@
       "suite": "test-injection-budget",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "d2cef08",
+      "verifiedAt": "4ad9481",
       "subjects": [
         "db/injection-budget.js",
         "db/memory-clusters.js",
@@ -626,7 +626,7 @@
       "suite": "test-tools-settings",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "d2cef08",
+      "verifiedAt": "4ad9481",
       "subjects": [
         "db/secrets.js"
       ],
