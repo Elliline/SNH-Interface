@@ -622,6 +622,13 @@ function corrections(args = {}) {
   // they would be him telling Ellie he edited something he did not touch — the
   // same phantom-action class as claiming a tool call he never made.
   const kindOf = (row, ev) => {
+    // A DECISION IS A RECORD, NOT AN EDIT. The repair build files one for every
+    // conclusion the entity reaches and every refusal a guardrail makes, so that
+    // what it settled is as readable as what it could not. Nothing changed in
+    // the corpus when one is written, and reported as a correction it would be
+    // the entity telling Ellie it edited something it never touched — the same
+    // phantom-action class as claiming a tool call it never made.
+    if (row.action === 'decision') return 'decision-only';
     if (ev && ev.unresolved === true) return 'raised-unresolved';
     if (/^REFUSED by the identity lock/.test(row.reason || '')) return 'refused-by-lock';
     // A note ABOUT a fact, written when the fact was already inactive — the
@@ -695,7 +702,9 @@ function corrections(args = {}) {
       } : {}),
       what_happened: kind === 'applied'
         ? `A ${row.tier} ${row.action} was applied.`
-        : kind === 'raised-unresolved'
+        : kind === 'decision-only'
+          ? 'NOTHING WAS CHANGED BY THIS ENTRY. It is the record of a decision — what was concluded, what it rested on, and why — filed so that a settled question is as readable as an unsettled one. Any change that followed from it is its own entry.'
+          : kind === 'raised-unresolved'
           ? 'NOTHING WAS CHANGED. These two facts contradict each other and the evidence behind them was evenly matched, so both are still held and it was raised for Ellie to decide.'
           : kind === 'recorded-only'
             ? 'NOTHING WAS CHANGED. The fact was already inactive; this entry exists so the REASON is on the record.'
@@ -805,7 +814,7 @@ function correctionsForFact(db, factId, currentSuccessorId = null) {
     return rows.map(r => {
       let ev = null;
       try { ev = r.evidence ? JSON.parse(r.evidence) : null; } catch { /* leave null */ }
-      const nothingHappened = (ev && ev.unresolved === true) || /^REFUSED by the identity lock/.test(r.reason || '');
+      const nothingHappened = r.action === 'decision' || (ev && ev.unresolved === true) || /^REFUSED by the identity lock/.test(r.reason || '');
       // A ledger entry is history and never rewritten, so an entry can be
       // TRUE ABOUT THE PAST and wrong about now: the supersession that retired
       // "User's name is Mike" named a survivor that was later found to be a

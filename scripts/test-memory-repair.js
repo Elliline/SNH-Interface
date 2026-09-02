@@ -412,6 +412,21 @@ const section = t => console.log(`\n=== ${t} ===`);
   const withRationale = sql.prepare("SELECT COUNT(*) n FROM corrections_ledger WHERE action = 'decision' AND reason IS NOT NULL AND reason <> ''").get().n;
   ok('…each carrying the reasoning it rested on', withRationale === decisions, `${withRationale}/${decisions}`);
 
+  // A decision changed nothing, so nothing that renders the ledger may show it
+  // as an edit — the phantom-action class, applied to the record itself.
+  const inspect = require(path.join(ROOT, 'db/memory-inspect'));
+  const anyDecision = sql.prepare("SELECT id FROM corrections_ledger WHERE action = 'decision' LIMIT 1").get();
+  const shown = inspect.corrections({ mode: 'get', id: anyDecision.id });
+  ok('a decision entry reads as a record, never as a correction that was applied',
+     shown.kind === 'decision-only' && /NOTHING WAS CHANGED BY THIS ENTRY/.test(shown.what_happened),
+     `${shown.kind}: ${String(shown.what_happened).slice(0, 60)}`);
+  ok('…and it offers nothing to revert',
+     !shown.retired && !shown.kept, JSON.stringify({ retired: !!shown.retired, kept: !!shown.kept }));
+  const uiSrc = fs.readFileSync(path.join(ROOT, 'public/script.js'), 'utf8');
+  ok('…and the Self tab gives it no Revert button either',
+     /const isDecision = c\.action === 'decision';/.test(uiSrc) &&
+     /noAction = isRaise \|\| isRefusal \|\| isDecision/.test(uiSrc));
+
   console.log(`\n${failed === 0 ? 'GREEN' : 'RED'} — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })().catch(e => { console.error('\nCRASH:', e.stack || e.message); process.exit(1); });

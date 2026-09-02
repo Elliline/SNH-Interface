@@ -168,8 +168,15 @@ function dayShape(day = null) {
   shape.factsLearnedAboutEllie = one(
     "SELECT COUNT(*) n FROM cluster_members WHERE subject='user' AND created_at >= ?", start);
   shape.correctionsMade = one("SELECT COUNT(*) n FROM corrections_ledger WHERE created_at >= ?", start);
-  shape.openAuditPairs = one(
-    "SELECT COUNT(*) n FROM corrections_ledger WHERE json_extract(evidence,'$.awaiting_entity_turn') = 1 AND reverted_at IS NULL");
+  // The SAME predicate audit-decisions.openPairs uses, and it has to be: keyed
+  // on the `awaiting_entity_turn` flag this read zero while six real questions
+  // were standing, because that flag only exists on findings raised after
+  // 2026-09-02. A day shape that says "no open questions about yourself" when
+  // there are six is worse than not reporting it at all.
+  shape.openAuditPairs = (() => {
+    try { return require('./audit-decisions').openPairs({ limit: 100 }).length; }
+    catch { return null; }
+  })();
   return shape;
 }
 

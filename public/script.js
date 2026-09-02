@@ -5484,7 +5484,11 @@ async function loadSelfTab() {
         // revertible" would say the opposite of what happened.
         const isRaise = ev.unresolved === true;
         const isRefusal = /^REFUSED by the identity lock/.test(c.reason || '');
-        const noAction = isRaise || isRefusal;
+        // A decision entry records what SNH concluded and why; it changed
+        // nothing itself. Rendering it with a struck-through "retired" line and
+        // a Revert button would offer to undo an edit that was never made.
+        const isDecision = c.action === 'decision';
+        const noAction = isRaise || isRefusal || isDecision;
 
         const bits = [];
         if (Number.isFinite(ev.similarity)) bits.push(`similarity ${ev.similarity.toFixed(2)}`);
@@ -5499,8 +5503,15 @@ async function loadSelfTab() {
         // record does not read as something waiting on her.
         const awaitingEntity = isRaise && ev.awaiting_entity_turn === true;
 
+        const decisionLabel = ev.outcome === 'refused'
+          ? 'refused — nothing changed'
+          : ev.outcome === 'cannot-settle'
+            ? 'SNH could not settle this — nothing changed'
+            : 'SNH decided this — nothing changed by the entry itself';
+
         const state = c.reverted_at
           ? `<span class="memory-corr-state reverted">reverted ${escapeHtml(fmtDate(c.reverted_at))}${c.reverted_by ? ` · ${escapeHtml(c.reverted_by)}` : ''}</span>`
+          : isDecision ? `<span class="memory-corr-state raised">${escapeHtml(decisionLabel)}</span>`
           : awaitingEntity ? '<span class="memory-corr-state raised">SNH\'s own question — nothing changed</span>'
             : isRaise ? '<span class="memory-corr-state raised">raised — nothing changed</span>'
               : isRefusal ? '<span class="memory-corr-state raised">refused — nothing changed</span>'
@@ -5508,12 +5519,12 @@ async function loadSelfTab() {
                   ? `<button class="memory-corr-revert" data-corr-id="${escapeHtml(c.id)}">Revert</button>`
                   : '<span class="memory-corr-state">not revertible</span>');
 
-        const label = noAction ? 'one' : 'retired';
-        const otherLabel = noAction ? 'other' : 'kept';
+        const label = isDecision ? 'about' : noAction ? 'one' : 'retired';
+        const otherLabel = isDecision ? 'and' : noAction ? 'other' : 'kept';
         return `
           <div class="memory-correction${c.reverted_at ? ' is-reverted' : ''}${noAction ? ' is-raise' : ''}">
             <div class="memory-corr-head">
-              <span class="memory-corr-tier tier-${escapeHtml(c.tier)}">${noAction ? 'raised' : escapeHtml(c.tier)}</span>
+              <span class="memory-corr-tier tier-${escapeHtml(c.tier)}">${isDecision ? 'decided' : noAction ? 'raised' : escapeHtml(c.tier)}</span>
               <span class="memory-corr-action">${escapeHtml(c.action)}</span>
               ${c.subject ? `<span class="memory-corr-subject">${escapeHtml(c.subject)}-fact</span>` : ''}
               <span class="memory-self-when">${escapeHtml(fmtDate(c.created_at))}</span>
