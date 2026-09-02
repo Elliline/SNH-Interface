@@ -2750,15 +2750,26 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // never told about again. Nothing expires an unannounced job, so the cost of
     // stamping late is one turn's delay and the cost of stamping early is
     // permanent silence.
+    //
+    // THE CHECK BELONGS TO THE MODULE THAT OWNS THE HEADINGS. It used to be a
+    // hard-coded search for '=== Background Work That Finished ===' right here,
+    // and a late history digest renders under its own heading and suppresses
+    // that one when it is alone — so the answer for that whole class was always
+    // "it did not survive", the stamp never ran, and one finished lookup was
+    // announced to him as news on every turn for days. confirmAnnounced checks
+    // each item against the heading its own kind actually renders under.
     if (announcedJobs && announcedJobs.length) {
       try {
-        const inMessage = !!(memorySystemMessage && memorySystemMessage.content
-          && memorySystemMessage.content.includes('=== Background Work That Finished ==='));
-        if (inMessage) {
-          const n = agentJobs.markAnnounced(announcedJobs);
-          console.log(`[AgentJobs] Marked ${n} finished job(s) announced (convo ${convoId})`);
-        } else {
-          console.warn('[AgentJobs] Announcement block did not survive assembly — NOT stamping; it will be offered again next turn');
+        const { stamped, skipped, missing } = agentJobs.confirmAnnounced(
+          announcedJobs, (memorySystemMessage && memorySystemMessage.content) || '');
+        if (stamped) console.log(`[AgentJobs] Marked ${stamped} finished job(s) announced (convo ${convoId})`);
+        if (skipped) {
+          console.warn(`[AgentJobs] ${skipped} announcement(s) did not survive assembly — NOT stamping; ` +
+            `they will be offered again next turn: ${missing.map(id => String(id).slice(0, 8)).join(', ')}`);
+        }
+        if (!stamped && !skipped) {
+          console.warn('[AgentJobs] Announcements were confirmed present but stamped 0 rows — ' +
+            'the mark did not land, so they are NOT counted as delivered and will be offered again');
         }
       } catch (stampErr) {
         console.error('[AgentJobs] Announcement stamping error:', stampErr.message);

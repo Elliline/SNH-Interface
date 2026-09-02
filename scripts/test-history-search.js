@@ -535,9 +535,71 @@ async function runOnce(question = 'What did the script for Lincoln City Animal C
       /polled their practice management system every fifteen minutes/.test(block.text));
     check('…labelled as the answer to the earlier question, since the chat may have moved on',
       /Your question, asked/.test(block.text) && /which question it answers/.test(block.text));
-    check('…and it is stamped once, so he is not told twice',
-      agentJobs.markAnnounced(block.items) >= 1 &&
+    // THE STAMP GOES THROUGH THE PATH PRODUCTION USES, NOT markAnnounced.
+    //
+    // The first version of this test called markAnnounced(block.items) directly
+    // and passed, while the live system re-delivered the same Aug 27 digest on
+    // every turn for days. markAnnounced was never the broken part: the CALLER
+    // decided whether to call it by searching the assembled message for the
+    // ordinary heading, and a late-digest-only block never emits that heading.
+    // Testing the stamp without the confirmation tested the half that worked.
+    check('…and the block a late digest ALONE produces carries only its own heading',
+      /The Lookup You Were Waiting On/.test(block.text) &&
+      !/Background Work That Finished/.test(block.text),
+      'the ordinary heading leaked in, which would mask the bug this guards');
+    check('…confirmAnnounced still recognises it as delivered',
+      agentJobs.confirmAnnounced(block.items, block.text).stamped >= 1,
+      'the late digest reached the message and was NOT counted as delivered — the live bug');
+    check('…so it is stamped once and he is not told twice',
       !agentJobs.pendingAnnouncements({ limit: 5 }).some(a => a.id === late.job_id));
+    check('…and confirming the SAME items again stamps nothing',
+      agentJobs.confirmAnnounced(block.items, block.text).stamped === 0,
+      'a re-confirmation inflated a repeat into a fresh delivery');
+  }
+
+  console.log('\n15b. Delivery is idempotent, and an unwritten mark is not a delivery');
+  {
+    const conv = database.createConversation('Idempotent delivery', 'test-model');
+    const late = await runLate(conv);
+    const block = agentJobs.renderAnnouncementBlock({ limit: 5, tokenCap: 400 });
+    const mine = block.items.filter(i => i.id === late.job_id);
+    check('the digest is queued once', mine.length === 1);
+
+    // A BLOCK THAT WAS TRIMMED AWAY IS NOT A DELIVERY. Same items, a message
+    // that does not contain them — nothing may be stamped, and it must still be
+    // pending afterwards so the next turn can offer it.
+    const trimmed = agentJobs.confirmAnnounced(mine, 'a system message with no announcement block in it at all');
+    check('a block that did not reach the message stamps nothing',
+      trimmed.stamped === 0 && trimmed.skipped === 1 && trimmed.missing[0] === late.job_id,
+      JSON.stringify(trimmed));
+    check('…and the job is still waiting to be announced',
+      agentJobs.pendingAnnouncements({ limit: 10 }).some(a => a.id === late.job_id),
+      'a trimmed block silently consumed the result');
+
+    // A MARK THAT CANNOT BE WRITTEN IS NOT A DELIVERY. The table is made
+    // read-only for one call so the UPDATE throws; the count must come back 0
+    // and the job must survive as pending.
+    db.exec('PRAGMA query_only = ON');
+    let failed;
+    try { failed = agentJobs.confirmAnnounced(mine, block.text); }
+    finally { db.exec('PRAGMA query_only = OFF'); }
+    check('a mark that FAILS to write is not counted as delivered',
+      failed.stamped === 0, `stamped=${failed && failed.stamped} on a read-only store`);
+    check('…and the job is still pending, so it will be offered again',
+      agentJobs.pendingAnnouncements({ limit: 10 }).some(a => a.id === late.job_id),
+      'a failed write consumed the result anyway');
+
+    // And now, writable again, it goes through exactly once.
+    check('…and once the write can land, it is delivered exactly once',
+      agentJobs.confirmAnnounced(mine, block.text).stamped === 1 &&
+      agentJobs.confirmAnnounced(mine, block.text).stamped === 0 &&
+      !agentJobs.pendingAnnouncements({ limit: 10 }).some(a => a.id === late.job_id));
+
+    // The stamp is all-or-nothing across a batch.
+    check('markAnnounced runs in one transaction (all or nothing)',
+      /db\.transaction\(/.test(require('fs').readFileSync(path.join(ROOT, 'db/agent-jobs.js'), 'utf8')
+        .split('function markAnnounced')[1].split('\nfunction ')[0]),
+      'markAnnounced can stamp part of a batch and leave the rest');
   }
 
   console.log('\n16. v1.1 — a repeat ask joins the lookup, never starts a second');

@@ -1324,19 +1324,100 @@ function renderActiveJobsBlock() {
   return { text, running: running.length, queued: queued.length };
 }
 
-/** Stamp announcements as delivered. Called only once the block is really in the request. */
+/**
+ * THE SECTION HEADING EACH KIND RENDERS UNDER, derived from the text above
+ * rather than retyped. This is what "was it really in the message" is answered
+ * with, and retyping it is precisely how the answer went wrong: the caller held
+ * its own copy of one heading and a whole section rendered under the other.
+ */
+// Computed on CALL, not at load: ANNOUNCEMENT is declared further down this
+// file, and reading it from a top-level const here is a temporal-dead-zone
+// crash on require. Lazy also means the marker can never drift from the text —
+// it is re-derived from whatever the heading currently says.
+function markers() {
+  return {
+    history: ANNOUNCEMENT.LATE_HEADER.split('\n')[0],
+    default: ANNOUNCEMENT.HEADER.split('\n')[0]
+  };
+}
+function markerFor(item) {
+  const m = markers();
+  return item && item.kind === 'history' ? m.history : m.default;
+}
+
+/**
+ * Stamp announcements as delivered. Called only once the block is really in the
+ * request — see confirmAnnounced, which is what callers should use.
+ *
+ * ALL OR NOTHING. One transaction over every item, so a stamp that throws
+ * halfway does not leave some jobs marked and the rest not: either the whole
+ * batch is recorded as handed over or none of it is, and a batch that failed
+ * comes back around next turn intact. A partially-stamped batch is the one
+ * outcome with no honest recovery — the unstamped half repeats and the stamped
+ * half is lost, and nothing afterwards can tell which was which.
+ *
+ * `AND announced_at IS NULL` is the idempotency guard: stamping twice writes
+ * nothing the second time and reports 0 changes, so a caller can never inflate
+ * a re-delivery into a fresh one.
+ *
+ * @returns {number} rows actually stamped; 0 if the write failed
+ */
 function markAnnounced(items = []) {
   const db = getSqliteDb();
   if (!db || !items.length) return 0;
   const now = new Date().toISOString();
   const job = db.prepare('UPDATE agent_jobs SET announced_at = ? WHERE id = ? AND announced_at IS NULL');
   const run = db.prepare('UPDATE job_runs SET announced_at = ? WHERE id = ? AND announced_at IS NULL');
-  let n = 0;
-  for (const it of items) {
-    const res = it.kind === 'scheduled' ? run.run(now, it.id) : job.run(now, it.id);
-    n += res.changes;
+  try {
+    return db.transaction(() => {
+      let n = 0;
+      for (const it of items) {
+        n += (it.kind === 'scheduled' ? run : job).run(now, it.id).changes;
+      }
+      return n;
+    })();
+  } catch (err) {
+    // The transaction rolled back, so nothing is stamped and every item will be
+    // offered again. Reporting 0 rather than a partial count is the whole point:
+    // a job whose mark did not land has not been delivered.
+    console.error('[AgentJobs] markAnnounced ROLLED BACK — nothing stamped, all will be re-offered:', err.message);
+    return 0;
   }
-  return n;
+}
+
+/**
+ * Confirm the announcement block reached the assembled message, and stamp only
+ * what actually did.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT A STRING SEARCH IN THE CALLER. The rule is
+ * right and stays: stamp AFTER the injection ceiling, and only if the block
+ * survived, because a job stamped by a block that was then trimmed is a result
+ * he is never told about again. The caller implemented that rule by searching
+ * the message for one hard-coded heading — and the late-digest section renders
+ * under a different one, and deliberately suppresses the first when it is alone.
+ * So for that whole class the answer was always "it did not survive", the stamp
+ * never ran, and one Aug 27 lookup about Ellie's dogs was handed to him as news
+ * on every turn for days, in five different conversations.
+ *
+ * The check now belongs to the module that owns the headings, and it is
+ * PER ITEM: each is confirmed against the heading its own kind renders under.
+ * A trimmed section skips only its own items instead of silencing or repeating
+ * the rest.
+ *
+ * @param {Array} items - what renderAnnouncementBlock returned
+ * @param {string} assembledText - the final system message, after the ceiling
+ * @returns {{stamped:number, skipped:number, missing:string[]}}
+ */
+function confirmAnnounced(items = [], assembledText = '') {
+  if (!items.length) return { stamped: 0, skipped: 0, missing: [] };
+  const text = String(assembledText || '');
+  const present = [], missing = [];
+  for (const it of items) (text.includes(markerFor(it)) ? present : missing).push(it);
+  return {
+    stamped: present.length ? markAnnounced(present) : 0,
+    skipped: missing.length,
+    missing: missing.map(m => m.id)
+  };
 }
 
 /**
@@ -1355,6 +1436,23 @@ const ANNOUNCEMENT = {
     'These are your own jobs — work you handed off, or a scheduled job of yours — that finished since you ' +
     'last spoke with her. They landed in her jobs panel, which does not notify her, so assume she has NOT ' +
     'read them.\n',
+  // THE LATE-DIGEST SECTION'S HEADER LIVES HERE TOO, and that is the fix for a
+  // real bug rather than tidiness. It used to be a literal inside
+  // renderAnnouncementBlock, and server.js confirmed delivery by searching the
+  // assembled message for the ORDINARY header — which a late-digest-only block
+  // deliberately never emits. So the confirmation never fired, the stamp was
+  // never written, and one finished lookup was handed to him again on every
+  // single turn. Both headers are here so `MARKER` below can be DERIVED from
+  // the text that actually renders; a third section added later gets a marker
+  // by construction instead of silently re-opening the same hole.
+  LATE_HEADER:
+    '=== The Lookup You Were Waiting On ===\n' +
+    'You called history_search earlier, it did not come back inside the turn, and you said you would ' +
+    'return to it. This is what it found. She has NOT seen any of this — it went nowhere except here.\n' +
+    'Tell her now, in your own words, and say which question it answers, because the conversation may ' +
+    'have moved on since you asked. The quoted lines are verified verbatim from her own messages and ' +
+    'yours; everything else is the lookup\'s framing. If it says nothing was found, tell her that — ' +
+    'do not fill it in.\n',
   FOOTER:
     '\nIf one of these is worth leading with, say it in your own words — what you found, not that a job ran. ' +
     'If none of it matters to what she just said, let it go; they are already recorded and you are not ' +
@@ -1403,14 +1501,7 @@ function renderAnnouncementBlock({ limit = 3, tokenCap = 400 } = {}) {
     return `--- Your question, asked ${when}: "${it.question || it.title}"\n${body}`;
   });
   const lateBlock = late.length
-    ? '=== The Lookup You Were Waiting On ===\n' +
-      'You called history_search earlier, it did not come back inside the turn, and you said you would ' +
-      'return to it. This is what it found. She has NOT seen any of this — it went nowhere except here.\n' +
-      'Tell her now, in your own words, and say which question it answers, because the conversation may ' +
-      'have moved on since you asked. The quoted lines are verified verbatim from her own messages and ' +
-      'yours; everything else is the lookup\'s framing. If it says nothing was found, tell her that — ' +
-      'do not fill it in.\n\n' +
-      lateLines.join('\n\n')
+    ? ANNOUNCEMENT.LATE_HEADER + '\n' + lateLines.join('\n\n')
     : '';
 
   const lines = [];
@@ -1476,6 +1567,9 @@ module.exports = {
   markRunSeen,
   pendingAnnouncements,
   markAnnounced,
+  confirmAnnounced,
+  markers,
+  markerFor,
   renderActiveJobsBlock,
   jobsStartedInTurn,
   renderAnnouncementBlock,
