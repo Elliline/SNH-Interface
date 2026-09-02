@@ -188,6 +188,8 @@ const section = t => console.log(`\n=== ${t} ===`);
      `${oldRow.status}/${oldRow.inactive_reason}`);
   ok('…the copy is under the new subject, reworded for it',
      newRow.subject === 'self' && /check my work/.test(newRow.content), newRow.content);
+  ok('…and carries its anchor flag at write time, not only after the next restart',
+     newRow.anchor === 'anchored', String(newRow.anchor));
   ok('…and it files ONE ledger entry, under the eighth action',
      sql.prepare("SELECT COUNT(*) n FROM corrections_ledger WHERE action = 'refile' AND target_id = ?").get(refileFact.id).n === 1);
   ok('…which is not `repoint`, because repoint refuses an active fact by design',

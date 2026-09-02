@@ -976,8 +976,9 @@ async function refile(memberId, to = {}, opts = {}) {
         INSERT INTO cluster_members (
           id, cluster_id, content, source, importance, created_at, updated_at,
           salience, subject, subject_entity_id, claim_type, status,
-          conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale
-        ) VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+          conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale,
+          anchor
+        ) VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
       `).run(
         newMemberId, clusterId, content, member.source || 'refile', now, now,
         Number.isFinite(opts.salience) ? opts.salience : member.salience,
@@ -987,7 +988,12 @@ async function refile(memberId, to = {}, opts = {}) {
         // same origin — dropping it here would turn a fact with a source into
         // a felt report, which is precisely the flag the detector now reads.
         member.conversation_id, member.message_id, member.verbatim_source_text,
-        member.input_modality, member.salience_rationale
+        member.input_modality, member.salience_rationale,
+        // Written here rather than left to the boot re-derivation. anchorOf()
+        // would fall back to the same rule on read and the next restart would
+        // fill it in, so nothing was WRONG — but a row that leaves this NULL is
+        // a row whose flag depends on when you look at it.
+        (member.message_id && String(member.message_id).trim()) ? 'anchored' : 'felt'
       );
       const changed = db.prepare(`
         UPDATE cluster_members
