@@ -22,7 +22,7 @@
       "suite": "test-agent-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js"
@@ -68,7 +68,7 @@
       "suite": "test-bell-routing",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine — the bell's routing is a type predicate, not a judgement.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/initiatives.js",
         "db/initiative-engine.js",
@@ -127,7 +127,7 @@
       "suite": "test-cluster-audit-quiet",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "d2cef08",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/memory-clusters.js",
         "db/memory-manager.js"
@@ -253,7 +253,7 @@
       "suite": "test-display-time",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/memory-manager.js",
         "db/datetime.js",
@@ -371,7 +371,7 @@
       "suite": "test-identity-intake",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/identity-lock.js",
         "db/memory-write.js",
@@ -401,7 +401,7 @@
       "suite": "test-initiative-scoring",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/memory-manager.js",
         "db/initiatives.js",
@@ -414,7 +414,7 @@
       "suite": "test-injection-budget",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "4ad9481",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/injection-budget.js",
         "db/memory-clusters.js",
@@ -489,7 +489,7 @@
       "suite": "test-log-followup",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/daily-log-reader.js",
         "db/memory-manager.js",
@@ -504,7 +504,7 @@
       "suite": "test-memory-repair",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; the model is pinned throughout, so what it asserts is the guardrails refusing — receipts, the referent check, the day cap, the merge rules, the decided-pair drop — never a judgement an engine makes.",
-      "verifiedAt": "PENDING",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/memory-repair.js",
         "db/audit-decisions.js",
@@ -545,7 +545,7 @@
       "suite": "test-conversation-channel",
       "expectedFailures": 0,
       "reason": "Green at the commit that folded the messages panel into the conversation list; deterministic, no engine. Two groups of assertions carry it: the negative ones (nothing expires unread, an archived conversation refuses both of them, reflection insights and daily-log follow-ups did not follow the others over) and the watermark ones, which assert the two ways per-conversation unread fails silently — a watermark format that will not compare with messages.timestamp, and same-second arrivals against its one-second resolution.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/conversation-channel.js",
         "db/initiative-engine.js",
@@ -560,7 +560,7 @@
       "suite": "test-message-standards",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic — the model is pinned, so what it asserts is the routing and the two checks, never a judgement call by an engine.",
-      "verifiedAt": "a935c40",
+      "verifiedAt": "f641b36",
       "subjects": [
         "db/message-standards.js",
         "db/self-audit.js",
