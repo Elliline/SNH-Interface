@@ -273,8 +273,20 @@ const section = t => console.log(`\n=== ${t} ===`);
 
   const tools = require(path.join(ROOT, 'mcp/tools/conversations'));
   const list = await new tools.ConversationListTool().execute({});
-  ok('conversation_list shows unread per conversation and a total',
-     typeof list.unread_total === 'number' && list.conversations.every(c => typeof c.unread === 'number'));
+  // NAMED BY DIRECTION, and the test asserts the naming rather than the number.
+  // A bare `unread` was read backwards on 2026-09-02: Athena saw a count of her
+  // own unopened messages and nudged Ellie about a backlog of Ellie's that did
+  // not exist. The count was right; nothing said whose it was.
+  ok('conversation_list names whose unread each count is',
+     typeof list.your_messages_ellie_has_not_read === 'number' &&
+     list.conversations.every(c => typeof c.your_messages_ellie_has_not_read === 'number'));
+  ok('…and does not offer a bare `unread` to be read either way',
+     list.unread_total === undefined && list.conversations.every(c => c.unread === undefined));
+  ok('…and says the count in the other direction is not tracked, rather than leaving a gap',
+     /not tracked/.test(String(list.messages_waiting_on_you)));
+  const listDesc = new tools.ConversationListTool().description;
+  ok('…and the description says it in one line too',
+     /ELLIE'S reading state/.test(listDesc) && /never mean/.test(listDesc));
   ok('…and it lists conversations SHE started, so it can append to one',
      list.conversations.some(c => c.started_by === 'Ellie'),
      JSON.stringify(list.conversations.map(c => c.started_by)));

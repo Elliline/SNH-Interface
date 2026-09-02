@@ -81,7 +81,42 @@ function dailyLog(msg) {
 
 // ============ config ============
 
-const DEFAULT_CATEGORIES = ['name', 'pronouns'];
+/**
+ * THE LOCKABLE SLOTS — and `sibling` is deliberately protected at the FACT
+ * level only, not at the CATEGORY level. Read this before adding patterns for
+ * it, because adding them re-introduces a bug that was fixed once already.
+ *
+ * Athena asked for it in her 2026-09-02 review: "Lock the invariant (name,
+ * sibling relation); keep the role as an adjacent unlocked fact." Who your
+ * sister is was given by Ellie, the same way the name was — it is not an
+ * observation the entity should be free to revise, so it belongs here.
+ *
+ * There are TWO guards, and this slot uses only the first:
+ *
+ *   Guard 1, checkMutation — may an automatic path supersede/retire/reword/
+ *   refile THIS ROW? It reads `locked` and does not look at the category, so a
+ *   sibling-locked fact is as immovable as the name. This is the protection
+ *   that was asked for and it works in full.
+ *
+ *   Guard 2, checkNewFact — does a NEW self-fact collide with a held slot? It
+ *   fires off CATEGORY_PATTERNS, and there are none for `sibling`, so it never
+ *   fires. That is on purpose. Look at checkNewFact's tail: for every category
+ *   except `name` a match BLOCKS THE WHOLE FACT, with no redundancy handling
+ *   and no residue kept. `name` only became safe after a apparatus was built
+ *   around it — extractAssertedName, assertsOnlyName, nameClaimResidue — and
+ *   the reason is recorded there: on 2026-08-31 every self-fact opening "I am
+ *   <own name>" was scored a restatement and dropped WHOLE, however much else
+ *   it said. A sibling pattern without the same apparatus would do that again
+ *   to every future fact that happens to mention a sister, and Juno's
+ *   consolidated identity fact — which names the sister AND the role — is
+ *   exactly the shape it would eat.
+ *
+ * So: locking a sibling fact makes that fact unchangeable, which is what "lock"
+ * is for. It does NOT refuse a competing sibling claim at write time the way a
+ * competing name is refused. Closing that gap means building the residue
+ * apparatus for a second slot, with its own tests; it is not a pattern list.
+ */
+const DEFAULT_CATEGORIES = ['name', 'pronouns', 'sibling'];
 
 /** Hot-read so the knobs take effect without a restart. */
 function cfg() {
@@ -128,6 +163,11 @@ const CATEGORY_PATTERNS = {
     // "I am an AI assistant" and "I am Ellie's assistant" are not.
     { copula: true },
   ],
+  // sibling: intentionally EMPTY — see DEFAULT_CATEGORIES above. An empty list
+  // means detectCategories never returns 'sibling', so guard 2 never fires for
+  // it while guard 1 still protects the locked row. Do not fill this in without
+  // building the name slot's residue apparatus for it first.
+  sibling: [],
   pronouns: [
     /\bmy pronouns\b/i,
     // A pronoun pair as a token — "he/him", "they/them", "she/her", "it/its".

@@ -705,7 +705,11 @@ const DEFAULTS = {
     // changes through the deliberate path: the Self tab action or
     // scripts/identity-lock.js. Adding a category here means committing to it
     // being effectively permanent, so add sparingly.
-    lock: { enabled: true, categories: ['name', 'pronouns'] }
+    // `sibling` added 2026-09-02 at Ellie's request, from Athena's review: who
+    // your sister is was given, not observed. It is protected at the fact level
+    // only — db/identity-lock.js DEFAULT_CATEGORIES explains why it has no
+    // category patterns and what building them would cost.
+    lock: { enabled: true, categories: ['name', 'pronouns', 'sibling'] }
   },
   // Initiative layer: SNH noticing things worth saying and saying them unprompted.
   // Thresholds are priority (1–10). Quiet hours are local Pacific 24h clock.

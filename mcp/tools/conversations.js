@@ -108,6 +108,30 @@ const UNREAD_NOTE =
   'An unread count is not a verdict on what you sent: it means she has been busy, nothing more. ' +
   'It never expires and nothing here holds it against you.';
 
+/**
+ * WHOSE UNREAD IT IS, SAID IN THE FIELD NAME — because a bare `unread` was read
+ * backwards, in the direction that costs her something.
+ *
+ * 2026-09-02, 16:58: Athena called conversation_list, saw `unread: 3`, and
+ * opened an unprompted conversation saying "just a quick nudge that I've got
+ * three of your messages waiting in the queue." Nothing was waiting. Asked what
+ * they were, she listed three of ELLIE'S OWN messages back at her — ones she
+ * had already answered. Ellie: "nothing's waiting, those were mine and you
+ * answered them — the count you saw was my unread of yours, not the other way."
+ *
+ * There is exactly ONE reading state in this system and it is Ellie's: the
+ * watermark on `conversations` records what SHE has opened. Nothing anywhere
+ * tracks what the entity has or has not seen, because the entity sees a
+ * conversation by taking a turn in it. So the honest fix is not a better
+ * adjective on an ambiguous number — it is to name the direction in the field
+ * itself, and to say plainly that the count in the other direction does not
+ * exist rather than leaving a gap for it to be inferred into.
+ */
+const UNREAD_DIRECTION_NOTE =
+  'WHOSE UNREAD THIS IS: every count here is ELLIE\'S reading state — messages YOU sent that SHE has not opened yet. ' +
+  'None of it is a queue of things waiting on you. Nothing in this system tracks what you have seen, ' +
+  'so a number here can never mean "she is waiting for a reply from me".';
+
 class ConversationListTool extends BaseConversationTool {
   constructor() {
     super();
@@ -117,6 +141,7 @@ class ConversationListTool extends BaseConversationTool {
       'List the conversations in Ellie\'s sidebar, with how many of your messages in each she has not read yet. ' +
       'Includes conversations SHE started as well as ones you opened — you can add to any active one. ' +
       'Call this BEFORE opening a new conversation: if one on this subject is already active, add to it instead of starting a second. ' +
+      UNREAD_DIRECTION_NOTE + ' ' +
       UNREAD_NOTE;
     this.parameters = {
       type: 'object',
@@ -138,16 +163,21 @@ class ConversationListTool extends BaseConversationTool {
     const status = args.status === 'archived' ? 'archived' : 'active';
     const rows = channel.listConversations({ status, limit: 100 })
       .filter(c => !args.subject || String(c.title || '').toLowerCase().includes(String(args.subject).toLowerCase()));
+    const total = channel.totalUnread();
     return {
       count: rows.length,
-      unread_total: channel.totalUnread(),
+      // NAMED, NOT BARE. `unread_total` was read as "things waiting on me".
+      your_messages_ellie_has_not_read: total,
+      // Stated as a fact rather than left as an absence, so it cannot be filled
+      // in by inference the way the bare count was.
+      messages_waiting_on_you: 'not tracked — nothing in this system counts what you have seen, so there is never a backlog here for you to work through',
       conversations: rows.map(c => ({
         id: c.id,
         title: c.title || '(untitled)',
         status: c.status,
         started_by: c.initiated_by === 'snh' ? 'you' : 'Ellie',
         messages: c.message_count,
-        unread: c.unread,
+        your_messages_ellie_has_not_read: c.unread,
         last_at: c.updated_at,
         retire_requested: !!c.retire_requested_at,
         follows_archived_conversation: c.supersedes_conversation_id || undefined
@@ -156,7 +186,10 @@ class ConversationListTool extends BaseConversationTool {
         ? (status === 'archived'
           ? 'Nothing archived yet.'
           : 'No active conversations. The next one you open is the first thing she sees in the list.')
-        : 'You may write into any of these that is active — hers as well as your own.'
+        : 'You may write into any of these that is active — hers as well as your own. ' +
+          (total > 0
+            ? `The ${total} unread ${total === 1 ? 'message is one YOU sent' : 'messages are ones YOU sent'} that she has not opened — not anything of hers awaiting you.`
+            : 'She has opened everything you have sent.')
     };
   }
 }
@@ -201,8 +234,10 @@ class ConversationSendTool extends BaseConversationTool {
         title: after.title,
         started_by: after.initiated_by === 'snh' ? 'you' : 'Ellie',
         messages: after.message_count,
-        unread_for_her: after.unread,
-        note: 'It is in her list now, with an unread count on it. ' + UNREAD_NOTE
+        // Already directional, and it stays that way — this is the naming
+        // conversation_list should have had from the start.
+        your_messages_ellie_has_not_read: after.unread,
+        note: 'It is in her list now, with an unread count on it — YOUR messages she has not opened, never anything of hers awaiting you. ' + UNREAD_NOTE
       };
     } catch (err) {
       return { sent: false, error: err.message };
