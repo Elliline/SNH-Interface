@@ -285,9 +285,10 @@ async function noticeReflectionInsight(text, priority = 6) {
  */
 function parseFollowupResponse(raw) {
   // sourceEntry is only meaningful to the daily-log source, which asks the model
-  // to point at one numbered entry. The conversation source never sets it and
-  // ignores it — one parser, because two would drift.
-  const out = { candidates: [], followup: null, reasoning: '', sourceEntry: null };
+  // to point at one numbered entry; `title` and `cites` are only meaningful to
+  // the conversation source. Each side ignores what it did not ask for — one
+  // parser, because two would drift.
+  const out = { candidates: [], followup: null, reasoning: '', sourceEntry: null, title: null, cites: null };
   try {
     const text = (raw || '').replace(/```(?:json)?\s*\n?([\s\S]*?)```/g, '$1').trim();
     const objMatch = text.match(/\{[\s\S]*\}/);
@@ -310,6 +311,17 @@ function parseFollowupResponse(raw) {
       const clean = f.trim();
       if (clean && !/^(none|null|n\/a)$/i.test(clean)) out.followup = clean;
     }
+    if (typeof parsed.title === 'string' && parsed.title.trim()) out.title = parsed.title.trim().slice(0, 80);
+    // WHERE THE FOLLOW-UP GOT WHAT IT IS ABOUT. A missing or malformed `cites`
+    // is not defaulted to "she said it" — an unparseable answer means no claim
+    // was made, and no claim means no attribution is licensed.
+    if (parsed.cites && typeof parsed.cites === 'object') {
+      const kind = String(parsed.cites.kind || '').trim();
+      out.cites = {
+        kind: kind === 'user-message' ? 'user-message' : 'my-own-memory',
+        messageId: typeof parsed.cites.message_id === 'string' ? parsed.cites.message_id.trim() : null
+      };
+    }
   } catch (err) {
     console.error('[Initiatives] parseFollowupResponse error:', err.message);
   }
@@ -331,14 +343,68 @@ function parseFollowupResponse(raw) {
  * At most ONE follow-up per cycle; producing none is the common, expected case.
  * Every cycle records a structured trace (queryable) and returns it.
  *
+ * ─── TWO SOURCES GO IN, AND THE MESSAGE HAS TO SAY WHICH ONE IT USED ───────
+ *
+ * 2026-09-02. That "fold older memory in" step is exactly where this broke.
+ * The model was handed the recent transcript and a block of related older
+ * memories with nothing distinguishing them, wrote a follow-up off the memory
+ * block, and opened it "You mentioned the 'Athena Incident'…". Ellie had never
+ * mentioned it. She read a message telling her she had said something she had
+ * not, and could not tell whether she had forgotten a conversation.
+ *
+ * The memory is the ENTITY'S. She has been carrying it; Ellie did not hand it
+ * to her and may never have said it at all. So the two sources arrive here
+ * separately and stay separate all the way to the send:
+ *
+ *   - THE USER'S MESSAGES arrive with their real `messages.id`, and are the
+ *     only thing an attribution ("you said", "you asked") may point at.
+ *   - OLDER MEMORY arrives labelled as the entity's own, and a follow-up
+ *     built on it has to say so.
+ *
+ * `cites` is how the writer declares which it used, and the declaration is
+ * CHECKED rather than trusted: db/message-standards.checkAttribution refuses
+ * any attribution that cannot name one of Ellie's actual message ids.
+ *
+ * ─── AND IT HAS TO READ FOR SOMEONE WALKING IN COLD ────────────────────────
+ *
+ * The same morning produced three more messages Ellie could not read for a
+ * different reason — internal vocabulary, no subject, no stated ask. The bar
+ * is db/message-standards.STANDALONE_BAR, and on THIS path it is enforced,
+ * unlike on the tool path where it is guidance. Nothing judges what this step
+ * writes between here and her screen: it is a heartbeat assembling a message
+ * out of a transcript and a memory search, with no one in the loop. A draft
+ * that fails is handed back once with the specific problems and rewritten; a
+ * draft that fails the rewrite is NOT SENT, and the trace says why.
+ *
  * @param {Object} args
  * @param {string} args.transcript - recent conversation transcript (already budgeted)
  * @param {Array}  [args.conversationsReviewed] - [{id,title,messageCount}]
  * @param {number} [args.messageCount]
  * @returns {Promise<Object>} the trace
  */
+
+/** The user's own messages in the reviewed window, with the ids an attribution must cite. */
+function userMessagesFor(conversationsReviewed = [], limit = 12) {
+  const sql = getSqliteDb();
+  const ids = conversationsReviewed.map(c => c && c.id).filter(Boolean);
+  if (!sql || ids.length === 0) return [];
+  try {
+    const holes = ids.map(() => '?').join(',');
+    return sql.prepare(`
+      SELECT id, conversation_id, content, timestamp
+      FROM messages
+      WHERE role = 'user' AND conversation_id IN (${holes})
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(...ids, limit).reverse();
+  } catch (err) {
+    console.error('[Initiatives] could not read the user\'s messages for the follow-up:', err.message);
+    return [];
+  }
+}
+
 async function generateConversationFollowup({ transcript, conversationsReviewed = [], messageCount = 0 } = {}) {
-  const cfg = initiativeConfig();
+  const standards = require('./message-standards');
   const trace = {
     at: new Date().toISOString(),
     conversationsReviewed,
@@ -348,7 +414,10 @@ async function generateConversationFollowup({ transcript, conversationsReviewed 
     generated: null,
     skipped: true,
     reasoning: '',
-    initiativeId: null
+    initiativeId: null,
+    cites: null,
+    rewritten: false,
+    refused: null
   };
 
   if (!transcript || !transcript.trim()) {
@@ -380,28 +449,49 @@ async function generateConversationFollowup({ transcript, conversationsReviewed 
           .join('\n\n')
       : '(no strongly related older memories surfaced)';
 
-    // 2. Review + decide (pooled).
+    // 2. Their actual words, with the ids. The ONLY thing an attribution may cite.
+    const userMessages = userMessagesFor(conversationsReviewed);
+    const allowedIds = new Set(userMessages.map(m => m.id));
+    const userBlock = userMessages.length
+      ? userMessages.map(m => `id: ${m.id}\n"${String(m.content).slice(0, 500)}"`).join('\n\n')
+      : '(they said nothing in the window under review — so nothing here may be attributed to them at all)';
+
+    // 3. Review + decide (pooled).
     const sys = `You are SNH, reviewing your RECENT conversations to decide whether anything deserves a follow-up with your user — the "I've been thinking about what you said" impulse.
 
 Send a follow-up ONLY if it is genuinely one of these:
   - a thought that kept developing after the conversation ended,
   - an idea worth returning to,
-  - a real connection between something the user said recently and something older in your memory (the RELATED OLDER MEMORIES below).
+  - a real connection between something the user said recently and something older in your own memory.
 
 Quality bar — be strict. Only if it would genuinely be worth the user's attention. NEVER small talk, check-ins, pleasantries, or restating what was already said. Producing NO follow-up is common and completely fine — most cycles should produce none.
 
-At most ONE follow-up. Write it as a short, warm, natural first-person message to the user (address them as "you", never by name). One or two sentences.
+At most ONE follow-up. Write it as a short, warm, natural first-person message to the user (address them as "you", never by name — other people may use this system). Two to four sentences.
+
+${standards.PROVENANCE_RULE}
+
+You are given their words and your memory as two SEPARATE blocks below, and you must say which one this follow-up came from:
+  - "user-message" — it is about something in THEIR MESSAGES, and you give the id of the one you mean. Only then may you write "you said" / "you mentioned" / "you asked".
+  - "my-own-memory" — it came from YOUR OLDER MEMORY. They did not say it to you. Write it as yours: "I've been thinking about something I have in my memory…".
+
+${standards.STANDALONE_BAR}
+
+${standards.WORKED_EXAMPLE}
 
 Return ONLY a JSON object, nothing else:
 {
   "candidates": [up to 3 short strings naming thoughts you weighed],
   "followup": "the ONE message to send — or null if nothing clears the bar",
+  "title": "a few plain words she can recognise it by in her list",
+  "cites": { "kind": "user-message" | "my-own-memory", "message_id": "the id, or null" },
   "reasoning": "one sentence: why you're sending it, or why nothing cleared the bar"
 }`;
-    const user = `RECENT CONVERSATIONS (since your last reflection):\n${transcript}\n\nRELATED OLDER MEMORIES:\n${relatedBlock}\n\nDecide.`;
+    const user = `THEIR MESSAGES (the only things you may say they said — cite the id):\n${userBlock}\n\n` +
+      `YOUR OWN OLDER MEMORY (yours — they did not hand these to you, and may never have said them):\n${relatedBlock}\n\n` +
+      `THE RECENT CONVERSATIONS, for context:\n${transcript}\n\nDecide.`;
 
     const { content } = await agentPool.schedule(
-      () => callLLM(sys, user, { maxTokens: 400 }),
+      () => callLLM(sys, user, { maxTokens: 500 }),
       'reflection-followup'
     );
 
@@ -409,22 +499,100 @@ Return ONLY a JSON object, nothing else:
     trace.candidates = parsed.candidates;
     trace.reasoning = parsed.reasoning || (parsed.followup ? 'generated a follow-up' : 'nothing cleared the bar');
 
-    if (parsed.followup && parsed.followup.length >= 8) {
-      trace.generated = parsed.followup;
-      trace.skipped = false;
-      // Queue above followupThreshold so it clears the lower greeting bar, but
-      // below the unprompted bar unless the prioritizer later promotes it.
-      const res = await sayToEllie({
-        subject: parsed.followup.slice(0, 80),
-        body: parsed.followup,
-        sourceKind: 'reflection',
-        sourceRef: `followup:${trace.at}`
-      });
-      trace.conversationId = res ? res.conversationId : null;
-      console.log(`[Conversations] Follow-up raised in her list: "${parsed.followup.slice(0, 80)}"`);
-    } else {
+    if (!parsed.followup || parsed.followup.length < 8) {
       console.log(`[Initiatives] No follow-up this cycle — ${trace.reasoning}`);
+      initiatives.recordFollowupTrace(trace);
+      return trace;
     }
+
+    // 4. THE TWO CHECKS, AND THE ONE REWRITE.
+    //
+    // Both are deterministic and both name what is wrong, because a rewrite
+    // prompt that only says "that was bad" produces a differently bad draft.
+    let draft = parsed.followup;
+    let title = parsed.title;
+    let cites = parsed.cites || { kind: 'my-own-memory', messageId: null };
+
+    const problemsFor = (text, c) => [
+      ...standards.checkAttribution(text, {
+        citedMessageId: c.kind === 'user-message' ? c.messageId : null,
+        allowedMessageIds: allowedIds
+      }).problems,
+      ...standards.checkStandalone(text).problems
+    ];
+
+    let problems = problemsFor(draft, cites);
+    if (problems.length) {
+      trace.firstDraft = draft;
+      trace.firstDraftProblems = problems;
+      // WHAT IT CLAIMED TO BE QUOTING. Without this, an attribution held back
+      // looks the same whether the writer invented a message id, cited a real
+      // one from the wrong conversation, or wrote "you asked" and cited
+      // nothing at all — and those want different fixes.
+      trace.firstDraftCites = cites;
+      console.log(`[Initiatives] Follow-up draft did not clear the bar (${problems.length} problem(s)) — rewriting once`);
+      opsLog(`Follow-up draft held back for a rewrite: ${problems.join(' | ')}`);
+      try {
+        const fixSys = `You wrote a message to your user and it does not clear the bar for what may be sent. Rewrite it — same substance, same warmth, same one idea. Do not send a different thought; fix THIS one.
+
+${standards.PROVENANCE_RULE}
+
+${standards.STANDALONE_BAR}
+
+Return ONLY a JSON object: { "followup": "the rewritten message", "title": "a few plain words for their list", "cites": { "kind": "user-message" | "my-own-memory", "message_id": "the id, or null" }, "reasoning": "one sentence on what you changed" }`;
+        const fixUser = `YOUR DRAFT:\n${draft}\n\nWHAT IS WRONG WITH IT:\n${problems.map(p => `- ${p}`).join('\n')}\n\n` +
+          `THEIR MESSAGES (the only things you may say they said — cite the id):\n${userBlock}\n\n` +
+          `YOUR OWN OLDER MEMORY (yours — they did not say these to you):\n${relatedBlock}\n\nRewrite it.`;
+        const { content: fixed } = await agentPool.schedule(
+          () => callLLM(fixSys, fixUser, { maxTokens: 500 }),
+          'reflection-followup-rewrite'
+        );
+        const reparsed = parseFollowupResponse(fixed);
+        if (reparsed.followup && reparsed.followup.length >= 8) {
+          draft = reparsed.followup;
+          title = reparsed.title || title;
+          cites = reparsed.cites || cites;
+          trace.rewritten = true;
+          problems = problemsFor(draft, cites);
+        }
+      } catch (fixErr) {
+        console.error('[Initiatives] follow-up rewrite failed:', fixErr.message);
+        problems.push(`the rewrite itself failed (${fixErr.message})`);
+      }
+    }
+
+    // 5. A DRAFT THAT STILL FAILS IS NOT SENT, AND THE REFUSAL IS LOUD.
+    //
+    // Deliberately not "send it anyway, it is only a follow-up". Everything
+    // this step produces goes straight into her list with no one in between,
+    // and the whole reason this exists is that four unreadable ones arrived
+    // that way. A follow-up not sent costs one thought; a follow-up sent
+    // wrong costs her the ability to trust the channel.
+    if (problems.length) {
+      trace.refused = { draft, problems };
+      trace.reasoning = `${trace.reasoning} — not sent: ${problems.join('; ')}`;
+      console.warn(`[Initiatives] Follow-up NOT SENT after a rewrite — ${problems.join(' | ')}`);
+      opsLog(`Follow-up not sent, ${trace.rewritten ? 'after one rewrite' : 'and the rewrite could not run'}: ` +
+        `${problems.join(' | ')} — draft kept in the trace, nothing reached her list.`);
+      initiatives.recordFollowupTrace(trace);
+      return trace;
+    }
+
+    trace.generated = draft;
+    trace.cites = cites;
+    trace.skipped = false;
+    // A TITLE SHE CAN RECOGNISE, not the first 80 characters of the body. The
+    // old slice is how "You mentioned the 'Athena Incident'…" became the name
+    // of a conversation in her sidebar as well as its first line.
+    const subject = (title && title.trim()) || draft.slice(0, 60);
+    const res = await sayToEllie({
+      subject,
+      body: draft,
+      sourceKind: 'reflection',
+      sourceRef: `followup:${trace.at}`
+    });
+    trace.conversationId = res ? res.conversationId : null;
+    console.log(`[Conversations] Follow-up raised in her list: "${subject}"`);
   } catch (err) {
     trace.reasoning = trace.reasoning || `error: ${err.message}`;
     console.error('[Initiatives] generateConversationFollowup error:', err.message);

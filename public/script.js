@@ -5491,13 +5491,22 @@ async function loadSelfTab() {
         if (ev.deciding_axis) bits.push(`decided on ${ev.deciding_axis}`);
         if (Number.isFinite(ev.survivor_salience)) bits.push(`salience ${ev.loser_salience ?? '?'} → ${ev.survivor_salience}`);
 
+        // A FINDING ADDRESSED TO THE ENTITY, NOT TO ELLIE. The self-coherence
+        // audit's "do you want to revise this claim?" is written to SNH about
+        // its own self-facts; until 2026-09-02 the ask half was also opening a
+        // conversation in Ellie's list, where the "you" silently re-pointed at
+        // her. It stays here now, and the row says whose question it is so the
+        // record does not read as something waiting on her.
+        const awaitingEntity = isRaise && ev.awaiting_entity_turn === true;
+
         const state = c.reverted_at
           ? `<span class="memory-corr-state reverted">reverted ${escapeHtml(fmtDate(c.reverted_at))}${c.reverted_by ? ` · ${escapeHtml(c.reverted_by)}` : ''}</span>`
-          : isRaise ? '<span class="memory-corr-state raised">raised — nothing changed</span>'
-            : isRefusal ? '<span class="memory-corr-state raised">refused — nothing changed</span>'
-              : (c.reversible
-                ? `<button class="memory-corr-revert" data-corr-id="${escapeHtml(c.id)}">Revert</button>`
-                : '<span class="memory-corr-state">not revertible</span>');
+          : awaitingEntity ? '<span class="memory-corr-state raised">SNH\'s own question — nothing changed</span>'
+            : isRaise ? '<span class="memory-corr-state raised">raised — nothing changed</span>'
+              : isRefusal ? '<span class="memory-corr-state raised">refused — nothing changed</span>'
+                : (c.reversible
+                  ? `<button class="memory-corr-revert" data-corr-id="${escapeHtml(c.id)}">Revert</button>`
+                  : '<span class="memory-corr-state">not revertible</span>');
 
         const label = noAction ? 'one' : 'retired';
         const otherLabel = noAction ? 'other' : 'kept';
@@ -5513,6 +5522,7 @@ async function loadSelfTab() {
             ${c.target_text ? `<div class="memory-corr-target"><span class="memory-corr-label">${label}</span>${escapeHtml(c.target_text)}</div>` : ''}
             ${c.survivor_text ? `<div class="memory-corr-survivor"><span class="memory-corr-label">${otherLabel}</span>${escapeHtml(c.survivor_text)}</div>` : ''}
             <div class="memory-corr-reason">${escapeHtml(c.reason || '')}</div>
+            ${awaitingEntity ? '<div class="memory-corr-evidence">This one is addressed to SNH about its own self-description, not to you. It is waiting on SNH\'s own turn on it — it only reaches your conversation list if SNH takes that turn and still has something to ask.</div>' : ''}
             ${bits.length ? `<div class="memory-corr-evidence">${escapeHtml(bits.join(' · '))}</div>` : ''}
           </div>`;
       }).join('');

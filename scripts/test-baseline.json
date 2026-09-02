@@ -541,6 +541,20 @@
       "timeoutSeconds": 300
     },
     {
+      "suite": "test-message-standards",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; deterministic — the model is pinned, so what it asserts is the routing and the two checks, never a judgement call by an engine.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/message-standards.js",
+        "db/self-audit.js",
+        "db/initiative-engine.js",
+        "mcp/tools/conversations.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-probe-verdict",
       "expectedFailures": 0,
       "reason": "The liveness probe's slow-vs-dead adjudicator. Uses local stub HTTP servers for the engine — no GPU, no live engine, deterministic.",

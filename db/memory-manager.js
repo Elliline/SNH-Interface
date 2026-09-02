@@ -2360,11 +2360,35 @@ Respond with ONLY that message, or exactly NONE.`;
 
     const at = new Date().toISOString();
 
+    // WHY NOTHING WAS STORED, WHEREVER "NOTHING WAS STORED" IS SAID.
+    //
+    // 2026-09-02: two reflections in one evening each noticed five things about
+    // herself and stored none of them, and both the daily line and the Self tab
+    // said only "0 self-fact(s) stored". The reason was the daily cap doing
+    // exactly its job — five already recorded earlier that day — and
+    // processSelfFacts had said so, in `budgetBlocked`, which this function
+    // then dropped on the floor. Every OTHER surface in that path is loud about
+    // a refusal on purpose ("a silently dropped observation is
+    // indistinguishable from one that was never had"); the summary a person
+    // actually reads was the one place that was not. It is not a new rule, just
+    // the existing one reaching the last step.
+    const whyNotStored = () => {
+      const parts = [];
+      if (selfResult.budgetBlocked) {
+        const b = selfResult.budget || {};
+        parts.push(`${selfResult.budgetBlocked} not recorded — my daily limit of ${b.cap} self-observations was already used up (${b.usedToday} earlier today)`);
+      }
+      if (selfResult.dedupSkipped) parts.push(`the duplicate check did not run (${selfResult.dedupSkipped.reason})`);
+      if (selfResult.lockDuplicates) parts.push(`${selfResult.lockDuplicates} dropped for asserting only my locked name`);
+      if (selfResult.raised) parts.push(`${selfResult.raised} left unresolved for me to decide`);
+      return parts.length ? ` (${parts.join('; ')})` : '';
+    };
+
     // Log the reflection to the daily log like everything else.
     const dailyDir = path.join(MEMORY_DIR, 'daily');
     factExtractor.appendToDailyLog(
       `Reflection: reviewed ${rows.length} message(s) across ${conversationCount} conversation(s) → ` +
-      `${selfResult.stored} self-fact(s) stored, ${selfResult.superseded} superseded. ` +
+      `${selfResult.stored} self-fact(s) stored, ${selfResult.superseded} superseded${whyNotStored()}. ` +
       (observations.length ? `Noticed: ${observations.map(o => `"${o}"`).join('; ')}` : 'Nothing new noticed.'),
       dailyDir
     );
@@ -2384,7 +2408,14 @@ Respond with ONLY that message, or exactly NONE.`;
       conversationCount,
       observations,
       stored: selfResult.stored,
-      superseded: selfResult.superseded
+      superseded: selfResult.superseded,
+      // Only present when something was actually refused, so an ordinary
+      // record keeps its old shape and the Self tab has nothing to explain.
+      ...(selfResult.budgetBlocked ? { budgetBlocked: selfResult.budgetBlocked, budget: selfResult.budget } : {}),
+      ...(selfResult.dedupSkipped ? { dedupSkipped: selfResult.dedupSkipped } : {}),
+      ...(selfResult.lockDuplicates ? { lockDuplicates: selfResult.lockDuplicates } : {}),
+      ...(selfResult.raised ? { raised: selfResult.raised } : {}),
+      notStoredBecause: whyNotStored().replace(/^ \(|\)$/g, '') || null
     });
 
     // Advance the reflection watermark to the newest message just reviewed.
@@ -2397,6 +2428,7 @@ Respond with ONLY that message, or exactly NONE.`;
       observations,
       stored: selfResult.stored,
       superseded: selfResult.superseded,
+      notStoredBecause: whyNotStored().replace(/^ \(|\)$/g, '') || null,
       followup
     };
   } catch (error) {

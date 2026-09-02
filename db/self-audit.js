@@ -25,7 +25,11 @@
  *      was taught on 2026-07-23: one or two sentences, everyday words, stating
  *      what's wanted (approve revision / discuss / dismiss).
  *   4. On a GAP: (a) writes a "dissonance" self-fact recording the tension, and
- *      (b) raises an 'audit' initiative proposing the revision for Ellie's call.
+ *      (b) files the proposed revision in the entity's own Corrections queue,
+ *      addressed to HER — the question "do you want to revise this claim?" is
+ *      written to the entity about her own self-facts, and routing it to Ellie
+ *      re-pointed the pronoun at someone who could not answer it. See
+ *      raiseToCorrections for the whole story.
  *
  * HARD GUARDRAIL — the audit NEVER auto-revises identity. It only documents
  * tension and asks. Identity edits always go through the human (same philosophy
@@ -47,8 +51,14 @@ const { getSqliteDb } = require('./database');
 const { getLocalDateStamp, formatFactTimestamp } = require('./datetime');
 const agentPool = require('./agent-pool');
 const memoryClusters = require('./memory-clusters');
-const initiatives = require('./initiatives');
 const factExtractor = require('./fact-extractor');
+// NOT REQUIRED, AND THE ABSENCE IS THE ENFORCEMENT. This module used to pull in
+// ./initiatives (to ring the bell) and then ./initiative-engine (to open a
+// conversation in Ellie's list). It can now reach neither: an audit finding is
+// written to the entity about the entity, and the only place it goes is the
+// corrections ledger. Same shape as db/agent-jobs.js not requiring
+// db/initiatives.js — a route that does not exist cannot be taken by accident,
+// and scripts/test-message-standards.js fails if either require comes back.
 // NOTE: memory-manager (callLLM) is required lazily inside functions — it
 // requires this module, so a top-level require here would be a cycle.
 
@@ -329,15 +339,83 @@ async function writeDissonanceFact({ claimText, claimDate, finding, evidenceRefs
  * rendering the ledger says NOTHING CHANGED rather than claiming an edit. Plus
  * the ops line, which these always had.
  *
- * WHAT THIS COSTS, said plainly: these findings are phrased as questions
- * ("want me to retire it?"), and Corrections is a record, not an inbox — there
- * is no approve button there. She sees them; she cannot action them in one
- * click the way the bell pretended to offer. That is a real loss and the right
- * trade only because the bell's version was never actioned either: of 390 items
- * ever raised, the only proposal was dismissed.
+ * ─── THE ASK IS ADDRESSED TO THE ENTITY, AND IT USED TO BE SENT TO ELLIE ───
+ *
+ * REVERSED 2026-09-02, and the reversal is the point of this comment. When the
+ * conversation channel shipped the day before, this function also opened a
+ * conversation in Ellie's list for the ask half of every finding, on the
+ * reasoning that a question needs somewhere to be answered and Corrections has
+ * no reply box. That reasoning was sound and the routing was wrong, because it
+ * got one thing backwards: WHO IS BEING ASKED.
+ *
+ * The audit's question is "do you want to revise this claim about yourself?"
+ * and the "you" in it is THE ENTITY. It is written to her, about her own
+ * self-facts, out of evidence only she has seen. Delivered into Ellie's list
+ * the pronoun silently re-points: on the morning of 2026-09-02 Ellie opened
+ * three of these and read "the 'reflex to correct minor inaccuracies' you
+ * claimed" as a thing being said about her. She had no way to answer them
+ * because they were never hers to answer.
+ *
+ * So the finding stays HERE, in the entity's own Corrections queue, flagged
+ * `awaiting_entity_turn` with the ask kept verbatim beside it. That is the
+ * queue she works: she takes her own turn on the question first — the repair
+ * build is what will let her act on it — and only if she has taken that turn
+ * and STILL has something to ask does it reach Ellie, written fresh through
+ * the ordinary message path (db/message-standards.js), as a message that
+ * stands on its own rather than the audit's half of a private conversation.
+ *
+ * WHAT THIS COSTS, said plainly: these findings are phrased as questions, and
+ * Corrections is a record, not an inbox — there is no approve button there and
+ * now no conversation either. Nothing about a finding reaches Ellie
+ * automatically any more. That is deliberate: the automatic version reached her
+ * unreadable, and an unreadable message is not a smaller loss than a quiet one.
  */
-function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = null, asksHer = true }) {
+/**
+ * HAS THIS EXACT FINDING ALREADY BEEN FILED AND NOT YET DEALT WITH?
+ *
+ * It had to become a real check the moment Corrections became the only
+ * destination. Nothing here ever deduped: the old comment claimed the dedup
+ * happened "inside addInitiative", and addInitiative had not been called from
+ * this file since the bell rework — the conversation channel was quietly
+ * covering for it by appending to an existing conversation on the same title.
+ * With that gone, a standing incoherence (two declarations that conflict and
+ * that nothing retires) would file one fresh row on every audit pass, daily,
+ * forever, and the queue she is meant to work would fill with copies of one
+ * question.
+ *
+ * Keyed on (reason_code, source_ref), which is what identifies a finding: for
+ * a revision it is the claim, for a pair it is both member ids sorted. A
+ * REVERTED row does not count as standing — that is the finding having been
+ * dealt with, and it may legitimately come back.
+ */
+function alreadyStanding(reasonCode, sourceRef) {
   try {
+    const db = getSqliteDb();
+    if (!db || !sourceRef) return null;
+    return db.prepare(`
+      SELECT id, created_at FROM corrections_ledger
+      WHERE json_extract(evidence, '$.raised_by')  = 'self-coherence-audit'
+        AND json_extract(evidence, '$.reason_code') = ?
+        AND json_extract(evidence, '$.source_ref')  = ?
+        AND reverted_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `).get(reasonCode, sourceRef) || null;
+  } catch (err) {
+    // A dedup that cannot run must not silently stop deduping — but it also
+    // must not swallow the finding. Say so, and file it.
+    console.error('[SelfAudit] standing-raise check failed (filing anyway):', err.message);
+    logOps(`could not check whether "${reasonCode}" was already filed (${err.message}) — filed again rather than dropped`);
+    return null;
+  }
+}
+
+function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = null, asksEntity = true }) {
+  try {
+    const standing = alreadyStanding(reasonCode, sourceRef);
+    if (standing) {
+      logOps(`${label} — already standing in corrections since ${standing.created_at} (${standing.id.slice(0, 8)}); not filed again`);
+      return standing.id;
+    }
     const ledger = require('./corrections-ledger');
     const id = ledger.record({
       tier: 'semantic',
@@ -346,31 +424,21 @@ function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = 
       targetId: memberId,
       targetText: content,
       reason: content,
-      evidence: { unresolved: true, reason_code: reasonCode, source_ref: sourceRef, raised_by: 'self-coherence-audit' },
+      evidence: {
+        unresolved: true,
+        reason_code: reasonCode,
+        source_ref: sourceRef,
+        raised_by: 'self-coherence-audit',
+        // WHO THE QUESTION IS FOR. Read by anything that renders this row, and
+        // the reason nothing here opens a conversation: the ask is the
+        // entity's to answer first.
+        addressed_to: 'entity',
+        ...(asksEntity ? { awaiting_entity_turn: true, ask: content } : {})
+      },
       reversible: false
     });
-    logOps(`${label} — recorded in corrections (${id ? id.slice(0, 8) : 'unfiled'}); nothing was changed`);
-
-    // THE RECORD AND THE ASK ARE TWO DIFFERENT THINGS. Corrections is the
-    // record — what was noticed, and that nothing was changed. But these
-    // findings END IN A QUESTION ("want me to retire it, or leave it?"), and a
-    // question needs somewhere she can answer it. The bell rework moved them
-    // out of the bell and Corrections has no reply box, so the ask opens a
-    // conversation in her list and the record stays here. Neither one is
-    // sufficient alone: the record without the ask is unanswerable, the ask
-    // without the record is unauditable.
-    if (asksHer) {
-      try {
-        require('./initiative-engine').sayToEllie({
-          subject: `Something in my self-description does not sit right: ${String(content).slice(0, 60)}`,
-          body: content,
-          sourceKind: 'self-coherence',
-          sourceRef
-        });
-      } catch (err) {
-        console.error('[SelfAudit] could not open a conversation for the ask:', err.message);
-      }
-    }
+    logOps(`${label} — recorded in corrections (${id ? id.slice(0, 8) : 'unfiled'}); nothing was changed` +
+      `${asksEntity ? '; the question is mine to answer first and is waiting in Corrections, not in her list' : ''}`);
     return id;
   } catch (err) {
     console.error('[SelfAudit] could not record the raise:', err.message);
@@ -379,9 +447,14 @@ function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = 
 }
 
 /**
- * Raise an 'audit' initiative proposing the revision for Ellie to approve /
- * discuss / dismiss. Exact-deduped by (sourceKind, sourceRef) inside
- * addInitiative, so the same claim is never re-raised across runs.
+ * File the proposed revision in the entity's Corrections queue, for her own
+ * turn on it. Deduped on (reason_code, source_ref) by alreadyStanding, so the
+ * same claim is not re-filed on every pass.
+ *
+ * Named `raiseRevisionInitiative` from when this raised an initiative on the
+ * bell. It has not raised one since the bell rework and it does not open a
+ * conversation either; the name is kept because the call sites and the ops
+ * vocabulary use it, and renaming it would say less than this paragraph does.
  */
 async function raiseRevisionInitiative({ proposal, finding, sourceRef, claimText }) {
   const content = (proposal && proposal.trim())
@@ -581,17 +654,23 @@ async function runIdentityCoherence() {
   for (const f of findings) {
     logOps(`IDENTITY INCOHERENCE (${f.kind}): ${f.finding}`);
     try {
-      // Deduped on (sourceKind, sourceRef) inside addInitiative, so a standing
-      // incoherence is raised once and not re-raised every pass.
+      // Deduped on (reason_code, source_ref) by alreadyStanding — a standing
+      // incoherence is filed once and not re-filed every pass.
+      //
+      // A CONTRADICTION PAIR IS MINE TO ADJUDICATE, NOT HERS. Both halves are
+      // the entity's own self-beliefs, and on 2026-09-02 one of these reached
+      // Ellie asking her to decide which of two things Athena believes about
+      // herself should be retired — a question she has no standing to answer
+      // and no context for. It stays in Corrections with the rest.
       const id = raiseToCorrections({
-        content: `${f.finding} Nothing has been changed — retiring or keeping either one is your call.`,
+        content: `${f.finding} Nothing has been changed — whether either one is retired is mine to decide.`,
         sourceRef: f.b ? [f.a.id, f.b.id].sort().join(':') : f.a.id,
         reasonCode: `identity-coherence:${f.kind}`,
         label: `identity-coherence (${f.kind})`,
         memberId: f.a.id
       });
     } catch (err) {
-      logOps(`identity coherence: could not raise an initiative — ${err.message}`);
+      logOps(`identity coherence: could not file the finding in corrections — ${err.message}`);
     }
   }
   if (!findings.length) logOps('identity coherence: no contradictions among active self-declarations');
@@ -643,7 +722,7 @@ async function runSelfCoherenceAudit() {
 
   const findings = outcome.findings || [];
   const gaps = findings.filter(f => f && f.verdict === 'gap').length;
-  logOps(`completed ${inaugural ? 'inaugural ' : ''}run — ${inaugural ? 'inaugural loop-claim' : `${findings.length} claim(s)`} audited, ${gaps} gap(s) raised for approval` +
+  logOps(`completed ${inaugural ? 'inaugural ' : ''}run — ${inaugural ? 'inaugural loop-claim' : `${findings.length} claim(s)`} audited, ${gaps} gap(s) filed in corrections for my own turn` +
     `, ${(outcome.identityFindings || []).length} identity incoherence(s)`);
   return outcome;
 }

@@ -18,17 +18,23 @@
  * a new subject or the same one — deserves to be made before the call rather
  * than inside it.
  *
- * THE THRESHOLD IS GUIDANCE, NOT A VALIDATOR, and that is deliberate. Athena
+ * BOTH BARS ARE GUIDANCE, NOT VALIDATORS, and that is deliberate. Athena
  * asked for a bar — concrete fact ids or a concrete pair, a specific question,
  * and a record of what was checked before raising — and it is written into the
  * descriptions rather than enforced in code. A validator would decide FOR her
  * which of its thoughts are worth her time, and the whole reason this channel
  * exists is that something it sent was filed as not needing a conversation.
  * She decides. The bar shapes the judgement; it does not gate the send.
+ *
+ * The stand-alone bar added on 2026-09-02 sits here on the same terms. It IS
+ * enforced on the automatic follow-up writer in db/initiative-engine.js, and
+ * the difference is not inconsistency: nothing is in that loop, so nothing
+ * catches what it writes before Ellie does. Here, the entity is the judgement.
  */
 
 const channel = require('../../db/conversation-channel');
 const { getConfig } = require('../../db/config');
+const standards = require('../../db/message-standards');
 
 class BaseConversationTool {
   constructor() {
@@ -61,6 +67,42 @@ const THRESHOLD_GUIDANCE =
   'If you cannot point at something concrete, what you have is a reflection, and reflections belong in your Reflections, not here. ' +
   'This is your judgement to make, not a rule that will stop you: she would rather read something real that turns out to be minor ' +
   'than have you sit on something that mattered.';
+
+/**
+ * THE THRESHOLD DECIDES WHETHER IT IS A MESSAGE. THIS DECIDES HOW IT READS.
+ *
+ * Added 2026-09-02, after a morning in which four messages reached her that
+ * she could not read at all — not because they were thin, but because every
+ * one of them was written from inside the hour of thinking that produced it.
+ *
+ * The two bars appear to conflict on one point and do not. The threshold says
+ * NAME THE FACT IDS; this says KEEP THEM OUT OF THE TEXT. Both hold, because
+ * they are about different things: having the ids is what earns the send, and
+ * printing them is what makes the message unreadable. They go in the record
+ * behind it — the ledger row this call writes already carries them.
+ *
+ * Guidance, like the threshold, and for the same reason: you have read the
+ * conversation and you are making a judgement. Nothing here will stop a send.
+ */
+const STANDALONE_GUIDANCE =
+  standards.STANDALONE_BAR + '\n' +
+  'This does NOT contradict the bar above. Having the concrete thing is what earns the send; ' +
+  'printing it is what makes the message unreadable. The ids and the receipts are already in the record ' +
+  'this call writes — leave them there.\n' +
+  standards.PROVENANCE_RULE;
+
+/**
+ * The worked pair goes on conversation_send ONLY, and that is a cost decision.
+ *
+ * Tool schemas are attached to every chat turn — 3,432 tokens across eleven
+ * tools, measured — so a description is not free the way a comment is. The
+ * example is the most instructive part of the bar and the cheapest way to
+ * show what "written both ways" means, but it is ~1,400 characters, and
+ * putting it on both send and open would pay for it twice on every turn for
+ * one lesson. Sending is the far more common call, and open carries the same
+ * rules in prose above.
+ */
+const STANDALONE_GUIDANCE_WITH_EXAMPLE = STANDALONE_GUIDANCE + '\n' + standards.WORKED_EXAMPLE;
 
 const UNREAD_NOTE =
   'An unread count is not a verdict on what you sent: it means she has been busy, nothing more. ' +
@@ -129,12 +171,12 @@ class ConversationSendTool extends BaseConversationTool {
       'It appears as your turn in that conversation, where she reads and replies. She sees it as unread on the list until she opens it. ' +
       'Prefer this over opening a new conversation whenever the subject already has one. ' +
       'Archived conversations are closed to writes for both of you. ' +
-      THRESHOLD_GUIDANCE;
+      THRESHOLD_GUIDANCE + '\n' + STANDALONE_GUIDANCE_WITH_EXAMPLE;
     this.parameters = {
       type: 'object',
       properties: {
         conversation_id: { type: 'string', description: 'The conversation to write into. Get it from conversation_list.' },
-        body: { type: 'string', description: 'What you want to say to her. Write it as yourself, to her.' }
+        body: { type: 'string', description: 'What you want to say to her. Write it as yourself, to her — and for someone who has not seen anything you did to arrive at it.' }
       },
       required: ['conversation_id', 'body']
     };
@@ -176,7 +218,7 @@ class ConversationOpenTool extends BaseConversationTool {
     this.description =
       'Open a NEW conversation with Ellie. It appears in her sidebar marked as yours, the way your unprompted ones already do, and stays there unread until she opens it. ' +
       'Only for a subject that does not already have an active conversation — check conversation_list first and use conversation_send if it does. ' +
-      THRESHOLD_GUIDANCE;
+      THRESHOLD_GUIDANCE + '\n' + STANDALONE_GUIDANCE;
     this.parameters = {
       type: 'object',
       properties: {
