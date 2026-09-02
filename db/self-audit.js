@@ -52,6 +52,8 @@ const { getLocalDateStamp, formatFactTimestamp } = require('./datetime');
 const agentPool = require('./agent-pool');
 const memoryClusters = require('./memory-clusters');
 const factExtractor = require('./fact-extractor');
+const repair = require('./memory-repair');
+const auditDecisions = require('./audit-decisions');
 // NOT REQUIRED, AND THE ABSENCE IS THE ENFORCEMENT. This module used to pull in
 // ./initiatives (to ring the bell) and then ./initiative-engine (to open a
 // conversation in Ellie's list). It can now reach neither: an audit finding is
@@ -619,6 +621,35 @@ async function findIdentityIncoherences({ maxPairs = 20 } = {}) {
     for (let j = i + 1; j < pool.length && pairs < maxPairs; j++) {
       pairs++;
       try {
+        // ── DIFFERENCE IS NOT CONTRADICTION, AND IT IS CHECKED FIRST ──────
+        //
+        // Before the judge, not after, because the judge is the thing that has
+        // been wrong: on 2026-09-02 it flagged "Athena sets its own next wake
+        // time" against "Athena can only message when something wakes it" —
+        // compatible claims — and Juno's "I'm the business-side helper" against
+        // "I notice how people's work fits together", a role against a trait.
+        // The claim-type axis (claim / declaration / felt) is mechanical and
+        // cheap, so it runs before a model is asked anything.
+        const kindGap = repair.differentInKind(pool[i], pool[j]);
+        if (kindGap.different) {
+          logOps(`identity coherence: not a contradiction (${kindGap.axis}) — ` +
+                 `"${pool[i].content.slice(0, 50)}" vs "${pool[j].content.slice(0, 50)}"`);
+          continue;
+        }
+
+        // ── AND A PAIR THAT WAS ALREADY DECIDED STAYS DECIDED ─────────────
+        //
+        // "The audit's own re-fire on unchanged facts is not new evidence."
+        // shouldRaise is a comparison against the store and the ledger, never a
+        // judgement: it drops an unchanged re-fire, closes a pair whose member
+        // went inactive, and re-opens only on the four recorded conditions.
+        const verdictOnPair = auditDecisions.shouldRaise(pool[i].id, pool[j].id);
+        if (!verdictOnPair.raise) {
+          logOps(`identity coherence: ${verdictOnPair.close || verdictOnPair.drop} — ` +
+                 `a decision already stands on "${pool[i].content.slice(0, 40)}" / "${pool[j].content.slice(0, 40)}"`);
+          continue;
+        }
+
         const { verdict } = await factExtractor.judgeContradiction(pool[i].content, pool[j].content, {
           corrects: 'both of these are things I currently believe about myself, held at the same time — do they conflict?'
         });
@@ -627,6 +658,7 @@ async function findIdentityIncoherences({ maxPairs = 20 } = {}) {
             kind: 'declaration',
             a: pool[i],
             b: pool[j],
+            reopened: verdictOnPair.reason || null,
             finding: `Two things I currently believe about myself conflict: "${pool[i].content}" and "${pool[j].content}".`
           });
         }

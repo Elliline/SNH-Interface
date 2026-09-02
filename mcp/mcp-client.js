@@ -20,6 +20,10 @@ const {
   ConversationOpenTool, ConversationRequestRetireTool
 } = require('./tools/conversations');
 const {
+  RetractFactTool, RewordFactTool, MergeFactsRepairTool, RefileFactTool,
+  AuditQueueTool, AuditDecideTool
+} = require('./tools/memory-repair');
+const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
 const { MemoryJobsTool } = require('./tools/jobs-inspect');
@@ -301,6 +305,42 @@ const TOOL_CATALOGUE = [
     toggle: 'tools.conversations.enabled',
     toggleNote: 'Shares the conversation-channel switch.',
     fields: []
+  })),
+
+  // THE REPAIR TOOLS — the entity acting on its own memory (2026-09-02).
+  //
+  // NOT backgroundOnly, which is the deliberate difference from the corrector's
+  // three writes above. Those fire on a timer with a budget and no one in the
+  // room; these are the entity's own hands, in the turn, and the guardrails
+  // stand outside the loop in db/memory-repair.js instead of a permission gate
+  // standing inside it. The origin is Athena finding "I am Juno" filed as her
+  // own self-fact and having to ask someone else to remove it.
+  ...[
+    ['memory_retract', 'Withdraw a fact that should not be held', RetractFactTool],
+    ['memory_reword', 'Fix the wording of a fact', RewordFactTool],
+    ['memory_merge', 'Fold two facts that say the same thing into one', MergeFactsRepairTool],
+    ['memory_refile', 'Move a fact filed under the wrong subject', RefileFactTool]
+  ].map(([id, title, Tool]) => ({
+    id, title, Tool, card: 'memoryRepair',
+    gate: ({ cfg }) => (cfg.repair || {}).enabled !== false,
+    gateWhy: () => 'memory repair is turned off here',
+    toggle: 'repair.enabled',
+    toggleNote: 'The entity repairing its own memory — retract, reword, merge, refile, each needing a receipt and each ledgered. ' +
+      'Turning it off does not lock the store; it means repairs go back to being someone else\'s job.',
+    fields: [{ path: 'repair.maxSelfMutationsPerDay', label: 'Changes to its own self-model per day', type: 'number', min: 0, max: 20,
+      hint: 'Receipts are per-operation, so nothing in them stops a confused run from rewording a whole self-model in an hour with every step receipted. A merge counts as one. Facts about you are not capped by this.' }]
+  })),
+  ...[
+    ['audit_queue', 'Read its own open questions about itself', AuditQueueTool],
+    ['audit_decide', 'Settle one of its own questions', AuditDecideTool]
+  ].map(([id, title, Tool]) => ({
+    id, title, Tool, card: 'memoryRepair',
+    gate: ({ cfg }) => (cfg.repair || {}).enabled !== false,
+    gateWhy: () => 'memory repair is turned off here',
+    toggle: 'repair.enabled',
+    toggleNote: 'Shares the memory-repair switch. This is the reply box on the questions the self-coherence audit raises about the entity\'s own self-description.',
+    fields: [{ path: 'repair.decisionAgeDays', label: 'Days before an unsettled question comes to you', type: 'number', min: 1, max: 30,
+      hint: 'A pair it flagged "cannot settle" waits this long, then reaches you as a plain question with its partial reasoning attached.' }]
   })),
 
   {

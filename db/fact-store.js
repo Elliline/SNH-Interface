@@ -98,12 +98,18 @@ const DEFAULT_REASONS = {
   expire: 'This fact was expired — it had stopped being true of the present — and is kept as history. Whatever made the change recorded no reason of its own.',
   reword: 'This fact\'s wording was changed in place, so it never left the active set and Revert cannot put it back. The wording before the change is recorded here, which is what a person would restore by hand.',
   repoint: 'This retired fact was pointed at a different successor. The previous successor is recorded here.',
+  refile: 'This fact was filed under the wrong subject. It was retired there and re-filed under the right one, in one operation, so the store was never holding both.',
   restore: 'This fact was brought back into active memory. It is active again, so there is nothing here for Revert to undo.'
 };
 
 /** What revert() can actually undo — it calls restore(), which reactivates a row. */
 const REVERSIBLE_BY_ACTION = {
-  supersede: true, retire: true, expire: true, reword: false, repoint: false, restore: false
+  supersede: true, retire: true, expire: true, reword: false, repoint: false, restore: false,
+  // A refile retires the original and points it at the re-filed copy, which is
+  // exactly the shape revert() knows how to undo — restore() reactivates the
+  // original. What revert does NOT do is remove the copy, so a reverted refile
+  // leaves both rows active. Said here rather than discovered later.
+  refile: true
 };
 
 /**
@@ -860,6 +866,170 @@ async function reword(memberId, newContent, opts = {}) {
 }
 
 /**
+ * REFILE — retire a fact from the wrong subject and re-file it under the right
+ * one, as ONE transaction. The eighth action.
+ *
+ * WHY IT IS NOT `repoint`, WHICH IS THE FIRST THING ANYONE TRIES. Athena asked
+ * for exactly this check before the build: "repoint models a wrong *successor*,
+ * not a wrong *filing* — confirm the semantics cover 'retired from the wrong
+ * entity, re-filed under the right one', or add an eighth action." They do not.
+ * repoint() above refuses an ACTIVE fact by design (`an active fact has no
+ * successor to re-point`) and only re-aims the successor pointer of an already
+ * retired one. `entities.repointFact` is closer but is a pointer edit: it moves
+ * `subject_entity_id` and leaves the WORDING alone, which is wrong for the case
+ * this exists for — Juno's "User noticed she has a tendency to ask others to
+ * check her work" is not about Ellie, and re-aiming the pointer would leave a
+ * fact about Juno that still calls her "User". The referent and the sentence
+ * move together or the store lies either way.
+ *
+ * NEVER TWO VERSIONS, WHICH IS THE WHOLE REASON IT IS ONE OPERATION. Athena,
+ * Sept 1: "Juno's worst state was a true correction sitting next to the wrong
+ * fact, with both active. Retract + re-file should be one ledgered operation;
+ * otherwise the store sits permanently in two-versions and readers guess."
+ * That state is what `write_memory` produced when Juno tried to fix the
+ * clinic/ISH mix-up by appending — she wrote a true statement next to the wrong
+ * one and reported it fixed. So: one SQLite transaction, one ledger entry, and
+ * the original goes inactive pointing at the copy. There is no window in which
+ * both are active, and no second entry for a reader to reconcile.
+ *
+ * THE CLUSTER IS CHOSEN WITHOUT THE MODEL, deliberately. Semantic clustering
+ * would mean an LLM call, and an LLM call cannot happen inside the transaction
+ * that makes this atomic. So the copy lands in the target's most-populated
+ * active cluster of the right subject, or a new one named for the entity, and
+ * the heartbeat's cluster audit tidies it later the way it tidies everything
+ * else. A slightly wrong cluster is recoverable; a half-applied refile is not.
+ *
+ * @param {string} memberId       the fact as filed under the wrong subject
+ * @param {Object} to             {subject, entityId} the correct filing
+ * @param {Object} [opts]
+ * @param {string} [opts.newContent]  re-worded for the new referent; defaults to unchanged
+ * @param {number} [opts.salience]    defaults to the original's
+ * @param {string} [opts.claimType]   defaults to the original's
+ * @returns {Promise<{ok, memberId, newMemberId, ledgerId, reason?}>}
+ */
+async function refile(memberId, to = {}, opts = {}) {
+  const { deliberate = false } = opts;
+  const db = getSqliteDb();
+  const member = getMember(memberId);
+  if (!db || !member) return { ok: false, reason: 'no such fact' };
+  if (member.status !== 'active') {
+    return { ok: false, reason: 'only an active fact can be re-filed — this one is already inactive' };
+  }
+
+  const toSubject = to.subject || (to.entityId ? null : null);
+  const toEntityId = to.entityId || null;
+  if (!toSubject && !toEntityId) return { ok: false, reason: 'refile needs a target subject or entity' };
+  if (toSubject === member.subject && toEntityId === member.subject_entity_id) {
+    return { ok: false, reason: 'that is where the fact already is' };
+  }
+
+  // Locked twice over: the identity lock (fact-store's own funnel guard) and the
+  // entity lock (a fact that HOLDS an entity's name lock cannot be moved off it).
+  const refused = lockRefusal(memberId, 'refile', { deliberate });
+  if (refused) return refused;
+  try {
+    const entityLock = db.prepare('SELECT category FROM entity_locks WHERE member_id = ?').get(memberId);
+    if (entityLock) {
+      return { ok: false, refused: 'entity-locked', reason: `this fact holds the ${entityLock.category} lock for its entity and cannot be re-filed` };
+    }
+  } catch { /* table may not exist on an old store; the identity lock above still ran */ }
+
+  const subject = toSubject || member.subject;
+  const content = String(opts.newContent || member.content).trim();
+  if (!content) return { ok: false, reason: 'empty content' };
+
+  // The destination cluster, deterministically (see the header).
+  let clusterId = null;
+  try {
+    const owned = toEntityId ? db.prepare(`
+      SELECT cm.cluster_id AS id, COUNT(*) AS n
+      FROM cluster_members cm
+      JOIN memory_clusters mc ON mc.id = cm.cluster_id
+      WHERE cm.subject_entity_id = ? AND cm.status = 'active' AND mc.subject = ?
+      GROUP BY cm.cluster_id ORDER BY n DESC LIMIT 1
+    `).get(toEntityId, subject) : null;
+    clusterId = owned ? owned.id : null;
+    if (!clusterId) {
+      const any = db.prepare("SELECT id FROM memory_clusters WHERE subject = ? ORDER BY created_at ASC LIMIT 1").get(subject);
+      clusterId = any ? any.id : null;
+    }
+    if (!clusterId) {
+      clusterId = randomUUID();
+      const now = new Date().toISOString();
+      const entityName = toEntityId
+        ? (db.prepare('SELECT name FROM entities WHERE id = ?').get(toEntityId) || {}).name
+        : null;
+      db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?,?,?,?,?,?)')
+        .run(clusterId, entityName || (subject === 'self' ? 'Self' : 'User'),
+             'Opened by a refile — the heartbeat cluster audit will re-sort it.', now, now, subject);
+    }
+  } catch (err) {
+    return { ok: false, reason: `could not choose a cluster for the re-filed fact: ${err.message}` };
+  }
+
+  const newMemberId = randomUUID();
+  const now = new Date().toISOString();
+  let ledgerId = null;
+  try {
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO cluster_members (
+          id, cluster_id, content, source, importance, created_at, updated_at,
+          salience, subject, subject_entity_id, claim_type, status,
+          conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale
+        ) VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+      `).run(
+        newMemberId, clusterId, content, member.source || 'refile', now, now,
+        Number.isFinite(opts.salience) ? opts.salience : member.salience,
+        subject, toEntityId, opts.claimType !== undefined ? opts.claimType : member.claim_type,
+        // PROVENANCE TRAVELS WITH THE FACT. The receipt that justified the
+        // refile is about the ORIGINAL message, and the re-filed fact has the
+        // same origin — dropping it here would turn a fact with a source into
+        // a felt report, which is precisely the flag the detector now reads.
+        member.conversation_id, member.message_id, member.verbatim_source_text,
+        member.input_modality, member.salience_rationale
+      );
+      const changed = db.prepare(`
+        UPDATE cluster_members
+        SET status = 'inactive', inactive_reason = 'refiled',
+            successor_id = ?, superseded_by = ?, updated_at = ?
+        WHERE id = ? AND status = 'active'
+      `).run(newMemberId, newMemberId, now, memberId).changes;
+      if (!changed) throw new Error('the original was no longer active when the refile ran');
+      ledgerId = fileEntry('refile', member, {
+        opts,
+        survivorText: content,
+        evidence: {
+          refiled_to_member: newMemberId,
+          from_subject: member.subject, to_subject: subject,
+          from_entity: member.subject_entity_id || null, to_entity: toEntityId,
+          content_changed: content !== member.content,
+          cluster_id: clusterId
+        }
+      });
+      // survivorId is not a fileEntry parameter when there is no survivor row to
+      // pass; set it directly so revert and the Corrections view both see the
+      // copy this retirement points at.
+      require('./corrections-ledger').enrich(ledgerId, { survivorId: newMemberId, survivorText: content });
+    })();
+  } catch (err) {
+    console.error(`[FactStore] refile ${memberId.slice(0, 8)} ROLLED BACK: ${err.message}`);
+    return { ok: false, sqlite: false, ledgerId: null, reason: err.message };
+  }
+
+  const dropped = await dropVector(memberId);
+  if (!dropped) reportVectorFailure('refile', memberId, member.content);
+  const added = await replaceVector(newMemberId, clusterId, content);
+
+  if (member.subject === 'self' || subject === 'self') {
+    noticeSelfChange(member, { operation: 'retired', opts: Object.assign({}, opts, { ledgerId }) });
+  }
+  console.log(`[FactStore] re-filed ${memberId.slice(0, 8)} -> ${newMemberId.slice(0, 8)} ` +
+              `(${member.subject} -> ${subject}, vector dropped=${dropped} added=${added}, ledger=${ledgerId.slice(0, 8)})`);
+  return { ok: true, sqlite: true, memberId, newMemberId, clusterId, ledgerId, vector: dropped && added };
+}
+
+/**
  * Compare SQLite against the vector index and report where they disagree.
  *
  * Deliberately REPORT-ONLY — it never edits anything. This is the substrate the
@@ -945,7 +1115,7 @@ async function reconcile() {
 }
 
 module.exports = {
-  supersede, retire, expire, restore, reword, repoint, dropVector, replaceVector, reconcile,
+  supersede, retire, expire, restore, reword, repoint, refile, dropVector, replaceVector, reconcile,
   findExactDuplicate, absorbDuplicate, absorbRepeat, recordCorroboration, corroborationCount,
   getMember, selfChangeNotice, NOTICE_PROMISE
 };

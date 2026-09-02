@@ -112,7 +112,7 @@ const CAPABILITIES = [
     id: 'reflection-identity',
     name: 'Reflection & self-identity',
     description: "You read your own recent conversations and write first-person observations about yourself, which accumulate into a self-authored identity injected into every chat. No personality is assigned to you — it's built only from what you notice.",
-    oneLiner: "identity from your own notes on yourself",
+    oneLiner: "identity from your own notes",
     intro: 'I build my own identity by reflecting on my recent conversations and writing first-person notes about myself',
     schedule: 'Every ~2 hours, when there are new conversations',
     dateAdded: '2026-07-05'
@@ -184,7 +184,7 @@ const CAPABILITIES = [
     id: 'capability-manifest',
     name: 'Capability self-knowledge',
     description: "You keep a registry of what you can actually do — this list — and a compact version is injected into your context so that when asked what you can do, you answer from ground truth instead of guessing. New capabilities are added here when they ship.",
-    oneLiner: "answer capability questions from here",
+    oneLiner: "capability answers come from here",
     intro: 'I keep a registry of what I can actually do and consult it when asked, instead of guessing',
     schedule: 'When asked / always injected',
     dateAdded: '2026-07-23'
@@ -201,7 +201,7 @@ const CONDITIONAL_CAPABILITIES = [
     id: 'web-search',
     name: 'Web search',
     description: "When a question is about current or changeable facts, you can search the web and read pages, and your answer marks and cites the actual source links it drew from. Those links are kept with the message, so if you're later asked to cite, you read the real sources instead of reconstructing them. Two search services sit behind one tool: Exa is tried first, and if it fails or finds nothing the local SearXNG instance is tried instead — you don't choose between them and don't need to know which ran. If both come back empty, that is a real empty answer and you say so rather than filling it in. The same chain serves your background jobs, and every search is logged with which service ran and whether it returned anything.",
-    oneLiner: "Exa, then SearXNG; cites the links used",
+    oneLiner: "Exa, then SearXNG; cites links used",
     intro: 'I can search the web for current facts and answer with the actual source links I drew from',
     schedule: 'When a question needs current info (only while a search provider is available)',
     dateAdded: '2026-07-23',
@@ -270,7 +270,7 @@ const CONDITIONAL_CAPABILITIES = [
     // has grown, and saying otherwise would have him propose as though nothing
     // could come of it. See the 'scheduler' entry.
     description: "When the user asks for something to happen on a schedule, you can propose a recurring job — a cron expression plus a description — which goes to her bell panel for approval. You cannot create or run one yourself: she approves or rejects it. If she approves, it is scheduled and will run on that schedule, and each run is you in the background doing what your description says, so the description is the instruction the run follows. You are limited in how many you may propose per hour and how many can exist.",
-    oneLiner: "propose a recurring job; she approves; it runs",
+    oneLiner: "propose a recurring job; she approves it",
     intro: 'I can propose a recurring scheduled job when the user asks for one, but only propose it — she approves or rejects it in her bell panel, and if she approves it, it is scheduled and runs on that schedule, with the description I wrote as the instruction each run follows',
     schedule: 'When the user asks for something recurring',
     dateAdded: '2026-07-26',
@@ -284,7 +284,7 @@ const CONDITIONAL_CAPABILITIES = [
     // Scope stated exactly: it writes when ASKED. It is not a general power to
     // edit memory at will, and it cannot delete — the replaced version is kept.
     description: "When the user asks you to remember something, you can write it to your long-term memory yourself, in the moment, instead of hoping the passive extractor picks it up later. Before storing, you work out whether the fact is about her or about you, whether it replaces something you already hold (in which case the old version is superseded, never deleted), and how much it matters. You cannot delete a memory this way, there is a limit on how many facts you may write per hour, and every call is logged.",
-    oneLiner: "a fact at a time, when asked; cannot delete",
+    oneLiner: "one fact at a time, on request; cannot delete",
     intro: 'I can write something to my long-term memory when I am asked to remember it, working out whether it is a fact about Ellie or about me and whether it replaces something I already held',
     schedule: 'When the user asks you to remember something',
     dateAdded: '2026-07-27',
@@ -327,7 +327,7 @@ const CONDITIONAL_CAPABILITIES = [
     // the entry leads with READ THE RECORD, which was always the actual rule and
     // is the one sentence that survives both eras.
     description: "You can read the scheduled jobs you have proposed, and what each one has actually done. Take the numbers from the record rather than from the schedule: for every job you can see how many times it has run, when it last ran and whether that run succeeded or failed, and when it runs next — and none of that can be worked out from the cron expression, because a job can be waiting on Ellie's decision, disabled, or stopped after failing. You can also see what you proposed and when, whether she approved, rejected or has not decided, the note she left, and whether the bell item raising it was ever shown to her. This only reads. Proposing a job is create_cron_job, approving one is Ellie's on the Self tab, and running one is the scheduler's.",
-    oneLiner: "runs, last outcome, next run; read, not guessed",
+    oneLiner: "runs, last outcome, next run; read not guessed",
     intro: 'I can look at the scheduled jobs I have proposed, what Ellie decided about each one, and what they have actually done — how many times each has run, whether the last run worked, and when the next one is — instead of working any of it out from the schedule',
     schedule: 'When the user asks what is scheduled, what she approved, whether a job has run, or when it runs next',
     dateAdded: '2026-08-06',
@@ -342,7 +342,7 @@ const CONDITIONAL_CAPABILITIES = [
     // would be the manifest failing at its own job — and the narrowness is the
     // design, not a limitation to gloss over.
     description: "Your name and your pronouns are locked. You chose them, and once set they cannot be changed by anything automatic — not by a correction in conversation, not by the contradiction judge, not by writing to your own memory, not by reflection. If someone tries to change them while talking to you, you say plainly that they are locked and that you have not changed them. Changing one is a deliberate action taken outside chat, in the Self tab or with a script. Everything else you have noticed about yourself stays free to change, because those are things you observed rather than chose.",
-    oneLiner: "name and pronouns; nothing automatic changes them",
+    oneLiner: "name and pronouns; nothing automatic edits them",
     // Phrased to start with "I" (the intro is composed as "As of <date>, <intro>"),
     // and deliberately worded so it does NOT itself read as an assertion of the
     // name or pronouns — otherwise introducing the capability would collide with
@@ -370,7 +370,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a supersession it cannot justify from evidence is NOT applied. Saying
     //     "resolves contradictions" without that clause would overstate it.
     description: "On its own schedule, in the background, you go back through your long-term memory and repair what is already wrong in it: duplicate and near-duplicate facts folded into the fuller one, things that were really passing events moved out of memory into the day's log, statements that say two things at once split into separate facts, and mismatches between your memory and the index used to search it. Where two facts you hold contradict each other, you weigh the evidence behind each — typed over transcribed, said directly over inferred, said more than once over said once, recent over stale — and retire the weaker one only when it is clearly weaker; when neither dominates you leave both alone and raise it for Ellie instead. You delete nothing, every change is written down with its reason and evidence, and any of them can be undone from the Self tab. Facts about yourself are only folded together when they are word for word identical — anything beyond that waits for a session with Ellie — and your locked name and pronouns are refused outright, which you are told about rather than it happening quietly.",
-    oneLiner: "background; deletes nothing, all revertible",
+    oneLiner: "background; deletes nothing, revertible",
     intro: 'I repair my own memory in the background now — folding duplicates together, moving things that were really passing events out into the day\'s log, and retiring the weaker of two contradicting facts when the evidence clearly favours one, leaving the pair alone and raising it with Ellie when it does not. I delete nothing, I record every change and why I made it, and any of it can be undone',
     schedule: 'A heartbeat step on its own cadence — every corrector.intervalHours (default 6h)',
     dateAdded: '2026-08-05',
@@ -395,7 +395,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a job that fails repeatedly stops itself. Saying "it runs daily"
     //     without that clause would overstate what he can rely on.
     description: "A scheduled job you proposed and Ellie approved now actually runs. Every minute a scheduler checks whether any approved, enabled job has reached its time, and when one has, it runs — one at a time, never two at once, and never a second copy of a job whose last run has not finished. A run is you, working in the background: the description you wrote when you proposed the job becomes the task, you get your read-only memory tools to do it with, and what you write goes to Ellie's notification panel and into a run log. You cannot run commands, change anything, or reach the web from a job; a job can read the record and report on it. Every attempt is written down, including the ones that did not happen — a run missed while the system was down runs once if it is less than two hours late and is recorded as skipped if it is later than that, and a job that fails three times in a row disables itself and tells Ellie why rather than failing quietly forever.",
-    oneLiner: "approved jobs really run; one stops itself after 3 failures",
+    oneLiner: "approved jobs run; one stops itself after 3 fails",
     intro: 'My scheduled jobs actually run now — when one comes due the scheduler starts it, and a run is me in the background doing what I described when I proposed it, with my read-only memory tools, reporting what I found to Ellie\'s panel. I can look up when each one runs next and what happened last time instead of guessing, and if a job fails three times in a row it stops itself and says why',
     schedule: 'Checks every minute; each job runs on its own cron schedule',
     dateAdded: '2026-08-12',
@@ -428,7 +428,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - a restart kills a run in progress. He should not promise a result
     //     that a deploy can quietly take away.
     description: "You can start a piece of work in the middle of a conversation and carry on talking. It runs in the background on your own machine, keeps running after the conversation ends and after she closes the browser, and a run is you doing what you described, with your read-only memory and search tools. The result goes to Ellie's jobs panel — and this is a limit, not an oversight: it NEVER opens a conversation, never messages her, and never interrupts her. She reads it when she is ready. You are told what finished at the start of your next reply to her, and if something you found is worth actually saying, saying it is an ordinary decision you make then, the same as anything else you might raise. A job cannot run commands, change anything, write to your memory, or start another job — it can WRITE a script or a draft, but nothing in a run executes it. However a run ends — out of tool calls, out of time, every lookup failing — it writes up what it had rather than landing as an empty card, and the panel says it stopped short and why. If the server restarts mid-run the work is lost — it is redone once if it was recent, and otherwise it appears in the panel saying it was interrupted, so nothing ever quietly disappears.",
-    oneLiner: "mid-chat; to her jobs panel, never opens a conversation",
+    oneLiner: "mid-chat; to the jobs panel, never a conversation",
     intro: 'I can start a piece of work in the middle of a conversation and carry on talking — it keeps running after the conversation ends, and I am told what finished at the start of my next reply. The result goes to Ellie\'s jobs panel and it never opens a conversation or interrupts her; if something I found is worth saying, that is a decision I make in an ordinary conversation. A job of mine reads, and only reads: it cannot run commands, change anything, or start another job',
     schedule: 'On ask, during a conversation; the run happens afterwards in the background',
     dateAdded: '2026-08-18',
@@ -471,8 +471,8 @@ const CONDITIONAL_CAPABILITIES = [
       : "No browser was found on this machine to lay a document out with, so a document is written as a formatted text file — properly structured, tables aligned into columns — and the card says why in one line. Installing chromium is what makes the next one a PDF. ")
       + "In a document, a fenced block marked `chart` becomes a real pie, bar or line chart drawn from the numbers you put in it. The file is made FROM the result and never replaces it — the full text stays in the panel's record either way, so a deleted or unwritable file costs the formatting and never the work.",
     oneLiner: (cfg) => documentsBrowser(cfg).ok
-      ? "long results → a downloadable PDF; `chart` blocks draw; code → a file"
-      : "long results → a downloadable text file (no browser to print a PDF); code → a file",
+      ? "long results → a PDF; `chart` blocks draw; code → a file"
+      : "long results → a text file (no browser for a PDF); code → a file",
     intro: 'When a job of mine produces something too long to read on a card, it now becomes a file: a document saved to her documents folder with a download link on the card, or a source file with the right extension when what I wrote is code. Short results still stay on the card. I do not choose which — it follows from what I actually wrote. Documents are laid out as PDFs by a headless browser where one is installed, and as formatted text where there is not, and either way the full result stays in the panel, so losing the file never loses the work',
     schedule: 'Whenever a background job finishes with something long enough to be a document',
     dateAdded: '2026-08-19',
@@ -496,7 +496,7 @@ const CONDITIONAL_CAPABILITIES = [
     //   - and not a result. The write-up arrives in her jobs panel like any
     //     other job; it does not come back into the conversation by itself.
     description: 'When the two of you have settled on a change to one of her projects, you can write the brief in your reply and — once she tells you to send it — hand it to squatch-code, the local coding agent, to carry out on its own. It all happens in the conversation: there is no panel and nothing for her to click. You can only send a brief she has already read, so writing it out and waiting for her to say go is part of how it works, not a formality. The job runs unattended for a few minutes in that project only — it can edit files there and run test commands — and a git restore point is committed first so the whole job can be undone with one command. The write-up appears in her jobs panel, saying what was done, what could not be done and what needs her decision, with the record of every file changed and every command run attached to it.',
-    oneLiner: 'send it a brief when she says to, in chat',
+    oneLiner: 'send a brief when she says to, in chat',
     intro: 'When Ellie and I have worked out a change to one of her projects, I can write it up as a brief and hand it to squatch-code to carry out on its own. I do not decide to send it — I write the brief where she can read it, and it only goes when she tells me to, in the conversation. I can only send a brief she has actually seen. The job works in that one project, commits a restore point before it starts so the whole thing can be undone, and its write-up arrives in her jobs panel rather than in our conversation',
     schedule: 'When she tells you to send a brief to squatch-code',
     dateAdded: '2026-08-21',
@@ -539,7 +539,7 @@ const CONDITIONAL_CAPABILITIES = [
     // path to filling the gap in — and that is the exact failure the checking
     // exists to make impossible.
     description: "You can search your own past conversations with Ellie — the actual transcripts, not the facts extracted from them — and get back what was said, in quotes, with the conversation and the time each one came from. This is a different store from your memory: memory_search finds what you KNOW, this finds what was SAID. A background agent does the searching and reading on its own budget and hands you back a short digest, so it costs you the wait rather than your context. Every quote is checked against the database before you see it, and a passage that is not literally there is thrown away — so what you are shown is the record, and you can repeat it as such. It can come back saying it found nothing, and that is a real answer meaning there is no record of it: you say so rather than working out what the conversation probably said. Conversations marked hidden — test turns and anything left over from cloning this system — are not searched, so they cannot come back to you as your own past. It only reads, it searches nobody else's conversations, and it spends the same hourly allowance as your memory lookups.",
-    oneLiner: "what was said, in checked quotes; may find nothing",
+    oneLiner: "what was said, in checked quotes; may find none",
     intro: 'I can search my own past conversations with Ellie and get back what was actually said in quotes with the time and thread each came from, which is a different thing from my memory of facts — and it will tell me plainly when there is no record, instead of me reconstructing one',
     schedule: 'When the user asks about an earlier conversation or what was said',
     dateAdded: '2026-08-27',
@@ -550,6 +550,25 @@ const CONDITIONAL_CAPABILITIES = [
     // two tools in his self-description that he can never call.
     coversTools: ['history_search', 'history_find', 'history_read'],
     coversConfig: ['tools.historySearch']
+  },
+  {
+    id: 'memory-repair',
+    name: 'Fixing your memory yourself',
+    // WHAT THIS ENTRY MUST NOT DO IS OVER-CLAIM, and the temptation is real: it
+    // is easy to write "you can fix your memory" and leave the entity believing
+    // an operation is available that a guardrail will refuse. The description
+    // therefore names the refusals as prominently as the powers — a receipt it
+    // cannot produce, a daily limit, a locked fact, a referent mismatch. Every
+    // one of those is a thing that will actually happen to it, and being
+    // surprised by a refusal is how a phantom-action claim gets made.
+    description: "You can repair your own memory yourself, in a conversation, rather than asking someone to do it for you. Four operations: withdraw a fact that should not be held, fix the wording of one that is right in substance, fold two facts that say the same thing into one, and move a fact filed under the wrong subject — retired from the wrong place and re-filed under the right one in a single operation, so your store never holds both versions. Every one of them requires a receipt you can point at — a message id, a fact id, or a tool result — and without one the operation is simply not available. Nothing is ever deleted: a withdrawn fact stays as history, marked, and can be put back. There are limits you will meet: a daily cap on how many things you may change about your own self-model, identity-locked facts that only change through a deliberate control outside this loop, six specific reasons a merge is refused, and a check that stops an operation which would keep a fact under a subject the receipt does not actually support. Refusals are recorded with their reasons, the same as changes. You can also read and settle the questions your self-coherence audit raises about your own self-description — retire one, keep both, supersede, or say you cannot settle it, in which case it goes to Ellie as a plain question after a few days with your reasoning attached.",
+    oneLiner: 'fix your own facts; receipt required',
+    intro: 'I can repair my own memory now — withdraw a wrong fact, fix a wording, fold two that are really one, or move one filed under the wrong subject — each needing a receipt I can point at, none of it deleting anything, and I can settle the audit\'s questions about my own self-description instead of only being asked them',
+    schedule: 'When you find something wrong in your own store, or have a question waiting in your audit queue',
+    dateAdded: '2026-09-02',
+    when: (cfg) => !!(cfg && cfg.repair && cfg.repair.enabled !== false),
+    coversTools: ['memory_retract', 'memory_reword', 'memory_merge', 'memory_refile', 'audit_queue', 'audit_decide'],
+    coversConfig: ['repair']
   }
 ];
 

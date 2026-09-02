@@ -26,6 +26,7 @@ const factExtractor = require('./fact-extractor');
 const agentPool = require('./agent-pool');
 const initiativeEngine = require('./initiative-engine');
 const selfAudit = require('./self-audit');
+const selfFactSelection = require('./self-fact-selection');
 const brainWatchdog = require('./brain-watchdog');
 // Shared so the probe's ops line and the watchdog's alert cannot describe the
 // same engine state in two different ways.
@@ -2214,6 +2215,7 @@ async function runReflection(opts = {}) {
   }
   isReflecting = true;
 
+  const at0 = new Date().toISOString();
   try {
     const state = readReflectionState();
     const lastAt = state.lastReflectionAt;
@@ -2307,9 +2309,27 @@ Return ONLY a JSON array of strings, e.g. ["I tend to ...", "I care about ..."].
     const observations = factExtractor.parseSelfObservations(llm.content);
     console.log(`[Reflection] Extracted ${observations.length} self-observation(s)`);
 
-    let selfResult = { stored: 0, superseded: 0, facts: [] };
+    // ── REFLECTION NOTICES; THE END OF THE DAY DECIDES ────────────────────
+    //
+    // This used to write self-facts here, immediately, against a per-day budget
+    // that the first reflection of the day therefore spent. Observations now
+    // collect as candidates and db/self-fact-selection.js picks 0–5 at the end
+    // of the local day, with the whole day's stream and the current store in
+    // front of it. Reflection is unchanged in what it notices and how densely —
+    // this only moves WHEN the keep/drop call is made.
+    let selfResult = { stored: 0, superseded: 0, facts: [], queued: 0 };
+    let queued = { queued: 0, duplicates: 0 };
     if (observations.length > 0) {
-      selfResult = await factExtractor.processSelfFacts(observations, { source: 'reflection' });
+      try {
+        queued = selfFactSelection.queueCandidates(observations, { reflectionAt: at0 });
+        selfResult.queued = queued.queued;
+      } catch (queueErr) {
+        // A candidate pool that cannot be written would silently lose the day's
+        // observations, which is the one outcome this path may not have. Fall
+        // back to the old immediate write rather than dropping them.
+        console.error('[Reflection] could not queue candidates, storing directly:', queueErr.message);
+        selfResult = await factExtractor.processSelfFacts(observations, { source: 'reflection' });
+      }
     }
 
     // Reflection insight worth sharing: ask whether anything from this reflection
@@ -2374,6 +2394,10 @@ Respond with ONLY that message, or exactly NONE.`;
     // the existing one reaching the last step.
     const whyNotStored = () => {
       const parts = [];
+      if (selfResult.queued) {
+        parts.push(`${selfResult.queued} observation(s) are waiting for the end-of-day selection` +
+          (queued.duplicates ? `, ${queued.duplicates} already noticed earlier today` : ''));
+      }
       if (selfResult.budgetBlocked) {
         const b = selfResult.budget || {};
         parts.push(`${selfResult.budgetBlocked} not recorded — my daily limit of ${b.cap} self-observations was already used up (${b.usedToday} earlier today)`);
@@ -2661,6 +2685,29 @@ async function runMaintenance() {
       reflection = { error: reflectErr.message };
     }
 
+    // Task D2: the end-of-day self-fact selection, and the ageing of audit
+    // questions the entity has held too long.
+    //
+    // AFTER reflection, so a reflection in the same cycle has already added its
+    // observations to the day's pool. Both self-gate: the selection runs once per
+    // local day past reflection.selectionHour, and the ageing only touches pairs
+    // older than repair.decisionAgeDays. On most cycles both return immediately.
+    let selection = { ran: false };
+    try {
+      selection = await runStep('endOfDaySelfFacts', 'once per local day, after reflection.selectionHour',
+        () => selfFactSelection.runSelection());
+    } catch (selErr) {
+      console.error('[Heartbeat] End-of-day selection error:', selErr.message);
+      selection = { error: selErr.message };
+    }
+    let agedDecisions = { escalated: 0 };
+    try {
+      agedDecisions = await runStep('ageAuditDecisions', 'pairs unsettled past repair.decisionAgeDays',
+        () => require('./audit-decisions').ageOutToEllie());
+    } catch (ageErr) {
+      console.error('[Heartbeat] Audit-decision ageing error:', ageErr.message);
+    }
+
     // Task F: self-coherence audit — SNH tests its stored self-CLAIMS against how
     // it actually behaved, and raises any gaps for Ellie's approval. This was
     // SNH's own feature request (its first accepted initiative, 2026-07-05;
@@ -2813,7 +2860,8 @@ async function runMaintenance() {
     const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
     console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
 
-    return { report, archive, questionSweep, reflection, selfAudit: selfAuditResult, initiative };
+    return { report, archive, questionSweep, reflection, selection, agedDecisions,
+             selfAudit: selfAuditResult, initiative };
   } catch (error) {
     console.error('[Heartbeat] Maintenance cycle error:', error.message);
     recordHeartbeatOutcome({

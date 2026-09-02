@@ -49,7 +49,8 @@ const CARDS = [
   { id: 'memoryWrite', title: 'Writing to memory', blurb: 'Recording something you asked to be remembered. Direct-execute, on the chat path, where a person is in the room.' },
   { id: 'conversations', title: 'Talking to you', blurb: 'How he reaches you: opening a conversation in your sidebar, or adding to one already there — yours as well as his. There is no separate inbox; what he sends shows as unread on the conversation until you open it, and nothing here can archive a conversation without your approval.' },
   { id: 'cron', title: 'Scheduled jobs', blurb: 'Proposals only: a call raises an item in the bell panel for you to approve or reject. Nothing is scheduled without your decision.' },
-  { id: 'correctorWrites', title: 'Repairing the record', blurb: 'The three narrow writes the background corrector may make. Never offered in a conversation, and every change is reversible from the Self tab.' }
+  { id: 'correctorWrites', title: 'Repairing the record', blurb: 'The three narrow writes the background corrector may make. Never offered in a conversation, and every change is reversible from the Self tab.' },
+  { id: 'memoryRepair', title: 'Repairing its own memory', blurb: 'The entity fixing its own store, in the turn, with its own hands — withdraw a wrong fact, fix a wording, fold two that are one, move one filed under the wrong subject. Every operation needs a receipt it can point at or it is not available, every one is ledgered and readable in Corrections, and identity-locked facts stay locked. Also the reply box on the questions its self-coherence audit raises about itself, which used to have nowhere to be answered.' }
 ];
 
 /** Resolve a dotted path against live config, for a field's current value. */

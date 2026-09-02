@@ -1172,6 +1172,17 @@ function initDatabase() {
       throw e;
     }
 
+    // MEMORY REPAIR — the anchor flag on facts, and the decided-pair table
+    // (2026-09-02). Before entities, because entities repoints cluster_members
+    // rows and this only adds a column to them; after everything that creates
+    // the table itself.
+    try {
+      require('./memory-repair').initSchema(sqliteDb);
+    } catch (e) {
+      console.error('Migration: memory repair FAILED —', e.message);
+      throw e;
+    }
+
     // ENTITIES — the third subject (2026-09-01). Last, because it repoints rows
     // in cluster_members and memory_clusters and so needs every column above it
     // to exist first. Idempotent: re-running finds the founding entities already

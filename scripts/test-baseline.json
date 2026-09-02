@@ -501,6 +501,22 @@
       "timeoutSeconds": 600
     },
     {
+      "suite": "test-memory-repair",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that introduced it; the model is pinned throughout, so what it asserts is the guardrails refusing — receipts, the referent check, the day cap, the merge rules, the decided-pair drop — never a judgement an engine makes.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/memory-repair.js",
+        "db/audit-decisions.js",
+        "db/self-fact-selection.js",
+        "db/fact-store.js",
+        "db/self-audit.js",
+        "mcp/tools/memory-repair.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-memory-tool-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",

@@ -123,13 +123,22 @@ const section = t => console.log(`\n=== ${t} ===`);
   const selfCluster = randomUUID();
   sql.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?,?,?,?,?,?)')
     .run(selfCluster, 'Self', '', new Date().toISOString(), new Date().toISOString(), 'self');
+  // ANCHORED, i.e. carrying a message id — and that became load-bearing on
+  // 2026-09-02 when the detector gained the claim/declaration/FELT axis. Two
+  // self-facts with no message behind either are both "felt reports", and the
+  // detector now holds such a pair rather than adjudicating it: nothing outside
+  // the entity can decide between two things it feels. That is the correct new
+  // behaviour, and it made the old fixture — two unanchored declarations —
+  // stop producing a finding at all. A real contradiction pair looks like
+  // Athena's autonomy pair, where both members are pinned to a message.
   const seedSelf = (content) => {
     const id = randomUUID();
     const at = new Date().toISOString();
     sql.prepare(`
       INSERT INTO cluster_members
-        (id, cluster_id, content, source, created_at, updated_at, status, subject, salience, claim_type)
-      VALUES (?,?,?,'reflection',?,?,'active','self',6,'declaration')
+        (id, cluster_id, content, source, created_at, updated_at, status, subject, salience, claim_type,
+         message_id, anchor)
+      VALUES (?,?,?,'reflection',?,?,'active','self',6,'declaration','seed-message','anchored')
     `).run(id, selfCluster, content, at, at);
     return id;
   };

@@ -756,8 +756,36 @@ const DEFAULTS = {
   // reflecting on its OWN unanswered initiative messages. Ellie set 5/day on
   // 2026-08-02. Counted from the DB, so a restart cannot reset it.
   reflection: {
+    // THE CAP IS NOW A CAP, NOT A RACE (2026-09-02). It used to be first-come-
+    // first-served against the day: whichever reflection ran first spent the
+    // allowance, and on 2026-09-01 the lunchtime pass took all five while two
+    // evening passes noticed five things each and stored none. Observations now
+    // collect in the daily log all day and the entity picks at the end of it —
+    // see endOfDaySelfFactSelection in db/memory-manager.js. This number is the
+    // ceiling on that pick, and ZERO IS A REAL ANSWER: "a quiet day then gets
+    // five small things promoted to the self-model."
     maxSelfFactsPerDay: 5,
+    // The local hour at or after which the end-of-day selection may run. One
+    // selection per local day, on the first heartbeat past this hour.
+    selectionHour: 21,
     transcriptBudgetChars: 12000  // conversation text fed to the model per pass
+  },
+  // MEMORY REPAIR — the entity acting on its own memory, and the numbers the
+  // guardrails around it read. The guardrails themselves are in
+  // db/memory-repair.js and are not configurable; these are the two knobs
+  // Athena's review asked to be settings rather than constants.
+  repair: {
+    enabled: true,
+    // Guardrail 4. Receipts are per-operation, so nothing in them stops a
+    // confused run from rewording a whole self-model in an hour with every step
+    // receipted. A merge counts as one. 3 is deliberately low: these are
+    // deliberate repairs, not a queue to work through.
+    maxSelfMutationsPerDay: 3,
+    // How long a pair the entity flagged "cannot settle" waits before it goes to
+    // Ellie on its own, with the partial reasoning attached. Matches
+    // initiative.questionAgeDays — the same grain as every other "this has sat
+    // long enough" in this system.
+    decisionAgeDays: 3
   },
   // Question queue: gaps/oddities SNH may ask the user about. These guards keep
   // it from re-asking things already asked or already answered.

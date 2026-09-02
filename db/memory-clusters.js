@@ -695,13 +695,24 @@ async function assignToCluster(fact, provider, model, apiKey, host, source = 'co
       INSERT INTO cluster_members (
         id, cluster_id, content, source, importance, created_at, updated_at,
         salience, subject, subject_entity_id, claim_type, status,
-        conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale
+        conversation_id, message_id, verbatim_source_text, input_modality, salience_rationale,
+        anchor
       )
-      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       memberId, clusterId, fact, source, nowIso, nowIso, salienceValue, subject, subjectEntityId,
       claimType, memberStatus,
-      p.conversationId, p.messageId, p.verbatimSourceText, p.inputModality, p.salienceRationale
+      p.conversationId, p.messageId, p.verbatimSourceText, p.inputModality, p.salienceRationale,
+      // ANCHORED OR FELT, SET BY THE STORE AT WRITE TIME AND NEVER BY THE ENTITY.
+      // "Assign it mechanically — a fact with no message or tool receipt is a
+      // felt report — not by me, because if I flag, I flag the ones I like."
+      // Computed here rather than left to a backfill so the flag is on the fact
+      // from the moment it exists; db/memory-repair.anchorOf falls back to the
+      // same rule for any row written before the column did.
+      // A MESSAGE ID AND NOTHING ELSE — verbatim_source_text is a copy of the
+      // fact's own sentence on the reflection path, so counting it would let a
+      // self-observation anchor itself. See db/memory-repair.js initSchema.
+      (p.messageId && String(p.messageId).trim()) ? 'anchored' : 'felt'
     );
 
     console.log(`[Clusters] Added fact to cluster: ${clusterName}`);
