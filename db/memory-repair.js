@@ -489,20 +489,40 @@ function mergeRefusal(loser, survivor) {
       'The merge would delete the history that is the point. Supersede instead.');
   }
 
-  // 1. The small text difference IS the fact — a negation one side asserts and
-  //    the other denies. Detected as a negation asymmetry over shared content
-  //    words, which is deliberately eager: it errs toward refusing a merge.
-  const NEG = /\b(?:not|never|no|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't|nor)\b/i;
-  const negA = NEG.test(loser.content), negB = NEG.test(survivor.content);
-  if (negA !== negB) {
-    const words = t => new Set(String(t || '').toLowerCase().match(/\b[a-z]{5,}\b/g) || []);
-    const wa = words(loser.content), wb = words(survivor.content);
-    const shared = [...wa].filter(w => wb.has(w));
-    if (shared.length >= 3) {
-      return no('negation-divergence',
-        'One of these asserts what the other denies, about the same thing. That difference IS the fact — ' +
-        'merging it would let a wording decide the question. This is a decision plus a supersession, not tidying.');
+  // 1. THE SMALL TEXT DIFFERENCE IS THE FACT — one asserts what the other denies.
+  //
+  // The test is NOT "one of them contains a negation and they share some
+  // words", which is what this was first written as and which was wrong on the
+  // first real pair it met. Juno's two identity facts share six content words
+  // and one of them ends "and I am not a third party" — a negation of something
+  // the other never mentions. That is an extra assertion, not an opposition,
+  // and refusing it would have blocked a legitimate merge for the wrong reason.
+  //
+  // What makes it an opposition is that the NEGATED THING is itself asserted by
+  // the other fact. So: take the words just after the negation, and require
+  // them to appear in the other text. Athena's autonomy pair passes that test
+  // — "I do NOT have a staged-autonomy permission requirement" against "I have
+  // been granted staged autonomy where I must ask for permission" — and Juno's
+  // third-party clause does not.
+  const oppositionOn = (negated, other) => {
+    const NEG_SPAN = /\b(?:not|never|no longer|cannot|can't|do not|don't|does not|doesn't|did not|didn't|is not|isn't|are not|aren't|will not|won't)\b\s+((?:[\w'-]+\s+){0,5}[\w'-]+)/gi;
+    const otherWords = new Set(String(other || '').toLowerCase().match(/\b[a-z]{4,}\b/g) || []);
+    let m;
+    while ((m = NEG_SPAN.exec(String(negated || ''))) !== null) {
+      const span = (m[1].toLowerCase().match(/\b[a-z]{4,}\b/g) || []);
+      if (span.length < 2) continue;
+      const hits = span.filter(w => otherWords.has(w)).length;
+      // Half the substantive words of what is being denied are asserted over
+      // there: the two facts are arguing, not merely differing.
+      if (hits >= 2 && hits / span.length >= 0.5) return m[0].trim();
     }
+    return null;
+  };
+  const opposed = oppositionOn(loser.content, survivor.content) || oppositionOn(survivor.content, loser.content);
+  if (opposed) {
+    return no('negation-divergence',
+      `One of these denies what the other asserts ("${opposed.slice(0, 60)}"). That difference IS the fact — ` +
+      'merging it would let a wording decide the question. This is a decision plus a supersession, not tidying.');
   }
 
   return { ok: true, code: null, reason: null };
