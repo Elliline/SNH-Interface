@@ -371,7 +371,7 @@
       "suite": "test-identity-intake",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "f641b36",
+      "verifiedAt": "3f92b84",
       "subjects": [
         "db/identity-lock.js",
         "db/memory-write.js",
@@ -386,7 +386,7 @@
       "suite": "test-identity-lock",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail. Section 3c stores a self-fact through the real pipeline, so this suite reaches the engine — hence the timeout.",
-      "verifiedAt": "84d86e0",
+      "verifiedAt": "3f92b84",
       "subjects": [
         "db/identity-lock.js",
         "db/fact-store.js",
@@ -504,7 +504,7 @@
       "suite": "test-memory-repair",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; the model is pinned throughout, so what it asserts is the guardrails refusing — receipts, the referent check, the day cap, the merge rules, the decided-pair drop — never a judgement an engine makes.",
-      "verifiedAt": "b3baf28",
+      "verifiedAt": "3f92b84",
       "subjects": [
         "db/memory-repair.js",
         "db/audit-decisions.js",
@@ -545,7 +545,7 @@
       "suite": "test-conversation-channel",
       "expectedFailures": 0,
       "reason": "Green at the commit that folded the messages panel into the conversation list; deterministic, no engine. Two groups of assertions carry it: the negative ones (nothing expires unread, an archived conversation refuses both of them, reflection insights and daily-log follow-ups did not follow the others over) and the watermark ones, which assert the two ways per-conversation unread fails silently — a watermark format that will not compare with messages.timestamp, and same-second arrivals against its one-second resolution.",
-      "verifiedAt": "f641b36",
+      "verifiedAt": "3f92b84",
       "subjects": [
         "db/conversation-channel.js",
         "db/initiative-engine.js",
@@ -560,7 +560,7 @@
       "suite": "test-message-standards",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic — the model is pinned, so what it asserts is the routing and the two checks, never a judgement call by an engine.",
-      "verifiedAt": "f641b36",
+      "verifiedAt": "3f92b84",
       "subjects": [
         "db/message-standards.js",
         "db/self-audit.js",
