@@ -86,32 +86,43 @@ function daysAgoIso(days) {
  */
 
 /**
- * Put something into the MESSAGE CHANNEL rather than the bell.
+ * Put something into HER CONVERSATION LIST rather than the bell.
  *
- * Appends to an active thread on the same subject when one exists, because the
- * whole point of threads is that a subject stays in one place — and opens a new
- * one pointing at the last retired thread on that subject when it does not, so
- * the entity can see it raised this before.
+ * Appends to an active conversation on the same subject when one exists,
+ * because a subject stays in one place — and opens a new one pointing at the
+ * last archived conversation on that subject when it does not, so the entity
+ * can see it raised this before.
+ *
+ * MATCHED ON TITLE, WHICH IS NARROWER THAN WHAT THE TOOL CAN DO, ON PURPOSE.
+ * The entity writing by hand may add to ANY active conversation, hers included,
+ * because it has read the conversation and judged that this belongs there. This
+ * path has read nothing: it is a heartbeat routing a follow-up, a stale
+ * question or a self-coherence finding with no model in the loop. So it only
+ * ever appends to a conversation whose title is the subject it is raising —
+ * which in practice means one this same path opened — and otherwise opens its
+ * own. An automatic append into the middle of a chat she is having about
+ * something else is the failure mode here, and a title match is the cheap
+ * guard against it.
  */
 async function sayToEllie({ subject, body, sourceKind = null, sourceRef = null }) {
-  const messages = require('./messages');
+  const channel = require('./conversation-channel');
   try {
-    const prior = messages.findPriorThreads(subject, { limit: 5 });
-    const active = prior.find(t => t.status === 'active');
+    const prior = channel.findPrior(subject, { limit: 5 });
+    const active = prior.find(c => c.status === 'active');
     if (active) {
-      messages.addMessage(active.id, body, 'self');
-      opsLog(`Added to message thread "${subject}" rather than opening a second one.`);
-      return { threadId: active.id, appended: true };
+      channel.sendInto(active.id, body, { sourceKind, sourceRef });
+      opsLog(`Added to the conversation "${subject}" rather than opening a second one.`);
+      return { conversationId: active.id, appended: true };
     }
-    const retired = prior.find(t => t.status === 'retired') || null;
-    const t = messages.openThread({
-      subject, body, sourceKind, sourceRef,
-      supersedesThreadId: retired ? retired.id : null
+    const archived = prior.find(c => c.status === 'archived') || null;
+    const c = channel.openConversation({
+      title: subject, body, sourceKind, sourceRef,
+      supersedesConversationId: archived ? archived.id : null
     });
-    opsLog(`Opened message thread "${subject}"${retired ? ' (the subject came back — it points at the closed one)' : ''}.`);
-    return { threadId: t.id, appended: false };
+    opsLog(`Opened the conversation "${subject}"${archived ? ' (the subject came back — it points at the archived one)' : ''}.`);
+    return { conversationId: c.id, appended: false };
   } catch (err) {
-    console.error('[Messages] could not raise a thread:', err.message);
+    console.error('[Conversations] could not raise a conversation:', err.message);
     return null;
   }
 }
@@ -159,8 +170,9 @@ async function noticeFromQuestions() {
       if ((q.salience ?? 5) < 6) continue;
       const priority = Math.min(10, (q.salience ?? 5) + 1);
       // A QUESTION IS THE ENTITY WANTING TO ASK HER SOMETHING, which is a
-      // message, not a notification. The bell rework left this type
-      // pending-but-silent because it had nowhere else to be; now it does.
+      // conversation, not a notification. The bell rework left this type
+      // pending-but-silent because it had nowhere else to be; now it opens or
+      // joins a conversation in her list, where she can actually answer it.
       if (await sayToEllie({
         subject: q.question.slice(0, 80),
         body: q.question,
@@ -408,8 +420,8 @@ Return ONLY a JSON object, nothing else:
         sourceKind: 'reflection',
         sourceRef: `followup:${trace.at}`
       });
-      trace.threadId = res ? res.threadId : null;
-      console.log(`[Messages] Follow-up sent to the message channel: "${parsed.followup.slice(0, 80)}"`);
+      trace.conversationId = res ? res.conversationId : null;
+      console.log(`[Conversations] Follow-up raised in her list: "${parsed.followup.slice(0, 80)}"`);
     } else {
       console.log(`[Initiatives] No follow-up this cycle — ${trace.reasoning}`);
     }
@@ -625,11 +637,12 @@ Return ONLY a JSON object, nothing else:
       // whose follow-up expired UNREAD comes back into view, because that
       // follow-up was never read by anyone and the entry is still actionable.
       // Filtering on source alone "eats the corpus" — measured at 18 -> 15
-      // entries over seven passes. Messages deliberately never expire, so
-      // routing this here would consume a log entry permanently on the first
-      // follow-up ever raised about it, and the valve would have nothing to
-      // release. That is a real trade about how her daily log is spent, not an
-      // implementation detail, so it is hers to make.
+      // entries over seven passes. A conversation deliberately never expires,
+      // so routing this there would consume a log entry permanently on the
+      // first follow-up ever raised about it, and the valve would have nothing
+      // to release. That is a real trade about how her daily log is spent, not
+      // an implementation detail, so it is hers to make. LEFT ALONE AGAIN in
+      // the rework that folded messages into conversations.
       //
       // The conversation follow-up above HAS moved, because it is the kind that
       // was sitting in the bell under "no conversation needed".
@@ -815,12 +828,13 @@ async function prioritize() {
     // deciding what gets SAID and no longer decides what gets KEPT. If it is
     // ever removed, those three thresholds are what has to move with it.
 
-    // THE BACKLOG SEAM, NOW WIRED. It reads the real unread count from the
-    // message channel and fires only on the threshold crossing — the messages
-    // view carries its own count, so the bell's job is the pile-up, not the
-    // arrival.
+    // THE BACKLOG SEAM, WIRED TO THE REAL TOTAL. It reads the unread count
+    // across her ACTIVE conversations and fires only on the threshold crossing.
+    // The conversation list carries a count on every row and a total at the
+    // top, so the bell's job here is the pile-up, never the arrival — a new
+    // message does not ring.
     try {
-      await raiseMessageBacklog(require('./messages').unreadCount());
+      await raiseMessageBacklog(require('./conversation-channel').totalUnread());
     } catch (e) {
       console.error('[Initiatives] backlog check failed:', e.message);
     }
@@ -962,20 +976,21 @@ async function openInitiativeConversation(it, channel) {
  * @param {{kind: string, id: string, message: string, detail?: string}} m
  */
 /**
- * BACKLOG — the seam, deliberately not wired.
+ * BACKLOG — the pile-up, never the arrival.
  *
- * The bell should say "you have unanswered messages piling up", not "a message
- * arrived": the messages view will carry its own unread count, and duplicating
- * it here would be a second badge saying the same thing. So this fires on a
- * THRESHOLD she sets, and only on the crossing.
+ * The bell says "you have unanswered messages piling up", not "a message
+ * arrived": the conversation list carries an unread count on every row and a
+ * total at its top, and ringing on arrival would be a second badge saying what
+ * the list already says. So this fires on a THRESHOLD she sets, and only on the
+ * crossing.
  *
- * The messages system does not exist yet and is NOT being built here. This is
- * the whole of the seam: pass it an unread count and it does the rest. Until
- * something calls it, it is inert — there is no poller, no table read and no
- * guess at where the count will live, because guessing that is how a seam turns
- * into a thing that has to be unpicked later.
+ * IT STILL TAKES THE COUNT AS AN ARGUMENT rather than reading it. The seam is
+ * the point: nothing here polls, nothing here knows where unread lives, and the
+ * one caller that does — prioritize() — passes the total in. That is also what
+ * lets the bell-routing suite exercise the crossing with a bare number and no
+ * conversations at all.
  *
- * @param {number} unreadCount  unanswered messages, from the messages system
+ * @param {number} unreadCount  unread across her active conversations
  * @returns the initiative id, or null when the threshold is not crossed
  */
 async function raiseMessageBacklog(unreadCount) {
@@ -986,7 +1001,7 @@ async function raiseMessageBacklog(unreadCount) {
   if (n < threshold) return null;
   return initiatives.addInitiative({
     type: 'backlog',
-    content: `You have ${n} message${n === 1 ? '' : 's'} from me waiting for a reply.`,
+    content: `You have ${n} message${n === 1 ? '' : 's'} from me waiting in your conversations.`,
     sourceKind: 'messages',
     // One row per backlog level, so crossing the threshold again after she has
     // read some does not stack a second identical item on the first.

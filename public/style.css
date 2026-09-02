@@ -3813,61 +3813,109 @@ body.coder-working { padding-top: 1.9rem; }
 }
 
 /* ============================================================
-   MESSAGES — threads, not items. Reuses the initiative panel's
-   frame; what differs is that nothing here can be dismissed.
-   ============================================================ */
-.message-thread { cursor: pointer; }
-.message-thread:hover { border-color: var(--primary-color); }
+   THE CONVERSATION LIST — one list, and the only list.
 
-.message-unread {
-  font-size: 0.68rem;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: rgba(59, 130, 246, 0.22);
-  color: #93c5fd;
+   What the entity says to her arrives here, so the sidebar row
+   carries the unread count and the header carries the total.
+   The Messages panel these styles replaced is gone.
+   ============================================================ */
+
+/* Active | Archive. The archive is the same area, not another place. */
+.conversation-scopes {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.conversation-scope {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-family: inherit;
+  padding: 5px 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.conversation-scope:hover { border-color: var(--primary-color); }
+.conversation-scope.active {
+  color: var(--text-color);
+  border-color: var(--primary-color);
+  background: rgba(158, 127, 255, 0.10);
+}
+
+/* The total, beside "Conversations". Same blink as the per-row count, because
+   it is the same fact at a different scope. */
+.sidebar-unread-total {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(59, 130, 246, 0.28);
+  color: #bfdbfe;
+  font-size: 0.65rem;
+  font-weight: 600;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+
+/* THE PER-CONVERSATION COUNT. A number and nothing else — no exclamation
+   mark, no red, no fading with age. It says "she has not got to this yet",
+   and it is not permitted to imply anything about what was sent. */
+.conversation-unread {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(59, 130, 246, 0.28);
+  color: #bfdbfe;
+  font-size: 0.65rem;
+  font-weight: 600;
+  vertical-align: middle;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+
+/* Blink, not flash: the count has to be findable in a long list without
+   turning the sidebar into an alarm. Opacity only, so it never moves the row. */
+@keyframes unread-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* Anyone who has asked their browser not to animate gets a steady badge.
+   The count still has to be legible — it is the notice. */
+@media (prefers-reduced-motion: reduce) {
+  .conversation-unread,
+  .sidebar-unread-total { animation: none; }
+}
+
+.conversation-item.has-unread .conversation-title { font-weight: 600; }
+
+/* "raised before" and "asked to archive" — quiet notes on the row. */
+.conversation-follows {
+  font-size: 0.63rem;
+  color: var(--text-secondary);
+  opacity: 0.85;
   white-space: nowrap;
 }
 
-.message-preview {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  margin-top: 4px;
+/* An archived conversation is readable and closed to writes for both. The
+   input says so rather than silently doing nothing. */
+.input-area.conversation-archived {
+  opacity: 0.7;
 }
-
-.message-back {
-  background: none;
-  border: none;
-  color: var(--primary-color);
-  cursor: pointer;
-  font-size: 0.8rem;
-  padding: 4px 0 10px;
+.input-area.conversation-archived .message-input {
+  cursor: not-allowed;
+  font-style: italic;
 }
-
-.message-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
-
-.message-bubble {
-  padding: 9px 11px;
-  border-radius: var(--border-radius);
-  border: 1px solid var(--border-color);
-  font-size: 0.85rem;
-  line-height: 1.45;
-}
-/* Hers and its are told apart by side and tint, the way a person expects. */
-.message-bubble.from-snh  { background: var(--surface-color); margin-right: 14%; }
-.message-bubble.from-user { background: rgba(158, 127, 255, 0.10); margin-left: 14%; }
-
-.message-meta { font-size: 0.68rem; color: var(--text-secondary); margin-bottom: 4px; }
-.message-body { white-space: pre-wrap; }
-
-.message-reply textarea {
-  width: 100%;
-  background: var(--surface-color);
-  color: var(--text-color);
-  border: 1px solid var(--border-color);
-  border-radius: var(--border-radius);
-  padding: 8px;
-  font-size: 0.85rem;
-  font-family: inherit;
-  resize: vertical;
-}
-.message-reply textarea:focus { outline: none; border-color: var(--primary-color); }

@@ -355,10 +355,10 @@ function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = 
     // record — what was noticed, and that nothing was changed. But these
     // findings END IN A QUESTION ("want me to retire it, or leave it?"), and a
     // question needs somewhere she can answer it. The bell rework moved them
-    // out of the bell and Corrections has no reply box, so the ask goes to the
-    // message channel and the record stays here. Neither one is sufficient
-    // alone: the record without the ask is unanswerable, the ask without the
-    // record is unauditable.
+    // out of the bell and Corrections has no reply box, so the ask opens a
+    // conversation in her list and the record stays here. Neither one is
+    // sufficient alone: the record without the ask is unanswerable, the ask
+    // without the record is unauditable.
     if (asksHer) {
       try {
         require('./initiative-engine').sayToEllie({
@@ -368,7 +368,7 @@ function raiseToCorrections({ content, sourceRef, reasonCode, label, memberId = 
           sourceRef
         });
       } catch (err) {
-        console.error('[SelfAudit] could not open a thread for the ask:', err.message);
+        console.error('[SelfAudit] could not open a conversation for the ask:', err.message);
       }
     }
     return id;

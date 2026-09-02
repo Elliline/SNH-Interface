@@ -1,6 +1,13 @@
 /**
  * Conversation Management API Routes
- * Handles CRUD operations for chat conversations
+ *
+ * THE SIDEBAR LIST IS THE ONLY LIST (2026-09-01). What the entity wants to say
+ * to her arrives here, not in a second inbox — so these routes carry the unread
+ * counts, the total, and the archive scope alongside the ordinary CRUD.
+ *
+ * OPENING A CONVERSATION MARKS IT READ, because opening it is what reading is,
+ * and it is the ONLY thing that clears unread. There is no expiry, no
+ * auto-dismiss and no sweep anywhere in this file or the module behind it.
  */
 
 const express = require('express');
@@ -15,23 +22,50 @@ const {
   updateConversationTitle,
   deleteConversationEmbeddings
 } = require('../db/database.js');
+const channel = require('../db/conversation-channel');
 
 /**
  * GET /api/conversations
- * List all conversations for sidebar
- * Returns: [{ id, title, updated_at, preview }]
- * preview = first 50 chars of first user message
+ * List conversations for the sidebar, with per-conversation unread counts.
+ *
+ * ?status=archived for the Archive tab; active is the default.
+ *
+ * Still returns a bare ARRAY, because that is what the sidebar has always been
+ * handed and every field it needs now rides on the rows themselves. The totals
+ * the header shows come from GET /api/conversations/unread — one small request
+ * a badge can poll without pulling the whole list.
  */
 router.get('/', (req, res) => {
   try {
-    const conversations = getConversations();
-    res.json(conversations);
+    const status = req.query.status === 'archived' ? 'archived'
+      : req.query.status === 'all' ? null : 'active';
+    res.json(getConversations(status));
   } catch (error) {
     console.error('Error fetching conversations:', error.message);
     res.status(500).json({
       error: 'Failed to fetch conversations',
       details: error.message
     });
+  }
+});
+
+/**
+ * GET /api/conversations/unread
+ * The number at the top of the list. Active conversations only — see
+ * totalUnread() for why an archived conversation's unread stops counting.
+ *
+ * Declared BEFORE /:id so "unread" is never read as a conversation id.
+ */
+router.get('/unread', (req, res) => {
+  try {
+    res.json({
+      unread: channel.totalUnread(),
+      unreadAll: channel.totalUnreadAll(),
+      archived: getConversations('archived').length
+    });
+  } catch (error) {
+    console.error('Error counting unread:', error.message);
+    res.status(500).json({ error: 'Failed to count unread' });
   }
 });
 
@@ -86,6 +120,10 @@ router.get('/:id', async (req, res) => {
       });
     }
 
+    // Opening it IS reading it, and this is the only place unread ever clears.
+    // ?peek=1 for anything that needs to look without claiming she looked.
+    const unreadBefore = req.query.peek === '1' ? channel.unreadFor(id) : channel.markRead(id);
+
     const conversation = getConversation(id);
 
     if (!conversation) {
@@ -94,7 +132,7 @@ router.get('/:id', async (req, res) => {
       });
     }
 
-    res.json(conversation);
+    res.json({ ...conversation, unread_cleared: unreadBefore, unread: channel.unreadFor(id) });
   } catch (error) {
     console.error('Error fetching conversation:', error.message);
     res.status(500).json({
@@ -210,6 +248,37 @@ router.put('/:id/title', async (req, res) => {
       error: 'Failed to update conversation title',
       details: error.message
     });
+  }
+});
+
+/**
+ * POST /api/conversations/:id/archive
+ * She retires it. Hers alone — the entity can only ask, and its ask arrives on
+ * the bell as an approval; approving there lands here.
+ *
+ * Archived means closed to writes for BOTH of them and readable by both
+ * forever. Nothing is deleted and no unread is cleared.
+ */
+router.post('/:id/archive', (req, res) => {
+  try {
+    const conversation = channel.archive(req.params.id, { by: 'user' });
+    res.json({ success: true, conversation });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/conversations/:id/unarchive
+ * She changes her mind. Also hers alone: the entity has no path back either,
+ * because "closed to writes for both" has to mean something.
+ */
+router.post('/:id/unarchive', (req, res) => {
+  try {
+    const conversation = channel.unarchive(req.params.id, { by: 'user' });
+    res.json({ success: true, conversation });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 

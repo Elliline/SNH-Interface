@@ -1159,14 +1159,16 @@ function initDatabase() {
     }
     sqliteDb.exec('CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON conversations(hidden)');
 
-    // MESSAGES — the channel where the entity talks to her (2026-09-01). Its own
-    // tables on purpose: the initiatives table is already doing two jobs (the
-    // bell, and the greeting queue) and a third would make all three harder to
-    // reason about.
+    // THE CONVERSATION CHANNEL — unread and archive state, ON THIS TABLE
+    // (2026-09-01). Additive columns rather than a second set of tables beside
+    // it: what the entity says to her is a conversation, so the row that holds a
+    // conversation is the row that holds its unread count. An earlier build the
+    // same day put this in `message_threads`/`thread_messages`; those are gone,
+    // and scripts/migrate-threads-to-conversations.js moved their contents here.
     try {
-      require('./messages').initSchema(sqliteDb);
+      require('./conversation-channel').initSchema(sqliteDb);
     } catch (e) {
-      console.error('Migration: messages FAILED —', e.message);
+      console.error('Migration: conversation channel FAILED —', e.message);
       throw e;
     }
 
@@ -1203,29 +1205,21 @@ function initDatabase() {
 }
 
 /**
- * Get list of all conversations with preview
+ * Get list of conversations with preview, unread count and archive state.
+ *
+ * Delegates to db/conversation-channel.js so there is ONE definition of unread.
+ * Duplicating that SQL here is how the sidebar's count and the bell's backlog
+ * would drift apart, and the whole point of the number is that she can trust it.
+ *
+ * @param {'active'|'archived'|null} [status='active'] - null for both scopes
  * @returns {Array} Array of conversation objects
  */
-function getConversations() {
+function getConversations(status = 'active') {
   try {
     if (!sqliteDb) {
       throw new Error('Database not initialized. Call initDatabase() first.');
     }
-
-    const stmt = sqliteDb.prepare(`
-      SELECT
-        c.id,
-        c.title,
-        c.created_at,
-        c.updated_at,
-        c.model_used,
-        c.initiated_by,
-        (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY timestamp ASC LIMIT 1) as preview
-      FROM conversations c
-      ORDER BY c.updated_at DESC
-    `);
-
-    return stmt.all();
+    return require('./conversation-channel').listConversations({ status });
   } catch (error) {
     console.error('Error fetching conversations:', error.message);
     throw error;
@@ -1278,8 +1272,13 @@ function getConversation(id) {
     }
 
     // Get conversation metadata
+    // status/archive columns come back with it: the chat view has to know
+    // whether this conversation is closed to writes before it offers her a box
+    // to type in.
     const conversationStmt = sqliteDb.prepare(`
-      SELECT id, title, created_at, updated_at, model_used, initiated_by
+      SELECT id, title, created_at, updated_at, model_used, initiated_by,
+             status, archived_at, archived_by, retire_requested_at, retire_reason,
+             supersedes_conversation_id, last_read_at
       FROM conversations
       WHERE id = ?
     `);

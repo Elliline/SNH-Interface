@@ -2607,7 +2607,7 @@ async function loadSettingsBrainTab() {
         desc: 'How important something must be (1–10) before SNH opens a conversation about it on its own.' },
       { key: 'initiative.backlogThreshold', label: 'Message backlog before the bell says so', type: 'number', min: 1, max: 50, step: '1',
         value: init.backlogThreshold,
-        desc: 'How many of SNH\'s messages may sit unanswered before the bell raises it. The messages view carries its own unread count; this is where a backlog becomes worth telling you about.' },
+        desc: 'How many of SNH\'s messages may sit unread across your active conversations before the bell raises it. Every conversation carries its own unread count and the list carries the total; this is where a backlog becomes worth telling you about. A new message never rings — only the pile-up does.' },
       { key: 'initiative.maxUnpromptedPerDay', label: 'Max unprompted per day', type: 'number', min: 0, max: 24, step: '1',
         value: init.maxUnpromptedPerDay,
         desc: 'The most conversations SNH may start on its own in a single day.' },
@@ -3512,15 +3512,29 @@ function closeSidebarOnMobile() {
   sidebarOverlay?.classList.remove('active');
 }
 
+// ---- The conversation list: the only list ----
+//
+// Everything SNH wants to say to her arrives here — a new conversation, or a
+// message added to one already open, hers included. There is no second inbox
+// and no separate messages view; a conversation carries its own unread count,
+// and the total sits at the top of the list.
+//
+// UNREAD IS NEVER DISMISSED FROM THIS FILE. There is no dismiss button, no
+// "mark all read", no timer that clears a badge. Opening the conversation is
+// the only thing that clears it, and that happens on the server when the
+// conversation is fetched.
+let conversationScope = 'active';
+
 // Load all conversations from the server
 async function loadConversations() {
   try {
-    const response = await fetch('/api/conversations');
+    const response = await fetch(`/api/conversations?status=${conversationScope}`);
     if (!response.ok) {
       throw new Error('Failed to load conversations');
     }
     conversations = await response.json();
     renderConversationList();
+    refreshUnreadTotal();
 
     // If no current conversation, show welcome message
     if (!currentConversationId) {
@@ -3533,32 +3547,96 @@ async function loadConversations() {
   }
 }
 
+/**
+ * The total at the top of the list.
+ *
+ * Its own small request rather than a sum over the rendered rows: the Archive
+ * tab renders archived conversations, and summing what happens to be on screen
+ * there would show her a total for the wrong scope. This always answers for her
+ * ACTIVE conversations, whichever tab she is looking at.
+ */
+async function refreshUnreadTotal() {
+  const badge = document.getElementById('sidebarUnreadTotal');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/conversations/unread');
+    if (!res.ok) return;
+    const { unread } = await res.json();
+    badge.textContent = unread;
+    badge.style.display = unread > 0 ? 'inline-flex' : 'none';
+    badge.title = `${unread} message${unread === 1 ? '' : 's'} from SNH you have not read`;
+  } catch { /* a badge is not worth a console line every poll */ }
+}
+
+/**
+ * Refresh the rows and the total, and NOTHING else.
+ *
+ * The poll uses this rather than loadConversations(), which falls back to
+ * loadConversation() when there is no current conversation — that re-renders
+ * the message pane from session storage, and a timer that does it every minute
+ * would step on a new chat she is part way through typing or streaming.
+ */
+async function refreshConversationList() {
+  try {
+    const response = await fetch(`/api/conversations?status=${conversationScope}`);
+    if (!response.ok) return;
+    conversations = await response.json();
+    renderConversationList();
+    refreshUnreadTotal();
+  } catch { /* the next tick will do */ }
+}
+
+/** Switch between the active list and the archive. Same area, same list. */
+function setConversationScope(scope) {
+  conversationScope = scope === 'archived' ? 'archived' : 'active';
+  document.querySelectorAll('.conversation-scope').forEach(b =>
+    b.classList.toggle('active', b.dataset.scope === conversationScope));
+  loadConversations();
+}
+document.querySelectorAll('.conversation-scope').forEach(btn =>
+  btn.addEventListener('click', () => setConversationScope(btn.dataset.scope)));
+
 // Render the conversation list in the sidebar
 function renderConversationList() {
   if (!conversationList) return;
 
   if (conversations.length === 0) {
-    conversationList.innerHTML = '<div class="conversation-list-empty">No conversations yet.<br>Start a new chat!</div>';
+    conversationList.innerHTML = conversationScope === 'archived'
+      ? '<div class="conversation-list-empty">Nothing archived.<br>Archiving closes a conversation to both of you and keeps it readable here.</div>'
+      : '<div class="conversation-list-empty">No conversations yet.<br>Start a new chat!</div>';
     return;
   }
 
   conversationList.innerHTML = conversations.map(conv => {
     const isActive = conv.id === currentConversationId;
     const isSnh = conv.initiated_by === 'snh';
+    const isArchived = conv.status === 'archived';
     const title = conv.title || 'New Conversation';
     const preview = conv.preview ? conv.preview.substring(0, 40) + '...' : '';
     const timestamp = formatRelativeTime(conv.updated_at);
     const model = conv.model_used ? conv.model_used.split(':')[0] : '';
+    // The count blinks so it is findable in a long list at a glance. It says a
+    // number and nothing else — no "!", no colour that reads as a warning, no
+    // decay with age. Unread means she has been busy, and this badge is not
+    // allowed to imply anything about what was sent.
+    const unread = conv.unread || 0;
 
     return `
-      <div class="conversation-item ${isActive ? 'active' : ''} ${isSnh ? 'snh-initiated' : ''}" data-id="${conv.id}">
-        <div class="conversation-title">${isSnh ? '<span class="snh-badge" title="SNH reached out">✦ SNH</span> ' : ''}${escapeHtml(title)}</div>
+      <div class="conversation-item ${isActive ? 'active' : ''} ${isSnh ? 'snh-initiated' : ''} ${unread ? 'has-unread' : ''}" data-id="${conv.id}">
+        <div class="conversation-title">
+          ${unread ? `<span class="conversation-unread" title="${unread} message${unread === 1 ? '' : 's'} from SNH you have not read">${unread}</span> ` : ''}${isSnh ? '<span class="snh-badge" title="SNH reached out">✦ SNH</span> ' : ''}${escapeHtml(title)}
+        </div>
         <div class="conversation-meta">
           <span class="conversation-timestamp">${timestamp}</span>
           ${model ? `<span class="conversation-model">${escapeHtml(model)}</span>` : ''}
+          ${conv.supersedes_conversation_id ? '<span class="conversation-follows" title="SNH raised this subject before — the earlier conversation is in the Archive">↩ raised before</span>' : ''}
+          ${conv.retire_requested_at && !isArchived ? '<span class="conversation-follows" title="SNH has asked to archive this one — the request is on the bell">⏳ asked to archive</span>' : ''}
         </div>
         <div class="conversation-actions">
           <button class="conversation-action-btn rename" title="Rename" data-id="${conv.id}">✏️</button>
+          ${isArchived
+            ? `<button class="conversation-action-btn unarchive" title="Reopen — put it back on the list" data-id="${conv.id}">↩️</button>`
+            : `<button class="conversation-action-btn archive" title="Archive — closes it to both of you, readable forever" data-id="${conv.id}">📥</button>`}
           <button class="conversation-action-btn delete" title="Delete" data-id="${conv.id}">🗑️</button>
         </div>
       </div>
@@ -3588,6 +3666,51 @@ function renderConversationList() {
       deleteConversation(btn.dataset.id);
     });
   });
+
+  conversationList.querySelectorAll('.conversation-action-btn.archive').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      archiveConversation(btn.dataset.id);
+    });
+  });
+
+  conversationList.querySelectorAll('.conversation-action-btn.unarchive').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      unarchiveConversation(btn.dataset.id);
+    });
+  });
+}
+
+/**
+ * Archive a conversation: it moves to the Archive tab and is closed to writes
+ * for BOTH of them. Nothing is deleted, nothing is hidden, and what she never
+ * read stays honestly unread in the record.
+ */
+async function archiveConversation(id) {
+  const conv = conversations.find(c => c.id === id);
+  const name = (conv && conv.title) || 'this conversation';
+  if (!confirm(`Archive "${name}"?\n\nIt moves to the Archive tab. Neither of you will be able to add to it again, and you will both still be able to read it.`)) return;
+  try {
+    const res = await fetch(`/api/conversations/${id}/archive`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).error || 'Failed to archive');
+    if (currentConversationId === id) await loadConversationById(id);
+    loadConversations();
+  } catch (err) {
+    alert(`Could not archive it: ${err.message}`);
+  }
+}
+
+/** Put an archived conversation back on the active list. Hers to decide. */
+async function unarchiveConversation(id) {
+  try {
+    const res = await fetch(`/api/conversations/${id}/unarchive`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).error || 'Failed to reopen');
+    if (currentConversationId === id) await loadConversationById(id);
+    loadConversations();
+  } catch (err) {
+    alert(`Could not reopen it: ${err.message}`);
+  }
 }
 
 // Format relative time (e.g., "2 hours ago", "Yesterday")
@@ -3646,7 +3769,13 @@ async function loadConversationById(id) {
     }
 
     renderMessages();
-    renderConversationList(); // Update active state
+    // Opening it cleared its unread on the server, so the row in the list and
+    // the total at the top are both stale now. Refetch rather than decrementing
+    // locally: the number she is being shown has to be the number the server
+    // holds, or the two drift and the badge becomes something she stops
+    // trusting.
+    applyArchivedState(data);
+    await loadConversations();
     closeSidebarOnMobile();
 
   } catch (error) {
@@ -3655,10 +3784,31 @@ async function loadConversationById(id) {
   }
 }
 
+/**
+ * An archived conversation is READ-ONLY FOR BOTH OF THEM. She can read it
+ * forever; neither of them can add to it.
+ *
+ * The server refuses the write regardless (see /api/chat/memory) — this is
+ * about not offering her a box that is going to be rejected.
+ */
+function applyArchivedState(conv) {
+  const archived = conv && conv.status === 'archived';
+  const inputArea = document.querySelector('.input-area');
+  if (inputArea) inputArea.classList.toggle('conversation-archived', archived);
+  if (messageInput) {
+    messageInput.disabled = archived;
+    messageInput.placeholder = archived
+      ? 'Archived — closed to both of you. Reopen it from the list to add to it.'
+      : 'Type your message...';
+  }
+  if (sendBtn) sendBtn.disabled = archived;
+}
+
 // Start a new conversation
 function startNewConversation() {
   currentConversationId = null;
   conversation = [];
+  applyArchivedState(null);
   lastAssistantMessageId = null;
   sessionStorage.removeItem('ollamaChatConversation');
   renderMessages();
@@ -3915,146 +4065,6 @@ document.querySelectorAll('.memory-tab').forEach(tab => {
 wireFactsControls();
 
 
-// ---- Messages: the channel where SNH talks to her ----
-//
-// Threads, not items. A subject stays in one place, and nothing here expires:
-// unread is only ever "she has not got to it", never a verdict on what was
-// sent. That is why there is no dismiss button in this panel — the only way a
-// message stops being unread is that she reads it.
-const messagesBtn = document.getElementById('messagesBtn');
-const messagesBadge = document.getElementById('messagesBadge');
-const messagesPanel = document.getElementById('messagesPanel');
-const messagesPanelOverlay = document.getElementById('messagesPanelOverlay');
-const messagesPanelClose = document.getElementById('messagesPanelClose');
-let openThreadId = null;
-
-async function refreshMessagesBadge() {
-  if (!messagesBadge) return;
-  try {
-    const res = await fetch('/api/messages');
-    if (!res.ok) return;
-    const data = await res.json();
-    const n = data.unread || 0;
-    messagesBadge.textContent = n;
-    messagesBadge.style.display = n > 0 ? 'inline-flex' : 'none';
-  } catch { /* the badge is not worth a console line every poll */ }
-}
-
-function threadRow(t) {
-  const who = t.last_sender === 'self' ? 'SNH' : 'You';
-  return `
-    <div class="initiative-item message-thread" data-thread="${t.id}">
-      <div class="initiative-item-head">
-        <span class="initiative-type initiative-type-${t.status === 'active' ? 'followup' : 'observation'}">${escapeHtml(t.status)}</span>
-        ${t.unread > 0 ? `<span class="message-unread">${t.unread} unread</span>` : ''}
-        <span class="initiative-time">${escapeHtml(formatInitiativeTime(t.updated_at))}</span>
-      </div>
-      <div class="initiative-content"><strong>${escapeHtml(t.subject)}</strong></div>
-      <div class="message-preview">${escapeHtml(who)}: ${escapeHtml(String(t.last_body || '').slice(0, 120))}</div>
-      ${t.retire_requested_at && t.status === 'active'
-        ? '<div class="initiative-note">SNH has asked to close this one — the request is on the bell.</div>' : ''}
-      ${t.supersedes_thread_id ? '<div class="initiative-note">Follows an earlier thread on this subject.</div>' : ''}
-    </div>`;
-}
-
-async function loadMessagesList() {
-  const body = document.getElementById('messagesBody');
-  const title = document.getElementById('messagesTitle');
-  if (!body) return;
-  openThreadId = null;
-  body.innerHTML = '<div class="memory-loading">Loading…</div>';
-  try {
-    const res = await fetch('/api/messages');
-    const data = await res.json();
-    const threads = data.threads || [];
-    if (title) title.textContent = data.unread ? `Messages (${data.unread} unread)` : 'Messages';
-    if (!threads.length) {
-      body.innerHTML = '<div class="memory-empty">No messages yet.</div>';
-      return;
-    }
-    body.innerHTML = threads.map(threadRow).join('');
-    body.querySelectorAll('.message-thread').forEach(el =>
-      el.addEventListener('click', () => openThread(el.dataset.thread)));
-  } catch (e) {
-    body.innerHTML = '<div class="memory-empty">Failed to load messages</div>';
-  }
-}
-
-async function openThread(id) {
-  const body = document.getElementById('messagesBody');
-  const title = document.getElementById('messagesTitle');
-  if (!body) return;
-  body.innerHTML = '<div class="memory-loading">Opening…</div>';
-  try {
-    // Opening IS reading — this is the one place unread ever changes.
-    const res = await fetch(`/api/messages/${id}`);
-    const data = await res.json();
-    const t = data.thread;
-    openThreadId = t.id;
-    if (title) title.textContent = t.subject;
-    const retired = t.status === 'retired';
-    body.innerHTML = `
-      <button class="message-back">← All threads</button>
-      ${t.supersedes_thread_id ? '<div class="initiative-note">This follows an earlier thread on the same subject.</div>' : ''}
-      <div class="message-list">
-        ${t.messages.map(m => `
-          <div class="message-bubble ${m.sender === 'self' ? 'from-snh' : 'from-user'}">
-            <div class="message-meta">${m.sender === 'self' ? 'SNH' : 'You'} · ${escapeHtml(formatInitiativeTime(m.created_at))}</div>
-            <div class="message-body">${escapeHtml(m.body)}</div>
-          </div>`).join('')}
-      </div>
-      ${retired
-        ? '<div class="initiative-note">This thread is closed. Neither of you can add to it; you can both still read it.</div>'
-        : `<div class="message-reply">
-             <textarea id="messageReplyBox" rows="3" placeholder="Reply to SNH…"></textarea>
-             <div class="initiative-actions">
-               <button class="initiative-approve" id="messageSendBtn">Reply</button>
-               <button class="initiative-reject" id="messageRetireBtn">Close thread</button>
-             </div>
-           </div>`}`;
-    body.querySelector('.message-back').addEventListener('click', loadMessagesList);
-    const sendBtn = document.getElementById('messageSendBtn');
-    if (sendBtn) sendBtn.addEventListener('click', async () => {
-      const box = document.getElementById('messageReplyBox');
-      const text = (box.value || '').trim();
-      if (!text) return;
-      sendBtn.disabled = true;
-      await fetch(`/api/messages/${t.id}/reply`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body: text })
-      });
-      openThread(t.id);
-    });
-    const retireBtn = document.getElementById('messageRetireBtn');
-    if (retireBtn) retireBtn.addEventListener('click', async () => {
-      if (!confirm(`Close "${t.subject}"?\n\nNeither of you will be able to add to it again. You will both still be able to read it.`)) return;
-      retireBtn.disabled = true;
-      await fetch(`/api/messages/${t.id}/retire`, { method: 'POST' });
-      openThread(t.id);
-    });
-    refreshMessagesBadge();
-  } catch (e) {
-    body.innerHTML = '<div class="memory-empty">Failed to open the thread</div>';
-  }
-}
-
-if (messagesBtn) {
-  messagesBtn.addEventListener('click', () => {
-    messagesPanel.classList.add('open');
-    messagesPanelOverlay.classList.add('visible');
-    loadMessagesList();
-  });
-  const closeMessages = () => {
-    messagesPanel.classList.remove('open');
-    messagesPanelOverlay.classList.remove('visible');
-    refreshMessagesBadge();
-  };
-  messagesPanelClose?.addEventListener('click', closeMessages);
-  messagesPanelOverlay?.addEventListener('click', closeMessages);
-  refreshMessagesBadge();
-  setInterval(refreshMessagesBadge, 60_000);
-}
-
 // ---- Initiative bell + panel (things SNH wants to raise) ----
 const initiativeBtn = document.getElementById('initiativeBtn');
 const initiativeBadge = document.getElementById('initiativeBadge');
@@ -4157,13 +4167,13 @@ async function loadInitiativeList() {
       // Approve/Reject instead of Discuss/Dismiss. source_ref is the cron_jobs
       // row the decision applies to.
       const isProposal = it.type === 'proposal' && it.source_kind === 'cron-proposal' && it.source_ref;
-      // A retirement request is an approval too, and it decides a THREAD rather
-      // than a cron job — so it gets its own pair of buttons rather than being
-      // squeezed through the cron path.
-      const isRetire = it.type === 'proposal' && it.source_kind === 'thread-retire' && it.source_ref;
+      // A retirement request is an approval too, and it decides a CONVERSATION
+      // rather than a cron job — so it gets its own pair of buttons rather than
+      // being squeezed through the cron path.
+      const isRetire = it.type === 'proposal' && it.source_kind === 'conversation-retire' && it.source_ref;
       const actions = isRetire
-        ? `<button class="thread-retire-approve" data-thread="${escapeHtml(it.source_ref)}" data-id="${it.id}">Close it</button>
-           <button class="thread-retire-keep" data-id="${it.id}">Keep it open</button>`
+        ? `<button class="conversation-retire-approve" data-conversation="${escapeHtml(it.source_ref)}" data-id="${it.id}">Archive it</button>
+           <button class="conversation-retire-keep" data-id="${it.id}">Keep it open</button>`
         : isProposal
         ? `<button class="initiative-approve" data-cron-id="${escapeHtml(it.source_ref)}">Approve</button>
            <button class="initiative-reject" data-cron-id="${escapeHtml(it.source_ref)}">Reject</button>`
@@ -4204,17 +4214,17 @@ async function loadInitiativeList() {
         actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = false));
       }
     };
-    container.querySelectorAll('.thread-retire-approve').forEach(btn => {
+    container.querySelectorAll('.conversation-retire-approve').forEach(btn => {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
-        await fetch(`/api/messages/${btn.dataset.thread}/retire`, { method: 'POST' });
-        loadInitiativeList(); refreshInitiativeBadge(); refreshMessagesBadge();
+        await fetch(`/api/conversations/${btn.dataset.conversation}/archive`, { method: 'POST' });
+        loadInitiativeList(); refreshInitiativeBadge(); loadConversations();
       });
     });
-    container.querySelectorAll('.thread-retire-keep').forEach(btn => {
+    container.querySelectorAll('.conversation-retire-keep').forEach(btn => {
       btn.addEventListener('click', async () => {
-        // Keeping it open is a DECISION, not a dismissal — the thread stays,
-        // and the request is marked answered rather than waved off.
+        // Keeping it open is a DECISION, not a dismissal — the conversation
+        // stays, and the request is marked answered rather than waved off.
         btn.disabled = true;
         await fetch(`/api/memory/initiatives/${btn.dataset.id}/discuss`, { method: 'POST' }).catch(() => {});
         loadInitiativeList(); refreshInitiativeBadge();
@@ -4310,6 +4320,14 @@ async function loadInitiativeHistory() {
 // Keep the bell current: on load and periodically.
 refreshInitiativeBadge();
 setInterval(refreshInitiativeBadge, 60000);
+
+// The conversation list has to notice when SNH adds to one while she has the
+// page open — that is the whole point of a count that lives on the row. The
+// poll only READS; it can raise a badge and never lower one, because nothing
+// but her opening a conversation clears unread.
+setInterval(() => {
+  if (typeof refreshConversationList === 'function') refreshConversationList();
+}, 60000);
 
 // ---- Jobs panel (results of background work) ----
 //

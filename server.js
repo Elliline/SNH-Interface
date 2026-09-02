@@ -45,10 +45,10 @@ const { getConfig, updateConfig, getProviderInstance, getVoiceProvider, getSearx
 
 // Routes
 const conversationsRouter = require('./routes/conversations');
+const conversationChannel = require('./db/conversation-channel');
 const memoryRouter = require('./routes/memory');
 const jobsRouter = require('./routes/jobs');
 const toolsRouter = require('./routes/tools');
-const messagesRouter = require('./routes/messages');
 
 const app = express();
 
@@ -403,7 +403,6 @@ app.use('/api/conversations', conversationsRouter);
 
 // Mount memory routes
 app.use('/api/memory', memoryRouter);
-app.use('/api/messages', messagesRouter);
 
 // Mount the jobs routes — the ROBOT channel. Its own prefix, not a corner of
 // /api/memory, because job results are not initiatives and must not be served
@@ -1826,6 +1825,16 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (!convoId) {
       // Create a new conversation
       convoId = db.createConversation(null, model);
+    } else {
+      // AN ARCHIVED CONVERSATION IS CLOSED TO WRITES FOR BOTH OF THEM. The UI
+      // hides the box, but the rule lives here: "closed to both" that only the
+      // client enforces is closed to neither.
+      const existing = conversationChannel.getState(convoId);
+      if (existing && existing.status === 'archived') {
+        return res.status(409).json({
+          error: 'That conversation is archived. Archived conversations are closed to writes for both of you and stay readable by both — reopen it, or start a new one.'
+        });
+      }
     }
 
     // Get the latest user message
@@ -4137,6 +4146,19 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     if (fullResponse) {
       const assistantMsgId = db.addMessage(convoId, 'assistant', fullResponse, model,
         usedSources.length ? usedSources : null);
+
+      // SHE IS IN THIS CONVERSATION, SO THIS REPLY IS NOT UNREAD. She typed the
+      // turn that produced it and it streamed onto her screen; leaving it to
+      // count would put an unread badge on the conversation she is looking at,
+      // on every single turn.
+      //
+      // This is NOT an auto-clear, and the distinction is the whole rule of
+      // this feature. Nothing here expires unread, dismisses it, or decides on
+      // her behalf that she has seen enough — the only thing that ever clears
+      // it is her being in the conversation, and typing into it is the least
+      // ambiguous evidence of that there is.
+      try { conversationChannel.markRead(convoId); }
+      catch (e) { console.warn('[Conversations] could not advance the read mark:', e.message); }
 
       // Embed assistant response for future retrieval
       try {

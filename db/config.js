@@ -1053,8 +1053,9 @@ const DEFAULTS = {
     // because what is worth bounding is how much of a turn goes into rummaging;
     // four separate budgets would let a loop spend 4× while each counter looked
     // healthy. Counted from tool_call_log, so a restart grants no fresh budget.
-    // The message channel. A rate limit, never a quality bar.
-    messages: { enabled: true, maxSendsPerHour: 10 },
+    // The conversation channel — his messages into her sidebar. A rate limit,
+    // never a quality bar.
+    conversations: { enabled: true, maxSendsPerHour: 10 },
     memoryInspect: {
       enabled: true,
       maxCallsPerHour: 40

@@ -15,7 +15,10 @@ const {
   MemorySearchTool, MemoryListTool, MemoryCountTool, MemoryGetTool, MemoryCorrectionsTool
 } = require('./tools/memory-inspect');
 const { EntityListTool, EntityGetTool } = require('./tools/entity-registry');
-const { MessageThreadsTool, MessageSendTool, MessageRequestRetireTool } = require('./tools/messages');
+const {
+  ConversationListTool, ConversationSendTool,
+  ConversationOpenTool, ConversationRequestRetireTool
+} = require('./tools/conversations');
 const {
   MergeFactsTool, ExpireFactTool, SupersedeFactTool
 } = require('./tools/memory-correct');
@@ -270,31 +273,33 @@ const TOOL_CATALOGUE = [
     fields: []
   })),
 
-  // The message channel. `message_threads` is a read and rides on the memory
-  // read switch; the two writes are their own capability with their own switch,
-  // because being able to SEND her something is a different decision from being
-  // able to look at what you already sent.
+  // The conversation channel — how he says something in her sidebar rather
+  // than in a second inbox. `conversation_list` is a read; the three writes
+  // share the same switch, because opening a conversation, adding to one and
+  // asking to archive one are all the same capability: putting something in
+  // front of her where she reads.
   {
-    id: 'message_threads',
-    title: 'List his message threads with her',
-    Tool: MessageThreadsTool,
-    card: 'messages',
-    gate: ({ cfg }) => ((cfg.tools && cfg.tools.messages) || {}).enabled !== false,
-    gateWhy: () => 'the message channel is turned off here',
-    toggle: 'tools.messages.enabled',
-    toggleNote: 'The message channel — his threads with her. Turning it off stops him opening or adding to threads; existing ones stay readable.',
-    fields: [{ path: 'tools.messages.maxSendsPerHour', label: 'Messages per hour', type: 'number', min: 1, max: 60,
+    id: 'conversation_list',
+    title: 'List her conversations, with what she has not read',
+    Tool: ConversationListTool,
+    card: 'conversations',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.conversations) || {}).enabled !== false,
+    gateWhy: () => 'the conversation channel is turned off here',
+    toggle: 'tools.conversations.enabled',
+    toggleNote: 'The conversation channel — how he reaches her in the sidebar she already reads. Turning it off stops him opening conversations or adding to hers; everything already there stays exactly as it is.',
+    fields: [{ path: 'tools.conversations.maxSendsPerHour', label: 'Messages per hour', type: 'number', min: 1, max: 60,
       hint: 'How many messages he may send in an hour. This is a rate limit, not a quality bar — nothing here decides for her which of his messages are worth reading.' }]
   },
   ...[
-    ['message_send', 'Send her a message', MessageSendTool],
-    ['message_request_retire', 'Ask her to close a thread', MessageRequestRetireTool]
+    ['conversation_send', 'Say something in an open conversation', ConversationSendTool],
+    ['conversation_open', 'Open a new conversation with her', ConversationOpenTool],
+    ['conversation_request_retire', 'Ask her to archive a conversation', ConversationRequestRetireTool]
   ].map(([id, title, Tool]) => ({
-    id, title, Tool, card: 'messages',
-    gate: ({ cfg }) => ((cfg.tools && cfg.tools.messages) || {}).enabled !== false,
-    gateWhy: () => 'the message channel is turned off here',
-    toggle: 'tools.messages.enabled',
-    toggleNote: 'Shares the message-channel switch.',
+    id, title, Tool, card: 'conversations',
+    gate: ({ cfg }) => ((cfg.tools && cfg.tools.conversations) || {}).enabled !== false,
+    gateWhy: () => 'the conversation channel is turned off here',
+    toggle: 'tools.conversations.enabled',
+    toggleNote: 'Shares the conversation-channel switch.',
     fields: []
   })),
 
