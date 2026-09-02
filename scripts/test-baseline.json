@@ -22,7 +22,7 @@
       "suite": "test-agent-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js"
@@ -148,7 +148,7 @@
       "suite": "test-coding-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/coding-jobs.js",
         "db/agent-jobs.js"
@@ -253,7 +253,7 @@
       "suite": "test-display-time",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/memory-manager.js",
         "db/datetime.js",
@@ -356,8 +356,8 @@
     {
       "suite": "test-history-search",
       "expectedFailures": 0,
-      "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "reason": "Green at the commit that made announcement delivery idempotent. Section 15 now goes through confirmAnnounced with the real assembled text rather than calling markAnnounced directly — the earlier version tested the half that worked and passed for days while the live system re-delivered one Aug 27 digest on every turn. 15b covers the two cases the fix turns on: a block that never reached the message stamps nothing and stays pending, and a mark that cannot be written is not counted as delivered.",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js",
@@ -440,7 +440,7 @@
       "suite": "test-job-artifacts",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/markdown.js",
         "db/charts.js",
@@ -563,7 +563,7 @@
       "suite": "test-scheduler",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "aff8f16",
+      "verifiedAt": "70defd8",
       "subjects": [
         "db/memory-manager.js",
         "db/scheduler.js",
