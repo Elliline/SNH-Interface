@@ -22,7 +22,7 @@
       "suite": "test-agent-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "73f7d2b",
+      "verifiedAt": "13f274b",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js"
@@ -68,7 +68,7 @@
       "suite": "test-bell-routing",
       "expectedFailures": 0,
       "reason": "Green at the commit that introduced it; deterministic, no engine — the bell's routing is a type predicate, not a judgement.",
-      "verifiedAt": "f641b36",
+      "verifiedAt": "13f274b",
       "subjects": [
         "db/initiatives.js",
         "db/initiative-engine.js",
@@ -167,7 +167,7 @@
       "suite": "test-conversation-channel",
       "expectedFailures": 0,
       "reason": "Green at the commit that folded the messages panel into the conversation list; deterministic, no engine. Two groups of assertions carry it: the negative ones (nothing expires unread, an archived conversation refuses both of them, reflection insights and daily-log follow-ups did not follow the others over) and the watermark ones, which assert the two ways per-conversation unread fails silently — a watermark format that will not compare with messages.timestamp, and same-second arrivals against its one-second resolution.",
-      "verifiedAt": "3f92b84",
+      "verifiedAt": "13f274b",
       "subjects": [
         "db/conversation-channel.js",
         "db/initiative-engine.js",
@@ -182,7 +182,7 @@
       "suite": "test-conversation-review",
       "expectedFailures": 0,
       "reason": "The review as a job: close/request/leave-open, save-before-close, the open-item guard, self-archive refused into a request, restore, a SIGKILLed child resumed by a new process, the budget ask both ways, retry. Judge calls go to a scripted engine; only memory-write is stubbed.",
-      "verifiedAt": "PENDING",
+      "verifiedAt": "13f274b",
       "subjects": [
         "db/conversation-review.js",
         "db/conversation-channel.js",
@@ -495,7 +495,7 @@
       "suite": "test-job-failures",
       "expectedFailures": 0,
       "reason": "The real runner against a scripted engine: stall, wall clock, provider down, cut stream, killed process + restart, the budget ask both ways, retry. Spawns two child processes; ~60s.",
-      "verifiedAt": "73f7d2b",
+      "verifiedAt": "13f274b",
       "subjects": [
         "db/agent-jobs.js",
         "db/job-failure.js",
@@ -625,7 +625,7 @@
       "suite": "test-run-limits-exposed",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "13f274b",
       "subjects": [],
       "dataDir": "required"
     },
