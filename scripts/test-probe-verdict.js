@@ -91,6 +91,7 @@ function stubEngine(state) {
   const mm = require(path.join(ROOT, 'db/memory-manager'));
 
   const slow = { ok: false, ms: 8001, error: 'timeout after 8000ms', kind: 'slow' };
+  const good = { ok: true, ms: 150, kind: 'ok' };
   let v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
   check('a timed-out probe against a BUSY, PROGRESSING engine is `saturated`',
     v.verdict === 'saturated', v.verdict);
@@ -101,6 +102,9 @@ function stubEngine(state) {
   busy.close();
 
   // ---- stalled: holding work, counter frozen -------------------------------
+  // A different engine from the one above, so the cross-probe memory (which
+  // would read 4242 > the busy engine's counter as progress) is cleared first.
+  mm._resetProbeMemory();
   const stuck = await stubEngine({ running: 3, waiting: 0, tokens: 4242 });
   pointAt(stuck.address().port);
   v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
@@ -109,6 +113,38 @@ function stubEngine(state) {
   check('…and it says so in the engine record',
     v.engine.generating === false && v.engine.running === 3, JSON.stringify(v.engine));
   stuck.close();
+
+  // ---- A PREFILL IS NOT A WEDGE (2026-09-09) --------------------------------
+  //
+  // Three probes a minute apart each landed while the engine was reading a
+  // long prompt; none of vLLM's counters move until the first output token,
+  // so each 750ms window read as "holding work, producing nothing" and a
+  // healthy engine (43.9 tok/s between probes) was restarted under a job.
+  // The adjudicator now also compares against the counter it saw at the LAST
+  // failed probe: movement since then is progress, however still the window.
+  mm._resetProbeMemory();
+  let counter = 5000;
+  const prefill = await stubEngine({ running: 1, waiting: 1, tokens: () => counter });   // frozen within a probe
+  pointAt(prefill.address().port);
+  v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
+  check('the FIRST probe into a frozen window is still `stalled` (nothing to compare with yet)',
+    v.verdict === 'stalled' && v.engine.progressSinceLastProbe === null, `${v.verdict} ${v.engine.progressSinceLastProbe}`);
+  counter = 7600;   // a round's worth of output landed between the probes
+  v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
+  check('the NEXT probe, frozen in its window but past the last one\'s counter, is `saturated`',
+    v.verdict === 'saturated' && v.engine.generating === true && v.engine.progressSinceLastProbe === true, `${v.verdict} ${JSON.stringify(v.engine)}`);
+  v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
+  check('and a probe with NO movement since the last one is `stalled` — a real wedge still trips',
+    v.verdict === 'stalled' && v.engine.progressSinceLastProbe === false, `${v.verdict} ${JSON.stringify(v.engine)}`);
+  counter = 10;     // the engine restarted: a new process counts from zero
+  v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
+  check('a counter that went DOWN is not read as progress', v.verdict === 'stalled', v.verdict);
+  v = await mm.adjudicateProbe(good, { metricsTimeoutMs: 500 });
+  counter = 20;
+  v = await mm.adjudicateProbe(slow, { metricsTimeoutMs: 2000 });
+  check('an ok probe clears the memory: the next failure compares with nothing', v.engine.progressSinceLastProbe === null, JSON.stringify(v.engine));
+  prefill.close();
+  mm._resetProbeMemory();
 
   // ---- idle but not answering ----------------------------------------------
   const idle = await stubEngine({ running: 0, waiting: 0, tokens: 7 });
@@ -132,7 +168,6 @@ function stubEngine(state) {
   check('a connection failure is `unreachable` without consulting metrics at all',
     v.verdict === 'unreachable' && v.engine === null, v.verdict);
 
-  const good = { ok: true, ms: 150, kind: 'ok' };
   v = await mm.adjudicateProbe(good, { metricsTimeoutMs: 500 });
   check('a probe that answered is `ok` and costs no extra call',
     v.verdict === 'ok' && v.engine === null, v.verdict);

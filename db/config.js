@@ -362,6 +362,12 @@ const DEFAULTS = {
       // meant to bound WORK DONE, and a job that spent all twelve of its calls on
       // the same broken-URL error had done none.
       failedCallCost: 0.25,
+      // ONE FREE RETRY (2026-09-10). A call that ERRORS — a timeout, a dead
+      // provider, a thrown tool — is tried again once before it is billed at
+      // all; only if the retry also fails does the pair cost failedCallCost. A
+      // call that ran and found nothing is not retried: that result is an
+      // answer. The retry still counts toward the raw attempt ceiling below.
+      failedCallRetries: 1,
       // And the floor under the discount: no session may make more than this
       // multiple of its budget in RAW calls, whatever they were worth. Without
       // it, a quarter-price failure lets an everything-fails loop run four times
@@ -464,6 +470,24 @@ const DEFAULTS = {
     // LLM call cannot be resumed, so the run is lost either way; the only
     // question is whether repeating it is still useful.
     retryGraceMinutes: 30,
+    // ASK, DON'T STOP (2026-09-10). Ellie's position: the limits above exist so
+    // a loop cannot run forever, not to hold the entities back from good work.
+    // So when a job is near any ceiling — calls, rounds or the clock — and the
+    // model has just asked for more tools (the only evidence that work remains),
+    // it PAUSES, saves its transcript, releases its lane, and asks her in the
+    // conversation that dispatched it: what it has, what is left, how much more
+    // it wants. Yes resumes it with the extension; no has it write up what it
+    // has and finish as partial. The bell points at the conversation and never
+    // holds the ask itself. A paused job does not expire.
+    //
+    // askAtPercent is the share of a limit past which "near" is true. 0 or 100
+    // switches asking off and the hard stop behaves as it always did.
+    askBeforeCeiling: true,
+    askAtPercent: 80,
+    // What a plain "yes" grants, as a share of the ORIGINAL limits — 50 on a
+    // 40-call budget is 20 more calls, 8 more rounds, half the clock again. She
+    // can name a number in her answer ("yes, 30 more") and that wins.
+    extensionPercent: 50,
     // Terminal rows older than this are pruned. The run they describe stays in
     // the ops log; this table is a panel, not an archive.
     retentionDays: 90

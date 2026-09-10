@@ -437,7 +437,15 @@ router.get('/initiatives', (req, res) => {
     // rest of the pending pool still exists and is still what the greeting path
     // may raise in conversation — it simply does not ring. No limit: a
     // notification queue that drops notifications is worse than a long one.
-    const pending = initiatives.listPendingForBell();
+    const pending = initiatives.listPendingForBell().map(i => {
+      // A budget ask's bell item POINTS at a conversation and holds nothing
+      // else; the panel needs the id to offer the door.
+      if (i.source_kind === 'job-budget-ask' && i.source_ref) {
+        try { return { ...i, conversation_id: require('../db/job-budget-ask').conversationForAsk(i.source_ref) }; }
+        catch { return i; }
+      }
+      return i;
+    });
     res.json({
       initiatives: pending,
       threshold,

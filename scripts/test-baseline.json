@@ -164,6 +164,21 @@
       "dataDir": "required"
     },
     {
+      "suite": "test-conversation-channel",
+      "expectedFailures": 0,
+      "reason": "Green at the commit that folded the messages panel into the conversation list; deterministic, no engine. Two groups of assertions carry it: the negative ones (nothing expires unread, an archived conversation refuses both of them, reflection insights and daily-log follow-ups did not follow the others over) and the watermark ones, which assert the two ways per-conversation unread fails silently — a watermark format that will not compare with messages.timestamp, and same-second arrivals against its one-second resolution.",
+      "verifiedAt": "3f92b84",
+      "subjects": [
+        "db/conversation-channel.js",
+        "db/initiative-engine.js",
+        "routes/conversations.js",
+        "mcp/tools/conversations.js",
+        "mcp/mcp-client.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 300
+    },
+    {
       "suite": "test-correction-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
@@ -452,6 +467,31 @@
       "dataDir": "required"
     },
     {
+      "suite": "test-job-failure",
+      "expectedFailures": 0,
+      "reason": "Pure: the stop-source/kind vocabulary in db/job-failure.js. No engine, no store.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/job-failure.js"
+      ],
+      "dataDir": "forbidden"
+    },
+    {
+      "suite": "test-job-failures",
+      "expectedFailures": 0,
+      "reason": "The real runner against a scripted engine: stall, wall clock, provider down, cut stream, killed process + restart, the budget ask both ways, retry. Spawns two child processes; ~60s.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/agent-jobs.js",
+        "db/job-failure.js",
+        "db/job-budget-ask.js",
+        "db/memory-manager.js",
+        "db/brain-watchdog.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 600
+    },
+    {
       "suite": "test-job-status-line",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
@@ -540,21 +580,6 @@
       "dataDir": "required",
       "flaky": true,
       "timeoutSeconds": 900
-    },
-    {
-      "suite": "test-conversation-channel",
-      "expectedFailures": 0,
-      "reason": "Green at the commit that folded the messages panel into the conversation list; deterministic, no engine. Two groups of assertions carry it: the negative ones (nothing expires unread, an archived conversation refuses both of them, reflection insights and daily-log follow-ups did not follow the others over) and the watermark ones, which assert the two ways per-conversation unread fails silently — a watermark format that will not compare with messages.timestamp, and same-second arrivals against its one-second resolution.",
-      "verifiedAt": "3f92b84",
-      "subjects": [
-        "db/conversation-channel.js",
-        "db/initiative-engine.js",
-        "routes/conversations.js",
-        "mcp/tools/conversations.js",
-        "mcp/mcp-client.js"
-      ],
-      "dataDir": "required",
-      "timeoutSeconds": 300
     },
     {
       "suite": "test-message-standards",

@@ -453,13 +453,15 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
     // `partial` keeps the text — it is real work — and names the limit, because
     // "stopped early" is not something anyone can act on and "the answer budget
     // is 4096" is.
-    if (output && (res.truncated || res.outOfRounds || (budget && budget.exhausted))) {
+    // The words come from db/job-failure.js, the same place the agent path's
+    // do, so a scheduled run's card names the side and the limit the same way.
+    const cut = require('./job-failure').classifyCutShort({
+      truncated: !!res.truncated, outOfRounds: !!res.outOfRounds, budget,
+      answerTokens: c.answerTokens, maxRounds: c.maxRoundsPerRun
+    });
+    if (output && cut) {
       status = 'partial';
-      error = res.truncated
-        ? `it hit the answer budget (${c.answerTokens} tokens) and stopped mid-result — what is above is cut off, not finished. Raise "Answer budget, scheduled jobs" in Settings if this keeps happening`
-        : res.outOfRounds
-          ? `it ran out of tool rounds (${c.maxRoundsPerRun}) before it was finished — what is above is what it had`
-          : `it stopped early: ${budget.exhausted} — what is above is what it had`;
+      error = `${cut.plain.replace('"Answer budget, agent jobs"', '"Answer budget, scheduled jobs"')} What is above is what it had.`;
     }
 
     if (!output) {
@@ -472,9 +474,17 @@ async function runJob(job, { trigger = 'schedule', scheduledFor = null } = {}) {
     }
   } catch (err) {
     status = 'failed';
-    error = err.message || String(err);
-    budget = session.summary();
-    console.error(`[Scheduler] job ${job.id.slice(0, 8)} failed:`, error);
+    budget = (err && err.budget) || session.summary();
+    // NEVER THE RAW WORD. "terminated" on a card is what this replaces — the
+    // sentence says which side stopped it, and the raw text goes to the log.
+    const failure = require('./job-failure').classifyThrown(err, {
+      round: err && err.round, calls: Array.isArray(err && err.toolCalls) ? err.toolCalls.length : null,
+      recentRestart: (() => { try { return require('./brain-watchdog').recentRestart(); } catch { return null; } })(),
+      formatTime: (ms) => formatLocalTime(new Date(ms), { style: 'time', fallback: 'an unclear time' })
+    });
+    error = failure.plain;
+    toolCalls = Array.isArray(err && err.toolCalls) ? err.toolCalls.length : toolCalls;
+    console.error(`[Scheduler] job ${job.id.slice(0, 8)} failed (${failure.source}/${failure.kind}):`, failure.technical || error);
   } finally {
     runningJobId = null;
   }
@@ -636,7 +646,7 @@ function applyOutcome(job, { status, error, at, durationMs, trigger, toolCalls }
 
   const max = cfg().maxConsecutiveFailures;
   if (fails < max) {
-    const line = `Scheduled job FAILED: "${job.description}" (${job.id.slice(0, 8)}) — ${error}. That is ${fails} in a row; it disables itself at ${max}.`;
+    const line = `Scheduled job FAILED: "${job.description}" (${job.id.slice(0, 8)}) — ${String(error || '').replace(/\.$/, '')}. That is ${fails} in a row; it disables itself at ${max}.`;
     console.warn(`[Scheduler] ${line}`);
     opsLog(line);
     armJob(job.id, { from: at, reason: `after failure ${fails}/${max}` });
@@ -649,12 +659,12 @@ function applyOutcome(job, { status, error, at, durationMs, trigger, toolCalls }
   const line = `Scheduled job DISABLED: "${job.description}" (${job.id.slice(0, 8)}) — ${reason}`;
   console.error(`[Scheduler] ${line}`);
   opsLog(line);
-  dailyLog(`One of my scheduled jobs stopped itself: "${job.description}". It failed ${fails} times in a row and the last error was: ${error}. It will not run again until Ellie re-enables it.`);
+  dailyLog(`One of my scheduled jobs stopped itself: "${job.description}". It failed ${fails} times in a row and the last error was: ${String(error || '').replace(/\.$/, '')}. It will not run again until Ellie re-enables it.`);
   initiatives().addInitiative({
     type: 'alert',
     content:
       `A scheduled job of mine has disabled itself: "${job.description}" (${job.schedule}). ` +
-      `It failed ${fails} times in a row and the last error was: ${error}. ` +
+      `It failed ${fails} times in a row and the last error was: ${String(error || '').replace(/\.$/, '')}. ` +
       `It will not run again until it is re-enabled.`,
     sourceKind: 'scheduled-job-disabled',
     sourceRef: job.id,

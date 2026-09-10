@@ -187,6 +187,26 @@ router.post('/:id/cancel', actionLimiter, (req, res) => {
 });
 
 /**
+ * POST /api/jobs/:id/retry
+ * Run the same task again, as a NEW row that carries the last attempt's reason
+ * and partial output in its brief. Her action from the card; refused with the
+ * reason when the job is still going, was already retried, or is a coding job
+ * (those re-run from the conversation, where the restore-point rules live).
+ */
+router.post('/:id/retry', actionLimiter, (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid job ID' });
+    const result = agentJobs.retry(id);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    res.json({ success: true, id: result.id });
+  } catch (error) {
+    console.error('[JobsAPI] Error retrying job:', error.message);
+    res.status(500).json({ error: 'Failed to retry job' });
+  }
+});
+
+/**
  * What squatch-code is doing right now.
  *
  * Feeds the strip in the header. Returns an empty array when nothing is

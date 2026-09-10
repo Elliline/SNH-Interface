@@ -185,14 +185,28 @@ function createToolSession(stepName, allowedTools = [], overrides = {}) {
     // happened rather than on what it was worth.
     failedCallCost: Math.min(1, Math.max(0, overrides.failedCallCost ?? cfg.failedCallCost ?? 0.25)),
     maxAttempts: Math.max(1, overrides.maxAttempts ?? Math.ceil(maxCalls * (cfg.attemptCeilingMultiple ?? 2))),
+    // ONE FREE RETRY FOR A CALL THAT ERRORED (2026-09-10). A call that times
+    // out, hits a dead provider or throws is tried again once before it is
+    // billed at all; only if the retry ALSO fails does the pair cost
+    // `failedCallCost`. A call that ran fine and found nothing is not retried
+    // and is not free — an empty result is an answer, and asking the same
+    // question again would not change it. The retry counts toward the raw
+    // attempt ceiling (it is a real request against a possibly-dead provider)
+    // but not toward `calls`, which stays what the model asked for.
+    failedCallRetries: Math.max(0, Math.floor(overrides.failedCallRetries ?? cfg.failedCallRetries ?? 1)),
     // `calls` stays the RAW count of calls made — it is what the logs, the panel
     // and every existing reader mean by "tool calls", and a billed figure in that
     // field would quietly change what those numbers say. `billed` is the budget.
     calls: 0,
     billed: 0,
     failedCalls: 0,
+    retries: 0,
+    roundsUsed: 0,
     startedMs: Date.now(),
     exhaustedReason: null,
+    // How much a "yes" added, if the job asked for more mid-run — so the
+    // summary can say "40 + 20 calls" rather than presenting 60 as the setting.
+    extended: null,
 
     /** @returns {string|null} the reason the budget is spent, or null */
     spent() {
@@ -202,12 +216,76 @@ function createToolSession(stepName, allowedTools = [], overrides = {}) {
           : `${this.calls} call(s)`;
         return `call budget spent (${this.billed.toFixed(2)}/${this.maxCalls} billed over ${spentOn})`;
       }
-      if (this.calls >= this.maxAttempts) {
-        return `attempt ceiling reached (${this.calls}/${this.maxAttempts} calls, ${this.failedCalls} of them empty or failed — nothing is coming back, so it stopped trying)`;
+      if (this.calls + this.retries >= this.maxAttempts) {
+        return `attempt ceiling reached (${this.calls + this.retries}/${this.maxAttempts} calls, ${this.failedCalls} of them empty or failed — nothing is coming back, so it stopped trying)`;
       }
       const elapsed = Date.now() - this.startedMs;
       if (elapsed >= this.maxWallMs) return `time budget spent (${Math.round(elapsed / 1000)}s of ${Math.round(this.maxWallMs / 1000)}s)`;
       return null;
+    },
+
+    /**
+     * NEAR THE CEILING, WITH WORK LEFT — the moment a job should ASK rather
+     * than run into the wall. `pct` is the share of any one limit (calls,
+     * rounds, wall clock) past which this returns the limit that is near.
+     * Called only when the model has just asked for more tools, because that
+     * is the only evidence there is that work remains. Returns null when
+     * nothing is near, or when asking is switched off (pct <= 0 or >= 100 is
+     * "never ask" — the hard stop behaves as it always did).
+     */
+    nearing(pct) {
+      const share = Number(pct);
+      if (!Number.isFinite(share) || share <= 0 || share >= 100) return null;
+      const f = share / 100;
+      const elapsed = Date.now() - this.startedMs;
+      if (this.billed >= this.maxCalls * f) {
+        return { limit: 'calls', used: Math.round(this.billed * 100) / 100, max: this.maxCalls, calls: this.calls };
+      }
+      if (this.roundsUsed >= this.maxRounds * f) {
+        return { limit: 'rounds', used: this.roundsUsed, max: this.maxRounds };
+      }
+      if (elapsed >= this.maxWallMs * f) {
+        return { limit: 'time', used: elapsed, max: this.maxWallMs };
+      }
+      return null;
+    },
+
+    /**
+     * She said yes: raise the limits by these amounts. Additive, and recorded,
+     * so the card can say what was granted rather than what was configured.
+     */
+    extend({ calls = 0, rounds = 0, wallMs = 0 } = {}) {
+      const add = { calls: Math.max(0, calls | 0), rounds: Math.max(0, rounds | 0), wallMs: Math.max(0, wallMs | 0) };
+      this.maxCalls += add.calls;
+      this.maxAttempts += Math.ceil(add.calls * (cfg.attemptCeilingMultiple ?? 2));
+      this.maxRounds += add.rounds;
+      this.maxWallMs += add.wallMs;
+      this.exhaustedReason = null;
+      const prev = this.extended || { calls: 0, rounds: 0, wallMs: 0, times: 0 };
+      this.extended = { calls: prev.calls + add.calls, rounds: prev.rounds + add.rounds, wallMs: prev.wallMs + add.wallMs, times: prev.times + 1 };
+      return this.extended;
+    },
+
+    /**
+     * THE COUNTERS, AS A CHECKPOINT. Elapsed time is stored as a duration, not
+     * a start time, so a paused job's clock stops while it waits for her.
+     */
+    state() {
+      return {
+        calls: this.calls, billed: this.billed, failedCalls: this.failedCalls, retries: this.retries,
+        roundsUsed: this.roundsUsed, elapsedMs: Date.now() - this.startedMs,
+        maxCalls: this.maxCalls, maxAttempts: this.maxAttempts, maxRounds: this.maxRounds, maxWallMs: this.maxWallMs,
+        extended: this.extended
+      };
+    },
+    restore(st) {
+      if (!st || typeof st !== 'object') return this;
+      for (const k of ['calls', 'billed', 'failedCalls', 'retries', 'roundsUsed', 'maxCalls', 'maxAttempts', 'maxRounds', 'maxWallMs']) {
+        if (Number.isFinite(st[k])) this[k] = st[k];
+      }
+      if (Number.isFinite(st.elapsedMs)) this.startedMs = Date.now() - st.elapsedMs;
+      if (st.extended) this.extended = st.extended;
+      return this;
     },
 
     /**
@@ -240,9 +318,13 @@ function createToolSession(stepName, allowedTools = [], overrides = {}) {
         // are different reports, and only the second one explains a thin result.
         billed: Math.round(this.billed * 100) / 100,
         failedCalls: this.failedCalls,
+        retries: this.retries,
         maxAttempts: this.maxAttempts,
+        rounds: this.roundsUsed,
+        maxRounds: this.maxRounds,
         elapsedMs: Date.now() - this.startedMs,
         maxWallMs: this.maxWallMs,
+        extended: this.extended,
         exhausted: this.exhaustedReason
       };
     }
@@ -268,20 +350,44 @@ async function executeBackgroundTool(session, name, args) {
     return { error: `Tool "${name}" is not available to this background step.` };
   }
   session.calls++;
-  let result;
-  try {
-    result = await client.executeTool(name, args, { caller: session.stepName });
-  } catch (err) {
-    result = { error: `Tool execution failed: ${err.message}` };
+  const attempt = async () => {
+    try {
+      return await client.executeTool(name, args, { caller: session.stepName });
+    } catch (err) {
+      return { error: `Tool execution failed: ${err.message}` };
+    }
+  };
+  let result = await attempt();
+  // ONE FREE RETRY FOR AN ERROR. A timeout, a dead provider, a thrown tool —
+  // anything that comes back as `error` — is tried again before it is billed.
+  // An EMPTY result is not an error and is not retried: it is the answer.
+  // The retry counts toward the raw attempt ceiling (it is a real request) so
+  // a dead provider still cannot double the runaway allowance.
+  let retried = false;
+  for (let r = 0; r < session.failedCallRetries && result && result.error; r++) {
+    if (session.calls + session.retries >= session.maxAttempts) break;
+    session.retries++;
+    retried = true;
+    console.log(`[Heartbeat] ${session.stepName} ${name} errored (${String(result.error).slice(0, 120)}) — retrying once, free`);
+    await new Promise(res => setTimeout(res, RETRY_PAUSE_MS));
+    result = await attempt();
+  }
+  if (result && typeof result === 'object' && retried) {
+    try { Object.defineProperty(result, '_retried', { value: true, enumerable: false }); } catch { /* frozen */ }
   }
   // BILLED HERE, once, from the actual result — never at the call site. A caller
   // that decides its own cost is a caller that can forget to.
   const cost = session.charge(name, result);
   if (cost < 1) {
-    console.log(`[Heartbeat] ${session.stepName} ${name} was unproductive (${toolCallCost(name, result, session.failedCallCost).why}) — billed ${cost}, ${session.billed.toFixed(2)}/${session.maxCalls}`);
+    console.log(`[Heartbeat] ${session.stepName} ${name} was unproductive (${toolCallCost(name, result, session.failedCallCost).why}${retried ? ', after a free retry' : ''}) — billed ${cost}, ${session.billed.toFixed(2)}/${session.maxCalls}`);
+  } else if (retried) {
+    console.log(`[Heartbeat] ${session.stepName} ${name} succeeded on the free retry — billed ${cost} as a usable result`);
   }
   return result;
 }
+
+/** The pause before a free retry. Long enough for a hiccup, short enough not to matter. */
+const RETRY_PAUSE_MS = 1000;
 
 /**
  * Strip channel/control markers from a tool-loop response.
@@ -526,14 +632,20 @@ async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label
     // this call failed, however the reader chose to end.
     if (killReason) throw new Error(killReason);
   } catch (err) {
+    // WHAT HAD ARRIVED BEFORE IT BROKE travels with the error. A stream cut off
+    // mid-writeup used to lose every token it had streamed; the caller writing
+    // the failure card now gets the text up to the cut, labelled as partial.
+    const partial = { content, reasoningChars: reasoning.length, toolCallsSoFar: toolAcc.size };
     if (killReason) {
       // Named so the log says which limit bound, and typed so the existing
       // circuit-breaker classifier still counts it as a timeout — a wedge has to
       // keep tripping the breaker exactly as it did before.
       const e = new Error(`${label ? `${label}: ` : ''}${killReason}`);
       e.name = 'TimeoutError';
+      e.partial = partial;
       throw e;
     }
+    if (err && typeof err === 'object') { try { err.partial = partial; } catch { /* frozen error */ } }
     throw err;
   } finally {
     clearInterval(watchdog);
@@ -563,12 +675,16 @@ async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label
  * without them, so the step gets an answer built from what it managed to look up
  * rather than nothing at all.
  */
-async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts, providerName }) {
+async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts, providerName,
+                             resume = null, checkpoint = null, pauseWhen = null }) {
   const MCPClient = require('../mcp/mcp-client');
   const client = MCPClient.shared();
   const specs = client.getToolsForOpenAISubset(session.allowedTools);
-  const convo = [...messages];
-  const toolCalls = [];
+  // A RESUMED RUN PICKS UP ITS OWN TRANSCRIPT. `resume.convo` is the message
+  // array a checkpoint saved — the same system prompt, the same tool results —
+  // so the model continues from where it stopped rather than from zero.
+  const convo = resume && Array.isArray(resume.convo) && resume.convo.length ? [...resume.convo] : [...messages];
+  const toolCalls = resume && Array.isArray(resume.toolCalls) ? [...resume.toolCalls] : [];
 
   // WHERE A RUN'S TIME ACTUALLY WENT — measured, not inferred.
   //
@@ -590,44 +706,27 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
     session.exhaust('no allowed tools are registered');
   }
 
-  for (let round = 0; round < session.maxRounds; round++) {
-    const spentReason = session.spent();
-    if (spentReason) session.exhaust(spentReason);
-    const offerTools = specs.length > 0 && !session.exhaustedReason;
-
-    const roundBody = { ...body, messages: convo };
-    if (offerTools) roundBody.tools = specs;
-
-    console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
-                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
-
-    const roundStarted = Date.now();
-    const data = await streamChat({
-      url, body: roundBody, openAiStyle,
-      firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
-      label: `${session.stepName} round ${round + 1}`
-    });
-    roundMs.push(Date.now() - roundStarted);
-    reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
-
-    const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
-    const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
-    const requested = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-
-    if (requested.length === 0 || !offerTools) {
-      closeCircuit();
-      return {
-        content: stripChannelMarkers(msg.content),
-        provider: providerName,
-        truncated: finishReason === 'length',
-        toolCalls,
-        budget: session.summary(),
-        reasoningChars,
-        roundMs
-      };
+  // THE RECORD ON DISK, AFTER EVERY STEP THAT CHANGES IT. A crash cannot write
+  // anything after the fact, so the transcript is written as it grows: after
+  // every tool result and every round. The caller decides where; this loop
+  // only says when. Never allowed to fail the run.
+  const save = (extra = {}) => {
+    if (typeof checkpoint !== 'function') return;
+    try { checkpoint({ convo, toolCalls, session: session.state(), ...extra }); }
+    catch (e) { console.warn(`[Heartbeat] ${session.stepName} checkpoint failed: ${e.message}`); }
+  };
+  // AND THE STATE TRAVELS WITH A THROW. The in-process failure path (the
+  // stream cut mid-round, a wedged engine) used to lose the whole tool record
+  // because it lived only in this frame. Attached to the error, the caller
+  // writing the failure card has the same record the checkpoint has.
+  const attach = (err, round) => {
+    if (err && typeof err === 'object') {
+      try { err.toolCalls = toolCalls; err.convo = convo; err.round = round; err.budget = session.summary(); } catch { /* frozen */ }
     }
+    return err;
+  };
 
-    convo.push(msg);
+  const runCalls = async (requested, round) => {
     for (const call of requested) {
       const name = call.function?.name;
       // OpenAI-style providers send arguments as a JSON STRING; Ollama sends an
@@ -653,9 +752,104 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
       // `note` carries WHY a call was worth nothing, so a caller writing up a
       // thin run can say "four searches, all empty" instead of "no results".
       const worth = toolCallCost(name, result, session.failedCallCost);
-      toolCalls.push({ name, args, ok: !result?.error, productive: worth.productive, note: worth.productive ? null : worth.why });
+      toolCalls.push({ name, args, ok: !result?.error, productive: worth.productive, note: worth.productive ? null : worth.why, retried: !!(result && result._retried), round });
       convo.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
+      save({ round });
     }
+  };
+
+  // A run paused mid-round with tool calls the model had asked for and nobody
+  // ran. They run first, before the model is asked anything, so the transcript
+  // is well-formed (an assistant tool_calls turn followed by its results).
+  if (resume && Array.isArray(resume.pendingCalls) && resume.pendingCalls.length) {
+    const round = session.roundsUsed || 0;
+    try { await runCalls(resume.pendingCalls, round); }
+    catch (err) { throw attach(err, round); }
+    save({ round });
+  }
+  // And what changed while it was away — "she said yes, you have N more", or
+  // "SNH restarted, the round in progress was lost" — said into the transcript
+  // AFTER the pending results, so the assistant turn that asked for them is
+  // still followed by them.
+  if (resume && resume.note) {
+    convo.push({ role: 'user', content: String(resume.note) });
+    save({ round: session.roundsUsed || 0 });
+  }
+
+  const startRound = Math.max(0, session.roundsUsed | 0);
+  for (let round = startRound; round < session.maxRounds; round++) {
+    const spentReason = session.spent();
+    if (spentReason) session.exhaust(spentReason);
+    const offerTools = specs.length > 0 && !session.exhaustedReason;
+
+    const roundBody = { ...body, messages: convo };
+    if (offerTools) roundBody.tools = specs;
+
+    console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
+                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
+
+    session.roundsUsed = round + 1;
+    const roundStarted = Date.now();
+    let data;
+    try {
+      data = await streamChat({
+        url, body: roundBody, openAiStyle,
+        firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs,
+        label: `${session.stepName} round ${round + 1}`
+      });
+    } catch (err) {
+      throw attach(err, round + 1);
+    }
+    roundMs.push(Date.now() - roundStarted);
+    reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
+
+    const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
+    const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
+    const requested = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+
+    if (requested.length === 0 || !offerTools) {
+      closeCircuit();
+      return {
+        content: stripChannelMarkers(msg.content),
+        provider: providerName,
+        truncated: finishReason === 'length',
+        toolCalls,
+        budget: session.summary(),
+        reasoningChars,
+        roundMs,
+        convo
+      };
+    }
+
+    convo.push(msg);
+
+    // NEAR THE CEILING WITH WORK LEFT: STOP AND ASK, do not run into the wall.
+    // The model has just asked for more tools, which is the only evidence
+    // there is that work remains. The calls it asked for are NOT run — they are
+    // handed back as `pendingCalls` so a resume can run them first — and the
+    // caller decides how to ask. A hard stop with the writeup is still what
+    // happens when asking is switched off (pauseWhen returns null).
+    const near = typeof pauseWhen === 'function' ? pauseWhen(session, round + 1) : null;
+    if (near) {
+      save({ round: round + 1, pendingCalls: requested });
+      return {
+        paused: true,
+        near,
+        pendingCalls: requested,
+        content: '',
+        provider: providerName,
+        truncated: false,
+        toolCalls,
+        budget: session.summary(),
+        reasoningChars,
+        roundMs,
+        convo
+      };
+    }
+
+    try { await runCalls(requested, round + 1); }
+    catch (err) { throw attach(err, round + 1); }
+    save({ round: round + 1 });
   }
 
   // ROUNDS EXHAUSTED WITH THE MODEL STILL ASKING — AND IT STILL HAS TO WRITE.
@@ -708,6 +902,7 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
         budget: session.summary(),
         reasoningChars,
         roundMs,
+        convo,
         // The caller needs to know this was cut short even when the text reads
         // whole — a partial run reported as complete is the same lie in a nicer
         // shape.
@@ -721,7 +916,7 @@ async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts
   closeCircuit();
   return {
     content: '', provider: providerName, truncated: false,
-    toolCalls, budget: session.summary(), outOfRounds: true
+    toolCalls, budget: session.summary(), outOfRounds: true, convo
   };
 }
 
@@ -766,10 +961,17 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
   const thinkingOverride = Number.isFinite(options.thinkingTokens) ? options.thinkingTokens : null;
   // Date/time awareness for all heartbeat/audit roles (single shared injection).
   const datedSystemPrompt = `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
-  const messages = [
-    { role: 'system', content: datedSystemPrompt },
-    { role: 'user', content: userPrompt }
-  ];
+  // A CALLER MAY CONTINUE A TRANSCRIPT IT ALREADY HOLDS. `continueMessages`
+  // is a full message array — a checkpointed job's own conversation — and it
+  // replaces the fresh system+user pair. This is how a paused job asks for
+  // more, resumes after a yes, and writes up after a no: the same transcript,
+  // one more turn, rather than a fresh prompt that has forgotten everything.
+  const messages = Array.isArray(options.continueMessages) && options.continueMessages.length
+    ? options.continueMessages
+    : [
+      { role: 'system', content: datedSystemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
 
   // Build provider call based on config
   // THE CALLER'S maxTokens IS THE ANSWER BUDGET, AND ON A REASONING MODEL THAT
@@ -868,7 +1070,10 @@ async function callLLM(systemPrompt, userPrompt, options = {}) {
       session: options.toolSession,
       openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
       url, body, messages, timeouts,
-      providerName: `${heartbeatModel.provider}/${heartbeatModel.model}`
+      providerName: `${heartbeatModel.provider}/${heartbeatModel.model}`,
+      resume: options.resume || null,
+      checkpoint: options.checkpoint || null,
+      pauseWhen: options.pauseWhen || null
     });
   }
 
@@ -1052,7 +1257,10 @@ async function readEngineState(timeoutMs = 2000) {
       waiting: b.waiting,
       // Any forward motion at all. Strictly greater: a counter that has not moved
       // across the gap while requests are held is the stall signature.
-      generating: b.tokens > a.tokens
+      generating: b.tokens > a.tokens,
+      // The counter itself, so the next failed probe can compare against THIS
+      // one — see adjudicateProbe for why 750ms is not always enough to see.
+      tokens: b.tokens
     };
   } catch (err) {
     // The metrics endpoint is the LAST thing to go. If it cannot be read either,
@@ -1076,12 +1284,41 @@ async function readEngineState(timeoutMs = 2000) {
  * `saturated` is the verdict that did not exist on 2026-08-27, which is why a
  * healthy engine was restarted.
  */
+/**
+ * THE COUNTER FROM THE LAST FAILED PROBE, so a prefill is not read as a wedge.
+ *
+ * 2026-09-09, aiserver: three probes a minute apart each found the engine
+ * "holding work, producing nothing" and the watchdog restarted vLLM under a
+ * healthy background job — 43.9 tok/s between the probes, requests completing
+ * 200 OK. Each probe had landed at the start of a new tool round, while the
+ * engine was reading a 35-message prompt. Measured on Sparky's engine: during
+ * an 18-second prefill of a 36k-token prompt NONE of vLLM's counters move —
+ * prompt_tokens_total, generation_tokens_total, the iteration histogram — they
+ * all advance at the first output token. A 750ms window cannot see through
+ * that, and the job's rounds happened to be as long as the probe interval, so
+ * three probes in a row sampled three prefills.
+ *
+ * So the verdict also asks "has the counter moved since the LAST failed probe",
+ * sixty seconds ago. A wedged engine shows no movement across both windows; a
+ * healthy one mid-prefill shows the last round's output in the wider one.
+ * Cleared on any probe that answers, and never used to manufacture progress
+ * after an engine restart — a counter that went DOWN is a new process.
+ */
+let lastFailedProbeSample = null;
+function _resetProbeMemory() { lastFailedProbeSample = null; }
+
 async function adjudicateProbe(probe, { metricsTimeoutMs = 2000 } = {}) {
-  if (probe.ok) return { ...probe, verdict: 'ok', engine: null };
-  if (probe.kind === 'unreachable') return { ...probe, verdict: 'unreachable', engine: null };
+  if (probe.ok) { lastFailedProbeSample = null; return { ...probe, verdict: 'ok', engine: null }; }
+  if (probe.kind === 'unreachable') { lastFailedProbeSample = null; return { ...probe, verdict: 'unreachable', engine: null }; }
 
   const engine = await readEngineState(metricsTimeoutMs);
-  if (!engine.reachable) return { ...probe, verdict: 'unreachable', engine };
+  if (!engine.reachable) { lastFailedProbeSample = null; return { ...probe, verdict: 'unreachable', engine }; }
+
+  const prev = lastFailedProbeSample;
+  lastFailedProbeSample = { tokens: engine.tokens, at: Date.now() };
+  const movedSinceLast = !!(prev && Number.isFinite(prev.tokens) && Number.isFinite(engine.tokens) && engine.tokens > prev.tokens);
+  engine.progressSinceLastProbe = prev ? movedSinceLast : null;
+  if (!engine.generating && movedSinceLast) engine.generating = true;
 
   const holding = (engine.running || 0) > 0 || (engine.waiting || 0) > 0;
   const verdict = (holding && engine.generating) ? 'saturated' : 'stalled';
@@ -3145,7 +3382,8 @@ function stopHeartbeat() {
 module.exports = {
   // Exported so the initiative engine can put a reflection insight where the
   // Self tab reads it, now that it no longer rings the bell.
-  appendReflectionRecord, runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, readEngineState, adjudicateProbe, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
+  appendReflectionRecord, runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, readEngineState, adjudicateProbe,
+  _resetProbeMemory, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
   // Exported for test: streaming tool-call reassembly and the stall clock are
   // the two things in this file that cannot be proven from the outside.
   streamChat };

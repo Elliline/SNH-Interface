@@ -37,11 +37,23 @@
  * owned by this module rather than by the request.
  *
  * WHAT A RESTART DOES, said plainly: it kills the run. An LLM call cannot be
- * resumed. So the loss is made loud instead of silent — sweepInterrupted()
- * closes every in-flight row as `interrupted` WITH THE REASON, re-queues it once
- * if it is still young enough to be worth redoing, and otherwise leaves it in
- * the panel saying what happened. A job never vanishes; that is the whole reason
- * the row is written before the work starts.
+ * resumed — but the transcript up to the last completed step can be, and since
+ * 2026-09-10 it is written to disk as the job runs (see "The record on disk"
+ * below). So the loss is made loud instead of silent — sweepInterrupted()
+ * closes every in-flight row as `interrupted` WITH THE REASON and what it had,
+ * or re-queues it once from its checkpoint if it is still young enough to be
+ * worth finishing. A job never vanishes; that is the whole reason the row is
+ * written before the work starts.
+ *
+ * WHY A JOB STOPPED IS SAID IN WORDS, WITH THE SIDE IT CAME FROM. The 2026-09-09
+ * card said "terminated". See db/job-failure.js — every stop carries
+ * stop_source (runner | engine | dispatched | user | unknown) and stop_kind, and
+ * `error` is the sentence she reads.
+ *
+ * AND A JOB NEAR ITS BUDGET ASKS. The one time a job speaks, in
+ * db/job-budget-ask.js: near a ceiling with work left it pauses, asks her in the
+ * conversation that dispatched it, and waits. Not a result, so not a breach of
+ * ROBOT-NOT-BELL: a decision she has to make, made where she makes them.
  *
  * CHAT IS STILL KING. Runs go through the agent pool, so they inherit its
  * throttle to concurrency 1 while a chat request is in flight. That gates
@@ -197,8 +209,95 @@ function cfg() {
     // Starts allowed per job, counting the first. Was the literal `< 2`.
     maxAttempts: Math.max(1, c.maxAttempts ?? 2),
     retryGraceMinutes: Math.max(0, c.retryGraceMinutes ?? 30),
-    retentionDays: Math.max(1, c.retentionDays ?? 90)
+    retentionDays: Math.max(1, c.retentionDays ?? 90),
+    // The budget ask — see db/config.js. `askAtPercent` outside (0, 100) means
+    // never ask, and so does the switch being off.
+    askBeforeCeiling: c.askBeforeCeiling !== false,
+    askAtPercent: Number.isFinite(c.askAtPercent) ? c.askAtPercent : 80,
+    extensionPercent: Math.max(1, Number.isFinite(c.extensionPercent) ? c.extensionPercent : 50)
   };
+}
+
+// ---------------------------------------------------------------------------
+// The record on disk — written as the job runs, not only at the end
+// ---------------------------------------------------------------------------
+
+/**
+ * WHERE A RUN'S TRANSCRIPT LIVES WHILE IT RUNS: <data>/jobs/<id>.json.
+ *
+ * A crash cannot write anything after the fact. On 2026-09-09 a job made 27
+ * tool calls across eight rounds, the engine was restarted underneath it, and
+ * every one of those results went with the process — the card said "I have no
+ * record of what it managed to look up first", which was true of the code and
+ * false of the run. So the tool loop hands its transcript here after every tool
+ * result and every round, and the three things that read it are:
+ *
+ *   - the failure path, so a killed run's card offers what it had (partial);
+ *   - the pause, so a job waiting on her answer holds its place on disk, not
+ *     in a lane;
+ *   - the resume, so a yes (or a restart) continues from the last completed
+ *     step rather than from zero.
+ *
+ * Kept after a non-ok finish until the row is pruned, because a retry's brief
+ * reads it. Dropped on `ok`: a finished job's record is its result.
+ */
+function jobsDir() { return path.join(getDataDir(), 'jobs'); }
+function checkpointPath(id) { return path.join(jobsDir(), `${id}.json`); }
+
+function writeCheckpoint(id, state) {
+  const fs = require('fs');
+  try {
+    fs.mkdirSync(jobsDir(), { recursive: true });
+    const tmp = `${checkpointPath(id)}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ jobId: id, updatedAt: new Date().toISOString(), ...state }));
+    fs.renameSync(tmp, checkpointPath(id));
+    return true;
+  } catch (err) {
+    console.warn(`[AgentJobs] ${String(id).slice(0, 8)} could not write its checkpoint: ${err.message}`);
+    return false;
+  }
+}
+
+function readCheckpoint(id) {
+  const fs = require('fs');
+  try { return JSON.parse(fs.readFileSync(checkpointPath(id), 'utf8')); }
+  catch { return null; }
+}
+
+function dropCheckpoint(id) {
+  const fs = require('fs');
+  try { fs.unlinkSync(checkpointPath(id)); } catch { /* none, or already gone */ }
+}
+
+/**
+ * A transcript is only resumable from a COMPLETE round: an assistant turn that
+ * asked for tools must be followed by every one of their results, or the next
+ * request is malformed. A restart mid-round leaves a tail that is not — this
+ * cuts it back to the last complete step and reports how much was dropped.
+ */
+function trimToCompleteRound(convo = [], toolCalls = []) {
+  const msgs = [...convo];
+  let dropped = 0;
+  // Only an INCOMPLETE tail goes: trailing tool results whose assistant turn
+  // asked for more than came back, or an assistant turn that asked and got
+  // nothing. A round whose every call answered is complete and stays.
+  let k = 0;
+  while (k < msgs.length && msgs[msgs.length - 1 - k].role === 'tool') k++;
+  const head = msgs[msgs.length - 1 - k];
+  if (head && head.role === 'assistant' && Array.isArray(head.tool_calls) && head.tool_calls.length > k) {
+    dropped = k + 1;
+    msgs.splice(msgs.length - dropped, dropped);
+  }
+  // Which rounds survived: the tool records carry their round number, and a
+  // record whose results were cut must not be carried as if they were there.
+  let lastRound = 0;
+  for (const m of msgs) if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) lastRound++;
+  const calls = toolCalls.filter(k => !Number.isFinite(k.round) || k.round <= lastRound);
+  return { convo: msgs, toolCalls: calls, dropped, lastRound };
+}
+
+function parseAsk(json) {
+  try { return json ? JSON.parse(json) : null; } catch { return null; }
 }
 
 /**
@@ -282,7 +381,7 @@ function refuse(outcome, error, { conversationId = null } = {}) {
  * @returns {{ok: true, id: string} | {ok: false, error: string}}
  */
 function enqueue({ title, task, why = null, conversationId = null, messageId = null, source = 'chat-handoff',
-                   countsAgainstStarts = true } = {}) {
+                   countsAgainstStarts = true, retryOf = null } = {}) {
   const db = getSqliteDb();
   if (!db) return { ok: false, error: 'The job queue is unavailable (no database handle).' };
 
@@ -316,10 +415,10 @@ function enqueue({ title, task, why = null, conversationId = null, messageId = n
 
   const id = randomUUID();
   db.prepare(`
-    INSERT INTO agent_jobs (id, title, task, why, status, source, conversation_id, message_id, created_at)
-    VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+    INSERT INTO agent_jobs (id, title, task, why, status, source, conversation_id, message_id, created_at, retry_of)
+    VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
   `).run(id, t.slice(0, 200), k, why ? String(why).trim().slice(0, 500) : null,
-    source, conversationId, messageId, new Date().toISOString());
+    source, conversationId, messageId, new Date().toISOString(), retryOf);
 
   console.log(`[AgentJobs] queued ${id.slice(0, 8)} (${source}): "${t}"`);
   opsLog(`Background job queued: "${t}" (${id.slice(0, 8)}, ${source}).`);
@@ -381,21 +480,30 @@ function drain() {
 }
 
 /** Close a job with what actually happened. The one write that ends a job. */
-function finish(id, { status, resultText = null, error = null, toolCalls = 0, budget = null }) {
+function finish(id, { status, resultText = null, error = null, toolCalls = 0, budget = null, stopSource = null, stopKind = null }) {
   const db = getSqliteDb();
   if (!db) return null;
   const job = getJob(id);
   if (!job) return null;
   const finishedAt = new Date();
   const startedAt = job.started_at ? new Date(job.started_at) : finishedAt;
-  const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+  // A job that paused and resumed ran in pieces; the duration is the running
+  // time, not the time she took to answer. The checkpointed elapsed figure is
+  // the truth when there is one.
+  const ranMs = budget && Number.isFinite(budget.elapsedMs) ? budget.elapsedMs : null;
+  const durationMs = Math.max(0, ranMs ?? (finishedAt.getTime() - startedAt.getTime()));
+  // THE CARD NEVER SHOWS A BARE WORD. `error` is the plain sentence; if a
+  // caller closed a non-ok job without saying who stopped it, it is recorded as
+  // unplaced rather than left null, so the panel can still say that much.
+  const src = status === 'ok' ? null : (stopSource || (status === 'cancelled' ? 'user' : status === 'interrupted' ? 'runner' : 'unknown'));
   db.prepare(`
     UPDATE agent_jobs
     SET status = ?, finished_at = ?, duration_ms = ?, result_text = ?, error = ?,
-        tool_calls = ?, budget_json = ?
+        tool_calls = ?, budget_json = ?, stop_source = ?, stop_kind = ?, resume_mode = NULL
     WHERE id = ?
   `).run(status, finishedAt.toISOString(), durationMs, resultText, error,
-    toolCalls ?? 0, budget ? JSON.stringify(budget) : null, id);
+    toolCalls ?? 0, budget ? JSON.stringify(budget) : null, src, status === 'ok' ? null : stopKind, id);
+  if (status === 'ok') dropCheckpoint(id);
   return { ...getJob(id) };
 }
 
@@ -476,7 +584,32 @@ async function attachArtifact(id, { note = null } = {}) {
 // The executor
 // ---------------------------------------------------------------------------
 
-function systemPrompt(job, tools) {
+/**
+ * WHAT A RETRY IS TOLD ABOUT THE ATTEMPT BEFORE IT. Bounded — a brief, not a
+ * transcript — because the previous attempt's card is its honest summary and
+ * a 60KB tool record would crowd out the task itself. The tool record comes
+ * from the checkpoint when one survived, so the names and arguments of what
+ * was already searched are there even when the result text is thin.
+ */
+const RETRY_BRIEF_CHARS = 6000;
+function retryBrief(prev) {
+  const lines = [];
+  lines.push(`THIS IS A RETRY. Attempt ${prev.attemptNumber || 'before this one'} of this same job stopped: ${prev.error || 'reason unrecorded'}`);
+  if (prev.resultText) {
+    lines.push(`WHAT IT HAD WHEN IT STOPPED (its own words, possibly partial):\n"""\n${String(prev.resultText).slice(0, RETRY_BRIEF_CHARS)}\n"""`);
+  }
+  if (Array.isArray(prev.toolCalls) && prev.toolCalls.length) {
+    const seen = prev.toolCalls.slice(0, 40).map((k, i) =>
+      `${i + 1}. ${k.name}${k.args ? ' ' + JSON.stringify(k.args).slice(0, 120) : ''}${k.productive === false ? ' (came back empty or failed)' : ''}`);
+    lines.push(`WHAT IT HAD ALREADY LOOKED UP (${prev.toolCalls.length} call(s)):\n${seen.join('\n')}`);
+  }
+  lines.push(`Build on this. Do not redo lookups that already came back with something unless you need to check them; ` +
+    `pick up what was left unfinished. If the previous attempt found things, they count only if you can still ` +
+    `stand behind them — say which parts are carried over from it.`);
+  return lines.join('\n') + '\n';
+}
+
+function systemPrompt(job, tools, { previous = null } = {}) {
   const now = new Date();
   return (
     `You are Aurelius, running one of your own background jobs. Nobody is in the room. This is not a ` +
@@ -486,6 +619,10 @@ function systemPrompt(job, tools) {
     `THE JOB, as you set it when you handed it off:\n"${job.task}"\n` +
     (job.why ? `Why you handed it off: "${job.why}"\n` : '') +
     `\n` +
+    // A RETRY DOES NOT START FROM ZERO. The previous attempt's reason for
+    // stopping, what it had written, and what it had already looked up are all
+    // in front of the model, so it builds on them rather than repeating them.
+    (previous ? retryBrief(previous) + '\n' : '') +
     (tools.length
       ? `You have these read-only tools: ${tools.join(', ')}. Use them.\n\n` +
         // TWO KINDS OF JOB, AND THE OLD PROMPT ONLY ADMITTED ONE.
@@ -583,8 +720,43 @@ function describeStop(calls = [], budget = null, c = cfg()) {
  * Returns null rather than throwing: the caller has a deterministic fallback and
  * a salvage attempt that fails must not turn a partial job into a crashed one.
  */
-async function salvageWriteup(job, calls = [], budget = null, c = cfg()) {
+async function salvageWriteup(job, calls = [], budget = null, c = cfg(), { convo = null, partialText = '', failure = null } = {}) {
   const mm = memoryManager();
+
+  // THE TRANSCRIPT ITSELF, WHEN THERE IS ONE. The checkpointed conversation
+  // holds every tool result the run received, which is a far better thing to
+  // write up from than a list of what was called. A run that died on a cut
+  // stream continues from its own transcript with one no-tools turn — the
+  // same shape as the out-of-rounds writeup.
+  if (Array.isArray(convo) && convo.length > 2) {
+    try {
+      const msgs = [...convo];
+      const last = msgs[msgs.length - 1];
+      // A dangling tool request (the round that was cut) gets results saying so,
+      // or the transcript is malformed for the next request.
+      if (last && last.role === 'assistant' && Array.isArray(last.tool_calls) && last.tool_calls.length) {
+        for (const call of last.tool_calls) {
+          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.function && call.function.name,
+            content: JSON.stringify({ error: 'Not run — the job stopped before this call could be made.' }) });
+        }
+      }
+      msgs.push({
+        role: 'user',
+        content:
+          `STOP — the job ended before you finished${failure ? `: ${failure}` : ''}. You have no tools for this turn. ` +
+          `Write up what you have NOW, from the tool results above, for Ellie's jobs panel: what you found, what it ` +
+          `means, and plainly where it stops. If a lookup failed, say it failed rather than reporting the gap as ` +
+          `nothing to find. Do not invent anything and do not answer with nothing.` +
+          (partialText ? `\n\nYou had already begun writing this before it was cut off — keep what is right in it:\n"""\n${partialText.slice(0, 6000)}\n"""` : '')
+      });
+      const res = await mm.callLLM(null, null, { continueMessages: msgs, maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens });
+      const text = String(res && res.content || '').trim();
+      if (text) return text;
+    } catch (err) {
+      console.warn(`[AgentJobs] salvage from transcript failed: ${err && err.message}`);
+    }
+  }
+
   const record = calls.length
     ? calls.map((k, i) => {
       const what = k && k.name ? k.name : 'a tool';
@@ -602,6 +774,7 @@ async function salvageWriteup(job, calls = [], budget = null, c = cfg()) {
     `THE JOB was: "${job.task}"\n\n` +
     `WHAT THE RUN ACTUALLY DID:\n${record}\n` +
     (budget && budget.exhausted ? `\nWhy it stopped: ${budget.exhausted}\n` : '') +
+    (partialText ? `\nWHAT YOU HAD ALREADY BEGUN WRITING before it was cut off (keep what is right in it):\n"""\n${partialText.slice(0, 6000)}\n"""\n` : '') +
     `\nWrite the result for Ellie's jobs panel now, in a few plain sentences in your own voice:\n` +
     `- What you managed to establish, if anything. Only what a tool result above actually supports.\n` +
     `- If the job asked you to WRITE or BUILD something, write it now from your own knowledge — that ` +
@@ -630,7 +803,7 @@ async function salvageWriteup(job, calls = [], budget = null, c = cfg()) {
  * invariant it defends is simple and absolute: a job that started has a result
  * she can read.
  */
-function mechanicalAccount(job, calls = [], budget = null, c = cfg(), thrownError = null) {
+function mechanicalAccount(job, calls = [], budget = null, c = cfg(), thrownError = null, { partialText = '' } = {}) {
   const dead = calls.filter(k => k && k.productive === false);
   const lines = [];
 
@@ -639,13 +812,21 @@ function mechanicalAccount(job, calls = [], budget = null, c = cfg(), thrownErro
   lines.push(`What I set out to do: ${job.task}`);
   lines.push('');
 
+  if (partialText) {
+    // What it had streamed before the cut is the most valuable thing here and
+    // it goes first, marked for what it is.
+    lines.push(`What I had written before it stopped (cut off, not finished):`);
+    lines.push('');
+    lines.push(partialText.slice(0, 20000));
+    lines.push('');
+  }
+
   if (!calls.length) {
-    // Careful with this sentence. When the run THREW, the tool record is lost
-    // with it — so "it looked nothing up" would be a claim, not a fact, and it
-    // would be false whenever the throw came in a later round. Say what is
-    // actually known: there is no record.
+    // Careful with this sentence. When the run THREW and no checkpoint survived,
+    // the tool record is gone — so "it looked nothing up" would be a claim, not
+    // a fact. Say what is actually known: there is no record.
     lines.push(thrownError
-      ? `The run failed and I have no record of what it managed to look up first. The error was: ${thrownError}`
+      ? `The run failed and I have no record of what it managed to look up first. What stopped it: ${thrownError}`
       : `No tools were called at all, and no answer was produced.`);
   } else {
     lines.push(`I made ${calls.length} tool call(s): ${calls.map(k => k.name).join(', ')}.`);
@@ -661,9 +842,9 @@ function mechanicalAccount(job, calls = [], budget = null, c = cfg(), thrownErro
   }
 
   if (budget && budget.exhausted) lines.push(`Why it stopped: ${budget.exhausted}.`);
-  if (thrownError && calls.length) lines.push(`The run then failed with: ${thrownError}`);
+  if (thrownError && calls.length) lines.push(`What stopped it: ${thrownError}`);
   lines.push('');
-  lines.push(`Ask me again and I will run it properly.`);
+  lines.push(`Retry it from the card and I will pick up from what is here.`);
 
   return lines.join('\n');
 }
@@ -693,8 +874,12 @@ async function runJob(id) {
   }
 
   const startedAt = new Date();
+  // A resume after her yes or no is the SAME attempt continuing, not a new
+  // start — only a fresh run or a restart's re-run counts. Otherwise one ask
+  // would use up the one retry a later restart is allowed.
+  const continuing = job.resume_mode === 'granted' || job.resume_mode === 'declined';
   db.prepare(
-    "UPDATE agent_jobs SET status = 'running', started_at = ?, attempts = COALESCE(attempts, 0) + 1 WHERE id = ?"
+    `UPDATE agent_jobs SET status = 'running', started_at = ?, attempts = COALESCE(attempts, 0) + ${continuing ? 0 : 1} WHERE id = ?`
   ).run(startedAt.toISOString(), id);
 
   // A history search is an agent run, but not THIS one. It has its own system
@@ -744,17 +929,40 @@ async function runJob(id) {
       outcome = {
         status: 'failed',
         resultText: `The dispatch itself failed: ${err.message}. Check git status in the project before assuming nothing changed.`,
-        error: err.message
+        error: `SNH's job runner failed while dispatching it: ${err.message}. Check git status in the project before assuming nothing changed.`,
+        stopSource: 'runner', stopKind: 'dispatch'
       };
     }
     return finish(id, {
       status: outcome.status,
       resultText: outcome.resultText,
       error: outcome.error || null,
-      toolCalls: outcome.toolCalls || 0
+      toolCalls: outcome.toolCalls || 0,
+      stopSource: outcome.stopSource || (outcome.status === 'ok' ? null : 'dispatched'),
+      stopKind: outcome.stopKind || null
     });
   }
 
+  return runChatHandoff(id, job);
+}
+
+/**
+ * THE AGENT RUN ITSELF — a chat-handoff job, fresh or resumed.
+ *
+ * Every exit writes exactly one terminal row OR one paused row. The shape:
+ *
+ *   fresh run ──► tool loop ──► ok / partial (cut short) / failed (threw)
+ *                     │
+ *                     └─ near a ceiling with work left ──► ASK ──► paused
+ *
+ *   paused + she said yes  ──► resumed from the checkpoint with more budget
+ *   paused + she said no   ──► one no-tools writeup ──► partial
+ *   killed by a restart    ──► resumed from the last complete round (if young)
+ *
+ * The checkpoint on disk is what makes every one of those arrows possible; the
+ * tool loop writes it after every step and this function reads it back.
+ */
+async function runChatHandoff(id, job) {
   const mm = memoryManager();
   const MCPClient = require('../mcp/mcp-client');
   const allowed = MCPClient.shared().backgroundToolsAmong(JOB_TOOLS);
@@ -774,20 +982,89 @@ async function runJob(id) {
     maxRounds: c.maxRoundsPerJob
   });
 
-  console.log(`[AgentJobs] === running ${id.slice(0, 8)}: "${job.title}" ===`);
+  // --- Where it picks up from, if anywhere ---------------------------------
+  const mode = job.resume_mode || null;                       // granted | declined | restart | null
+  const ask = parseAsk(job.ask_json);
+  const ck = mode ? readCheckpoint(id) : null;
+  let resume = null;
+  let restartNote = null;
+  if (mode && ck && Array.isArray(ck.convo) && ck.convo.length) {
+    session.restore(ck.session);
+    if (mode === 'granted') {
+      const g = (ask && ask.grant) || {};
+      session.extend({ calls: g.calls || 0, rounds: g.rounds || 0, wallMs: g.wallMs || 0 });
+      resume = {
+        convo: ck.convo, toolCalls: ck.toolCalls || [], pendingCalls: ck.pendingCalls || [],
+        note: `Ellie said yes. You have ${g.calls || 0} more tool call(s), ${g.rounds || 0} more round(s) and ` +
+          `${require('./job-failure').sayDuration(g.wallMs || 0)} more on the clock — ` +
+          `${session.billed.toFixed(1)} of ${session.maxCalls} calls used so far. Carry on and finish the job; ` +
+          `write the result when you have it.`
+      };
+      console.log(`[AgentJobs] ${id.slice(0, 8)} resuming with more budget: +${g.calls} calls, +${g.rounds} rounds, +${Math.round((g.wallMs || 0) / 60000)} min`);
+    } else if (mode === 'restart') {
+      const t = trimToCompleteRound(ck.convo, ck.toolCalls || []);
+      session.roundsUsed = t.lastRound;
+      resume = {
+        convo: t.convo, toolCalls: t.toolCalls, pendingCalls: [],
+        note: `SNH restarted while you were in the middle of a tool round, and that round was lost. ` +
+          `Everything above it is intact${t.toolCalls.length ? ` (${t.toolCalls.length} tool call(s) so far)` : ''}. Continue from here.`
+      };
+      restartNote = t;
+      console.log(`[AgentJobs] ${id.slice(0, 8)} resuming after a restart from round ${t.lastRound} (${t.dropped} message(s) of an unfinished round dropped)`);
+    }
+  } else if (mode && !ck) {
+    console.warn(`[AgentJobs] ${id.slice(0, 8)} was to resume (${mode}) but has no checkpoint — running from the start`);
+  }
+
+  // --- She said NO: one writeup turn, no tools, and it is over ---------------
+  if (mode === 'declined' && ck && Array.isArray(ck.convo) && ck.convo.length) {
+    return wrapUpDeclined(id, job, ck, session, c);
+  }
+
+  // --- A retry carries the previous attempt ----------------------------------
+  let previous = null;
+  if (job.retry_of) {
+    const prev = getJob(job.retry_of);
+    if (prev) {
+      const prevCk = readCheckpoint(prev.id);
+      previous = {
+        attemptNumber: prev.attempts || 1,
+        error: prev.error,
+        resultText: prev.result_text,
+        toolCalls: prevCk && Array.isArray(prevCk.toolCalls) ? prevCk.toolCalls : []
+      };
+    }
+  }
+
+  const askPct = c.askBeforeCeiling ? c.askAtPercent : 0;
+  const pauseWhen = (sess) => sess.nearing(askPct);
+  const checkpoint = (state) => writeCheckpoint(id, { ...state, title: job.title, task: job.task });
+
+  console.log(`[AgentJobs] === running ${id.slice(0, 8)}: "${job.title}"${mode ? ` (${mode})` : ''} ===`);
 
   let status = 'ok', error = null, output = '', budget = null, toolCalls = 0;
+  let stopSource = null, stopKind = null;
   let calls = [];
   try {
     const res = await mm.callLLM(
-      systemPrompt(job, allowed),
+      systemPrompt(job, allowed, { previous }),
       job.task,
-      { maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens, toolSession: session }
+      {
+        maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens, toolSession: session,
+        resume: resume ? { convo: resume.convo, toolCalls: resume.toolCalls, pendingCalls: resume.pendingCalls, note: resume.note } : null,
+        checkpoint, pauseWhen
+      }
     );
-    output = String(res && res.content || '').trim();
-    budget = (res && res.budget) || session.summary();
     calls = Array.isArray(res && res.toolCalls) ? res.toolCalls : [];
     toolCalls = calls.length;
+    budget = (res && res.budget) || session.summary();
+
+    // === NEAR A CEILING WITH WORK LEFT: ASK HER, THEN WAIT ===================
+    if (res && res.paused) {
+      return pauseAndAsk(id, job, res, session, c);
+    }
+
+    output = String(res && res.content || '').trim();
 
     // A run that was CUT SHORT but still wrote something is not "ok". The text is
     // kept in full and the card says which it was — see TERMINAL on `partial`.
@@ -800,20 +1077,17 @@ async function runJob(id) {
     // with a full-looking card. Measured cost (2026-08-18, aiserver): three
     // coding jobs cut off mid-function, all three presenting as finished.
     //
-    // This is the same class as the phantom dispatch — an output that reads as
-    // complete and is not — and it gets the same answer: the run does not get to
-    // claim it finished, and the card names the limit it hit. Truncation is
-    // checked FIRST because it is the most specific reason and the only one that
-    // says WHERE the result stops. A run can be out of rounds AND truncated; the
-    // cut mid-sentence is what she is looking at, and it is the one with an
-    // action attached — raise the budget.
-    if (output && (res.truncated || res.outOfRounds || (budget && budget.exhausted))) {
+    // Truncation is checked FIRST because it is the most specific reason and the
+    // only one that says WHERE the result stops — db/job-failure.js keeps that
+    // order, and names the source and the limit for each.
+    const cut = require('./job-failure').classifyCutShort({
+      truncated: !!(res && res.truncated), outOfRounds: !!(res && res.outOfRounds), budget,
+      answerTokens: c.answerTokens, maxRounds: session.maxRounds
+    });
+    if (output && cut) {
       status = 'partial';
-      error = res.truncated
-        ? `it hit the answer budget (${c.answerTokens} tokens) and stopped mid-result — what is above is cut off, not finished. Raise "Answer budget, agent jobs" in Settings if this keeps happening`
-        : res.outOfRounds
-          ? `it ran out of tool rounds (${c.maxRoundsPerJob}) before it was finished — what is above is what it had`
-          : `it stopped early: ${budget.exhausted} — what is above is what it had`;
+      stopSource = cut.source; stopKind = cut.kind;
+      error = `${cut.plain} What is above is what it had.`;
     }
 
     if (!output) {
@@ -834,33 +1108,51 @@ async function runJob(id) {
       //      involved, so it cannot itself come back empty. It is a thinner
       //      thing than a writeup and it is still a hundred times better than a
       //      blank card: it says what ran, what came back, and where it stopped.
-      const salvaged = await salvageWriteup(job, calls, budget, c);
+      const salvaged = await salvageWriteup(job, calls, budget, c, { convo: res && res.convo });
+      const stop = cut || require('./job-failure').classifyBudgetStop(budget, { maxRounds: session.maxRounds }) || { source: 'runner', kind: 'no-answer', plain: 'It stopped without writing an answer.' };
+      stopSource = stop.source; stopKind = stop.kind;
       if (salvaged) {
         output = salvaged;
         status = 'partial';
-        error = describeStop(calls, budget, c);
+        error = `${stop.plain} ${describeStop(calls, null, c)}`;
         console.warn(`[AgentJobs] ${id.slice(0, 8)} produced no answer — salvaged a writeup from ${toolCalls} tool call(s)`);
       } else {
         output = mechanicalAccount(job, calls, budget, c);
         status = 'partial';
-        error = describeStop(calls, budget, c);
+        error = `${stop.plain} ${describeStop(calls, null, c)}`;
         console.warn(`[AgentJobs] ${id.slice(0, 8)} produced no answer and no writeup — wrote the mechanical account instead`);
       }
     }
   } catch (err) {
     status = 'failed';
-    error = err && err.message ? err.message : String(err);
-    budget = session.summary();
-    console.error(`[AgentJobs] ${id.slice(0, 8)} failed:`, error);
-    // Even a thrown run writes what it has. The throw is usually the brain being
-    // unreachable, and then there is nothing to write up but the attempt — which
-    // is still a card that says what happened rather than one that says nothing.
-    calls = Array.isArray(calls) ? calls : [];
+    budget = (err && err.budget) || session.summary();
+    // THE RECORD SURVIVES THE THROW. The loop attaches its tool record and
+    // transcript to the error, and the checkpoint on disk has the same; between
+    // them the failure card can say what it had rather than "no record".
+    calls = Array.isArray(err && err.toolCalls) ? err.toolCalls : [];
+    if (!calls.length) { const saved = readCheckpoint(id); if (saved && Array.isArray(saved.toolCalls)) calls = saved.toolCalls; }
     toolCalls = calls.length;
-    output = mechanicalAccount(job, calls, budget, c, error);
+    const partialText = String(err && err.partial && err.partial.content || '').trim();
+    // WHO STOPPED IT. Never the raw error text as the sentence: the watchdog
+    // is consulted so a restart it issued is named as the cause.
+    const failure = require('./job-failure').classifyThrown(err, {
+      round: err && err.round, calls: toolCalls,
+      recentRestart: (() => { try { return require('./brain-watchdog').recentRestart(); } catch { return null; } })(),
+      formatTime: (ms) => formatLocalTime(new Date(ms), { style: 'time', fallback: 'an unclear time' })
+    });
+    stopSource = failure.source; stopKind = failure.kind;
+    error = failure.plain;
+    console.error(`[AgentJobs] ${id.slice(0, 8)} failed (${failure.source}/${failure.kind}):`, failure.technical || error);
+    // Even a thrown run writes what it has. First ask for a writeup from the
+    // transcript — the engine may well be back by now — and fall to the
+    // mechanical account if it is not. Either way the text it had streamed
+    // before the cut is kept, labelled as partial.
+    const convo = Array.isArray(err && err.convo) ? err.convo : ((readCheckpoint(id) || {}).convo || null);
+    const salvaged = calls.length || partialText ? await salvageWriteup(job, calls, budget, c, { convo, partialText, failure: error }) : null;
+    output = salvaged || mechanicalAccount(job, calls, budget, c, error, { partialText });
   }
 
-  const done = finish(id, { status, resultText: output || null, error, toolCalls, budget });
+  const done = finish(id, { status, resultText: output || null, error, toolCalls, budget, stopSource, stopKind });
   // The file comes after the status is settled — see attachArtifact.
   const withFile = done ? await attachArtifact(id, { note: error }) : null;
   const secs = done ? (done.duration_ms / 1000).toFixed(1) : '?';
@@ -869,6 +1161,165 @@ async function runJob(id) {
     : status === 'partial'
       ? `Background job finished PARTIAL: "${job.title}" (${id.slice(0, 8)}) — ${secs}s, ${toolCalls} tool call(s). It wrote up what it had. Why it stopped: ${error}`
       : `Background job FAILED: "${job.title}" (${id.slice(0, 8)}) — ${error}`;
+  console.log(`[AgentJobs] ${line}`);
+  opsLog(line);
+  return withFile || done;
+}
+
+/**
+ * THE ASK. The loop stopped short of running the calls the model wanted; this
+ * writes the message she will read, records what a yes grants, parks the row,
+ * and hands the delivery to db/job-budget-ask.js — the one module that lets a
+ * job speak, and only because a decision is needed from her.
+ */
+async function pauseAndAsk(id, job, res, session, c) {
+  const mm = memoryManager();
+  const { sayDuration } = require('./job-failure');
+  const near = res.near || {};
+  const pending = Array.isArray(res.pendingCalls) ? res.pendingCalls.length : 0;
+  const st = session.state();
+  const used = near.limit === 'calls'
+    ? `${near.used} of ${near.max} tool calls`
+    : near.limit === 'rounds'
+      ? `${near.used} of ${near.max} tool rounds`
+      : `${sayDuration(near.used)} of its ${sayDuration(near.max)} time limit`;
+
+  // What a plain yes grants: a share of the ORIGINAL limits, so repeated
+  // yeses do not compound.
+  const base = { calls: c.maxToolCallsPerJob, rounds: c.maxRoundsPerJob, wallMs: c.maxWallClockMs };
+  const f = c.extensionPercent / 100;
+  const defaultGrant = {
+    calls: Math.max(1, Math.round(base.calls * f)),
+    rounds: Math.max(1, Math.round(base.rounds * f)),
+    wallMs: Math.max(60000, Math.round(base.wallMs * f))
+  };
+
+  // The model writes the ask in its own voice, from its own transcript. A
+  // throwaway copy of the transcript: the checkpoint the resume reads was
+  // written by the loop before this turn and is not touched by it.
+  let askBody = '';
+  let wants = null;
+  try {
+    const convo = [...(res.convo || [])];
+    // Well-formed transcript: the assistant turn asked for tools, so each gets
+    // a result saying it was not run yet.
+    for (const call of (res.pendingCalls || [])) {
+      convo.push({ role: 'tool', tool_call_id: call.id, name: call.function && call.function.name,
+        content: JSON.stringify({ paused: 'Not run yet — you are near your budget and Ellie is being asked whether to extend it.' }) });
+    }
+    convo.push({
+      role: 'user',
+      content:
+        `PAUSE. You have used ${used}${near.limit === 'calls' ? ` (${st.calls} calls made, ${st.failedCalls} of them empty or failed)` : ''}, ` +
+        `and you just asked for ${pending} more tool call(s), so there is work left. Nothing more runs until Ellie decides.\n\n` +
+        `Write a short message TO ELLIE, in your own voice, that she will read in the conversation where she asked for this:\n` +
+        `1. What you have established so far — the actual findings, briefly. Only what your tool results support.\n` +
+        `2. What is still left to do.\n` +
+        `3. How much more you need, and why.\n` +
+        `End with one line on its own, exactly of the form:\nNEEDED: <whole number> more tool calls\n` +
+        `Under 200 words. No headings, no preamble, no apology.`
+    });
+    const r = await mm.callLLM(null, null, {
+      continueMessages: convo, maxTokens: Math.min(c.answerTokens, 1200), thinkingTokens: c.thinkingTokens
+    });
+    askBody = String(r && r.content || '').trim();
+    const m = /NEEDED:\s*(\d{1,3})\s*more/i.exec(askBody);
+    if (m) wants = Math.max(1, parseInt(m[1], 10));
+    askBody = askBody.replace(/\n?\s*NEEDED:\s*\d{1,3}\s*more[^\n]*/i, '').trim();
+  } catch (err) {
+    console.warn(`[AgentJobs] ${id.slice(0, 8)} could not write its own ask (${err.message}) — using the plain account`);
+  }
+  if (!askBody) {
+    const calls = Array.isArray(res.toolCalls) ? res.toolCalls : [];
+    askBody =
+      `I'm partway through "${job.title}" and I've used ${used}. I've made ${calls.length} lookup(s)` +
+      `${calls.filter(k => k.productive === false).length ? `, ${calls.filter(k => k.productive === false).length} of which came back empty or failed` : ''}, ` +
+      `and I had ${pending} more queued when I stopped to ask. I couldn't write up the findings in this pause, but they are saved and nothing is lost.`;
+  }
+
+  // A named number wins over the default, within reason: nobody gets to ask
+  // for a thousand. The rounds and clock scale with it so a call grant is not
+  // silently bound by the other two.
+  const grant = { ...defaultGrant };
+  if (wants) {
+    const capped = Math.min(wants, base.calls * 3);
+    grant.calls = capped;
+    grant.rounds = Math.max(defaultGrant.rounds, Math.ceil(capped / 2));
+  }
+
+  const footer =
+    `\n\nIf you say yes, I get ${grant.calls} more tool call${grant.calls === 1 ? '' : 's'}, ${grant.rounds} more round${grant.rounds === 1 ? '' : 's'} ` +
+    `and ${sayDuration(grant.wallMs)} more on the clock (name a number if you want a different amount). ` +
+    `If you say no, I'll write up what I have and stop there. I'll wait either way.`;
+  const askText = askBody + footer;
+
+  const askRecord = {
+    askedAt: new Date().toISOString(),
+    near, used: st, wants, grant, defaultGrant, pending,
+    text: askText,
+    answeredAt: null, decision: null
+  };
+  const db = getSqliteDb();
+  db.prepare(`UPDATE agent_jobs SET status = 'paused', paused_at = ?, ask_json = ?, budget_json = ?, tool_calls = ? WHERE id = ?`)
+    .run(askRecord.askedAt, JSON.stringify(askRecord), JSON.stringify(session.summary()), (res.toolCalls || []).length, id);
+
+  // Delivery: the conversation that dispatched it, and the bell pointing there.
+  let delivery = null;
+  try {
+    delivery = await require('./job-budget-ask').deliver(getJob(id), askText);
+  } catch (err) {
+    console.error(`[AgentJobs] ${id.slice(0, 8)} could not deliver its ask: ${err.message}`);
+    delivery = { error: err.message };
+  }
+  askRecord.delivery = delivery;
+  db.prepare('UPDATE agent_jobs SET ask_json = ? WHERE id = ?').run(JSON.stringify(askRecord), id);
+
+  const line = `Background job PAUSED to ask for more: "${job.title}" (${id.slice(0, 8)}) — near its ${near.limit} limit (${used}) with ${pending} call(s) queued. ` +
+    `A yes grants +${grant.calls} calls, +${grant.rounds} rounds, +${Math.round(grant.wallMs / 60000)} min.` +
+    (delivery && delivery.conversationId ? ` Asked in conversation ${String(delivery.conversationId).slice(0, 8)}.` : ` The ask could not be delivered: ${delivery && delivery.error}`);
+  console.log(`[AgentJobs] ${line}`);
+  opsLog(line);
+  return getJob(id);
+}
+
+/**
+ * SHE SAID NO. One turn, no tools, from the saved transcript: write up what you
+ * have. Then the row closes as partial, and the reason names her decision —
+ * which is not a failure of anything.
+ */
+async function wrapUpDeclined(id, job, ck, session, c) {
+  const mm = memoryManager();
+  const { sayDuration } = require('./job-failure');
+  const ask = parseAsk(job.ask_json) || {};
+  const convo = [...ck.convo];
+  for (const call of (ck.pendingCalls || [])) {
+    convo.push({ role: 'tool', tool_call_id: call.id, name: call.function && call.function.name,
+      content: JSON.stringify({ error: 'Not run — Ellie chose to stop here. Write up what you already have.' }) });
+  }
+  convo.push({
+    role: 'user',
+    content:
+      'Ellie said no to more budget, so this is the end of the job. You have no tools for this turn. ' +
+      'Write the result for her jobs panel now, from the tool results above: what you found, what it means, ' +
+      'and plainly which part is unfinished. Do not invent anything to fill the gap and do not answer with nothing.'
+  });
+  const calls = Array.isArray(ck.toolCalls) ? ck.toolCalls : [];
+  let output = '';
+  let failedWriteup = null;
+  try {
+    const r = await mm.callLLM(null, null, { continueMessages: convo, maxTokens: c.answerTokens, thinkingTokens: c.thinkingTokens });
+    output = String(r && r.content || '').trim();
+  } catch (err) {
+    failedWriteup = err.message;
+    console.warn(`[AgentJobs] ${id.slice(0, 8)} could not write up after the decline: ${err.message}`);
+  }
+  const st = session.state();
+  const usedLine = `${st.billed.toFixed(1)} of ${st.maxCalls} tool calls, ${st.roundsUsed} of ${st.maxRounds} rounds, ${sayDuration(st.elapsedMs)} of ${sayDuration(st.maxWallMs)}`;
+  const error = `It stopped at your decision: you chose not to extend its budget (it had used ${usedLine}). What is above is what it had.`;
+  if (!output) output = mechanicalAccount(job, calls, session.summary(), c, failedWriteup ? `the writeup call failed: ${failedWriteup}` : null);
+  const done = finish(id, { status: 'partial', resultText: output, error, toolCalls: calls.length, budget: session.summary(), stopSource: 'user', stopKind: 'budget-declined' });
+  const withFile = done ? await attachArtifact(id, { note: error }) : null;
+  const line = `Background job finished PARTIAL at Ellie's decision: "${job.title}" (${id.slice(0, 8)}) — she declined more budget; it wrote up what it had (${calls.length} tool call(s)).`;
   console.log(`[AgentJobs] ${line}`);
   opsLog(line);
   return withFile || done;
@@ -943,11 +1394,19 @@ function sweepInterrupted({ now = new Date() } = {}) {
     // already been told, in the turn itself, that the lookup did not come back.
     const inTurn = IN_TURN_SOURCES.includes(j.source);
     const retryable = !writesToDisk && !inTurn && (j.attempts || 0) < c.maxAttempts && startedMs > 0 && age <= graceMs;
+    // THE CHECKPOINT IS WHAT A RESTART COULD NOT TAKE. Written after every
+    // tool result, so a run killed in round eight resumes at round eight —
+    // or, if it is not run again, its card says what it had rather than
+    // nothing.
+    const ck = readCheckpoint(j.id);
+    const hasRecord = !!(ck && Array.isArray(ck.convo) && ck.convo.length);
 
     if (retryable) {
-      db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL WHERE id = ?").run(j.id);
+      db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL, resume_mode = ? WHERE id = ?")
+        .run(hasRecord ? 'restart' : null, j.id);
       requeued++;
-      const line = `Background job ${j.id.slice(0, 8)} ("${j.title}") was interrupted by a restart ${Math.round(age / 60000)} minute(s) in. It is being run again — this is its last attempt.`;
+      const line = `Background job ${j.id.slice(0, 8)} ("${j.title}") was interrupted by a restart ${Math.round(age / 60000)} minute(s) in. ` +
+        (hasRecord ? `It picks up from its last completed step (${(ck.toolCalls || []).length} tool call(s) kept) — this is its last attempt.` : `It is being run again from the start — this is its last attempt.`);
       console.warn(`[AgentJobs] ${line}`);
       opsLog(line);
     } else {
@@ -958,8 +1417,17 @@ function sweepInterrupted({ now = new Date() } = {}) {
         : (j.attempts || 0) >= c.maxAttempts
         ? NOT_RERUN.ALREADY_RETRIED
         : NOT_RERUN.tooOld(c.retryGraceMinutes);
-      finish(j.id, { status: 'interrupted', error: why, toolCalls: j.tool_calls || 0 });
-      const line = `Background job ${j.id.slice(0, 8)} ("${j.title}"): ${why}.`;
+      // What it had goes on the card, labelled partial, from the record on
+      // disk. No model call here: this runs at boot, before the engine may be
+      // back, and the mechanical account cannot fail.
+      const calls = hasRecord && Array.isArray(ck.toolCalls) ? ck.toolCalls : [];
+      const partialText = hasRecord && calls.length ? mechanicalAccount(j, calls, ck.session ? { ...ck.session, exhausted: null } : null, c, 'SNH restarted') : null;
+      finish(j.id, {
+        status: 'interrupted', error: why, toolCalls: calls.length || j.tool_calls || 0,
+        resultText: partialText, budget: hasRecord && ck.session ? { ...ck.session, exhausted: null } : null,
+        stopSource: 'runner', stopKind: 'service-restart'
+      });
+      const line = `Background job ${j.id.slice(0, 8)} ("${j.title}"): ${why}.${calls.length ? ` Its ${calls.length} tool call(s) are on the card as partial output.` : ''}`;
       console.warn(`[AgentJobs] ${line}`);
       opsLog(line);
     }
@@ -979,9 +1447,15 @@ function prune({ now = new Date() } = {}) {
   const db = getSqliteDb();
   if (!db) return 0;
   const cutoff = new Date(now.getTime() - cfg().retentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const old = db.prepare(
+    `SELECT id FROM agent_jobs WHERE status IN (${TERMINAL.map(() => '?').join(',')}) AND datetime(finished_at) < datetime(?)`
+  ).all(...TERMINAL, cutoff);
   const res = db.prepare(
     `DELETE FROM agent_jobs WHERE status IN (${TERMINAL.map(() => '?').join(',')}) AND datetime(finished_at) < datetime(?)`
   ).run(...TERMINAL, cutoff);
+  // The record on disk goes with the row: it was kept for a retry's brief, and
+  // there is no row left to retry.
+  for (const r of old) dropCheckpoint(r.id);
   if (res.changes) console.log(`[AgentJobs] pruned ${res.changes} job(s) finished before ${cutoff}`);
   return res.changes;
 }
@@ -1041,7 +1515,139 @@ function cancel(id) {
     // said it had stopped.
     return { ok: false, error: 'It is already running, and a run in progress cannot be stopped cleanly — it will finish and land in the panel.' };
   }
+  if (job.status === 'paused') {
+    // A paused job is holding nothing; "cancel" here means "no more" — it
+    // writes up what it has, exactly as a no in the conversation would.
+    return declineMore(id, { via: 'panel' });
+  }
   return { ok: false, error: `It has already finished (${job.status}).` };
+}
+
+// ---------------------------------------------------------------------------
+// The retry, and the two answers to a budget ask
+// ---------------------------------------------------------------------------
+
+/** Sources a person may retry from the card. A coding job re-runs from the conversation, where the restore-point rules live. */
+const RETRYABLE_SOURCES = ['chat-handoff'];
+
+/**
+ * RETRY FROM THE CARD: the same task, a NEW row, and a brief that carries the
+ * last attempt's reason and partial output so it does not start from zero.
+ *
+ * A new row on purpose — the old one holds the record of what happened and is
+ * never rewritten. The two point at each other (`retry_of` / `retried_by`) so
+ * the panel draws the chain. Her action, so it does not count against the
+ * entity's starts-per-hour; the queue-depth cap still applies because that one
+ * bounds the machine.
+ */
+function retry(id) {
+  const job = getJob(id);
+  if (!job) return { ok: false, error: 'No such job.' };
+  if (!TERMINAL.includes(job.status)) return { ok: false, error: `It has not finished (${job.status}) — there is nothing to retry yet.` };
+  if (!RETRYABLE_SOURCES.includes(job.source || 'chat-handoff')) {
+    return { ok: false, error: job.source === require('./coding-jobs').SOURCE
+      ? 'A coding job is re-run from the conversation, not from here — it edits files, and the restore-point rules live there.'
+      : `A ${job.source} job cannot be retried from the panel.` };
+  }
+  if (job.status === 'ok') return { ok: false, error: 'It finished — there is nothing to retry. Ask for it again in conversation if you want it run afresh.' };
+  if (job.retried_by) {
+    const later = getJob(job.retried_by);
+    return { ok: false, error: later && !TERMINAL.includes(later.status)
+      ? `It is already being retried (${later.status}).`
+      : 'It was already retried — retry the newer attempt instead, which carries this one.' };
+  }
+  const started = enqueue({
+    title: job.title, task: job.task, why: job.why,
+    conversationId: job.conversation_id, messageId: job.message_id,
+    source: job.source || 'chat-handoff',
+    countsAgainstStarts: false,
+    retryOf: job.id
+  });
+  if (!started.ok) return started;
+  const db = getSqliteDb();
+  db.prepare('UPDATE agent_jobs SET retried_by = ? WHERE id = ?').run(started.id, job.id);
+  opsLog(`Background job retried from the panel: "${job.title}" (${job.id.slice(0, 8)} → ${started.id.slice(0, 8)}), attempt ${(job.attempts || 1) + 1}. The new run carries the last one's reason and partial output.`);
+  return { ok: true, id: started.id };
+}
+
+/**
+ * SHE SAID YES. The grant is what the ask promised (or the number she named),
+ * the row goes back on the queue in `granted` mode, and the resume reads the
+ * checkpoint. Not a new attempt in her eyes — the same job, continuing.
+ */
+function grantMore(id, { calls = null, via = 'conversation' } = {}) {
+  const job = getJob(id);
+  if (!job) return { ok: false, error: 'No such job.' };
+  if (job.status !== 'paused') return { ok: false, error: `It is not waiting on an answer (${job.status}).` };
+  const ask = parseAsk(job.ask_json) || {};
+  const grant = { ...(ask.grant || { calls: 10, rounds: 4, wallMs: 300000 }) };
+  if (Number.isFinite(calls) && calls > 0) {
+    grant.calls = Math.min(Math.floor(calls), cfg().maxToolCallsPerJob * 3);
+    grant.rounds = Math.max(grant.rounds, Math.ceil(grant.calls / 2));
+  }
+  ask.answeredAt = new Date().toISOString();
+  ask.decision = 'yes';
+  ask.grant = grant;
+  ask.answeredVia = via;
+  const db = getSqliteDb();
+  db.prepare("UPDATE agent_jobs SET status = 'queued', resume_mode = 'granted', ask_json = ?, started_at = NULL WHERE id = ?")
+    .run(JSON.stringify(ask), id);
+  settleAskDelivery(job, ask, 'yes');
+  const line = `Background job "${job.title}" (${id.slice(0, 8)}): Ellie said YES to more budget (+${grant.calls} calls, +${grant.rounds} rounds, +${Math.round(grant.wallMs / 60000)} min). Resuming from where it paused.`;
+  console.log(`[AgentJobs] ${line}`);
+  opsLog(line);
+  launch(id);
+  return { ok: true, grant };
+}
+
+/** SHE SAID NO. One writeup turn from the checkpoint, then partial. */
+function declineMore(id, { via = 'conversation' } = {}) {
+  const job = getJob(id);
+  if (!job) return { ok: false, error: 'No such job.' };
+  if (job.status !== 'paused') return { ok: false, error: `It is not waiting on an answer (${job.status}).` };
+  const ask = parseAsk(job.ask_json) || {};
+  ask.answeredAt = new Date().toISOString();
+  ask.decision = 'no';
+  ask.answeredVia = via;
+  const db = getSqliteDb();
+  db.prepare("UPDATE agent_jobs SET status = 'queued', resume_mode = 'declined', ask_json = ?, started_at = NULL WHERE id = ?")
+    .run(JSON.stringify(ask), id);
+  settleAskDelivery(job, ask, 'no');
+  const line = `Background job "${job.title}" (${id.slice(0, 8)}): Ellie said NO to more budget. It will write up what it has and finish as partial.`;
+  console.log(`[AgentJobs] ${line}`);
+  opsLog(line);
+  launch(id);
+  return { ok: true };
+}
+
+/** The bell item that pointed at the ask is decided, not left ringing. */
+function settleAskDelivery(job, ask, decision) {
+  try { require('./job-budget-ask').settle(job, ask, decision); }
+  catch (err) { console.warn(`[AgentJobs] could not settle the ask's bell item: ${err.message}`); }
+}
+
+/**
+ * The paused job (if any) whose ask is waiting on THIS conversation — what the
+ * chat route checks before it decides whether her message is an answer.
+ */
+function pendingAsk(conversationId) {
+  const db = getSqliteDb();
+  if (!db || !conversationId) return null;
+  const rows = db.prepare("SELECT * FROM agent_jobs WHERE status = 'paused' ORDER BY datetime(paused_at) ASC").all();
+  for (const j of rows) {
+    const ask = parseAsk(j.ask_json) || {};
+    const convId = (ask.delivery && ask.delivery.conversationId) || j.conversation_id;
+    if (convId === conversationId && !ask.decision) return { job: j, ask };
+  }
+  return null;
+}
+
+/** Every job waiting on an answer, for the panel and the live block. */
+function pausedJobs() {
+  const db = getSqliteDb();
+  if (!db) return [];
+  return db.prepare("SELECT * FROM agent_jobs WHERE status = 'paused' ORDER BY datetime(paused_at) ASC").all()
+    .map(j => ({ ...j, ask: parseAsk(j.ask_json) }));
 }
 
 /** Mark a job read by Ellie in the panel. */
@@ -1099,6 +1705,17 @@ function feed({ limit = 50 } = {}) {
     seen_at: j.seen_at,
     conversation_id: j.conversation_id,
     cancellable: j.status === 'queued',
+    // Why it stopped and who stopped it — see db/job-failure.js.
+    stop_source: j.stop_source,
+    stop_kind: j.stop_kind,
+    // The attempt chain and the ask, for the card.
+    retry_of: j.retry_of,
+    retried_by: j.retried_by,
+    retryable: TERMINAL.includes(j.status) && j.status !== 'ok' && RETRYABLE_SOURCES.includes(j.source || 'chat-handoff') && !j.retried_by,
+    paused_at: j.paused_at,
+    ask: (() => { const a = parseAsk(j.ask_json); return a ? { text: a.text, grant: a.grant, decision: a.decision, answeredAt: a.answeredAt, conversationId: a.delivery && a.delivery.conversationId, near: a.near } : null; })(),
+    // A failed or interrupted job with text on it is offering PARTIAL output.
+    partial_output: !!((j.status === 'failed' || j.status === 'interrupted') && (j.result_text || '').trim()),
     // What it produced as a file. `artifact_path` is deliberately NOT here: the
     // panel has no use for a server path it cannot open, and the download route
     // looks it up by job id rather than being handed one. `artifact_location` is
@@ -1136,6 +1753,9 @@ function feed({ limit = 50 } = {}) {
     seen_at: r.seen_at,
     conversation_id: null,
     cancellable: false,
+    stop_source: r.status === 'ok' ? null : 'runner',
+    stop_kind: null,
+    retry_of: null, retried_by: null, retryable: false, paused_at: null, ask: null, partial_output: false,
     // A scheduled run produces no file. It is a digest that arrives on a
     // cadence, and one PDF per firing would silt up the documents folder with a
     // hundred near-identical reports nobody asked for. Named explicitly rather
@@ -1173,7 +1793,10 @@ function counts() {
   const active = db.prepare(
     `SELECT COUNT(*) n FROM agent_jobs WHERE status IN ('queued','running') AND ${inTurnSql()}`
   ).get().n;
-  return { unseen: unseenJobs + unseenRuns, active, total: unseenJobs + unseenRuns + active };
+  // Paused is its own number: not running, not a result — waiting on her, in
+  // a conversation. The badge does not count it; the panel says it.
+  const paused = db.prepare(`SELECT COUNT(*) n FROM agent_jobs WHERE status = 'paused' AND ${inTurnSql()}`).get().n;
+  return { unseen: unseenJobs + unseenRuns, active, paused, total: unseenJobs + unseenRuns + active };
 }
 
 /**
@@ -1291,8 +1914,8 @@ function renderActiveJobsBlock() {
   const db = getSqliteDb();
   if (!db) return null;
   const rows = db.prepare(
-    `SELECT id, title, status, created_at, started_at FROM agent_jobs
-     WHERE status IN ('queued','running') AND ${inTurnSql()} ORDER BY datetime(created_at) ASC`
+    `SELECT id, title, status, created_at, started_at, paused_at, ask_json FROM agent_jobs
+     WHERE status IN ('queued','running','paused') AND ${inTurnSql()} ORDER BY datetime(created_at) ASC`
   ).all();
   if (!rows.length) return null;
 
@@ -1307,13 +1930,16 @@ function renderActiveJobsBlock() {
 
   const running = rows.filter(r => r.status === 'running');
   const queued = rows.filter(r => r.status === 'queued');
+  const paused = rows.filter(r => r.status === 'paused');
   const lines = rows.map(r => r.status === 'running'
     ? `- RUNNING: "${r.title}" (${elapsed(r.started_at)})`
-    : `- WAITING TO START: "${r.title}"`);
+    : r.status === 'paused'
+      ? `- PAUSED, WAITING ON HER: "${r.title}" — it stopped near its budget with work left and asked her, in the conversation that started it, whether to give it more. It does not move until she answers yes or no there.`
+      : `- WAITING TO START: "${r.title}"`);
 
   const text =
     '=== Your Background Jobs, Right Now ===\n' +
-    `${running.length} running, ${queued.length} waiting to start.\n` +
+    `${running.length} running, ${queued.length} waiting to start${paused.length ? `, ${paused.length} paused waiting on her answer` : ''}.\n` +
     lines.join('\n') + '\n' +
     'This is the whole picture and it is live as of this message. You can see THAT they are ' +
     'running and for how long; you cannot see how far along one is, what it has found so far, or ' +
@@ -1321,7 +1947,7 @@ function renderActiveJobsBlock() {
     'you are told what it found at the top of a reply — until then the honest answer about its ' +
     'contents is that you do not know yet.';
 
-  return { text, running: running.length, queued: queued.length };
+  return { text, running: running.length, queued: queued.length, paused: paused.length };
 }
 
 /**
@@ -1577,5 +2203,17 @@ module.exports = {
   NOT_RERUN,
   activeCount,
   startsLastHour,
+  // The retry and the budget ask.
+  retry,
+  grantMore,
+  declineMore,
+  pendingAsk,
+  pausedJobs,
+  RETRYABLE_SOURCES,
+  // The record on disk, for tests and the ask module.
+  readCheckpoint,
+  writeCheckpoint,
+  checkpointPath,
+  trimToCompleteRound,
   _inFlight: inFlight
 };

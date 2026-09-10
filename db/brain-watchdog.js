@@ -462,4 +462,27 @@ function _reset() {
   restartIssuedAt = 0;
 }
 
-module.exports = { onProbeResult, brainStatus, describeBrainState, describeQueue, recoveryAlertContent, _getState, _reset };
+/**
+ * DID THIS WATCHDOG JUST RESTART THE ENGINE? — for a job that died under it.
+ *
+ * A background job whose stream was cut off cannot tell, from the error, why
+ * the engine went away. If a restart was ISSUED here inside the window, that is
+ * the answer, and the job's card should say "SNH's own watchdog restarted the
+ * engine" rather than blaming the engine. Measured from the issue time, not the
+ * completion: the 9/9 restart took 96 seconds to complete (vLLM waited for the
+ * job's own connection to close, then systemd killed it) and the job died
+ * 6 seconds after that — the issue is what started the chain.
+ *
+ * @param {number} withinMs  how far back counts as "just"
+ * @returns {{issuedAt:number, reason:string}|null}
+ */
+function recentRestart(withinMs = 10 * 60 * 1000, now = Date.now()) {
+  const at = restartIssuedAt || lastRestartAt;
+  if (!at || now - at > withinMs) return null;
+  return {
+    issuedAt: at,
+    reason: `${cfg().failureThreshold} failed liveness checks in a row, verdict "${lastVerdict || 'unclassified'}"`
+  };
+}
+
+module.exports = { onProbeResult, brainStatus, describeBrainState, describeQueue, recoveryAlertContent, recentRestart, _getState, _reset };

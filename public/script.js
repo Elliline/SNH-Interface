@@ -2293,6 +2293,27 @@ async function loadSettingsBrainTab() {
       },
 
       {
+        key: 'agentJobs.askBeforeCeiling',
+        label: 'Ask before hitting a limit',
+        type: 'checkbox',
+        value: config.agentJobs?.askBeforeCeiling !== false,
+        desc: 'On, a job that is close to any of the limits above and still has work to do PAUSES and asks you — in the conversation that started it — what it has, what is left, and how much more it wants. A yes there resumes it; a no has it write up what it has. The bell points at the conversation. Off, it runs into the limit and writes up what it had, as before.'
+      },
+      {
+        key: 'agentJobs.askAtPercent',
+        label: 'How close to a limit counts as "near" (percent)',
+        type: 'number', step: '5', min: 0, max: 100,
+        value: config.agentJobs?.askAtPercent,
+        desc: 'Applies to calls, rounds and the clock alike. At 80 on a 40-call budget it asks once it has spent 32. Lower and it asks earlier, with less to show; higher and it asks with almost nothing left to finish the sentence it is on. 0 or 100 means never ask.'
+      },
+      {
+        key: 'agentJobs.extensionPercent',
+        label: 'What a plain "yes" grants (percent of the original limits)',
+        type: 'number', step: '10', min: 1,
+        value: config.agentJobs?.extensionPercent,
+        desc: 'At 50 on a 40-call, 16-round, 15-minute job a yes adds 20 calls, 8 rounds and 7½ minutes. The job may name what it needs in its ask, and you can name a number in your answer ("yes, 30 more") — either of those wins over this.'
+      },
+      {
         key: 'agentJobs.maxQueued',
         label: 'Jobs waiting in the queue',
         type: 'number', step: '1', min: 1,
@@ -2478,6 +2499,13 @@ async function loadSettingsBrainTab() {
         type: 'number', step: '0.05', min: 0,
         value: config.heartbeat?.toolBudget?.failedCallCost,
         desc: 'Between 0 and 1, where a useful result costs 1. A search that errors or comes back empty is not progress, so charging it full price meant one broken provider could spend a whole job on nothing. At 0.25 a run gets four tries for the price of one result. Set it to 1 to go back to counting attempts.'
+      },
+      {
+        key: 'heartbeat.toolBudget.failedCallRetries',
+        label: 'Free retries for a tool call that errors',
+        type: 'number', step: '1', min: 0,
+        value: config.heartbeat?.toolBudget?.failedCallRetries,
+        desc: 'A call that times out, hits a dead provider or throws is tried again this many times before it costs anything; only if every try fails does it bill the fraction above. A call that ran fine and found nothing is NOT retried — that result is an answer. Retries still count toward the hard attempt ceiling below. 0 turns this off.'
       },
       {
         key: 'heartbeat.toolBudget.attemptCeilingMultiple',
@@ -4171,7 +4199,15 @@ async function loadInitiativeList() {
       // rather than a cron job — so it gets its own pair of buttons rather than
       // being squeezed through the cron path.
       const isRetire = it.type === 'proposal' && it.source_kind === 'conversation-retire' && it.source_ref;
-      const actions = isRetire
+      // A BUDGET ASK'S BELL ITEM IS A POINTER. The ask itself is a message in
+      // the conversation; the decision is made there. The only thing this item
+      // can do is open the door — no approve button, no dismiss (a proposal).
+      const isBudgetAsk = it.type === 'proposal' && it.source_kind === 'job-budget-ask';
+      const actions = isBudgetAsk
+        ? (it.conversation_id
+          ? `<button class="budget-ask-open" data-conversation="${escapeHtml(it.conversation_id)}">Open the conversation</button>`
+          : '<span class="initiative-note">Answer it in the conversation it asked in.</span>')
+        : isRetire
         ? `<button class="conversation-retire-approve" data-conversation="${escapeHtml(it.source_ref)}" data-id="${it.id}">Archive it</button>
            <button class="conversation-retire-keep" data-id="${it.id}">Keep it open</button>`
         : isProposal
@@ -4214,6 +4250,12 @@ async function loadInitiativeList() {
         actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = false));
       }
     };
+    container.querySelectorAll('.budget-ask-open').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        closeInitiativePanel();
+        try { await loadConversationById(btn.dataset.conversation); } catch (e) { /* the sidebar still has it */ }
+      });
+    });
     container.querySelectorAll('.conversation-retire-approve').forEach(btn => {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -4434,6 +4476,7 @@ function formatJobDuration(ms) {
 const JOB_STATUS_NOTE = {
   queued: 'Waiting to start.',
   running: 'Running now.',
+  paused: 'Paused — it is near its budget with work left, and it asked you for more.',
   // Every terminal state says what it means for her, because a bare status word
   // makes an interrupted job look like a failed one and a cancelled one look
   // like a crash.
@@ -4442,6 +4485,29 @@ const JOB_STATUS_NOTE = {
   interrupted: 'The server restarted while this was running.',
   cancelled: 'You cancelled this before it started.'
 };
+
+/**
+ * WHO STOPPED IT, as the card's lead-in. Mirrors db/job-failure.js sourceLabel:
+ * the sentence that follows carries the specifics; this says which side to go
+ * looking on, which is the question the 9/9 "terminated" card could not answer.
+ */
+const JOB_STOP_SOURCE = {
+  runner: "Stopped by SNH's job runner",
+  engine: 'Stopped on the engine side',
+  dispatched: 'Stopped by the agent it was handed to',
+  user: 'Stopped by you',
+  unknown: 'Stopped for a reason SNH could not place'
+};
+function renderStopLine(it, note) {
+  const lead = it.status === 'partial' || it.status === 'failed' || it.status === 'interrupted'
+    ? (JOB_STOP_SOURCE[it.stop_source] || JOB_STOP_SOURCE.unknown)
+    : '';
+  const bits = [];
+  if (lead) bits.push(`<strong>${escapeHtml(lead)}.</strong>`);
+  if (note && it.status !== 'partial') bits.push(escapeHtml(note));
+  if (it.error) bits.push(escapeHtml(it.error));
+  return bits.join(' ');
+}
 
 /**
  * A job result, rendered as the markdown it has always been.
@@ -4514,6 +4580,26 @@ function renderJobFile(it) {
     ${it.artifact_error ? `<div class="job-file-note">${escapeHtml(it.artifact_error)}</div>` : ''}`;
 }
 
+/**
+ * A PAUSED JOB'S CARD: the ask it sent, and where to answer. No decision
+ * buttons here on purpose — the decision is made in the conversation, in
+ * words, which is the one place she has ever made one (see CLAUDE.md, "Nothing
+ * that has to be ACTED ON goes on the bell"). The card is the record; the door
+ * is the button.
+ */
+function renderPausedCard(it) {
+  const ask = it.ask || {};
+  const g = ask.grant || {};
+  const askText = ask.text ? renderResultMarkdown(ask.text) : '<em>It asked for more budget.</em>';
+  const grant = g.calls
+    ? `A yes gives it ${g.calls} more tool call${g.calls === 1 ? '' : 's'}, ${g.rounds || 0} more round${g.rounds === 1 ? '' : 's'} and ${Math.round((g.wallMs || 0) / 60000)} more minute${Math.round((g.wallMs || 0) / 60000) === 1 ? '' : 's'}.`
+    : '';
+  return `
+    <div class="job-ask">${askText}</div>
+    <div class="job-error job-cutshort"><strong>Waiting on your answer.</strong> It is holding no lane and will not expire. ` +
+    `Reply <em>yes</em> or <em>no</em> in the conversation it asked in — that is what decides it. ${escapeHtml(grant)}</div>`;
+}
+
 async function loadJobsList() {
   const container = document.getElementById('jobsList');
   if (!container) return;
@@ -4530,8 +4616,9 @@ async function loadJobsList() {
     if (activity) {
       const running = items.filter(j => j.status === 'running').length;
       const queued = items.filter(j => j.status === 'queued').length;
-      if (running || queued) {
-        activity.textContent = `${running} running · ${queued} queued`;
+      const paused = items.filter(j => j.status === 'paused').length;
+      if (running || queued || paused) {
+        activity.textContent = `${running} running · ${queued} queued${paused ? ` · ${paused} waiting on you` : ''}`;
         activity.style.display = 'block';
       } else {
         activity.style.display = 'none';
@@ -4546,7 +4633,7 @@ async function loadJobsList() {
 
     // Work in flight sorts to the top — it is the part she is waiting on. The
     // rest stays newest-first underneath.
-    const rank = (j) => (j.status === 'running' ? 0 : j.status === 'queued' ? 1 : 2);
+    const rank = (j) => (j.status === 'paused' ? 0 : j.status === 'running' ? 1 : j.status === 'queued' ? 2 : 3);
     items.sort((a, b) => rank(a) - rank(b) || (new Date(b.created_at || 0) - new Date(a.created_at || 0)));
 
     container.innerHTML = items.map(it => {
@@ -4567,12 +4654,26 @@ async function loadJobsList() {
       // Without one, the result IS the card and is shown whole, as before.
       const shown = it.artifact_kind && it.summary_text ? it.summary_text : it.result_text;
       const rendered = shown ? renderResultMarkdown(shown) : '';
+      // A FAILED OR INTERRUPTED JOB WITH TEXT IS OFFERING PARTIAL OUTPUT, and
+      // the card says so above it rather than leaving her to guess whether
+      // what she is reading is a result or a corpse. The stop line — who
+      // stopped it, and which clock or limit — goes underneath.
+      const partialLead = it.partial_output
+        ? '<div class="job-partial-label">Partial output — what it had up to where it stopped:</div>' : '';
       const body = it.status === 'ok'
         ? rendered
-        : (rendered
-          ? `${rendered}<div class="job-error job-cutshort">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</div>`
-          : `<span class="job-error">${escapeHtml(note)}${it.error ? ` ${escapeHtml(it.error)}` : ''}</span>`);
+        : it.status === 'paused'
+          ? renderPausedCard(it)
+          : (rendered
+            ? `${partialLead}${rendered}<div class="job-error job-cutshort">${renderStopLine(it, note)}</div>`
+            : `<span class="job-error">${renderStopLine(it, note)}</span>`);
       const file = renderJobFile(it);
+      // THE ATTEMPT CHAIN. A retry is a new card that points back; the old one
+      // points forward. Both are in this list, so the links scroll.
+      const chain = [
+        it.retry_of ? `<a class="job-chain" href="#" data-goto="${escapeHtml(it.retry_of)}">retry of an earlier attempt</a>` : '',
+        it.retried_by ? `<a class="job-chain" href="#" data-goto="${escapeHtml(it.retried_by)}">retried — see the newer attempt</a>` : ''
+      ].filter(Boolean).join(' · ');
       // Elapsed, for the ones still going — "running" with no clock on it tells
       // her nothing about whether to keep waiting.
       const elapsed = (it.status === 'running' && it.started_at)
@@ -4585,6 +4686,10 @@ async function loadJobsList() {
 
       const actions = [];
       if (it.cancellable) actions.push(`<button class="job-cancel" data-id="${escapeHtml(it.id)}">Cancel</button>`);
+      if (it.retryable) actions.push(`<button class="job-retry" data-id="${escapeHtml(it.id)}" title="Runs the same task again. The new run is told why this one stopped and what it had, so it does not start from zero.">Retry</button>`);
+      if (it.status === 'paused' && it.ask && it.ask.conversationId) {
+        actions.push(`<button class="job-open-convo" data-conversation="${escapeHtml(it.ask.conversationId)}">Open the conversation</button>`);
+      }
       if (unread) actions.push(`<button class="job-seen" data-id="${escapeHtml(it.id)}" data-kind="${escapeHtml(it.kind)}">Mark read</button>`);
 
       return `
@@ -4599,7 +4704,7 @@ async function loadJobsList() {
           ? `<div class="initiative-note">${escapeHtml(note)} The result will appear here — it will not message you.</div>`
           : `<div class="initiative-content">${body}</div>`}
         ${file}
-        ${meta ? `<div class="job-meta">${meta}</div>` : ''}
+        ${meta || chain ? `<div class="job-meta">${[meta, chain].filter(Boolean).join(' · ')}</div>` : ''}
         ${actions.length ? `<div class="initiative-actions">${actions.join('')}</div>` : ''}
       </div>`;
     }).join('');
@@ -4616,6 +4721,44 @@ async function loadJobsList() {
           await loadJobsList();
           refreshJobsBadge();
         } catch (e) { btn.disabled = false; }
+      });
+    });
+
+    container.querySelectorAll('.job-retry').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Retrying…';
+        try {
+          const r = await fetch(`/api/jobs/${btn.dataset.id}/retry`, { method: 'POST' });
+          if (!r.ok) {
+            // The refusal is shown with its reason — a coding job, a job still
+            // going, one already retried — rather than a button that did nothing.
+            const err = await r.json().catch(() => ({}));
+            btn.textContent = 'Retry';
+            btn.insertAdjacentHTML('afterend', `<span class="job-error"> ${escapeHtml(err.error || 'Could not retry.')}</span>`);
+            return;
+          }
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; btn.textContent = 'Retry'; }
+      });
+    });
+
+    container.querySelectorAll('.job-open-convo').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        closeJobsPanel();
+        try { await loadConversationById(btn.dataset.conversation); } catch (e) { /* the sidebar still has it */ }
+      });
+    });
+
+    container.querySelectorAll('.job-chain').forEach(a => {
+      a.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        const target = container.querySelector(`.job-item[data-id="${a.dataset.goto}"]`);
+        if (!target) return;
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('job-highlight');
+        setTimeout(() => target.classList.remove('job-highlight'), 1600);
       });
     });
 

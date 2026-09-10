@@ -264,19 +264,19 @@ const minutesAgo = (n) => new Date(Date.now() - n * 60_000).toISOString();
     check(`…and the job stays armed while it has attempts left`, !!job(failing).next_run_at && !!job(failing).enabled);
   }
   const failRun = runs(failing)[0];
-  check('the run row carries the actual error text',
-    /circuit open/.test(failRun.error || ''), failRun.error);
+  check('the run row carries the reason in words, naming the side (the runner refused to send the call)',
+    /circuit breaker was open/.test(failRun.error || '') && /SNH's job runner/.test(failRun.error || ''), failRun.error);
 
   db.prepare('UPDATE cron_jobs SET next_run_at = ? WHERE id = ?').run(minutesAgo(1), failing);
   await scheduler.tick();
   check('the third consecutive failure disables the job', !job(failing).enabled);
   check('…disarms it, so it stops claiming a next run', !job(failing).next_run_at);
   check('…and says why, naming the error',
-    /3 consecutive failures/.test(job(failing).disabled_reason || '') && /circuit open/.test(job(failing).disabled_reason || ''),
+    /3 consecutive failures/.test(job(failing).disabled_reason || '') && /circuit breaker was open/.test(job(failing).disabled_reason || ''),
     job(failing).disabled_reason);
   const alert = db.prepare("SELECT * FROM initiatives WHERE type = 'alert' AND source_kind = 'scheduled-job-disabled'").get();
   check('…and raises it with Ellie rather than only in a log',
-    !!alert && /disabled itself/.test(alert.content) && /circuit open/.test(alert.content),
+    !!alert && /disabled itself/.test(alert.content) && /circuit breaker was open/.test(alert.content),
     alert && alert.content.slice(0, 140));
   const callsBefore3 = callCount;
   await scheduler.tick();

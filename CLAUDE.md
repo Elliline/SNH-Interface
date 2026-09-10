@@ -689,9 +689,11 @@ get the code right and the words wrong.
   producing nothing). Only the last two are strikes. **A saturated probe RESETS
   the strike counter** rather than being skipped: it is positive evidence of
   life, and skipping would let two unrelated busy minutes add up to a restart.
-  Progress is a token-counter delta across two samples 750ms apart, because "was
-  it producing tokens 60 seconds ago" does not answer "is it producing now".
-  Verify with `node scripts/test-probe-verdict.js` (stub engines, no GPU).
+  Progress is a token-counter delta across two samples 750ms apart — AND, since
+  2026-09-10, movement since the previous failed probe, because a 750ms window
+  cannot see through a prefill and that restarted a healthy engine under a job
+  (see *"Terminated" is not a diagnosis*). Verify with
+  `node scripts/test-probe-verdict.js` (stub engines, no GPU).
 
 - **`NVRM ... NV_ERR_NO_MEMORY` IS NOT A WEDGE MARKER.** It reads like one and it
   was treated as one through six incidents. Paired against container starts it
@@ -847,7 +849,8 @@ Four more things that are load-bearing if you touch this:
 - **A restart kills a run, so the loss is made loud.** The row is written before
   the work starts; `sweepInterrupted()` closes every `running` row as
   `interrupted` WITH THE REASON, and re-queues it once if it is inside
-  `agentJobs.retryGraceMinutes`. The retry was only safe because jobs were
+  `agentJobs.retryGraceMinutes` — since 2026-09-10 resuming from the checkpoint
+  rather than from zero (see *"Terminated" is not a diagnosis*). The retry was only safe because jobs were
   read-only, and this said the day one could write was the day to revisit it.
   **That day was 2026-08-20** — see *Coding work goes to squatch-code* below.
   A job whose `source` is `squatch-code` is NEVER re-queued: it may already
@@ -866,6 +869,127 @@ Four more things that are load-bearing if you touch this:
 - **The badge counts unread RESULTS, not work in progress.** Running jobs show as
   a slow pulse on the button. A badge that counted starts would say something is
   waiting on her when nothing is.
+
+## ⛔ "Terminated" is not a diagnosis — a stopped job names the side that stopped it
+
+On 2026-09-09 Juno's "Hailo-10H Pi software stack research" ran 6m45s, made 27
+tool calls across eight rounds, and closed as `failed` with `error = "terminated"`.
+That word is what Node's fetch throws when a response body is cut off mid-stream,
+written onto the card verbatim. Nobody could tell from the card whether SNH's
+runner had killed the job or the thing it was waiting on had died — the one
+question that decides where to look. The journal, vLLM's log and systemd's log
+together said: **SNH's own brain watchdog restarted vLLM underneath a healthy
+run.** Three liveness probes a minute apart each landed while the engine was
+reading a 35-message prompt (prefill: 2,900 tok/s prompt, 0 generation), and
+**none of vLLM's counters move until the first output token** — measured on
+Sparky: 18 s of prefill on a 36k-token prompt, every counter flat. The 750 ms
+progress window read three prefills as three wedges, the restart cut the job's
+stream, and the runner wrote down the word it was handed. The "81 KB" on the
+card was the PDF of the mechanical account, mostly fonts. The 27 tool results
+were in memory and went with the process.
+
+Five things follow, and they are all in `db/agent-jobs.js`, `db/job-failure.js`
+and `db/job-budget-ask.js`:
+
+- **A stop has a SOURCE and a KIND, decided in one pure place.** `db/job-failure.js`
+  maps every thrown error and every budget summary to `{source, kind, plain}`
+  — `runner` (a clock, a budget, a restart of SNH, the watchdog), `engine` (the
+  connection cut, nothing listening, a refusal), `dispatched` (squatch-code),
+  `user` (cancelled, or a declined budget ask), `unknown` (and then the raw text
+  is *quoted inside the sentence*, never shown alone). `stop_source`/`stop_kind`
+  are columns; `error` is the plain sentence, numbers said in words ("the stall
+  limit is 105 seconds", not `105600`). The card leads with the side
+  ("Stopped by SNH's job runner"), the announcement block carries the same
+  sentence, and `sayDuration` keeps seconds as seconds under two minutes so a
+  106-second stall and a 105-second limit do not both print as "2 minutes". A
+  connection cut is attributed to the watchdog when `brainWatchdog.recentRestart()`
+  says it issued one — measured from the ISSUE time, because the 9/9 restart took
+  96 s to complete (vLLM waited on the job's own connection) and the job died six
+  seconds after that. `scripts/test-job-failure.js` is the vocabulary.
+- **The record is written AS THE JOB RUNS.** `<data>/jobs/<id>.json` — the
+  transcript, the tool record, the session counters — after every tool result
+  and every round, from inside `runToolLoop` via a `checkpoint` callback. The
+  loop also attaches the same state to any error it throws (`err.toolCalls`,
+  `err.convo`, `err.round`), and `streamChat` attaches what it had streamed
+  (`err.partial.content`). So a failed card offers what it had, labelled
+  partial, from the transcript: the salvage writeup continues the job's own
+  conversation with one no-tools turn, and the mechanical account (no model,
+  cannot fail) lists the calls and the half-streamed text. `tool_calls` was 0 on
+  the 9/9 card against 27 in `budget_json` because the catch block read a
+  variable only the success path assigned — that class of loss is what the
+  checkpoint is for. Kept after a non-ok finish (a retry's brief reads it),
+  dropped on `ok`, dropped with the row at prune.
+- **A restart resumes from the last COMPLETE round.** `sweepInterrupted` sets
+  `resume_mode = 'restart'` on a young row and the run continues from the
+  checkpoint; `trimToCompleteRound` cuts an assistant turn whose tool results
+  did not all land, because a transcript that asks for three tools and shows
+  two answers is malformed for the next request. A row NOT re-run closes as
+  `interrupted` with the calls it made as partial output — no model call, since
+  this runs at boot before the engine may be back.
+- **Retry is a NEW row with a brief that carries the last attempt.** `retry(id)`
+  → `enqueue({ retryOf })`; `retry_of`/`retried_by` link the chain both ways and
+  the old row is never rewritten. The system prompt gets `retryBrief()`: the
+  reason it stopped, the partial text, and what it had already looked up (from
+  the checkpoint), capped at 6,000 chars. Her action from the card, so it does
+  not count against the entity's starts-per-hour; the queue-depth cap still
+  applies. An `ok` job and a coding job are refused with the reason (a coding
+  job re-runs from the conversation, where the restore-point rules live).
+- **A failed CALL gets one free retry; an EMPTY call does not.** `executeBackgroundTool`
+  retries a result carrying `error` once (`heartbeat.toolBudget.failedCallRetries`)
+  before billing; a retry that answers bills 1, a pair that both fail bills
+  `failedCallCost`. A search that ran and found nothing is an ANSWER — not
+  retried, billed as before. The retry counts toward the raw attempt ceiling
+  (`session.calls + session.retries`) so a dead provider cannot double the
+  runaway allowance; `session.calls` stays what the model asked for.
+
+**And the budget ASKS instead of stopping.** Ellie, 9/9: the limit exists so a
+loop cannot run forever, not to hold the entities back. When the model asks for
+more tools (the only evidence that work remains) and any limit is past
+`agentJobs.askAtPercent` (80) — calls, rounds or the clock — the loop returns
+`paused` with the calls it did not run, and `pauseAndAsk` has the model write
+the ask *from its own transcript*: what it has, what is left, how much more
+(`NEEDED: <n> more tool calls`, parsed into the grant; otherwise
+`extensionPercent` of the original limits). The row goes to `paused`, holds no
+lane, and does not expire.
+
+- **The ask is a MESSAGE in the conversation that dispatched the job** — an
+  assistant turn in the real transcript, the 9/1 rule — and **the bell holds a
+  `proposal` that only points there.** This is the one place a job speaks, it is
+  in `db/job-budget-ask.js` and nowhere else, and it is allowed because a
+  decision is needed from her, and her rule for decisions is "in the
+  conversation, in words". `db/agent-jobs.js` still requires neither
+  `initiatives` nor `conversation-channel`; a FINISHED job still leaves the bell
+  empty; `scripts/test-job-failures.js` asserts all three.
+- **Her next message there is read by a yes/no/neither classifier BEFORE the turn
+  generates** (`decideFromMessage`, same shape as the brief approval: 4 tokens,
+  temperature 0, fails to NEITHER). YES → `grantMore` (a number she names wins:
+  "yes, 30 more"), the row is re-queued in `granted` mode, the pending calls run
+  first, the transcript is told what she granted. NO → `declineMore`, one
+  no-tools writeup from the checkpoint, `partial` with `stop_source = 'user'`,
+  `stop_kind = 'budget-declined'` — her decision is not a failure of anything.
+  NEITHER leaves it waiting. The entity's turn gets a guidance block saying what
+  was done so its words match her card. A resume is the SAME attempt (`attempts`
+  does not move), so one ask cannot spend the one retry a later restart is
+  allowed. `cancel()` on a paused job is a NO.
+- **Asking off (`askBeforeCeiling` false, or `askAtPercent` 0/100) is the old
+  hard stop**, unchanged: budget spent → tools withdrawn → writeup → partial.
+
+**The watchdog now compares against the LAST failed probe as well as the 750 ms
+window.** `adjudicateProbe` keeps the counter it saw at the previous failed probe;
+movement since then is `saturated` (strike counter reset) however still the
+window was. A wedge shows no movement across both. A counter that went DOWN is a
+restarted engine, not progress; an ok probe clears the memory. The first probe
+into a prefill can still be a strike; the second cannot, and the threshold is
+three. `scripts/test-probe-verdict.js` has the sequence.
+
+Verify with `node scripts/test-job-failure.js` (pure) and
+`SNH_DATA_DIR=$(mktemp -d) node scripts/test-job-failures.js`, which drives the
+real runner against a scripted engine — a stall, the wall clock, a provider
+down, the cut stream with and without the watchdog, nothing listening, a process
+killed with SIGKILL mid-run and a new process resuming it, the ask answered all
+three ways, and a retry — and tears its store down. The two child roles in that
+file exist because a job cannot genuinely be killed mid-run from inside the
+process running it.
 
 ## ⛔ A mechanism is only safe in the context that made it safe
 

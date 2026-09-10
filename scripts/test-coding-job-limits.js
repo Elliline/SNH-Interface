@@ -121,8 +121,10 @@ function runWith(mode, { stallTimeoutMs, maxRuntimeMinutes, stepMs = 200, extra 
   check('  quickly, not at the ceiling', stalled.tookMs < 10000, `${stalled.tookMs}ms`);
   check('  the card says NO ACTIVITY', /no activity for/i.test(stalled.resultText), stalled.resultText.slice(0, 90));
   check('  and not "exceeded maximum runtime"', !/exceeded maximum runtime/i.test(stalled.resultText));
-  check('  the error names the stall and the limit',
-    /stalled — no progress for \d+s \(limit \d+s\)/.test(stalled.error), stalled.error);
+  check('  the error names the stall and the limit, in words',
+    /SNH's job runner stopped it: no progress for \d+ minute\(s\), and the stall limit is \d+ minutes/.test(stalled.error), stalled.error);
+  check('  and says which side stopped it',
+    stalled.stopSource === 'runner' && stalled.stopKind === 'stall', `${stalled.stopSource}/${stalled.stopKind}`);
 
   console.log('\n── A ceiling kill is a DIFFERENT card ──');
   // Steps every 200ms so nothing stalls; ceiling is what binds.
@@ -133,7 +135,9 @@ function runWith(mode, { stallTimeoutMs, maxRuntimeMinutes, stepMs = 200, extra 
   check('  and NOT "no activity"', !/no activity for/i.test(ceilinged.resultText));
   check('  it says the job was still working', /still working/i.test(ceilinged.resultText));
   check('  the error names the ceiling',
-    /exceeded maximum runtime of/.test(ceilinged.error), ceilinged.error);
+    /stopped it at the runtime ceiling: \d+ minutes/.test(ceilinged.error), ceilinged.error);
+  check('  and says which side stopped it',
+    ceilinged.stopSource === 'runner' && ceilinged.stopKind === 'wall-clock', `${ceilinged.stopSource}/${ceilinged.stopKind}`);
 
   console.log('\n── Slow but flowing SURVIVES past the old flat limit ──');
   // The regression that matters: steps 600ms apart, a stall window of 1.5s, and

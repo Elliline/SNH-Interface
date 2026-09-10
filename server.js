@@ -1973,6 +1973,28 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // The phrase list is KEPT, and it gates nothing. When it happens to hit it
     // saves a round trip; when it misses, the classifier decides. If they
     // disagree the classifier wins, because the list is the thing that failed.
+    // === A BUDGET ASK WAITING ON THIS CONVERSATION ===========================
+    //
+    // A background job that paused near its ceiling asked her here, in words,
+    // whether it may have more. Her answer is her next message. Read it BEFORE
+    // the turn is generated — same shape as the brief approval below — act on
+    // it (resume, or write up), and tell the entity what was done so its reply
+    // matches. Free on every turn with no ask waiting: pendingAsk is one SQL
+    // read and the classifier never runs.
+    let budgetAskOutcome = null;
+    try {
+      budgetAskOutcome = await require('./db/job-budget-ask').decideFromMessage({
+        conversationId: convoId,
+        message: userMessage.content,
+        callLLM: memoryManager.callLLM,
+      });
+      if (budgetAskOutcome) {
+        console.log(`[BudgetAsk] "${budgetAskOutcome.job.title}": her message read as ${budgetAskOutcome.decision.toUpperCase()} (${budgetAskOutcome.reason})`);
+      }
+    } catch (askErr) {
+      console.error('[BudgetAsk] decision error:', askErr.message);
+    }
+
     let forceCodingCall = false;
     let codingPinReason = null;
     // Set when a re-run was asked for and refused because the project is busy.
@@ -2306,6 +2328,17 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
     // Costs nothing on a normal turn — renderActiveJobsBlock returns null when
     // the queue is empty, and that absence is what the standing instruction
     // below keys off.
+    // What became of her answer to a budget ask, if there was one — before
+    // the live block, so "it resumed" reads next to "it is running".
+    if (budgetAskOutcome) {
+      try {
+        const g = require('./db/job-budget-ask').renderGuidance(budgetAskOutcome);
+        if (g) memoryParts.push({ kind: 'guidance', label: g.label, text: g.text });
+      } catch (gErr) {
+        console.error('[BudgetAsk] guidance render error:', gErr.message);
+      }
+    }
+
     let activeJobsBlock = null;
     try {
       activeJobsBlock = agentJobs.renderActiveJobsBlock();

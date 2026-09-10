@@ -179,7 +179,9 @@ async function settle(id, ms = 3000) {
   const threw = agentJobs.enqueue({ title: 'ask a wedged brain', task: 'anything' });
   const threwDone = await settle(threw.id);
   check('a throw is recorded as failed', threwDone.status === 'failed', threwDone.status);
-  check('the reason is the real one, not a placeholder', /circuit open/i.test(threwDone.error || ''), threwDone.error);
+  check('the reason is the real one, in words, not a placeholder', /circuit breaker was open/i.test(threwDone.error || ''), threwDone.error);
+  check('and it says which side stopped it — the runner refused to send the call',
+    threwDone.stop_source === 'runner' && threwDone.stop_kind === 'circuit-open', `${threwDone.stop_source}/${threwDone.stop_kind}`);
   check('a failed job still has a finish time', !!threwDone.finished_at);
   check('and even a thrown run writes an account rather than leaving an empty card',
     !!(threwDone.result_text || '').trim(), JSON.stringify(threwDone.result_text));
@@ -242,7 +244,9 @@ async function settle(id, ms = 3000) {
   const cutDone = await settle(cut.id);
   check('a cut-short run with real text is partial', cutDone.status === 'partial', cutDone.status);
   check('its text is kept whole', /two of the three suppliers/.test(cutDone.result_text || ''));
-  check('and it says it ran out of rounds', /ran out of tool rounds/.test(cutDone.error || ''), cutDone.error);
+  check('and it says it ran out of rounds', /round limit/.test(cutDone.error || ''), cutDone.error);
+  check('  naming the runner as the side that stopped it',
+    cutDone.stop_source === 'runner' && cutDone.stop_kind === 'rounds', `${cutDone.stop_source}/${cutDone.stop_kind}`);
 
   // What HE is told has to match what is on her card.
   const partialBlock = agentJobs.renderAnnouncementBlock({ limit: 5 });

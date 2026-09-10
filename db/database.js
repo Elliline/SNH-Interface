@@ -1075,7 +1075,27 @@ function initDatabase() {
       // so the first slow run's digest sat in this table, complete and correct,
       // while the entity told Ellie she would come back to it and then could
       // not. Everything in v1.1's late delivery hangs off this column.
-      ['delivered_at', 'DATETIME', 'when an in-turn digest reached the conversation that asked']
+      ['delivered_at', 'DATETIME', 'when an in-turn digest reached the conversation that asked'],
+      // WHY IT STOPPED, AND WHO STOPPED IT (2026-09-10). `error` stays the plain
+      // sentence she reads; these two are the machine-readable half so the
+      // panel, the tests and the retry brief can key on them without parsing
+      // prose. See db/job-failure.js for the vocabulary. Null on `ok`.
+      ['stop_source', 'TEXT', "who stopped it: runner | engine | dispatched | user | unknown"],
+      ['stop_kind', 'TEXT', 'which clock, limit or event: stall, wall-clock, call-budget, watchdog-restart, ...'],
+      // THE ATTEMPT CHAIN. A retry from the card is a NEW row that points back
+      // at the one it retries, and the old row points forward, so the panel can
+      // draw the chain in both directions and neither row is ever rewritten.
+      ['retry_of', 'TEXT', 'the agent_jobs row this run is a retry of'],
+      ['retried_by', 'TEXT', 'the agent_jobs row that retried this one'],
+      // THE BUDGET ASK. A job near its ceiling with work left pauses, asks her
+      // in the conversation that dispatched it, and waits here — status
+      // `paused`, holding no lane — until she answers. ask_json carries what it
+      // asked, what a yes grants, and how it was answered; resume_mode tells
+      // the next run whether it is continuing (granted), writing up (declined)
+      // or picking up after a restart.
+      ['ask_json', 'TEXT', 'the budget ask: what it wanted, why, what a yes grants, and the answer'],
+      ['paused_at', 'DATETIME', 'when it paused to ask'],
+      ['resume_mode', 'TEXT', 'granted | declined | restart — how the next run continues']
     ]) {
       if (!jobCols.some(c => c.name === col)) {
         sqliteDb.exec(`ALTER TABLE agent_jobs ADD COLUMN ${col} ${type}`);

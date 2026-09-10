@@ -686,7 +686,8 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
       return resolve({
         status: 'failed',
         resultText: `Could not create a place for the job's report: ${err.message}. Nothing was dispatched.`,
-        error: err.message
+        error: `SNH's job runner could not dispatch it: ${err.message}. Nothing ran.`,
+        stopSource: 'runner', stopKind: 'dispatch'
       });
     }
 
@@ -738,6 +739,8 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
         status: 'partial',
         resultText: resultText + dirtyStateNote(projectDir),
         error: errorText,
+        // SNH's own watcher killed it: the stall window or the runtime ceiling.
+        stopSource: 'runner', stopKind: reason === 'stall' ? 'stall' : 'wall-clock'
       }));
     };
 
@@ -766,7 +769,7 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
           `**Stopped: no activity for ${mins} minute${mins === 1 ? '' : 's'}.** The job stopped `
           + `making progress and was killed after waiting ${Math.round(stallMs / 60000)} minutes for `
           + `it to do something. It had been running ${Math.round(ran / 60000)} minutes in total.`,
-          `stalled — no progress for ${Math.round(idle / 1000)}s (limit ${Math.round(stallMs / 1000)}s)`);
+          `SNH's job runner stopped it: no progress for ${Math.round(idle / 60000)} minute(s), and the stall limit is ${Math.round(stallMs / 60000)} minutes ("Stall timeout, coding jobs" in Settings). It had run ${Math.round(ran / 60000)} minute(s) in total.`);
       } else if (ran >= ceilingMs) {
         clearInterval(watcher);
         killWith('ceiling',
@@ -774,7 +777,7 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
           + `${Math.round(idle / 1000)}s ago — but it passed the ${Math.round(ceilingMs / 60000)}-minute `
           + `ceiling and was stopped. That ceiling is a runaway guard, not a pace: if this was `
           + `legitimate work, raise it in Settings rather than splitting the brief.`,
-          `exceeded maximum runtime of ${Math.round(ceilingMs / 60000)} minutes`);
+          `SNH's job runner stopped it at the runtime ceiling: ${Math.round(ceilingMs / 60000)} minutes ("Maximum runtime, coding jobs" in Settings). It was still making progress ${Math.round(idle / 1000)}s before — raise the ceiling rather than splitting the brief.`);
       }
       // Poll fast enough that the window means what it says. A fixed 5s tick
       // makes a short window unreportable — a 1.5s stall window would still
@@ -786,7 +789,8 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
     child.on('error', err => done({
       status: 'failed',
       resultText: `Could not start ${bin}: ${err.message}. Nothing ran, and nothing in the project was touched.`,
-      error: err.message
+      error: `SNH's job runner could not start the coding agent (${bin}): ${err.message}. Nothing ran.`,
+      stopSource: 'runner', stopKind: 'dispatch'
     }));
 
     child.on('close', () => done(readReport(reportPath, {
@@ -795,14 +799,15 @@ function runDispatched(job, { timeoutMs = null, config = null } = {}) {
         'squatch-code exited without writing a report, so there is no account of what it did. ' +
         (stderr ? `It said:\n\n${stderr.trim()}` : 'It said nothing on stderr.') +
         `\n\nCheck git status in Projects/${project} before assuming nothing changed.`,
-      error: stderr.trim() || 'no report written'
+      error: `The coding agent exited without writing a report${stderr.trim() ? ` — it said: ${stderr.trim().slice(0, 300)}` : ' and said nothing'}. SNH's runner did not stop it; it died on its own side.`,
+      stopSource: 'dispatched', stopKind: 'died'
     })));
 
     try {
       child.stdin.write(job.task || '');
       child.stdin.end();
     } catch (err) {
-      done({ status: 'failed', resultText: `Could not send the brief: ${err.message}`, error: err.message });
+      done({ status: 'failed', resultText: `Could not send the brief: ${err.message}`, error: `SNH's job runner could not send the brief to the coding agent: ${err.message}.`, stopSource: 'runner', stopKind: 'dispatch' });
     }
   });
 }
@@ -830,10 +835,18 @@ function readReport(reportPath, fallback) {
     if (doc.restore_command) {
       text += `\n\nTo undo this whole job:\n\n    ${doc.restore_command}`;
     }
+    const status = ['ok', 'partial', 'failed'].includes(doc.status) ? doc.status : 'partial';
+    // A report written by the agent is the agent's account — its own stop
+    // reason, on its own side. Unless SNH killed it (the fallback carries the
+    // runner's verdict), in which case the runner's reason is the true one
+    // and the agent's report is just what it managed to write before the kill.
+    const killedBySnh = fallback && fallback.stopSource === 'runner';
     return {
-      status: ['ok', 'partial', 'failed'].includes(doc.status) ? doc.status : 'partial',
+      status: killedBySnh ? 'partial' : status,
       resultText: text.trim() || fallback.resultText,
-      error: doc.status === 'ok' ? null : (doc.stop_reason || null),
+      error: killedBySnh ? fallback.error : (status === 'ok' ? null : (doc.stop_reason ? `The coding agent stopped itself: ${doc.stop_reason}` : 'The coding agent stopped without saying why.')),
+      stopSource: killedBySnh ? 'runner' : (status === 'ok' ? null : 'dispatched'),
+      stopKind: killedBySnh ? fallback.stopKind : (status === 'ok' ? null : 'agent-stopped'),
       toolCalls: (doc.facts && doc.facts.tool_calls) || 0,
       document: doc
     };

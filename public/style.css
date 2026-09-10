@@ -2221,6 +2221,17 @@ a.msg-source:hover {
 .initiative-reject:hover:not(:disabled) { background: var(--error-color); color: #fff; }
 .initiative-approve:disabled,
 .initiative-reject:disabled { opacity: 0.5; cursor: default; }
+/* A budget ask's bell item has one action: the door to the conversation. */
+.budget-ask-open {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--secondary-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--secondary-color);
+  cursor: pointer;
+}
+.budget-ask-open:hover:not(:disabled) { background: var(--secondary-color); color: #fff; }
 
 /* Config item plain-language description */
 .config-item-desc {
@@ -3171,7 +3182,22 @@ a.msg-source:hover {
   color: var(--warning-color);
   font-size: 0.72rem;
 }
-.job-seen, .job-cancel {
+/* PAUSED is neither running nor a result: it is waiting on her, and reads as
+   the same caution colour as partial — attention, not alarm. */
+.job-status-paused { color: var(--warning-color); }
+/* The label over a failed job's text: what follows is offered as PARTIAL, so
+   she knows she is reading what it had rather than a finished answer. */
+.job-partial-label {
+  font-size: 0.72rem;
+  color: var(--warning-color);
+  margin-bottom: 6px;
+  letter-spacing: 0.02em;
+}
+.job-ask { font-size: 0.82rem; }
+.job-chain { color: var(--secondary-color); text-decoration: none; }
+.job-chain:hover { text-decoration: underline; }
+.job-item.job-highlight { outline: 2px solid var(--secondary-color); outline-offset: 2px; transition: outline 0.3s; }
+.job-seen, .job-cancel, .job-retry, .job-open-convo {
   padding: 4px 10px;
   font-size: 0.7rem;
   border-radius: var(--border-radius);
@@ -3180,11 +3206,11 @@ a.msg-source:hover {
   color: var(--text-secondary);
   cursor: pointer;
 }
-.job-seen:hover:not(:disabled), .job-cancel:hover:not(:disabled) {
+.job-seen:hover:not(:disabled), .job-cancel:hover:not(:disabled), .job-retry:hover:not(:disabled), .job-open-convo:hover:not(:disabled) {
   background: var(--surface-hover);
   color: var(--text-color);
 }
-.job-seen:disabled, .job-cancel:disabled { opacity: 0.5; cursor: default; }
+.job-seen:disabled, .job-cancel:disabled, .job-retry:disabled { opacity: 0.5; cursor: default; }
 
 
 /* Running count — a SECOND number, and deliberately not the badge's.
