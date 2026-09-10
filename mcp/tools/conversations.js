@@ -293,9 +293,11 @@ class ConversationRequestRetireTool extends BaseConversationTool {
     this.tier = 'act';
     this.name = 'conversation_request_retire';
     this.description =
-      'Ask Ellie to archive a conversation you think is finished. You cannot archive one yourself — it goes to her as an approval. ' +
+      'Ask Ellie to archive a conversation SHE started that you think is finished — it goes to her as an approval. ' +
+      '(One YOU opened you may close yourself with conversation_archive.) ' +
       'Archiving means neither of you can add to it again, though you can both still read it forever, and it moves to the Archive tab in her sidebar. ' +
-      'Ask when the thing is settled, not when it has gone quiet: unread is not the same as done.';
+      'Ask when the thing is settled, not when it has gone quiet: unread is not the same as done. ' +
+      'ONE AT A TIME ONLY. If she asks you to go through your open conversations, use review_conversations instead — that runs in the background, one conversation at a time, and does not lose the work if the turn dies.';
     this.parameters = {
       type: 'object',
       properties: {
@@ -324,7 +326,106 @@ class ConversationRequestRetireTool extends BaseConversationTool {
   }
 }
 
+/**
+ * THE ENTITY CLOSES ONE OF ITS OWN (Ellie's call, 2026-09-10).
+ *
+ * Only a conversation it STARTED — `initiated_by = 'snh'` on the row, a stored
+ * fact and never the entity's own reading. Asked to close one of hers, the
+ * channel turns the archive into a retirement request and the result says
+ * so; nothing is refused into silence. A conversation something is still
+ * using (a running or paused job, an ask waiting on her) cannot be closed by
+ * anyone, and the refusal names what is using it.
+ */
+class ConversationArchiveTool extends BaseConversationTool {
+  constructor() {
+    super();
+    this.tier = 'act';
+    this.name = 'conversation_archive';
+    this.description =
+      'Archive a conversation YOU opened, on your own — no approval needed. It moves to her Archive tab, closed to writes for both of you, readable forever, and she can reopen it. ' +
+      'Save anything worth keeping from it to memory FIRST: nothing else is saved when it closes. ' +
+      'A conversation ELLIE started is hers to close — this tool turns that into a request to her and tells you so. ' +
+      'One that still has work running in it (a job, an ask waiting on her) is refused with the reason. ' +
+      'For going through many at once, use review_conversations.';
+    this.parameters = {
+      type: 'object',
+      properties: {
+        conversation_id: { type: 'string', description: 'The conversation to archive. From conversation_list.' },
+        reason: { type: 'string', description: 'Why it is finished, in a sentence. She sees this in the record (and with the request, if it becomes one).' }
+      },
+      required: ['conversation_id']
+    };
+  }
+
+  async execute(args = {}) {
+    try {
+      const c = (getConfig().tools && getConfig().tools.conversations) || {};
+      const state = channel.getState(args.conversation_id);
+      if (!state) return { archived: false, error: 'no conversation by that id — call conversation_list to see them' };
+      if (state.status !== 'active') return { archived: false, error: 'it is already archived' };
+      if (c.selfArchive === false) {
+        const r = await channel.archiveBySelf(args.conversation_id, { reason: args.reason, forceRequest: true });
+        return { archived: false, requested: r.requested, conversation_id: state.id, title: state.title,
+          note: 'Closing your own conversations is switched off in Settings, so this went to her as a request instead.' };
+      }
+      const r = await channel.archiveBySelf(args.conversation_id, { reason: args.reason });
+      return {
+        archived: r.archived, requested: r.requested,
+        conversation_id: state.id, title: state.title,
+        started_by: state.initiated_by === 'snh' ? 'you' : 'Ellie',
+        note: r.note
+      };
+    } catch (err) {
+      return { archived: false, error: err.message };
+    }
+  }
+}
+
+/**
+ * THE REVIEW, DISPATCHED. When she asks the entity to go through its open
+ * conversations, the work is a background job — one conversation at a time,
+ * memory saved before anything closes, checkpointed, resumable, and reported
+ * back to her in the conversation she asked in. See db/conversation-review.js
+ * for why it is not one chat turn any more.
+ */
+class ReviewConversationsTool extends BaseConversationTool {
+  constructor() {
+    super();
+    this.tier = 'act';
+    this.name = 'review_conversations';
+    this.description =
+      'Go through ALL your open conversations in the background — use this whenever Ellie asks you to look at, review, tidy or close your open conversations. ' +
+      'It runs as a job, one conversation at a time: reads it, decides whether it is finished (your judgement), saves anything worth keeping to memory, ' +
+      'and only then closes it (if you opened it) or asks her to (if she did). Anything unfinished or still in use is left alone. ' +
+      'When it is done it sends her one message in this conversation listing what was closed and what is waiting on her. ' +
+      'Do NOT do the review by hand in this turn — that is how a 31-minute turn was lost. Call this, then tell her it is underway and will report back here.';
+    this.parameters = {
+      type: 'object',
+      properties: {
+        why: { type: 'string', description: 'One line on what she asked for, in your words.' }
+      },
+      required: []
+    };
+  }
+
+  async execute(args = {}, context = {}) {
+    try {
+      const review = require('../../db/conversation-review');
+      const r = review.enqueueReview({ conversationId: context.conversationId || null, messageId: context.messageId || null, why: args.why || null });
+      if (!r.ok) return { started: false, error: r.error };
+      return {
+        started: true, job_id: r.id, short_id: String(r.id).slice(0, 8),
+        message: 'Started — not finished. It works through the conversations one at a time in the background and will send Ellie one message HERE when it is done, ' +
+          'saying which it closed and which are waiting on her. Tell her that plainly now; do not describe conversations as closed until that message exists.'
+      };
+    } catch (err) {
+      return { started: false, error: err.message };
+    }
+  }
+}
+
 module.exports = {
   ConversationListTool, ConversationSendTool,
-  ConversationOpenTool, ConversationRequestRetireTool
+  ConversationOpenTool, ConversationRequestRetireTool,
+  ConversationArchiveTool, ReviewConversationsTool
 };

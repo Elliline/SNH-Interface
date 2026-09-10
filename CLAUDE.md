@@ -991,6 +991,72 @@ three ways, and a retry — and tears its store down. The two child roles in tha
 file exist because a job cannot genuinely be killed mid-run from inside the
 process running it.
 
+## ⛔ Going through the open conversations is a JOB, and nothing closes before its memory save lands
+
+On 2026-09-09 Ellie asked Athena to look at all her open conversations and
+ask to archive the finished ones. Athena did it inside the one chat turn:
+`conversation_list`, eight `history_search` reads, memory checks, then five
+`conversation_request_retire` calls in a single round — 31 minutes, a prompt
+that grew with every step — and round 7 was cut when the brain watchdog
+restarted the engine (Sparky's threshold is **2** strikes; both probes landed
+in prefill; 73f7d2b's probe fix covers it). All five requests had landed and
+no memory write was in flight, so nothing was half-done — but that was the
+luck of the ordering, and the write-up she never got was gone. **There was
+never a "last-call memory save" in the code**; what she saw per conversation
+was the model reading and checking on its own initiative.
+
+Now (`db/conversation-review.js`, on the agent-job queue as `source =
+'conversation-review'`):
+
+- **One step at a time, in this order and never another.** Per conversation:
+  skip if something is still using it; read it and JUDGE (one model call, the
+  entity's own judgement — the prompt defines nothing, `finished` is its
+  word); if finished, the LAST-CALL SAVE — the statements the judge chose,
+  each through `memoryWrite.write` (the write_memory funnel: its classifier,
+  its dedup, its hourly cap), each recorded in the checkpoint AS IT LANDS;
+  only from `saved` does it close. A save that fails leaves the conversation
+  open with the reason on the report. The item states are the contract:
+  `pending → judged → saved → closed | requested`, with `left-open`,
+  `skipped`, `save-failed`, `judge-failed`, `close-failed` as the ways out.
+- **A resume continues from the state each item reached.** A judged item is
+  not re-judged, a saved statement is not saved twice, an item at `saved`
+  goes straight to its close. `sweepInterrupted` recognises a review
+  checkpoint (`kind`, `items`) as a record to resume from; a review not
+  re-run gets the report as its card. Asserted by SIGKILLing a child process
+  mid-review and letting a new process pick it up.
+- **Who may close what comes from `initiated_by`, never from the model.**
+  `archiveBySelf` archives a conversation the entity opened (`'snh'`),
+  ledgered with `archived_by = 'snh'` and reopenable from the Archive tab
+  (`unarchive`, hers alone), and turns an archive of hers into
+  `requestRetire` — the result says so; nothing is refused into silence.
+  `tools.conversations.selfArchive` switches it off. The entity has the same
+  power in a turn through `conversation_archive`.
+- **Nobody archives a conversation something is using.** `openItemsFor` —
+  a queued/running/paused job dispatched from it, a coding job approved in
+  it, a budget ask delivered into it — and `archive()` refuses with the
+  items named, for Ellie (the route answers 409) as much as for the entity.
+- **The model in this job is never handed a write tool.** BACKGROUND_TOOLS
+  is unchanged; the model returns a judgement and a list of sentences, and
+  the runner — deterministic, ordered, checkpointed — makes the writes
+  through the same funnels the chat tools use. `review_conversations` is the
+  chat-side tool that dispatches it; a narrow `looksLikeReviewAsk` pushes a
+  guidance block and gates nothing.
+- **The report is ONE assistant message in the conversation she asked in**
+  (`[[conversation:<id>|Title]]` per item — `formatMessageContent` renders
+  it as a link that opens the conversation), unread by the watermark like
+  any entity message, and the job is stamped `announced_at` when it lands so
+  the next turn does not announce it a second time.
+- **And the pane she is IN now notices.** The 9/10 budget ask was delivered
+  correctly — message, bell, row count — and she was sitting in that
+  conversation, where nothing polled. `pullNewMessagesIntoOpenConversation`
+  runs on the list poll: unread on the open conversation, nothing streaming →
+  fetch with `?peek=1`, append with a "New — added while you were here"
+  strip, and keep the row's count blinking until she replies there or clicks
+  the message (`POST /api/conversations/:id/read`). Seen on screen and
+  acknowledged are different things.
+
+Verify with `SNH_DATA_DIR=$(mktemp -d) node scripts/test-conversation-review.js`.
+
 ## ⛔ A mechanism is only safe in the context that made it safe
 
 Three incidents in this codebase, all the same move: a pattern that was

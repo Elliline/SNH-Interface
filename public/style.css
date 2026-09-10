@@ -3194,6 +3194,20 @@ a.msg-source:hover {
   letter-spacing: 0.02em;
 }
 .job-ask { font-size: 0.82rem; }
+/* A message the entity added to the conversation she has OPEN, pulled in by
+   the poll. The strip says it is new; the row's count keeps blinking until she
+   replies or clicks it, because seen and acknowledged are different things. */
+.message.arrived-live { outline: 1px dashed var(--warning-color); outline-offset: 4px; border-radius: var(--border-radius); cursor: pointer; }
+.message-arrived {
+  font-size: 0.7rem;
+  color: var(--warning-color);
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+/* A link to another conversation, inside a message — the review's report. */
+a.convo-link { color: var(--secondary-color); text-decoration: underline dotted; }
+a.convo-link:hover { text-decoration: underline; }
 .job-chain { color: var(--secondary-color); text-decoration: none; }
 .job-chain:hover { text-decoration: underline; }
 .job-item.job-highlight { outline: 2px solid var(--secondary-color); outline-offset: 2px; transition: outline 0.3s; }

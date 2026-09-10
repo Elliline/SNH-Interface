@@ -632,6 +632,8 @@ async function sendMessage(inputModality = 'typed') {
   addMessage('user', message);
   messageInput.value = '';
   autoResizeInput();
+  // Replying here is reading what arrived here.
+  acknowledgeLiveMessages();
 
   // Show typing indicator
   showTypingIndicator();
@@ -1389,7 +1391,10 @@ function renderMessages() {
     if (msg.role === 'user') {
       messageElement.innerHTML = `<div class="message-content">${escapeHtml(msg.content)}</div>`;
     } else if (msg.role === 'assistant') {
-      messageElement.innerHTML = `<div class="message-content">${formatMessageContent(msg.content)}</div>${renderSourcesHtml(msg.sources)}`;
+      if (msg.arrivedLive) messageElement.classList.add('arrived-live');
+      messageElement.innerHTML =
+        `${msg.arrivedLive ? '<div class="message-arrived">New — added while you were here. Click to mark it read.</div>' : ''}` +
+        `<div class="message-content">${formatMessageContent(msg.content)}</div>${renderSourcesHtml(msg.sources)}`;
     } else if (msg.role === 'system') {
       messageElement.innerHTML = `<div class="message-content system-message">${escapeHtml(msg.content)}</div>`;
     } else if (msg.role === 'error') {
@@ -1408,11 +1413,74 @@ function formatMessageContent(content) {
   // SECURITY: Escape HTML first to prevent XSS, then apply markdown formatting
   const escaped = escapeHtml(content);
   return escaped
+    // A WAY TO OPEN A CONVERSATION FROM A MESSAGE. The review's report lists
+    // what it closed and what is waiting on her as `[[conversation:<id>|Title]]`;
+    // this renders each as a link the click handler below opens. The id is
+    // matched as a UUID and nothing else, and the title is already escaped.
+    .replace(/\[\[conversation:([0-9a-f-]{36})\|([^\]]*)\]\]/gi,
+      (m, id, title) => `<a href="#" class="convo-link" data-conversation="${id}" title="Open this conversation">${title || 'open it'}</a>`)
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
     .replace(/`(.*?)`/g, '<code>$1</code>')
     .replace(/\n/g, '<br>');
 }
+
+// Links to conversations inside messages — delegated, so a re-render never
+// loses them. Opening an archived one is fine: it loads read-only.
+messagesContainer?.addEventListener('click', (e) => {
+  const a = e.target.closest('a.convo-link');
+  if (!a) return;
+  e.preventDefault();
+  loadConversationById(a.dataset.conversation);
+});
+
+/**
+ * A MESSAGE THAT ARRIVES IN THE CONVERSATION SHE HAS OPEN.
+ *
+ * 2026-09-10: a background job paused and asked her, correctly, in the
+ * conversation she had dispatched it from — and she was sitting in that
+ * conversation. The row's count was on the sidebar behind her; the message
+ * itself never appeared in the pane, because nothing polled the open
+ * conversation. She found it through the jobs panel.
+ *
+ * So the list poll also checks the conversation she is IN: if the server says
+ * it has unread and nothing is streaming, the new messages are fetched
+ * (peeking — not claiming she read them) and appended with a marker, and the
+ * row keeps its blinking count until she acts here — sends a reply, or
+ * clicks the message — at which point it is marked read the way opening it
+ * would. Seen on screen and acknowledged are different things; the count
+ * clears on the second.
+ */
+let liveAppendedUnread = false;
+async function pullNewMessagesIntoOpenConversation() {
+  if (!currentConversationId || isTyping || streamingMessageElement) return;
+  const row = conversations.find(c => c.id === currentConversationId);
+  if (!row || !(row.unread > 0)) return;
+  try {
+    const res = await fetch(`/api/conversations/${currentConversationId}?peek=1`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const known = new Set(conversation.map(m => m.id));
+    const fresh = (data.messages || []).filter(m => m.role === 'assistant' && !known.has(m.id));
+    if (!fresh.length) return;
+    for (const m of fresh) conversation.push({ role: m.role, content: m.content, id: m.id, sources: m.sources || null, arrivedLive: true });
+    liveAppendedUnread = true;
+    saveConversation();
+    renderMessages();
+    lastAssistantMessageId = fresh[fresh.length - 1].id;
+  } catch { /* next tick */ }
+}
+
+/** She acted in the conversation — what arrived live counts as read now. */
+async function acknowledgeLiveMessages() {
+  if (!liveAppendedUnread || !currentConversationId) return;
+  liveAppendedUnread = false;
+  try { await fetch(`/api/conversations/${currentConversationId}/read`, { method: 'POST' }); } catch { /* the row will catch up */ }
+  refreshConversationList();
+}
+messagesContainer?.addEventListener('click', (e) => {
+  if (e.target.closest('.message.arrived-live')) acknowledgeLiveMessages();
+});
 
 // Escape HTML to prevent XSS
 function escapeHtml(text) {
@@ -2347,6 +2415,47 @@ async function loadSettingsBrainTab() {
         type: 'number', step: '10', min: 1,
         value: config.agentJobs?.retentionDays,
         desc: 'How long a finished job stays in the panel before it is pruned. The record of the run stays in the ops log either way — this table is a panel, not an archive. Too low and a result is gone before you get to it.'
+      }
+    ]));
+
+    // THE CONVERSATION REVIEW — the entity going through its open
+    // conversations as a job, one at a time, memory saved before anything
+    // closes. Every number here is a limit on that job.
+    container.appendChild(createConfigSection('Conversation review — the entity closing its own', [
+      {
+        key: 'conversationReview.enabled',
+        label: 'Review runs as a background job',
+        type: 'checkbox',
+        value: config.conversationReview?.enabled !== false,
+        desc: 'On, "look through your open conversations" becomes a background job: read each, decide if it is finished, save anything worth keeping to memory, and only then close it (its own) or ask you (yours). Off, the tool disappears and the entity is back to doing it by hand in one turn — which is how a 31-minute turn was lost on 9/9.'
+      },
+      {
+        key: 'conversationReview.maxFactsPerConversation',
+        label: 'Memory saves per conversation, at most',
+        type: 'number', step: '1', min: 0,
+        value: config.conversationReview?.maxFactsPerConversation,
+        desc: 'The last-call save before a conversation closes: how many statements it may write from one conversation. Each goes through the same memory-write path as a "remember this" in chat, with its own hourly cap. 0 means it judges and closes but saves nothing.'
+      },
+      {
+        key: 'conversationReview.transcriptChars',
+        label: 'How much of each conversation it reads (characters)',
+        type: 'number', step: '2000', min: 500,
+        value: config.conversationReview?.transcriptChars,
+        desc: 'The tail of the conversation the judge sees. 12000 is roughly the last 3,000 words. A long thread is judged on how it ended, which is where "finished" shows. Higher costs more per conversation; lower and it may miss an open question further up.'
+      },
+      {
+        key: 'conversationReview.maxConversationsPerReview',
+        label: 'Conversations per review, at most',
+        type: 'number', step: '5', min: 1,
+        value: config.conversationReview?.maxConversationsPerReview,
+        desc: 'One job looks at this many; anything beyond is listed as "beyond this review\'s limit" in the report and a second ask does the rest. Together with the job\'s call budget this is what keeps a review bounded.'
+      },
+      {
+        key: 'conversationReview.maxConsecutiveFailures',
+        label: 'Judgements that may fail in a row before it stops',
+        type: 'number', step: '1', min: 1,
+        value: config.conversationReview?.maxConsecutiveFailures,
+        desc: 'If the engine cannot answer this many times back to back, the review stops and says the engine is the problem, rather than marking every remaining conversation "could not judge". The ones it reached stay exactly as they were left.'
       }
     ]));
 
@@ -3659,6 +3768,7 @@ function renderConversationList() {
           ${model ? `<span class="conversation-model">${escapeHtml(model)}</span>` : ''}
           ${conv.supersedes_conversation_id ? '<span class="conversation-follows" title="SNH raised this subject before — the earlier conversation is in the Archive">↩ raised before</span>' : ''}
           ${conv.retire_requested_at && !isArchived ? '<span class="conversation-follows" title="SNH has asked to archive this one — the request is on the bell">⏳ asked to archive</span>' : ''}
+          ${isArchived && conv.archived_by === 'snh' ? '<span class="conversation-follows" title="SNH closed this one itself — a conversation it had opened. Reopen it with ↩️ if you want it back.">✦ closed by SNH</span>' : ''}
         </div>
         <div class="conversation-actions">
           <button class="conversation-action-btn rename" title="Rename" data-id="${conv.id}">✏️</button>
@@ -4367,8 +4477,9 @@ setInterval(refreshInitiativeBadge, 60000);
 // page open — that is the whole point of a count that lives on the row. The
 // poll only READS; it can raise a badge and never lower one, because nothing
 // but her opening a conversation clears unread.
-setInterval(() => {
-  if (typeof refreshConversationList === 'function') refreshConversationList();
+setInterval(async () => {
+  if (typeof refreshConversationList === 'function') await refreshConversationList();
+  if (typeof pullNewMessagesIntoOpenConversation === 'function') pullNewMessagesIntoOpenConversation();
 }, 60000);
 
 // ---- Jobs panel (results of background work) ----

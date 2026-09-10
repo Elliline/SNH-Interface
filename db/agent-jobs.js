@@ -503,7 +503,10 @@ function finish(id, { status, resultText = null, error = null, toolCalls = 0, bu
     WHERE id = ?
   `).run(status, finishedAt.toISOString(), durationMs, resultText, error,
     toolCalls ?? 0, budget ? JSON.stringify(budget) : null, src, status === 'ok' ? null : stopKind, id);
-  if (status === 'ok') dropCheckpoint(id);
+  // A review's checkpoint IS its record of what happened to each
+  // conversation, so it stays until the row is pruned; every other job's
+  // record on `ok` is its result.
+  if (status === 'ok' && job.source !== 'conversation-review') dropCheckpoint(id);
   return { ...getJob(id) };
 }
 
@@ -535,6 +538,9 @@ async function attachArtifact(id, { note = null } = {}) {
   // in her documents folder per lookup would bury the reports she actually
   // asked for under forty transcripts of things she was told out loud.
   if (IN_TURN_SOURCES.includes(job.source)) return job;
+  // A review's result is the message it sent her, and a PDF of a list of
+  // conversation links is not a document anyone wants in the folder.
+  if (job.source === require('./conversation-review').SOURCE) return job;
 
   let made;
   try {
@@ -943,7 +949,93 @@ async function runJob(id) {
     });
   }
 
+  // The conversation review: the entity going through its own open
+  // conversations one step at a time. Its own runner, because the ORDER of the
+  // steps is the point (read → judge → save → close, never close first) — but
+  // the same row, checkpoint, pause-and-ask, resume and retry as any job.
+  if (job.source === require('./conversation-review').SOURCE) {
+    return runReview(id, job);
+  }
+
   return runChatHandoff(id, job);
+}
+
+/**
+ * THE REVIEW, on the queue's rails. See db/conversation-review.js for the
+ * steps; this is the harness — budget, checkpoint, pause, resume, finish.
+ */
+async function runReview(id, job) {
+  const review = require('./conversation-review');
+  const mm = memoryManager();
+  const c = cfg();
+  const session = mm.createToolSession(`review:${id.slice(0, 8)}`, [], {
+    maxCalls: c.maxToolCallsPerJob, maxWallMs: c.maxWallClockMs, maxRounds: c.maxRoundsPerJob
+  });
+  const mode = job.resume_mode || null;
+  const ask = parseAsk(job.ask_json);
+  const ck = mode ? readCheckpoint(id) : null;
+  if (mode && ck) {
+    session.restore(ck.session);
+    if (mode === 'granted') {
+      const g = (ask && ask.grant) || {};
+      session.extend({ calls: g.calls || 0, rounds: g.rounds || 0, wallMs: g.wallMs || 0 });
+      console.log(`[AgentJobs] ${id.slice(0, 8)} review resuming with more budget: +${g.calls} calls`);
+    }
+  } else if (mode && !ck) {
+    console.warn(`[AgentJobs] ${id.slice(0, 8)} review was to resume (${mode}) but has no checkpoint — starting the list afresh`);
+  }
+  const askPct = c.askBeforeCeiling ? c.askAtPercent : 0;
+  console.log(`[AgentJobs] === running ${id.slice(0, 8)}: "${job.title}" (${job.source}${mode ? `, ${mode}` : ''}) ===`);
+
+  let outcome;
+  try {
+    outcome = await review.runDispatched(job, {
+      session, checkpoint: ck, mode,
+      save: (state) => writeCheckpoint(id, { ...state, title: job.title, task: job.task }),
+      askAtPercent: askPct
+    });
+  } catch (err) {
+    // Written not to throw; if it does, the row still closes with the side
+    // named and the record on disk intact for a retry.
+    const failure = require('./job-failure').classifyThrown(err, { calls: session.calls,
+      recentRestart: (() => { try { return require('./brain-watchdog').recentRestart(); } catch { return null; } })(),
+      formatTime: (ms) => formatLocalTime(new Date(ms), { style: 'time', fallback: 'an unclear time' }) });
+    const saved = readCheckpoint(id);
+    outcome = {
+      status: 'failed', error: failure.plain, stopSource: failure.source, stopKind: failure.kind,
+      resultText: saved && Array.isArray(saved.items) ? review.renderReport(saved, { cutShort: failure.plain }) : `The review failed before it recorded anything. ${failure.plain}`,
+      toolCalls: session.calls, budget: session.summary()
+    };
+    console.error(`[AgentJobs] ${id.slice(0, 8)} review threw (${failure.source}/${failure.kind}):`, failure.technical || failure.plain);
+  }
+
+  if (outcome && outcome.paused) {
+    return pauseAndAsk(id, job, { near: outcome.near, askText: outcome.askText, toolCalls: [], pendingCalls: [], convo: null, budget: outcome.budget }, session, c);
+  }
+
+  const done = finish(id, {
+    status: outcome.status, resultText: outcome.resultText || null, error: outcome.error || null,
+    toolCalls: outcome.toolCalls || 0, budget: outcome.budget || session.summary(),
+    stopSource: outcome.stopSource || null, stopKind: outcome.stopKind || null
+  });
+  // THE MESSAGE IS THE ANNOUNCEMENT. The report went to her as a message in
+  // the conversation she asked in; announcing the same job at the top of the
+  // next turn as well would have the entity report it twice. Stamped only when
+  // the message actually landed — a report that could not be delivered is
+  // still owed to her through the ordinary channel.
+  const delivered = outcome.report && outcome.report.delivery && outcome.report.delivery.conversationId;
+  if (done && delivered) {
+    getSqliteDb().prepare('UPDATE agent_jobs SET announced_at = ? WHERE id = ? AND announced_at IS NULL').run(new Date().toISOString(), id);
+  }
+  const secs = done ? (done.duration_ms / 1000).toFixed(1) : '?';
+  const line = outcome.status === 'ok'
+    ? `Conversation review finished: "${job.title}" (${id.slice(0, 8)}) — ok in ${secs}s, ${outcome.toolCalls || 0} call(s)` +
+      (outcome.report ? `, ${outcome.report.closed} closed, ${outcome.report.requested} sent for approval` : '') +
+      (delivered ? `; she was told in conversation ${String(delivered).slice(0, 8)}.` : '; the report could NOT be delivered and is on the card.')
+    : `Conversation review ${outcome.status.toUpperCase()}: "${job.title}" (${id.slice(0, 8)}) — ${outcome.error}`;
+  console.log(`[AgentJobs] ${line}`);
+  opsLog(line);
+  return done;
 }
 
 /**
@@ -1199,7 +1291,15 @@ async function pauseAndAsk(id, job, res, session, c) {
   // written by the loop before this turn and is not touched by it.
   let askBody = '';
   let wants = null;
-  try {
+  // A runner that keeps its own record (the conversation review) writes its
+  // ask from that record, in the entity's voice, with no model call. The
+  // tool loop's runs have a transcript instead, and the model writes it.
+  if (res.askText) {
+    askBody = String(res.askText).trim();
+    const m = /NEEDED:\s*(\d{1,3})\s*more/i.exec(askBody);
+    if (m) wants = Math.max(1, parseInt(m[1], 10));
+    askBody = askBody.replace(/\n?\s*NEEDED:\s*\d{1,3}\s*more[^\n]*/i, '').trim();
+  } else try {
     const convo = [...(res.convo || [])];
     // Well-formed transcript: the assistant turn asked for tools, so each gets
     // a result saying it was not run yet.
@@ -1261,7 +1361,7 @@ async function pauseAndAsk(id, job, res, session, c) {
   };
   const db = getSqliteDb();
   db.prepare(`UPDATE agent_jobs SET status = 'paused', paused_at = ?, ask_json = ?, budget_json = ?, tool_calls = ? WHERE id = ?`)
-    .run(askRecord.askedAt, JSON.stringify(askRecord), JSON.stringify(session.summary()), (res.toolCalls || []).length, id);
+    .run(askRecord.askedAt, JSON.stringify(askRecord), JSON.stringify(session.summary()), Array.isArray(res.toolCalls) && res.toolCalls.length ? res.toolCalls.length : (session.calls || 0), id);
 
   // Delivery: the conversation that dispatched it, and the bell pointing there.
   let delivery = null;
@@ -1399,7 +1499,8 @@ function sweepInterrupted({ now = new Date() } = {}) {
     // or, if it is not run again, its card says what it had rather than
     // nothing.
     const ck = readCheckpoint(j.id);
-    const hasRecord = !!(ck && Array.isArray(ck.convo) && ck.convo.length);
+    const isReview = !!(ck && ck.kind === 'conversation-review' && Array.isArray(ck.items));
+    const hasRecord = !!(ck && ((Array.isArray(ck.convo) && ck.convo.length) || isReview));
 
     if (retryable) {
       db.prepare("UPDATE agent_jobs SET status = 'queued', started_at = NULL, resume_mode = ? WHERE id = ?")
@@ -1421,9 +1522,13 @@ function sweepInterrupted({ now = new Date() } = {}) {
       // disk. No model call here: this runs at boot, before the engine may be
       // back, and the mechanical account cannot fail.
       const calls = hasRecord && Array.isArray(ck.toolCalls) ? ck.toolCalls : [];
-      const partialText = hasRecord && calls.length ? mechanicalAccount(j, calls, ck.session ? { ...ck.session, exhausted: null } : null, c, 'SNH restarted') : null;
+      // A review's record is per conversation, and its card is the report of
+      // what each one reached — closed, requested, or never looked at.
+      const partialText = isReview
+        ? require('./conversation-review').renderReport(ck, { cutShort: 'SNH restarted while it was running, and it was not run again.' })
+        : (hasRecord && calls.length ? mechanicalAccount(j, calls, ck.session ? { ...ck.session, exhausted: null } : null, c, 'SNH restarted') : null);
       finish(j.id, {
-        status: 'interrupted', error: why, toolCalls: calls.length || j.tool_calls || 0,
+        status: 'interrupted', error: why, toolCalls: calls.length || (isReview && ck.session ? ck.session.calls : 0) || j.tool_calls || 0,
         resultText: partialText, budget: hasRecord && ck.session ? { ...ck.session, exhausted: null } : null,
         stopSource: 'runner', stopKind: 'service-restart'
       });
@@ -1528,7 +1633,7 @@ function cancel(id) {
 // ---------------------------------------------------------------------------
 
 /** Sources a person may retry from the card. A coding job re-runs from the conversation, where the restore-point rules live. */
-const RETRYABLE_SOURCES = ['chat-handoff'];
+const RETRYABLE_SOURCES = ['chat-handoff', 'conversation-review'];
 
 /**
  * RETRY FROM THE CARD: the same task, a NEW row, and a brief that carries the

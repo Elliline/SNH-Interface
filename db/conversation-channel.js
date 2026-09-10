@@ -378,11 +378,62 @@ async function requestRetire(conversationId, reason = null) {
  * and the record says so; archiving only stops it counting toward the total she
  * is being asked to act on.
  */
+/**
+ * WHAT IS STILL USING THIS CONVERSATION — the things closing it would cut off.
+ *
+ * A background job dispatched from it (queued, running, or paused waiting on
+ * her answer THERE), a coding job approved in it, a budget ask delivered into
+ * it. Each of those writes into the conversation or waits on a reply in it,
+ * and an archived conversation is closed to writes for both sides. So nothing
+ * may archive while one is open — not the entity, not the review job, not
+ * Ellie from the sidebar: the item would be left talking to a closed door.
+ *
+ * Pure read. Returns [] when nothing is tied to it.
+ */
+function openItemsFor(conversationId) {
+  const sql = sqlite();
+  const items = [];
+  if (!conversationId) return items;
+  let rows = [];
+  try {
+    rows = sql.prepare(
+      "SELECT id, title, status, source, conversation_id, ask_json FROM agent_jobs WHERE status IN ('queued','running','paused')"
+    ).all();
+  } catch { rows = []; }
+  for (const j of rows) {
+    let askConv = null;
+    try { const a = j.ask_json ? JSON.parse(j.ask_json) : null; askConv = a && a.delivery && a.delivery.conversationId; } catch { /* no ask */ }
+    if (j.conversation_id === conversationId || askConv === conversationId) {
+      const what = j.source === 'squatch-code' ? 'coding job' : 'background job';
+      const state = j.status === 'paused'
+        ? 'paused, waiting on your answer in this conversation'
+        : j.status === 'running' ? 'running' : 'queued';
+      items.push({ kind: what, id: j.id, title: j.title, status: j.status, state });
+    }
+  }
+  return items;
+}
+
+/** The refusal sentence, when there is one. */
+function describeOpenItems(items) {
+  if (!items.length) return null;
+  const list = items.map(i => `${i.kind} "${i.title}" (${i.state})`).join('; ');
+  return `it still has work tied to it — ${list}. Closing it would cut that off; wait for it to finish, or answer it.`;
+}
+
 function archive(conversationId, { by = 'user', reason = null } = {}) {
   const sql = sqlite();
   const conv = getState(conversationId);
   if (!conv) throw new Error('no such conversation');
   if (conv.status === 'archived') return conv;
+  // NEVER CLOSE A CONVERSATION SOMETHING IS STILL USING. Both sides, same rule.
+  const open = openItemsFor(conv.id);
+  if (open.length) {
+    const err = new Error(`"${conv.title || 'this conversation'}" cannot be archived yet: ${describeOpenItems(open)}`);
+    err.code = 'OPEN_ITEMS';
+    err.items = open;
+    throw err;
+  }
   const now = sqlNow();
   sql.transaction(() => {
     sql.prepare("UPDATE conversations SET status = 'archived', archived_at = ?, archived_by = ? WHERE id = ?")
@@ -401,6 +452,43 @@ function archive(conversationId, { by = 'user', reason = null } = {}) {
     });
   })();
   return getState(conv.id);
+}
+
+/**
+ * THE ENTITY CLOSES ONE OF ITS OWN (Ellie's call, 2026-09-10).
+ *
+ * A conversation the entity STARTED — `initiated_by = 'snh'`, a stored fact
+ * about the row, never the entity's own reading of who began it — may be
+ * archived by the entity with no approval. One Ellie started still goes to her
+ * as a request, and this function makes that switch itself: asked to archive
+ * hers, it files the retirement request and says so, rather than refusing and
+ * leaving the entity to remember the other path. Every self-archive is ledgered
+ * with `archived_by = 'snh'`, and she can reopen any of them from the Archive
+ * tab — the same `unarchive` she already has.
+ *
+ * @returns {{archived:boolean, requested:boolean, conversation:Object, note:string}}
+ */
+async function archiveBySelf(conversationId, { reason = null, forceRequest = false } = {}) {
+  const conv = getState(conversationId);
+  if (!conv) throw new Error('no such conversation');
+  if (conv.status === 'archived') return { archived: false, requested: false, conversation: conv, note: 'it is already archived' };
+  const why = String(reason || '').trim() || 'It feels finished to me.';
+  if (conv.initiated_by !== 'snh' || forceRequest) {
+    if (conv.retire_requested_at) {
+      return { archived: false, requested: true, conversation: conv, note: 'Ellie started this one, so it is hers to close — and you have already asked her; it is waiting on her.' };
+    }
+    const after = await requestRetire(conv.id, why);
+    return {
+      archived: false, requested: true, conversation: after,
+      note: 'Ellie started this one, so it is hers to close. Your archive was turned into a request — it stays open and readable until she decides.'
+    };
+  }
+  const after = archive(conv.id, {
+    by: 'snh',
+    reason: `"${conv.title || 'an untitled conversation'}" was closed by the entity on its own — a conversation it opened itself. ${why} ` +
+      'It is closed to writes for both of them, stays readable by both, and Ellie can reopen it from the Archive tab.'
+  });
+  return { archived: true, requested: false, conversation: after, note: 'Archived. It is in her Archive tab, readable by both of you, and she can reopen it.' };
 }
 
 /** Put it back on the active list. Hers alone; the entity has no path here. */
@@ -436,5 +524,6 @@ function findPrior(subjectLike, { limit = 5 } = {}) {
 module.exports = {
   initSchema, sqlNow, UNREAD_SQL,
   listConversations, getState, unreadFor, totalUnread, totalUnreadAll, findPrior,
-  markRead, sendInto, openConversation, requestRetire, archive, unarchive
+  markRead, sendInto, openConversation, requestRetire, archive, archiveBySelf, unarchive,
+  openItemsFor, describeOpenItems
 };

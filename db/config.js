@@ -410,6 +410,40 @@ const DEFAULTS = {
     // the thinking budget have to be read against each other, and they cannot be
     // when they live in different sections and only one of them is on a screen.
   },
+  // THE CONVERSATION REVIEW (2026-09-10) — a background job, not a chat turn.
+  //
+  // On 2026-09-09 Ellie asked Athena to look through her open conversations
+  // and ask to archive the finished ones. Athena did five in one chat turn —
+  // eight history reads, memory checks, five requests — and the turn was
+  // killed 31 minutes in when the brain watchdog restarted the engine under
+  // it (a prefill misread as a wedge; fixed in 73f7d2b). Nothing was
+  // half-done, but the write-up was lost, and one turn is the wrong shape for
+  // work that grows with every conversation it reads. So the review runs as
+  // an agent job: one conversation at a time, each step checkpointed, and it
+  // gets the pause, the budget ask and the retry every other job has.
+  //
+  // Per conversation, in this order and never another: read it; judge whether
+  // it is finished (the entity's own judgement — nothing here says what
+  // "finished" means); do the last-call memory save; only once the save has
+  // landed, archive it (if the entity opened it) or ask Ellie (if she did).
+  conversationReview: {
+    enabled: true,
+    // Statements the last-call save may write per conversation. Each goes
+    // through the write_memory funnel (its own classifier, dedup and cap), so
+    // this bounds the model calls per conversation rather than the store.
+    maxFactsPerConversation: 3,
+    // How much of a conversation the judge reads — the tail, in characters.
+    // A long thread is judged on how it ended, which is where "finished" lives.
+    transcriptChars: 12000,
+    // One job reviews at most this many. More than this and it asks — the
+    // same way it asks near any other ceiling — rather than running on.
+    maxConversationsPerReview: 25,
+    // Judge calls that fail in a row before the review stops and says the
+    // engine is the problem, rather than marking every conversation "could
+    // not judge" and reporting a clean sweep of nothing.
+    maxConsecutiveFailures: 3
+  },
+
   // The agent-job queue (2026-08-18) — the async handoff.
   //
   // A chat turn can START work and END. The tool call writes a row and returns a
@@ -1111,7 +1145,11 @@ const DEFAULTS = {
     // healthy. Counted from tool_call_log, so a restart grants no fresh budget.
     // The conversation channel — his messages into her sidebar. A rate limit,
     // never a quality bar.
-    conversations: { enabled: true, maxSendsPerHour: 10 },
+    // selfArchive (2026-09-10, Ellie's call): the entity may close a
+    // conversation IT opened without asking. Who opened it is the stored
+    // `initiated_by`, never the entity's own reading. Off, every close goes to
+    // her as a request, as before.
+    conversations: { enabled: true, maxSendsPerHour: 10, selfArchive: true },
     memoryInspect: {
       enabled: true,
       maxCallsPerHour: 40

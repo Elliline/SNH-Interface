@@ -2316,6 +2316,31 @@ app.post('/api/chat/memory', chatLimiter, async (req, res) => {
       console.log(`[Handoff] tier ${handoffSignal.tier} (${handoffSignal.reason}) — nudging toward start_background_job (convo ${convoId})`);
     }
 
+    // === "Look through your open conversations" is a JOB, not a turn ===
+    //
+    // 2026-09-09: asked to review her open conversations, Athena did five in
+    // one chat turn and the turn died 31 minutes in. The review tool runs it
+    // in the background, one conversation at a time, checkpointed. This block
+    // gates nothing — the model decides — it just says, in the turn, that the
+    // tool exists for exactly this shape of ask.
+    try {
+      const review = require('./db/conversation-review');
+      if (mcpClient.hasTool('review_conversations') && review.looksLikeReviewAsk(userMessage.content)) {
+        memoryParts.push({
+          kind: 'guidance', label: 'conversation review',
+          text:
+            '=== She Is Asking You To Go Through Your Open Conversations ===\n' +
+            'Do it with review_conversations, NOT by hand in this turn. It runs in the background, one conversation at a time — ' +
+            'reads each, decides whether it is finished, saves anything worth keeping to memory, and only then closes it (if you opened it) ' +
+            'or asks her to (if she did) — and it sends her one message here when it is done. Doing it in this turn is how a ' +
+            '31-minute turn was lost with nothing written up. Call the tool, then tell her it is underway and will report back here.'
+        });
+        console.log(`[Review] her message looks like a review ask — nudging toward review_conversations (convo ${convoId})`);
+      }
+    } catch (revErr) {
+      console.error('[Review] nudge error:', revErr.message);
+    }
+
     // === What is running right now ===
     //
     // The live half of the jobs picture. The announcement block below covers

@@ -17,7 +17,8 @@ const {
 const { EntityListTool, EntityGetTool } = require('./tools/entity-registry');
 const {
   ConversationListTool, ConversationSendTool,
-  ConversationOpenTool, ConversationRequestRetireTool
+  ConversationOpenTool, ConversationRequestRetireTool,
+  ConversationArchiveTool, ReviewConversationsTool
 } = require('./tools/conversations');
 const {
   RetractFactTool, RewordFactTool, MergeFactsRepairTool, RefileFactTool,
@@ -292,12 +293,16 @@ const TOOL_CATALOGUE = [
     toggle: 'tools.conversations.enabled',
     toggleNote: 'The conversation channel — how he reaches her in the sidebar she already reads. Turning it off stops him opening conversations or adding to hers; everything already there stays exactly as it is.',
     fields: [{ path: 'tools.conversations.maxSendsPerHour', label: 'Messages per hour', type: 'number', min: 1, max: 60,
-      hint: 'How many messages he may send in an hour. This is a rate limit, not a quality bar — nothing here decides for her which of his messages are worth reading.' }]
+      hint: 'How many messages he may send in an hour. This is a rate limit, not a quality bar — nothing here decides for her which of his messages are worth reading.' },
+      { path: 'tools.conversations.selfArchive', label: 'May close conversations it opened itself', type: 'toggle',
+        hint: 'On, a conversation the entity started can be archived by the entity with no approval (you can reopen any of them from the Archive tab). Conversations you started always go to you as a request. Off, everything goes to you as a request.' }]
   },
   ...[
     ['conversation_send', 'Say something in an open conversation', ConversationSendTool],
     ['conversation_open', 'Open a new conversation with her', ConversationOpenTool],
-    ['conversation_request_retire', 'Ask her to archive a conversation', ConversationRequestRetireTool]
+    ['conversation_request_retire', 'Ask her to archive a conversation', ConversationRequestRetireTool],
+    ['conversation_archive', 'Close a conversation it opened itself', ConversationArchiveTool],
+    ['review_conversations', 'Review its open conversations in the background', ReviewConversationsTool]
   ].map(([id, title, Tool]) => ({
     id, title, Tool, card: 'conversations',
     gate: ({ cfg }) => ((cfg.tools && cfg.tools.conversations) || {}).enabled !== false,

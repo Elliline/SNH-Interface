@@ -63,7 +63,9 @@ const BLOCKS = [
   ['scheduler', () => getConfig().scheduler],
   ['agentPool', () => getConfig().agentPool],
   ['brainCircuit', () => getConfig().brainCircuit],
-  ['heartbeat.toolBudget', () => getConfig().heartbeat.toolBudget]
+  ['heartbeat.toolBudget', () => getConfig().heartbeat.toolBudget],
+  // The conversation review (2026-09-10): every leaf bounds one review job.
+  ['conversationReview', () => getConfig().conversationReview]
 ];
 
 console.log('\nRun-limit exposure\n');

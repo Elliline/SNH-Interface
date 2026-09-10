@@ -179,6 +179,21 @@
       "timeoutSeconds": 300
     },
     {
+      "suite": "test-conversation-review",
+      "expectedFailures": 0,
+      "reason": "The review as a job: close/request/leave-open, save-before-close, the open-item guard, self-archive refused into a request, restore, a SIGKILLed child resumed by a new process, the budget ask both ways, retry. Judge calls go to a scripted engine; only memory-write is stubbed.",
+      "verifiedAt": "PENDING",
+      "subjects": [
+        "db/conversation-review.js",
+        "db/conversation-channel.js",
+        "db/agent-jobs.js",
+        "db/job-budget-ask.js",
+        "mcp/tools/conversations.js"
+      ],
+      "dataDir": "required",
+      "timeoutSeconds": 600
+    },
+    {
       "suite": "test-correction-routing",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",

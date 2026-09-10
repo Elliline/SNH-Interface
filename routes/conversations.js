@@ -264,6 +264,23 @@ router.post('/:id/archive', (req, res) => {
     const conversation = channel.archive(req.params.id, { by: 'user' });
     res.json({ success: true, conversation });
   } catch (error) {
+    // 409 when something is still using it — a job, an ask — so the sidebar
+    // can say so rather than "failed to archive".
+    res.status(error.code === 'OPEN_ITEMS' ? 409 : 400).json({ error: error.message, open_items: error.items || undefined });
+  }
+});
+
+/**
+ * POST /api/conversations/:id/read
+ * She has read it — without reloading it. The chat pane calls this when a
+ * message the entity added to the conversation she is IN has been shown to
+ * her, so the count on the row clears the way opening it would.
+ */
+router.post('/:id/read', (req, res) => {
+  try {
+    const cleared = channel.markRead(req.params.id);
+    res.json({ success: true, unread_cleared: cleared, unread: channel.unreadFor(req.params.id) });
+  } catch (error) {
     res.status(400).json({ error: error.message });
   }
 });
