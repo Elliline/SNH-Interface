@@ -22,7 +22,7 @@
       "suite": "test-agent-jobs",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "f641b36",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/memory-manager.js",
         "db/agent-jobs.js"
@@ -115,7 +115,7 @@
       "suite": "test-chat-timeouts",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/chat-failure.js",
         "db/memory-manager.js"
@@ -138,7 +138,7 @@
       "suite": "test-coding-job-limits",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/coding-jobs.js"
       ],
@@ -281,7 +281,7 @@
       "suite": "test-empty-reply-retry",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/empty-reply-retry.js",
         "db/memory-manager.js"
@@ -470,7 +470,7 @@
       "suite": "test-job-failure",
       "expectedFailures": 0,
       "reason": "Pure: the stop-source/kind vocabulary in db/job-failure.js. No engine, no store.",
-      "verifiedAt": "PENDING",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/job-failure.js"
       ],
@@ -480,7 +480,7 @@
       "suite": "test-job-failures",
       "expectedFailures": 0,
       "reason": "The real runner against a scripted engine: stall, wall clock, provider down, cut stream, killed process + restart, the budget ask both ways, retry. Spawns two child processes; ~60s.",
-      "verifiedAt": "PENDING",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/agent-jobs.js",
         "db/job-failure.js",
@@ -599,7 +599,7 @@
       "suite": "test-probe-verdict",
       "expectedFailures": 0,
       "reason": "The liveness probe's slow-vs-dead adjudicator. Uses local stub HTTP servers for the engine — no GPU, no live engine, deterministic.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/memory-manager.js",
         "db/brain-watchdog.js"
@@ -618,7 +618,7 @@
       "suite": "test-scheduler",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "70defd8",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/memory-manager.js",
         "db/scheduler.js",
@@ -633,7 +633,7 @@
       "suite": "test-search-providers",
       "expectedFailures": 0,
       "reason": "Green at the verified commit; nothing expected to fail.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/search-log.js",
         "db/memory-manager.js"
@@ -682,7 +682,7 @@
       "suite": "test-stream-stall",
       "expectedFailures": 1,
       "reason": "One failing. Pre-existing and not investigated.",
-      "verifiedAt": "90a9c43",
+      "verifiedAt": "73f7d2b",
       "subjects": [
         "db/memory-manager.js"
       ],
