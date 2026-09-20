@@ -1,0 +1,7217 @@
+/**
+ * Squatch Neuro Hub
+ * Neural-linked AI assistant with associative cluster memory and multi-provider support
+ */
+
+// ============ Display time: the browser half of the timezone layer ============
+//
+// The server has db/datetime.js; this is the same contract for the surfaces that
+// render in the page. It exists for two reasons, and the second is the one that
+// bites.
+//
+// 1. THE CLOCK IS THE INSTANCE'S, NOT THE VIEWER'S. `toLocaleString()` with no
+//    timeZone renders in whatever timezone the browser is in. That agrees with
+//    the instance today because Ellie reads it from a machine in Oregon, but it
+//    is the same "coincidentally correct" the server side had: open the panel
+//    from a laptop in another timezone and every stored time silently shifts,
+//    while the digests the entity reads do not. One instance, one clock.
+//
+// 2. AN UNMARKED TIMESTAMP IS UTC. `messages.timestamp` and
+//    `conversations.updated_at` come from SQLite's CURRENT_TIMESTAMP as
+//    "2026-08-25 00:38:07" — UTC with nothing saying so, which the Date
+//    constructor reads as LOCAL. Four helpers in this file had already worked
+//    that out independently and each patched it in place with
+//    `iso.replace(' ','T') + 'Z'`; formatRelativeTime never got the memo, so
+//    every conversation in the sidebar read as seven hours in the future and
+//    therefore said "Just now" for most of the day. That is the whole argument
+//    for having one of these instead of six.
+let INSTANCE_TZ = null;
+
+async function loadInstanceTimezone() {
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    const tz = cfg && cfg.instance && cfg.instance.timezone;
+    if (tz) {
+      // Prove it before adopting it: an unknown name makes Intl throw, and a
+      // throw in a formatter blanks whatever was rendering.
+      new Intl.DateTimeFormat('en-US', { timeZone: tz }).format(new Date());
+      INSTANCE_TZ = tz;
+    }
+  } catch {
+    // Leave INSTANCE_TZ null — every formatter below falls back to the
+    // browser's own zone, which is what this page did before the layer existed.
+  }
+}
+
+/** Parse a stored instant, treating an unmarked timestamp as UTC. */
+function toUtcDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    const d = new Date(raw);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0), +(m[7] || 0)));
+  const dOnly = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dOnly) return new Date(Date.UTC(+dOnly[1], +dOnly[2] - 1, +dOnly[3], 12));
+  const f = new Date(raw);
+  return isNaN(f.getTime()) ? null : f;
+}
+
+/**
+ * Render a stored instant on the instance's clock.
+ * @param {string|Date} value
+ * @param {'datetime'|'date'|'time'} [style='datetime']
+ * @param {string} [fallback='']
+ */
+function formatLocalTime(value, style = 'datetime', fallback = '') {
+  const d = toUtcDate(value);
+  if (!d) return fallback;
+  const tz = INSTANCE_TZ || undefined;   // undefined = the browser's own zone
+  const dayOnly = typeof value === 'string' && /^\s*\d{4}-\d{2}-\d{2}\s*$/.test(value);
+  try {
+    if (style === 'date' || dayOnly) return d.toLocaleDateString('en-CA', { timeZone: tz });
+    const clock = d.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
+    const zone = INSTANCE_TZ
+      ? (new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+          .formatToParts(d).find(p => p.type === 'timeZoneName')?.value || '')
+      : '';
+    if (style === 'time') return zone ? `${clock} ${zone}` : clock;
+    const day = d.toLocaleDateString('en-CA', { timeZone: tz });
+    return `${day} ${clock}${zone ? ' ' + zone : ''}`;
+  } catch {
+    return fallback;
+  }
+}
+
+// DOM Elements
+const providerSelect = document.getElementById('providerSelect');
+const modelSelect = document.getElementById('modelSelect');
+const newChatBtn = document.getElementById('newChatBtn');
+const chatContainer = document.getElementById('chatContainer');
+const messagesContainer = document.getElementById('messages');
+const messageInput = document.getElementById('messageInput');
+const sendBtn = document.getElementById('sendBtn');
+const typingIndicator = document.getElementById('typingIndicator');
+const micBtn = document.getElementById('micBtn');
+const convoModeBtn = document.getElementById('convoModeBtn');
+const speakerToggle = document.getElementById('speakerToggle');
+const superSearchBtn = document.getElementById('superSearchBtn');
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsModal = document.getElementById('settingsModal');
+const closeModal = document.getElementById('closeModal');
+const saveSettingsBtn = document.getElementById('saveSettings');
+
+// SquatchServe model status elements
+const modelStatusBar = document.getElementById('modelStatusBar');
+const modelStatusText = document.getElementById('modelStatusText');
+const unloadModelBtn = document.getElementById('unloadModelBtn');
+
+// State variables
+let currentProvider = '';
+let currentModel = '';
+let providers = [];
+let conversation = [];
+let isTyping = false;
+let squatchserveStatusInterval = null;
+let loadedSquatchserveModel = null;
+let lastAssistantMessageId = null;
+let streamingMessageElement = null;
+let pendingContent = null;
+let animationFrameId = null;
+// Same rAF-coalescing pair as pendingContent/animationFrameId, for the thinking
+// panel — reasoning arrives token by token and would otherwise relayout per token.
+let pendingReasoning = null;
+let reasoningFrameId = null;
+let ttsEnabled = false;
+let isRecording = false;
+let mediaRecorder = null;
+let audioChunks = [];
+let conversationMode = false;
+let silenceTimer = null;
+let audioContext = null;
+let analyser = null;
+let audioUnlocked = false;
+let superSearch = false;
+const TTS_URL = '/api/tts';
+const STT_URL = '/api/stt';
+
+// TTS chunked pipeline — sends text to TTS as sentences complete during streaming
+const ttsChunker = {
+  sentIndex: 0,
+  chunkIndex: 0,
+  active: false,
+  flushed: false,
+  queue: [],          // { index, state: 'loading'|'ready'|'error', audio, url }
+  fetchChain: Promise.resolve(),  // sequential fetch pipeline
+  playing: false,
+  currentAudio: null,
+  abortController: null,
+
+  start() {
+    console.log('[ttsChunker] start() called, ttsEnabled:', ttsEnabled);
+    this.cancel();
+    this.sentIndex = 0;
+    this.chunkIndex = 0;
+    this.active = true;
+    this.flushed = false;
+    this.queue = [];
+    this.fetchChain = Promise.resolve();
+    this.playing = false;
+    this.currentAudio = null;
+    this.abortController = new AbortController();
+  },
+
+  feed(fullText) {
+    if (!this.active) {
+      console.log('[ttsChunker] feed() skipped — not active');
+      return;
+    }
+
+    while (true) {
+      // Chunk size is deliberately asymmetric. The FIRST chunk stays small so
+      // audio starts quickly; every chunk after it is allowed to grow, because
+      // by then playback is already running and the only thing extra requests
+      // buy is load. Each chunk is one /api/tts call, and a long spoken reply
+      // at a flat 80 chars was dozens of them — enough to exhaust the shared
+      // rate-limit window on its own (2026-07-27).
+      const minChunk = this.chunkIndex === 0 ? 80 : 280;
+      const unsent = fullText.slice(this.sentIndex);
+      if (unsent.length < minChunk) break;
+
+      // Find first sentence boundary (. ! ? followed by whitespace, or paragraph break)
+      const re = /[.!?](?=\s)|\n\n+/g;
+      let found = false;
+      let m;
+      while ((m = re.exec(unsent)) !== null) {
+        const textEnd = m[0].startsWith('\n') ? m.index : m.index + 1;
+        if (textEnd >= minChunk) {
+          const chunk = unsent.slice(0, textEnd).trim();
+          // Advance past the boundary and any trailing whitespace
+          this.sentIndex += m.index + m[0].length;
+          if (chunk) this._sendChunk(chunk);
+          found = true;
+          break;
+        }
+      }
+      if (!found) break;
+    }
+  },
+
+  flush(fullText) {
+    console.log('[ttsChunker] flush() called, active:', this.active, 'sentIndex:', this.sentIndex, 'fullText length:', fullText.length);
+    if (!this.active) return;
+    const remaining = fullText.slice(this.sentIndex).trim();
+    console.log('[ttsChunker] flush() remaining text length:', remaining.length);
+    if (remaining) {
+      this._sendChunk(remaining);
+    }
+    this.flushed = true;
+    this.active = false;
+    // If no chunks were queued at all, trigger conversation mode immediately
+    if (this.queue.length === 0 && conversationMode && !isRecording) {
+      startRecording();
+    }
+  },
+
+  cancel() {
+    this.active = false;
+    this.flushed = false;
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio.currentTime = 0;
+      this.currentAudio = null;
+    }
+    for (const entry of this.queue) {
+      if (entry.url) URL.revokeObjectURL(entry.url);
+    }
+    this.queue = [];
+    this.fetchChain = Promise.resolve();
+    this.playing = false;
+    this.sentIndex = 0;
+    this.chunkIndex = 0;
+  },
+
+  _sendChunk(text) {
+    const index = this.chunkIndex++;
+    console.log(`[ttsChunker] _sendChunk(${index}) text length:`, text.length, 'preview:', text.substring(0, 60));
+
+    // Clean markdown for TTS
+    text = text
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`(.*?)`/g, '$1')
+      .replace(/#{1,6}\s?/g, '')
+      .replace(/\n/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!text) return;
+
+    const entry = { index, state: 'loading', audio: null, url: null };
+    this.queue.push(entry);
+
+    // Chain fetches sequentially: each chunk waits for the previous fetch to complete.
+    // This gives 1-chunk lookahead — while chunk N plays, chunk N+1 fetch is in flight.
+    this.fetchChain = this.fetchChain.then(() => this._fetchChunk(entry, text, index));
+  },
+
+  _fetchChunk(entry, text, index) {
+    const signal = this.abortController?.signal;
+    return fetch(TTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal
+    })
+    .then(res => {
+      console.log(`[ttsChunker] chunk ${index} TTS response:`, res.status);
+      if (!res.ok) throw new Error(`TTS ${res.status}`);
+      return res.blob();
+    })
+    .then(blob => {
+      console.log(`[ttsChunker] chunk ${index} audio blob size:`, blob.size);
+      if (blob.size === 0) throw new Error('Empty audio');
+      entry.url = URL.createObjectURL(blob);
+      entry.audio = new Audio(entry.url);
+      entry.state = 'ready';
+      this._playNext();
+    })
+    .catch(err => {
+      if (err.name === 'AbortError') return;
+      console.error(`TTS chunk ${index} error:`, err);
+      entry.state = 'error';
+      this._playNext();
+    });
+  },
+
+  _playNext() {
+    if (this.playing || this.queue.length === 0) {
+      // Check if all done
+      if (!this.playing && this.queue.length === 0 && this.flushed) {
+        if (conversationMode && !isRecording) {
+          startRecording();
+        }
+      }
+      return;
+    }
+
+    const next = this.queue[0];
+
+    // Wait for in-order playback — if first chunk is still loading, wait
+    if (next.state === 'loading') return;
+
+    if (next.state === 'error') {
+      this.queue.shift();
+      this._playNext();
+      return;
+    }
+
+    // state === 'ready'
+    this.playing = true;
+    this.currentAudio = next.audio;
+
+    // Guard against double-fire (play() rejection + onerror can both trigger)
+    const cleanup = () => {
+      if (!this.playing) return;
+      next.audio.onended = null;
+      next.audio.onerror = null;
+      URL.revokeObjectURL(next.url);
+      this.queue.shift();
+      this.playing = false;
+      this.currentAudio = null;
+      this._playNext();
+    };
+
+    next.audio.onended = cleanup;
+    next.audio.onerror = cleanup;
+
+    next.audio.play().catch(e => {
+      console.error('TTS chunk play failed:', e);
+      cleanup();
+    });
+  }
+};
+
+// Conversation history state
+let currentConversationId = null;
+let conversations = [];
+let sidebarCollapsed = false;   
+
+// Initialize the app
+document.addEventListener('DOMContentLoaded', () => {
+  // Before anything renders a timestamp. It resolves fast and every formatter
+  // degrades to the browser's own zone until it lands, so nothing waits on it.
+  loadInstanceTimezone();
+  loadProviders();
+  loadConversations();
+  setupEventListeners();
+  setupSidebarListeners();
+  loadSettings();
+  checkMobileView();
+});
+
+// Load available providers
+async function loadProviders() {
+  try {
+    const hasClaudeKey = !!localStorage.getItem('claudeApiKey');
+    const hasGrokKey = !!localStorage.getItem('grokApiKey');
+    const hasOpenAIKey = !!localStorage.getItem('openaiApiKey');
+
+    const response = await fetch('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hasClaudeKey, hasGrokKey, hasOpenAIKey })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    providers = data.providers || [];
+
+    providerSelect.innerHTML = '<option value="">Select a provider</option>';
+    providers.forEach(provider => {
+      const option = document.createElement('option');
+      option.value = provider.id;
+      // Add visual indicator if API key is missing for providers that require it
+      const needsKey = provider.requiresKey && !provider.hasKey;
+      option.textContent = needsKey ? `${provider.name} (API key required)` : provider.name;
+      option.dataset.requiresKey = provider.requiresKey;
+      option.dataset.hasKey = provider.hasKey;
+      providerSelect.appendChild(option);
+    });
+
+    // Restore saved provider
+    const savedProvider = localStorage.getItem('selectedProvider');
+    if (savedProvider) {
+      providerSelect.value = savedProvider;
+      currentProvider = savedProvider;
+      await loadModelsForProvider(savedProvider);
+
+      // Initialize model status bar for SquatchServe
+      updateModelStatusBarVisibility();
+    }
+  } catch (error) {
+    console.error('Error loading providers:', error);
+    addMessage('error', 'Failed to load providers. Please check your connection.');
+  }
+}
+
+// Load models for selected provider
+async function loadModelsForProvider(providerId) {
+  try {
+    modelSelect.innerHTML = '<option value="">Select a model</option>';
+
+    const provider = providers.find(p => p.id === providerId);
+    if (!provider) return;
+
+    // Check if API key is required but missing
+    if (provider.requiresKey && !provider.hasKey) {
+      const keyName = provider.type === 'claude' ? 'Claude' : provider.type === 'openai' ? 'OpenAI' : 'Grok';
+      addMessage('system', `${keyName} requires an API key. Click the ⚙️ Settings button to add your API key.`);
+      return;
+    }
+
+    let models = [];
+
+    // Instance-based providers (ollama, vllm, llamacpp) use the instance/models endpoint
+    if (provider.instanceName) {
+      const response = await fetch('/api/instance/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerType: provider.type, instanceName: provider.instanceName })
+      });
+      if (!response.ok) throw new Error(`${provider.name} not available`);
+      const data = await response.json();
+      models = data.models || [];
+    } else if (provider.type === 'openai') {
+      // Fetch OpenAI models dynamically
+      const apiKey = localStorage.getItem('openaiApiKey');
+      const response = await fetch('/api/openai/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey })
+      });
+      if (!response.ok) throw new Error('Failed to fetch OpenAI models');
+      const data = await response.json();
+      models = data.models || [];
+    } else if (provider.type === 'squatchserve') {
+      // Fetch SquatchServe models dynamically
+      const squatchserveHost = localStorage.getItem('squatchserveHost') || '';
+      const url = squatchserveHost
+        ? `/api/squatchserve/models?host=${encodeURIComponent(squatchserveHost)}`
+        : '/api/squatchserve/models';
+      const response = await fetch(url);
+      if (!response.ok) throw new Error('SquatchServe not available');
+      const data = await response.json();
+      models = data.models || [];
+    } else {
+      // Use pre-defined models (Claude, Grok)
+      models = provider.models || [];
+    }
+
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.name;
+      modelSelect.appendChild(option);
+    });
+
+    // Restore saved model
+    const savedModel = localStorage.getItem('selectedModel');
+    if (savedModel) {
+      modelSelect.value = savedModel;
+      currentModel = savedModel;
+    }
+  } catch (error) {
+    console.error('Error loading models:', error);
+    addMessage('error', `Failed to load models for ${providerId}. Check that the server is running.`);
+  }
+}
+
+// Load conversation from session storage
+function loadConversation() {
+  try {
+    const savedConversation = sessionStorage.getItem('ollamaChatConversation');
+    if (savedConversation) {
+      conversation = JSON.parse(savedConversation);
+      renderMessages();
+    } else {
+      // Show welcome message
+      addMessage('system', 'Welcome to Neuro Hub! Select a provider and model to start chatting.');
+    }
+  } catch (error) {
+    console.error('Error loading conversation:', error);
+    conversation = [];
+    addMessage('system', 'Welcome to Neuro Hub! Select a provider and model to start chatting.');
+  }
+}
+
+// Save conversation to session storage
+function saveConversation() {
+  try {
+    sessionStorage.setItem('ollamaChatConversation', JSON.stringify(conversation));
+  } catch (error) {
+    console.error('Error saving conversation:', error);
+  }
+}
+
+// Set up event listeners
+function setupEventListeners() {
+  providerSelect.addEventListener('change', handleProviderChange);
+  modelSelect.addEventListener('change', handleModelChange);
+  newChatBtn.addEventListener('click', newChat);
+  // Wrapped, not passed directly: addEventListener would hand sendMessage the
+  // MouseEvent as its inputModality argument.
+  sendBtn.addEventListener('click', () => sendMessage('typed'));
+  messageInput.addEventListener('keydown', handleKeyDown);
+  messageInput.addEventListener('input', autoResizeInput);
+  micBtn.addEventListener('mousedown', startRecording);
+  convoModeBtn.addEventListener('click', toggleConversationMode);
+  micBtn.addEventListener('mouseup', stopRecording);
+  micBtn.addEventListener('mouseleave', stopRecording);
+  speakerToggle.addEventListener('click', toggleTTS);
+  superSearchBtn.addEventListener('click', toggleSuperSearch);
+  settingsBtn.addEventListener('click', openSettings);
+  closeModal.addEventListener('click', closeSettings);
+  saveSettingsBtn.addEventListener('click', saveSettingsHandler);
+
+  // Settings nav tab switching
+  document.querySelectorAll('.settings-nav-item').forEach(tab => {
+    tab.addEventListener('click', () => switchSettingsTab(tab.dataset.settingsTab));
+  });
+
+  // SquatchServe unload button
+  if (unloadModelBtn) {
+    unloadModelBtn.addEventListener('click', unloadSquatchserveModel);
+  }
+
+  // Close modal on outside click
+  settingsModal.addEventListener('click', (e) => {
+    if (e.target === settingsModal) {
+      closeSettings();
+    }
+  });
+}
+
+// Handle provider selection
+async function handleProviderChange() {
+  currentProvider = providerSelect.value;
+  localStorage.setItem('selectedProvider', currentProvider);
+
+  // Update model status bar visibility for SquatchServe
+  updateModelStatusBarVisibility();
+
+  if (currentProvider) {
+    await loadModelsForProvider(currentProvider);
+    addMessage('system', `Provider selected: ${providerSelect.options[providerSelect.selectedIndex].text}`);
+  }
+}
+
+// Handle model selection
+function handleModelChange() {
+  currentModel = modelSelect.value;
+  localStorage.setItem('selectedModel', currentModel);
+  
+  if (currentModel) {
+    addMessage('system', `Model selected: ${currentModel}`);
+  }
+}
+
+// Handle sending a message
+// inputModality: how this message reached the box — 'typed' by default, 'stt'
+// when sendAudioToWhisper hands over a transcription. It rides with the request
+// so the fact extractor can record whether a fact was spoken or typed; a
+// transcription is weaker evidence and the corrector needs to know.
+/**
+ * A system notice: shown to Ellie, attached to the turn she is reading, and
+ * never part of the message.
+ *
+ * Visually distinct on purpose. The whole reason this exists is that she could
+ * not tell a real status line from one the model typed, so a notice must not
+ * look like anything the model can produce inside its own text.
+ */
+function renderSystemNotice(n) {
+  try {
+    const messages = document.getElementById('messages');
+    if (!messages) return;
+    const el = document.createElement('div');
+    el.className = `system-notice notice-${String(n.kind || 'info').replace(/[^a-z-]/gi, '')}`;
+    const label = document.createElement('span');
+    label.className = 'system-notice-label';
+    label.textContent = 'from the system, not the model';
+    const body = document.createElement('div');
+    body.className = 'system-notice-body';
+    // The shared renderer (db/markdown.js, served at /markdown.js) so bold and
+    // code look the same here as in a message. Falls back to escaped text if it
+    // did not load — a notice must never fail to appear, since the cases it
+    // reports are exactly the ones she cannot otherwise detect.
+    const md = window.SNHMarkdown;
+    if (md && typeof md.renderMarkdown === 'function') {
+      try { body.innerHTML = md.renderMarkdown(String(n.text || '')); }
+      catch { body.textContent = String(n.text || ''); }
+    } else {
+      body.textContent = String(n.text || '');
+    }
+    el.appendChild(label);
+    el.appendChild(body);
+    messages.appendChild(el);
+    messages.scrollTop = messages.scrollHeight;
+  } catch (err) {
+    console.error('[Notice] could not render:', err);
+  }
+}
+
+async function sendMessage(inputModality = 'typed') {
+  const message = messageInput.value.trim();
+  // Cancel any pending TTS from previous message
+  ttsChunker.cancel();
+  if (!message || !currentModel || !currentProvider) {
+    if (!currentProvider || !currentModel) {
+      addMessage('error', 'Please select a provider and model first.');
+    }
+    return;
+  }
+
+  // Fix 6: Disable send button during streaming
+  sendBtn.disabled = true;
+  sendBtn.classList.add('btn-disabled');
+
+  // Add user message to conversation
+  addMessage('user', message);
+  messageInput.value = '';
+  autoResizeInput();
+  // Replying here is reading what arrived here.
+  acknowledgeLiveMessages();
+
+  // Show typing indicator
+  showTypingIndicator();
+
+  try {
+    let response = null;
+    const conversationMessages = conversation
+      .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+      .map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
+
+    // Resolve provider type and instance name from current selection
+    const selectedProvider = providers.find(p => p.id === currentProvider);
+    const providerType = selectedProvider?.type || currentProvider;
+    const instanceName = selectedProvider?.instanceName || undefined;
+
+    // Use memory-enhanced chat endpoint
+    const ollamaHost = localStorage.getItem('ollamaHost') || undefined;
+    const squatchserveHost = localStorage.getItem('squatchserveHost') || undefined;
+    const llamacppHost = localStorage.getItem('llamacppHost') || undefined;
+    const apiKey = providerType === 'claude'
+      ? localStorage.getItem('claudeApiKey')
+      : providerType === 'openai'
+        ? localStorage.getItem('openaiApiKey')
+        : providerType === 'grok'
+          ? localStorage.getItem('grokApiKey')
+          : undefined;
+
+    const requestBody = {
+      model: currentModel,
+      messages: conversationMessages,
+      provider: providerType,
+      instanceName,
+      conversation_id: currentConversationId,
+      ollamaHost,
+      squatchserveHost,
+      llamacppHost,
+      apiKey,
+      searxngHost: localStorage.getItem('searxngHost') || undefined,
+      ttsEnabled,
+      superSearch,
+      inputModality
+    };
+    console.log('[sendMessage] Provider:', providerType, 'Instance:', instanceName);
+
+    response = await fetch('/api/chat/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    });
+
+    // SECURITY FIX: Check if response exists before accessing properties
+    if (!response) {
+      throw new Error('No response received from provider');
+    }
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+      const err = new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      // When the server knows WHY - the model engine is restarting, say -
+      // the message explains itself and does not want a "Failed to send
+      // message:" bolted onto the front of it.
+      if (errorData.brain) { err.brain = errorData.brain; err.technical = errorData.technical; }
+      throw err;
+    }
+
+    // Get conversation ID from response headers
+    const newConversationId = response.headers.get('X-Conversation-Id');
+    const hasMemoryContext = response.headers.get('X-Has-Memory-Context') === 'true';
+
+    if (newConversationId && !currentConversationId) {
+      currentConversationId = newConversationId;
+    }
+
+    // Show memory context indicator if applicable
+    if (hasMemoryContext) {
+      showMemoryIndicator(response);
+    }
+
+    // Show tools indicator if applicable
+    const usedTools = response.headers.get('X-Tools-Used') === 'true';
+    if (usedTools) {
+      showToolsIndicator();
+    }
+
+    // Search provenance for the live turn: the server hands us the source links it
+    // drew from (URL-encoded JSON). Attached to the assistant message below so the
+    // clickable [S#] list renders immediately, matching the reload view.
+    // THE TERMINAL META FRAME lands here. Sources and tools-used are only known
+    // after the tool loop, and the stream now starts before that — so they
+    // arrive at the end of the body instead of in the headers. Headers are
+    // still read first as a fallback for a server that predates the frame.
+    window.__snhLastMeta = null;
+    let responseSources = null;
+    const sourcesHeader = response.headers.get('X-Sources');
+    if (sourcesHeader) {
+      try { responseSources = JSON.parse(decodeURIComponent(sourcesHeader)); } catch (e) { /* ignore */ }
+    }
+
+    // Handle streaming response
+    let fullResponse = '';
+    const assistantMessageId = Date.now();
+    conversation.push({
+      role: 'assistant',
+      content: '',
+      id: assistantMessageId
+    });
+    lastAssistantMessageId = assistantMessageId;
+
+    // Create the DOM element for streaming
+    streamingMessageElement = document.createElement('div');
+    streamingMessageElement.classList.add('message', 'assistant');
+    streamingMessageElement.innerHTML = '<div class="message-content"></div>';
+    messagesContainer.appendChild(streamingMessageElement);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+
+    // Start chunked TTS pipeline if TTS is active
+    console.log('[ttsChunker] Pre-stream check: ttsEnabled:', ttsEnabled);
+    if (ttsEnabled) ttsChunker.start();
+
+    // Process stream based on provider type
+    const streamType = selectedProvider?.type || currentProvider;
+    if (streamType === 'ollama' || streamType === 'squatchserve') {
+      // Ollama and SquatchServe use NDJSON streaming format
+      fullResponse = await processOllamaStream(response);
+    } else if (streamType === 'claude') {
+      fullResponse = await processClaudeStream(response);
+    } else if (streamType === 'grok' || streamType === 'openai' || streamType === 'llamacpp' || streamType === 'vllm') {
+      // Grok, OpenAI, Llama.cpp, and vLLM use OpenAI-compatible SSE streaming format
+      fullResponse = await processGrokStream(response);
+    }
+
+    // Update the assistant message with the complete response
+    console.log('[sendMessage] Stream complete, fullResponse length:', fullResponse.length);
+    const assistantMessageIndex = conversation.findIndex(msg => msg.id === assistantMessageId);
+    // The frame is authoritative; the header value was a best-effort guess made
+    // before the tool loop had run.
+    const meta = window.__snhLastMeta;
+    if (meta) {
+      if (Array.isArray(meta.sources) && meta.sources.length) responseSources = meta.sources;
+      if (meta.conversationId && !currentConversationId) currentConversationId = meta.conversationId;
+      if (meta.toolsUsed) showToolsIndicator();
+    }
+    if (assistantMessageIndex !== -1) {
+      conversation[assistantMessageIndex].content = fullResponse;
+      if (responseSources) conversation[assistantMessageIndex].sources = responseSources;
+      console.log('[sendMessage] Updated conversation at index:', assistantMessageIndex);
+    }
+
+    // Cancel any pending animation frame to avoid stale updates
+    if (animationFrameId) {
+      cancelAnimationFrame(animationFrameId);
+    }
+
+    // Clear streaming state BEFORE re-rendering
+    streamingMessageElement = null;
+    pendingContent = null;
+    animationFrameId = null;
+
+    saveConversation();
+
+    // Force re-render to ensure UI matches conversation state
+    // This guarantees the response is displayed even if streaming updates failed
+    renderMessages();
+
+    console.log('[ttsChunker] Post-stream: ttsEnabled:', ttsEnabled, 'fullResponse length:', fullResponse.length);
+    if (ttsEnabled) {
+      ttsChunker.flush(fullResponse);
+    }
+
+    // Refresh conversation list to show the new/updated conversation
+    loadConversations();
+
+    // AND THE ROBOT BUTTON, NOW RATHER THAN IN UP TO A MINUTE.
+    //
+    // The turn that just finished is the most likely moment for a job to have
+    // started, and the badge poll sits at 60s while nothing is known to be
+    // running — so the pulse that says "something is working" arrived up to a
+    // minute after the reply that started it, which reads as nothing having
+    // happened. One extra request per turn buys the indicator being true when she
+    // looks at it. refreshJobsBadge also steps the poll up to 15s on its own once
+    // it sees something active.
+    refreshJobsBadge();
+    if (jobsPanel?.classList.contains('open')) loadJobsList();
+
+  } catch (error) {
+    console.error('Error sending message:', error);
+    ttsChunker.cancel();
+    // A known engine state is already a complete explanation; anything
+    // else is an unexplained failure and should say so.
+    addMessage('error', error.brain
+      ? error.message
+      : `Failed to send message: ${error.message}`);
+    if (error.technical) console.error('[Chat] underlying error:', error.technical);
+  } finally {
+    hideTypingIndicator();
+    // Fix 6: Re-enable send button on all exit paths
+    sendBtn.disabled = false;
+    sendBtn.classList.remove('btn-disabled');
+  }
+}
+
+// Show memory context indicator (persistent, clickable, with source breakdown)
+function showMemoryIndicator(response) {
+  const indicator = document.createElement('div');
+  indicator.className = 'memory-indicator-persistent';
+
+  // Parse memory sources from response headers
+  let sourcesText = '';
+  if (response && response.headers) {
+    const sources = response.headers.get('X-Memory-Sources') || 'none';
+    if (sources !== 'none') {
+      const parts = sources.split(',');
+      const labels = parts.map(s => {
+        if (s === 'long-term') return 'Long-term memory';
+        if (s === 'user-profile') return 'User profile';
+        if (s === 'daily-today') return "Today's log";
+        if (s === 'daily-yesterday') return "Yesterday's log";
+        if (s.endsWith('-conversations')) return `${s.split('-')[0]} past conversations`;
+        if (s.endsWith('-clusters')) return `${s.split('-')[0]} memory clusters`;
+        return s;
+      });
+      sourcesText = labels.join(', ');
+    }
+  }
+
+  indicator.innerHTML = `
+    <span>Using memory context</span>
+    <div class="memory-indicator-details">${sourcesText ? escapeHtml(sourcesText) : 'Memory files loaded'}</div>
+  `;
+
+  indicator.addEventListener('click', () => {
+    indicator.classList.toggle('expanded');
+  });
+
+  messagesContainer.appendChild(indicator);
+}
+
+// Show tools usage indicator (persistent — matches memory indicator behavior)
+function showToolsIndicator() {
+  const indicator = document.createElement('div');
+  indicator.className = 'search-results-indicator';
+  indicator.textContent = 'Enhanced with tool results';
+  messagesContainer.appendChild(indicator);
+}
+
+// Process Ollama streaming response
+async function processOllamaStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullResponse = '';
+  let buffer = ''; // Buffer for partial lines across chunks
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // SECURITY FIX: Use stream:true to handle partial UTF-8 sequences
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+
+      // Keep the last incomplete line in buffer
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.trim() === '') continue;
+
+        try {
+          const data = JSON.parse(line);
+          if (data.message && data.message.content) {
+            fullResponse += data.message.content;
+            updateLastMessage(fullResponse);
+          }
+        } catch (e) {
+          console.error('Error parsing Ollama JSON:', e);
+        }
+      }
+    }
+
+    // Process any remaining buffered content
+    if (buffer.trim()) {
+      try {
+        const data = JSON.parse(buffer);
+        if (data.message && data.message.content) {
+          fullResponse += data.message.content;
+          updateLastMessage(fullResponse);
+        }
+      } catch (e) {
+        console.error('Error parsing final Ollama JSON:', e);
+      }
+    }
+  } finally {
+    // SECURITY FIX: Always release the reader lock
+    reader.releaseLock();
+  }
+
+  return fullResponse;
+}
+
+// Process Claude streaming response
+async function processClaudeStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullResponse = '';
+  let buffer = ''; // Buffer for partial lines across chunks
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // SECURITY FIX: Use stream:true to handle partial UTF-8 sequences
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+
+      // Keep the last incomplete line in buffer
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+              fullResponse += parsed.delta.text;
+              updateLastMessage(fullResponse);
+            }
+          } catch (e) {
+            console.error('Error parsing Claude SSE:', e);
+          }
+        }
+      }
+    }
+
+    // Process any remaining buffered content (handles missing trailing newline)
+    if (buffer.trim()) {
+      if (buffer.startsWith('data: ')) {
+        const data = buffer.slice(6);
+        if (data !== '[DONE]') {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+              fullResponse += parsed.delta.text;
+              updateLastMessage(fullResponse);
+            }
+          } catch (e) {
+            console.error('Error parsing final Claude SSE:', e);
+          }
+        }
+      }
+    }
+  } finally {
+    // SECURITY FIX: Always release the reader lock
+    reader.releaseLock();
+  }
+
+  return fullResponse;
+}
+
+// Process Grok streaming response (OpenAI-compatible)
+/**
+ * The reasoning text on one streamed frame, whichever field the engine uses.
+ *
+ * vLLM emits `reasoning`; DeepSeek-R1 and others emit `reasoning_content`. Both
+ * are read so this holds for the next reasoning model, not just this one. The
+ * text is returned to a SEPARATE accumulator — concatenating it into the answer
+ * would put the model's working out in the reply, in the transcript, and in
+ * everything downstream that reads a message as what SNH said.
+ */
+
+/**
+ * The running-tool line, above the answer and beside the thinking panel.
+ *
+ * At 22 tok/s a multi-round turn is legitimately a minute or two. Silence for
+ * that long reads as a hang; the same wait with "using web_search…" on screen
+ * reads as work. One line per tool, rewritten in place when it finishes, so a
+ * five-round turn leaves five short lines rather than a scrolling log.
+ */
+function renderToolStatus(st) {
+  if (!streamingMessageElement) return;
+  let rail = streamingMessageElement.querySelector('.tool-rail');
+  if (!rail) {
+    rail = document.createElement('div');
+    rail.className = 'tool-rail';
+    streamingMessageElement.insertBefore(rail, streamingMessageElement.firstChild);
+  }
+  const id = `tool-${st.round}-${st.tool}`;
+  let row = rail.querySelector(`[data-tool-id="${id}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'tool-rail-row running';
+    row.dataset.toolId = id;
+    rail.appendChild(row);
+  }
+  if (st.phase === 'tool_start') {
+    row.className = 'tool-rail-row running';
+    row.textContent = `using ${st.tool}…`;
+  } else if (st.phase === 'tool_end') {
+    row.className = 'tool-rail-row done';
+    const secs = st.ms != null ? ` — ${(st.ms / 1000).toFixed(1)}s` : '';
+    row.textContent = `${st.tool}${secs}`;
+  }
+}
+
+
+/**
+ * The running-tool rail: one line per tool, rewritten in place when it ends.
+ *
+ * Tool execution produces no tokens, so without this a multi-round turn shows
+ * nothing while the work happens. Round-1 content that arrived BEFORE a tool
+ * call is left on screen and the answer continues after it — the model's
+ * "let me look that up" is true and worth keeping, and erasing text the reader
+ * has already seen is worse than appending to it.
+ */
+function renderToolStatus(st) {
+  if (!streamingMessageElement) return;
+  let rail = streamingMessageElement.querySelector('.tool-rail');
+  if (!rail) {
+    rail = document.createElement('div');
+    rail.className = 'tool-rail';
+    streamingMessageElement.insertBefore(rail, streamingMessageElement.firstChild);
+  }
+  const id = `tool-${st.round}-${st.tool}`;
+  let row = rail.querySelector(`[data-tool-id="${id}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.dataset.toolId = id;
+    rail.appendChild(row);
+  }
+  if (st.type === 'tool_start') {
+    row.className = 'tool-rail-row running';
+    row.textContent = `using ${st.tool}`;
+  } else {
+    const secs = st.ms != null ? ` — ${(st.ms / 1000).toFixed(1)}s` : '';
+    row.className = `tool-rail-row ${st.ok === false ? 'failed' : 'done'}`;
+    row.textContent = `${st.tool}${secs}${st.ok === false ? ' — failed' : ''}`;
+  }
+}
+
+function extractReasoningDelta(parsed) {
+  const c = parsed.choices?.[0];
+  const node = c?.delta || c?.message;
+  if (!node) return '';
+  const v = node.reasoning ?? node.reasoning_content;
+  return typeof v === 'string' ? v : '';
+}
+
+async function processGrokStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullResponse = '';
+  let fullReasoning = '';
+  let buffer = ''; // Buffer for partial lines across chunks
+  let chunkCount = 0;
+
+  console.log('[processGrokStream] Starting stream processing');
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        console.log('[processGrokStream] Stream done, chunks received:', chunkCount);
+        break;
+      }
+
+      chunkCount++;
+      // SECURITY FIX: Use stream:true to handle partial UTF-8 sequences
+      buffer += decoder.decode(value, { stream: true });
+
+      // Log first chunk to see the format
+      if (chunkCount === 1) {
+        console.log('[processGrokStream] First chunk:', buffer.substring(0, 200));
+      }
+
+      const lines = buffer.split('\n');
+
+      // Keep the last incomplete line in buffer
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine || trimmedLine === 'data: [DONE]') continue;
+
+        let jsonStr = trimmedLine;
+
+        // Handle SSE format (data: {...})
+        if (trimmedLine.startsWith('data: ')) {
+          jsonStr = trimmedLine.slice(6);
+          if (jsonStr === '[DONE]') continue;
+        }
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+
+          // SYSTEM NOTICES — chrome, never the transcript.
+          //
+          // The server sends these when it has something to say ABOUT the
+          // reply: no job was started, a progress line was fabricated, the
+          // brief was actually sent after the fact. They used to be appended
+          // to the message text, which stored them as the model's own words
+          // and taught it to write them (that is how the forged status line
+          // happened). This channel is one-way: the model cannot emit a frame,
+          // only content, so anything rendered here came from the server.
+          if (parsed.snh_notice) {
+            renderSystemNotice(parsed.snh_notice);
+            continue;
+          }
+
+          // Not model output: turn metadata and live phase markers.
+          if (parsed.type === 'meta') { window.__snhLastMeta = parsed; continue; }
+          if (parsed.type === 'tool_start' || parsed.type === 'tool_end') {
+            renderToolStatus(parsed);
+            continue;
+          }
+
+          // WHAT IS HAPPENING RIGHT NOW, for the phases that emit no tokens.
+          // A tool round's thinking streams; executing the tool does not, and
+          // that gap was most of the dead air on a multi-round turn.
+          const status = parsed.choices?.[0]?.delta?.snh_status;
+          if (status) { renderToolStatus(status); continue; }
+
+          // THINKING — its own channel, never the answer.
+          const reasoned = extractReasoningDelta(parsed);
+          if (reasoned) {
+            fullReasoning += reasoned;
+            updateLastReasoning(fullReasoning);
+          }
+
+          let content = null;
+
+          // OpenAI-compatible streaming format (delta)
+          if (parsed.choices?.[0]?.delta?.content) {
+            content = parsed.choices[0].delta.content;
+          }
+          // Non-streaming format (message instead of delta)
+          else if (parsed.choices?.[0]?.message?.content) {
+            content = parsed.choices[0].message.content;
+          }
+          // Ollama format
+          else if (parsed.message?.content) {
+            content = parsed.message.content;
+          }
+          // Direct content field
+          else if (parsed.content) {
+            content = parsed.content;
+          }
+          // Direct text field
+          else if (parsed.text) {
+            content = parsed.text;
+          }
+          // Response field (some providers use this)
+          else if (parsed.response) {
+            content = parsed.response;
+          }
+
+          if (content) {
+            fullResponse += content;
+            updateLastMessage(fullResponse);
+          }
+        } catch (e) {
+          // Not valid JSON, skip this line
+        }
+      }
+    }
+
+    // Process any remaining buffered content (handles missing trailing newline)
+    if (buffer.trim()) {
+      let jsonStr = buffer.trim();
+
+      // Handle SSE format
+      if (jsonStr.startsWith('data: ')) {
+        jsonStr = jsonStr.slice(6);
+      }
+
+      if (jsonStr && jsonStr !== '[DONE]') {
+        try {
+          const parsed = JSON.parse(jsonStr);
+
+          const reasonedTail = extractReasoningDelta(parsed);
+          if (reasonedTail) {
+            fullReasoning += reasonedTail;
+            updateLastReasoning(fullReasoning);
+          }
+
+          let content = null;
+
+          if (parsed.choices?.[0]?.delta?.content) {
+            content = parsed.choices[0].delta.content;
+          } else if (parsed.choices?.[0]?.message?.content) {
+            content = parsed.choices[0].message.content;
+          } else if (parsed.message?.content) {
+            content = parsed.message.content;
+          } else if (parsed.content) {
+            content = parsed.content;
+          } else if (parsed.text) {
+            content = parsed.text;
+          } else if (parsed.response) {
+            content = parsed.response;
+          }
+
+          if (content) {
+            fullResponse += content;
+            updateLastMessage(fullResponse);
+          }
+        } catch (e) {
+          // Not valid JSON, ignore
+        }
+      }
+    }
+  } finally {
+    // SECURITY FIX: Always release the reader lock
+    reader.releaseLock();
+  }
+
+  console.log('[processGrokStream] Final response length:', fullResponse.length,
+              '| reasoning length:', fullReasoning.length);
+  if (fullResponse.length === 0) {
+    // Distinguish the two very different silences: a model that thought and
+    // never answered, versus a stream we failed to parse at all. They looked
+    // identical before, and the first one was diagnosed as the second.
+    if (fullReasoning.length > 0) {
+      console.log('[processGrokStream] NOTE: stream was all reasoning, no answer content —',
+                  fullReasoning.length, 'chars of thinking. Not a parse failure.');
+    } else {
+      console.log('[processGrokStream] WARNING: No content extracted! Remaining buffer:', buffer);
+    }
+  }
+
+  return fullResponse;
+}
+
+// Handle key down events (Enter to send, Shift+Enter for new line)
+function handleKeyDown(event) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    sendMessage();
+  }
+}
+
+// Auto-resize textarea
+function autoResizeInput() {
+  messageInput.style.height = 'auto';
+  messageInput.style.height = (messageInput.scrollHeight) + 'px';
+}
+
+// Add message to conversation
+function addMessage(role, content) {
+  conversation.push({
+    role,
+    content,
+    id: Date.now()
+  });
+  
+  saveConversation();
+  renderMessages();
+}
+
+// Stream the model's thinking into its own collapsed panel above the answer.
+//
+// Separate from the answer on purpose, and collapsed by default: it is working
+// out, not what SNH said. Opening it is the reader's choice, the state of that
+// choice survives further streaming, and nothing here ever touches
+// .message-content — so the answer, the TTS feed and the saved transcript are
+// all unaffected by whether thinking happened at all.
+function updateLastReasoning(reasoning) {
+  if (!streamingMessageElement || !reasoning) return;
+
+  let panel = streamingMessageElement.querySelector('.message-reasoning');
+  if (!panel) {
+    panel = document.createElement('details');
+    panel.className = 'message-reasoning thinking-entry';
+    panel.innerHTML =
+      '<summary class="thinking-head">' +
+      '<span class="thinking-kind thinking-kind-heartbeat">thinking</span>' +
+      '<span class="thinking-when"></span>' +
+      '</summary><div class="thinking-sentence reasoning-body"></div>';
+    // Above the answer, mirroring the order it was produced in.
+    streamingMessageElement.insertBefore(panel, streamingMessageElement.firstChild);
+  }
+
+  if (!reasoningFrameId) {
+    pendingReasoning = reasoning;
+    reasoningFrameId = requestAnimationFrame(() => {
+      if (pendingReasoning && streamingMessageElement) {
+        const body = streamingMessageElement.querySelector('.reasoning-body');
+        const meta = streamingMessageElement.querySelector('.message-reasoning .thinking-when');
+        if (body) body.textContent = pendingReasoning;
+        if (meta) meta.textContent = `${pendingReasoning.length} chars`;
+      }
+      reasoningFrameId = null;
+    });
+  } else {
+    pendingReasoning = reasoning;
+  }
+}
+
+// Update the last message (for streaming responses)
+function updateLastMessage(content) {
+  // First streamed token means prefill is done — retire the "thinking" timer so
+  // the visible response replaces it (and the elapsed counter reads as TTFT).
+  if (isTyping) hideTypingIndicator();
+  if (ttsEnabled) {
+    console.log('[ttsChunker] updateLastMessage feeding, content length:', content.length, 'active:', ttsChunker.active);
+    ttsChunker.feed(content);
+  }
+  if (streamingMessageElement) {
+    pendingContent = content;
+    
+    // Only update once per animation frame (usually 60fps)
+    if (!animationFrameId) {
+      animationFrameId = requestAnimationFrame(() => {
+        if (pendingContent && streamingMessageElement) {
+          const contentElement = streamingMessageElement.querySelector('.message-content');
+          contentElement.innerHTML = formatMessageContent(pendingContent);
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        animationFrameId = null;
+      });
+    }
+  }
+}
+
+// Render a message's saved search sources as a compact clickable [S#] list.
+// Maps the inline [S#] tags in the answer to their URLs; links open in a new tab.
+// Only http(s) URLs become links (guards against javascript: URLs in results).
+function renderSourcesHtml(sources) {
+  if (!Array.isArray(sources) || !sources.length) return '';
+  const items = sources.map(s => {
+    const label = `[S${s.n}]`;
+    const rawTitle = s.title || '';
+    const shortTitle = rawTitle.length > 55 ? rawTitle.slice(0, 55) + '…' : rawTitle;
+    const titleHtml = shortTitle ? ' ' + escapeHtml(shortTitle) : '';
+    const isHttp = typeof s.url === 'string' && /^https?:\/\//i.test(s.url);
+    if (isHttp) {
+      return `<a class="msg-source" href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.url)}">${label}${titleHtml}</a>`;
+    }
+    return `<span class="msg-source">${label}${titleHtml}</span>`;
+  }).join('');
+  return `<div class="message-sources"><span class="message-sources-label">Sources:</span> ${items}</div>`;
+}
+
+// Render messages to the chat container
+function renderMessages() {
+  messagesContainer.innerHTML = '';
+  
+  conversation.forEach((msg, index) => {
+    const messageElement = document.createElement('div');
+    messageElement.classList.add('message', msg.role);
+    
+    if (msg.role === 'user') {
+      messageElement.innerHTML = `<div class="message-content">${escapeHtml(msg.content)}</div>`;
+    } else if (msg.role === 'assistant') {
+      if (msg.arrivedLive) messageElement.classList.add('arrived-live');
+      messageElement.innerHTML =
+        `${msg.arrivedLive ? '<div class="message-arrived">New — added while you were here. Click to mark it read.</div>' : ''}` +
+        `<div class="message-content">${formatMessageContent(msg.content)}</div>${renderSourcesHtml(msg.sources)}`;
+    } else if (msg.role === 'system') {
+      messageElement.innerHTML = `<div class="message-content system-message">${escapeHtml(msg.content)}</div>`;
+    } else if (msg.role === 'error') {
+      messageElement.innerHTML = `<div class="message-content error-message">${escapeHtml(msg.content)}</div>`;
+    }
+    
+    messagesContainer.appendChild(messageElement);
+  });
+  
+  // Scroll to bottom
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+// Format message content (handle markdown-like formatting)
+function formatMessageContent(content) {
+  // SECURITY: Escape HTML first to prevent XSS, then apply markdown formatting
+  const escaped = escapeHtml(content);
+  return escaped
+    // A WAY TO OPEN A CONVERSATION FROM A MESSAGE. The review's report lists
+    // what it closed and what is waiting on her as `[[conversation:<id>|Title]]`;
+    // this renders each as a link the click handler below opens. The id is
+    // matched as a UUID and nothing else, and the title is already escaped.
+    .replace(/\[\[conversation:([0-9a-f-]{36})\|([^\]]*)\]\]/gi,
+      (m, id, title) => `<a href="#" class="convo-link" data-conversation="${id}" title="Open this conversation">${title || 'open it'}</a>`)
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.*?)\*/g, '<em>$1</em>')
+    .replace(/`(.*?)`/g, '<code>$1</code>')
+    .replace(/\n/g, '<br>');
+}
+
+// Links to conversations inside messages — delegated, so a re-render never
+// loses them. Opening an archived one is fine: it loads read-only.
+messagesContainer?.addEventListener('click', (e) => {
+  const a = e.target.closest('a.convo-link');
+  if (!a) return;
+  e.preventDefault();
+  loadConversationById(a.dataset.conversation);
+});
+
+/**
+ * A MESSAGE THAT ARRIVES IN THE CONVERSATION SHE HAS OPEN.
+ *
+ * 2026-09-10: a background job paused and asked her, correctly, in the
+ * conversation she had dispatched it from — and she was sitting in that
+ * conversation. The row's count was on the sidebar behind her; the message
+ * itself never appeared in the pane, because nothing polled the open
+ * conversation. She found it through the jobs panel.
+ *
+ * So the list poll also checks the conversation she is IN: if the server says
+ * it has unread and nothing is streaming, the new messages are fetched
+ * (peeking — not claiming she read them) and appended with a marker, and the
+ * row keeps its blinking count until she acts here — sends a reply, or
+ * clicks the message — at which point it is marked read the way opening it
+ * would. Seen on screen and acknowledged are different things; the count
+ * clears on the second.
+ */
+let liveAppendedUnread = false;
+async function pullNewMessagesIntoOpenConversation() {
+  if (!currentConversationId || isTyping || streamingMessageElement) return;
+  const row = conversations.find(c => c.id === currentConversationId);
+  if (!row || !(row.unread > 0)) return;
+  try {
+    const res = await fetch(`/api/conversations/${currentConversationId}?peek=1`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const known = new Set(conversation.map(m => m.id));
+    const fresh = (data.messages || []).filter(m => m.role === 'assistant' && !known.has(m.id));
+    if (!fresh.length) return;
+    for (const m of fresh) conversation.push({ role: m.role, content: m.content, id: m.id, sources: m.sources || null, arrivedLive: true });
+    liveAppendedUnread = true;
+    saveConversation();
+    renderMessages();
+    lastAssistantMessageId = fresh[fresh.length - 1].id;
+  } catch { /* next tick */ }
+}
+
+/** She acted in the conversation — what arrived live counts as read now. */
+async function acknowledgeLiveMessages() {
+  if (!liveAppendedUnread || !currentConversationId) return;
+  liveAppendedUnread = false;
+  try { await fetch(`/api/conversations/${currentConversationId}/read`, { method: 'POST' }); } catch { /* the row will catch up */ }
+  refreshConversationList();
+}
+messagesContainer?.addEventListener('click', (e) => {
+  if (e.target.closest('.message.arrived-live')) acknowledgeLiveMessages();
+});
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Show typing indicator. During long prefill (the model reading a large system
+// context before emitting its first token) the UI would otherwise look frozen —
+// indistinguishable from a crash. So we count up the elapsed seconds and, past a
+// threshold, add a hint that a large context is being processed.
+let typingTimerId = null;
+let typingStartMs = 0;
+const typingStatusEl = document.getElementById('typingStatus');
+const PREFILL_HINT_AFTER_MS = 10000;
+
+function renderTypingStatus() {
+  if (!typingStatusEl) return;
+  const secs = Math.floor((Date.now() - typingStartMs) / 1000);
+  let txt = `${secs}s`;
+  if (Date.now() - typingStartMs >= PREFILL_HINT_AFTER_MS) {
+    txt += ` <span class="typing-hint">· processing large context — the first response can take a while</span>`;
+  }
+  typingStatusEl.innerHTML = txt;
+}
+
+function showTypingIndicator() {
+  isTyping = true;
+  typingIndicator.style.display = 'flex';
+  typingStartMs = Date.now();
+  if (typingStatusEl) typingStatusEl.innerHTML = '0s';
+  if (typingTimerId) clearInterval(typingTimerId);
+  typingTimerId = setInterval(renderTypingStatus, 1000);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+// Hide typing indicator (also called on first token, so the counter reflects
+// time-to-first-token rather than total generation time).
+function hideTypingIndicator() {
+  isTyping = false;
+  typingIndicator.style.display = 'none';
+  if (typingTimerId) { clearInterval(typingTimerId); typingTimerId = null; }
+  if (typingStatusEl) typingStatusEl.innerHTML = '';
+}
+
+// Start a new chat
+function newChat() {
+  startNewConversation();
+}
+
+// TTS Toggle
+function toggleTTS() {
+  ttsEnabled = !ttsEnabled;
+  speakerToggle.textContent = ttsEnabled ? '🔊' : '🔇';
+  speakerToggle.classList.toggle('enabled', ttsEnabled);
+  
+  // Unlock audio on first interaction
+  if (!audioUnlocked) {
+    const silence = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
+    silence.play().then(() => audioUnlocked = true).catch(() => {});
+  }
+}
+
+// Super Search Toggle
+function toggleSuperSearch() {
+  superSearch = !superSearch;
+  superSearchBtn.classList.toggle('active', superSearch);
+}
+
+
+// Recording functions
+async function startRecording() {
+  // Unlock audio on mic interaction
+  if (!audioUnlocked) {
+    const silence = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
+    silence.play().then(() => audioUnlocked = true).catch(() => {});
+  }
+
+  // Secure-context guard: getUserMedia only exists in a secure context. Over
+  // plain http, navigator.mediaDevices is undefined and reaching for it would
+  // throw a TypeError. Fail with a clear, actionable message instead. Voice
+  // OUTPUT (TTS playback via /api/tts) does not use mediaDevices and is
+  // unaffected — only mic capture needs https.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('Mic needs a secure connection — open SNH over https (or on localhost), not plain http. Voice playback still works.');
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    
+    // Set up audio analysis for silence detection
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    const source = audioContext.createMediaStreamSource(stream);
+    source.connect(analyser);
+    analyser.fftSize = 512;
+    
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    
+    mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+    mediaRecorder.onstop = sendAudioToWhisper;
+    
+    mediaRecorder.start();
+    isRecording = true;
+    micBtn.classList.add('recording');
+    
+    // Start silence detection if in conversation mode
+    if (conversationMode) {
+      detectSilence();
+    }
+  } catch (err) {
+    console.error('Mic access error:', err);
+    alert('Could not access microphone');
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && isRecording) {
+    mediaRecorder.stop();
+    mediaRecorder.stream.getTracks().forEach(track => track.stop());
+    isRecording = false;
+    micBtn.classList.remove('recording');
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
+  }
+}
+
+async function sendAudioToWhisper() {
+  const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+
+  try {
+    const response = await fetch(STT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/webm' },
+      body: audioBlob
+    });
+    const data = await response.json();
+    if (data.text) {
+      messageInput.value = data.text;
+      sendMessage('stt');
+    }
+  } catch (err) {
+    console.error('STT error:', err);
+  }
+}
+
+async function speakText(text) {
+  if (!ttsEnabled) return;
+
+  // Clean markdown formatting
+  text = text
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/\*(.*?)\*/g, '$1')
+    .replace(/`(.*?)`/g, '$1')
+    .replace(/#{1,6}\s?/g, '')
+    .replace(/\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!text) return;
+
+  try {
+    const response = await fetch(TTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text })
+    });
+
+    if (!response.ok) {
+      console.error('TTS request failed:', response.status);
+      return;
+    }
+
+    const audioBlob = await response.blob();
+    if (audioBlob.size === 0) {
+      console.error('TTS returned empty audio');
+      return;
+    }
+
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio();
+    audio.src = audioUrl;
+
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      if (conversationMode && !isRecording) {
+        startRecording();
+      }
+    };
+
+    audio.onerror = (e) => {
+      console.error('Audio playback error:', e);
+      URL.revokeObjectURL(audioUrl);
+    };
+
+    await audio.play().catch(e => {
+      console.error('Audio play failed:', e);
+      const playBtn = document.createElement('button');
+      playBtn.textContent = '▶️ Play Response';
+      playBtn.className = 'play-response-btn';
+      playBtn.onclick = () => {
+        audio.play();
+        playBtn.remove();
+        audioUnlocked = true;
+      };
+      messagesContainer.appendChild(playBtn);
+    });
+  } catch (err) {
+    console.error('TTS error:', err);
+  }
+}
+
+// Silence detection for conversation mode
+function detectSilence() {
+  // Wait 2 seconds before starting silence detection
+  setTimeout(() => {
+  const bufferLength = analyser.fftSize;
+  const dataArray = new Uint8Array(bufferLength);
+  let silenceStart = null;
+  const silenceThreshold = 5;  // Adjust if needed
+  const silenceDuration = 4000; // 4 seconds of silence
+  
+  function checkAudio() {
+    if (!isRecording || !conversationMode) return;
+    
+    analyser.getByteTimeDomainData(dataArray);
+    
+    // Calculate volume
+    let sum = 0;
+    for (let i = 0; i < bufferLength; i++) {
+      const val = (dataArray[i] - 128) / 128;
+      sum += val * val;
+    }
+    const volume = Math.sqrt(sum / bufferLength) * 100;
+    
+    if (volume < silenceThreshold) {
+      if (!silenceStart) silenceStart = Date.now();
+      else if (Date.now() - silenceStart > silenceDuration) {
+        stopRecording();
+        return;
+      }
+    } else {
+      silenceStart = null;
+    }
+    
+    requestAnimationFrame(checkAudio);
+  }
+  
+  checkAudio();
+  }, 2000);
+}
+
+// Toggle conversation mode
+function toggleConversationMode() {
+  conversationMode = !conversationMode;
+  convoModeBtn.classList.toggle('active', conversationMode);
+  convoModeBtn.textContent = conversationMode ? '🗣️' : '💬';
+
+  // Also enable TTS when entering conversation mode
+  if (conversationMode) {
+    ttsEnabled = true;
+    speakerToggle.textContent = '🔊';
+    speakerToggle.classList.add('enabled');
+
+    // Unlock audio
+    const silence = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
+    silence.play().then(() => audioUnlocked = true).catch(() => {});
+
+    // Start listening
+    startRecording();
+  } else {
+    stopRecording();
+  }
+}
+
+// Settings Modal Functions
+
+// Track which tabs have been loaded this session to avoid re-rendering and losing edits
+const settingsTabsLoaded = new Set();
+
+function openSettings() {
+  // Clear loaded state so tabs re-fetch fresh data each time the modal opens
+  settingsTabsLoaded.clear();
+  settingsModal.style.display = 'flex';
+  const activeTab = document.querySelector('.settings-nav-item.active');
+  const tabName = activeTab ? activeTab.dataset.settingsTab : 'chat';
+  switchSettingsTab(tabName);
+}
+
+function closeSettings() {
+  settingsModal.style.display = 'none';
+}
+
+// loadSettings is called at init — just a no-op now since tabs load on demand
+function loadSettings() {
+  // Values are loaded per-tab when each tab is opened
+}
+
+// Fix 8: Escape key — close settings modal or memory panel (single listener)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (settingsModal.style.display !== 'none') {
+      closeSettings();
+    } else if (memoryPanel?.classList.contains('open')) {
+      closeMemoryPanel();
+    }
+  }
+});
+
+function switchSettingsTab(name) {
+  document.querySelectorAll('.settings-nav-item').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.settings-nav-item[data-settings-tab="${name}"]`)?.classList.add('active');
+  document.querySelectorAll('.settings-tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById(`settingsTab${name.charAt(0).toUpperCase() + name.slice(1)}`)?.classList.add('active');
+
+  // Only load tab content if not already loaded this modal session
+  if (!settingsTabsLoaded.has(name)) {
+    settingsTabsLoaded.add(name);
+    if (name === 'chat') loadSettingsChatTab();
+    else if (name === 'brain') loadSettingsBrainTab();
+    else if (name === 'voice') loadSettingsVoiceTab();
+    else if (name === 'tools') loadSettingsToolsTab();
+    else if (name === 'about') loadSettingsAboutTab();
+  }
+}
+
+let chatTabLoadGeneration = 0;
+let toolsTabLoadGeneration = 0;
+
+async function loadSettingsChatTab() {
+  const container = document.getElementById('settingsTabChat');
+  if (!container) return;
+
+  const generation = ++chatTabLoadGeneration;
+
+  const claudeKey = localStorage.getItem('claudeApiKey') || '';
+  const openaiKey = localStorage.getItem('openaiApiKey') || '';
+  const grokKey = localStorage.getItem('grokApiKey') || '';
+  const squatchserveHost = localStorage.getItem('squatchserveHost') || '';
+
+  // Load instances from config via providers endpoint
+  let instances = { ollama: [], vllm: [], llamacpp: [] };
+  try {
+    const res = await fetch('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hasClaudeKey: !!claudeKey,
+        hasGrokKey: !!localStorage.getItem('grokApiKey'),
+        hasOpenAIKey: !!localStorage.getItem('openaiApiKey')
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      instances = data.instances || instances;
+    }
+  } catch (e) {
+    console.error('[Settings] Failed to load instances:', e);
+  }
+
+  if (generation !== chatTabLoadGeneration) return;
+
+  container.innerHTML = '';
+
+  // Instance managers for each provider type
+  const providerTypes = [
+    { key: 'ollama', label: 'Ollama', hasModel: false },
+    { key: 'vllm', label: 'vLLM', hasModel: true },
+    { key: 'llamacpp', label: 'Llama.cpp', hasModel: true }
+  ];
+
+  for (const pt of providerTypes) {
+    const section = document.createElement('div');
+    section.className = 'settings-section';
+
+    const h3 = document.createElement('h3');
+    h3.textContent = `${pt.label} Instances`;
+    section.appendChild(h3);
+
+    const hint = document.createElement('p');
+    hint.className = 'settings-hint';
+    hint.textContent = pt.hasModel
+      ? `Named ${pt.label} server connections with model name`
+      : `Named ${pt.label} server connections (models fetched live)`;
+    section.appendChild(hint);
+
+    // Instance list
+    const listDiv = document.createElement('div');
+    listDiv.className = 'instance-list';
+    listDiv.id = `instance-list-${pt.key}`;
+
+    const currentInstances = instances[pt.key] || [];
+    for (const inst of currentInstances) {
+      listDiv.appendChild(createInstanceItem(pt.key, inst, pt.hasModel));
+    }
+
+    if (currentInstances.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'instance-empty';
+      empty.textContent = 'No instances configured';
+      listDiv.appendChild(empty);
+    }
+
+    section.appendChild(listDiv);
+
+    // Add form
+    const addForm = document.createElement('div');
+    addForm.className = 'instance-add-form';
+    addForm.innerHTML = `
+      <input type="text" placeholder="Name" class="instance-input instance-name-input" data-provider="${pt.key}">
+      <input type="text" placeholder="Host URL" class="instance-input instance-host-input" data-provider="${pt.key}">
+      ${pt.hasModel ? `<input type="text" placeholder="Model" class="instance-input instance-model-input" data-provider="${pt.key}">` : ''}
+      <button class="instance-add-btn" data-provider="${pt.key}" data-has-model="${pt.hasModel}">Add</button>
+    `;
+    section.appendChild(addForm);
+
+    // Wire up Add button
+    addForm.querySelector('.instance-add-btn').addEventListener('click', (e) => {
+      handleAddInstance(e, pt.key, pt.hasModel);
+    });
+
+    container.appendChild(section);
+  }
+
+  // === This instance ===
+  //
+  // First in the tab because it is about the deployment rather than about a
+  // provider. One setting today: the clock every displayed time is rendered on.
+  const instSection = document.createElement('div');
+  instSection.className = 'settings-section';
+  // INSTANCE_TZ is loaded from /api/config at boot, so it is the value the page
+  // is actually formatting with — which is the one worth showing as current.
+  const currentTz = INSTANCE_TZ || 'America/Los_Angeles';
+  // The full IANA list where the browser exposes it; a short sensible list where
+  // it does not. Either way the CURRENT value is always present, so opening this
+  // page can never silently offer to change a setting it could not display.
+  let zones = [];
+  try { zones = Intl.supportedValuesOf('timeZone') || []; } catch { zones = []; }
+  if (!zones.length) {
+    zones = ['America/Los_Angeles', 'America/Denver', 'America/Phoenix', 'America/Chicago',
+             'America/New_York', 'America/Anchorage', 'Pacific/Honolulu', 'UTC'];
+  }
+  if (!zones.includes(currentTz)) zones.unshift(currentTz);
+  instSection.innerHTML = `
+    <h3>This Instance</h3>
+    <p class="settings-hint">Settings for this deployment, not for the model.</p>
+    <div class="setting-item">
+      <label for="settings-instanceTimezone">Timezone</label>
+      <select id="settings-instanceTimezone" data-config-key="instance.timezone">
+        ${zones.map(z => `<option value="${escapeHtml(z)}"${z === currentTz ? ' selected' : ''}>${escapeHtml(z)}</option>`).join('')}
+      </select>
+    </div>
+    <p class="settings-hint">
+      Every time shown to you or to the entity — chat, memory, digests, the jobs panel,
+      daily logs — is rendered on this clock, and so is its own sense of "now".
+      Stored data is always UTC and is not affected; changing this changes only what is displayed,
+      and it takes effect on the next thing rendered, with no restart.
+    </p>
+  `;
+  container.appendChild(instSection);
+
+  // SquatchServe host (single instance, not converted to instance manager)
+  const sqSection = document.createElement('div');
+  sqSection.className = 'settings-section';
+  sqSection.innerHTML = `
+    <h3>SquatchServe</h3>
+    <p class="settings-hint">Single SquatchServe server connection</p>
+    <div class="setting-item">
+      <label for="settings-squatchserveHost">Host</label>
+      <input type="text" id="settings-squatchserveHost" class="api-key-input" placeholder="http://localhost:8111" value="${escapeHtml(squatchserveHost)}">
+    </div>
+  `;
+  container.appendChild(sqSection);
+
+  // API Keys section
+  const keysSection = document.createElement('div');
+  keysSection.className = 'settings-section';
+  keysSection.innerHTML = `
+    <h3>API Keys</h3>
+    <p class="settings-hint">API keys are stored locally in your browser and never sent to our servers</p>
+    <div class="setting-item">
+      <label for="settings-claudeApiKey">Claude API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-claudeApiKey" class="api-key-input" placeholder="sk-ant-..." value="${escapeHtml(claudeKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-claudeApiKey">👁️</button>
+      </div>
+    </div>
+    <div class="setting-item">
+      <label for="settings-openaiApiKey">OpenAI API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-openaiApiKey" class="api-key-input" placeholder="sk-..." value="${escapeHtml(openaiKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-openaiApiKey">👁️</button>
+      </div>
+    </div>
+    <div class="setting-item">
+      <label for="settings-grokApiKey">Grok API Key</label>
+      <div class="api-key-input-wrapper">
+        <input type="password" id="settings-grokApiKey" class="api-key-input" placeholder="xai-..." value="${escapeHtml(grokKey)}">
+        <button class="toggle-visibility-btn" data-target="settings-grokApiKey">👁️</button>
+      </div>
+    </div>
+  `;
+  container.appendChild(keysSection);
+
+  // Wire up visibility toggles
+  container.querySelectorAll('.toggle-visibility-btn').forEach(btn => {
+    btn.addEventListener('click', togglePasswordVisibility);
+  });
+}
+
+function createInstanceItem(providerType, inst, hasModel) {
+  const item = document.createElement('div');
+  item.className = 'instance-item';
+
+  const info = document.createElement('div');
+  info.className = 'instance-info';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'instance-name';
+  nameSpan.textContent = inst.name;
+  info.appendChild(nameSpan);
+
+  const hostSpan = document.createElement('span');
+  hostSpan.className = 'instance-host';
+  hostSpan.textContent = inst.host;
+  info.appendChild(hostSpan);
+
+  if (hasModel && inst.model) {
+    const modelSpan = document.createElement('span');
+    modelSpan.className = 'instance-model';
+    modelSpan.textContent = inst.model;
+    info.appendChild(modelSpan);
+  }
+
+  item.appendChild(info);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'instance-delete-btn';
+  deleteBtn.textContent = 'Delete';
+  deleteBtn.addEventListener('click', () => {
+    handleDeleteInstance(providerType, inst.name);
+  });
+  item.appendChild(deleteBtn);
+
+  return item;
+}
+
+async function handleAddInstance(event, providerType, hasModel) {
+  const form = event.target.closest('.instance-add-form');
+  const nameInput = form.querySelector('.instance-name-input');
+  const hostInput = form.querySelector('.instance-host-input');
+  const modelInput = hasModel ? form.querySelector('.instance-model-input') : null;
+
+  const name = nameInput.value.trim();
+  const host = hostInput.value.trim();
+  const model = modelInput ? modelInput.value.trim() : undefined;
+
+  if (!name || !host) {
+    alert('Name and Host are required.');
+    return;
+  }
+  if (hasModel && !model) {
+    alert('Model is required for this provider type.');
+    return;
+  }
+
+  const newInst = { name, host };
+  if (hasModel) newInst.model = model;
+
+  try {
+    const configRes = await fetch('/api/config');
+    if (!configRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+
+    const currentInstances = Array.isArray(config.providers?.[providerType]) ? config.providers[providerType] : [];
+
+    if (currentInstances.some(i => i.name === name)) {
+      alert(`An instance named "${name}" already exists for this provider.`);
+      return;
+    }
+
+    currentInstances.push(newInst);
+    const partial = { providers: { [providerType]: currentInstances } };
+
+    const saveRes = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(partial)
+    });
+    if (!saveRes.ok) throw new Error('Failed to save');
+
+    // The clock may have just changed. Re-read it before anything re-renders,
+    // or the page keeps formatting on the old zone until it is reloaded.
+    await loadInstanceTimezone();
+
+    // Clear inputs
+    nameInput.value = '';
+    hostInput.value = '';
+    if (modelInput) modelInput.value = '';
+
+    // Clear tab cache and reload
+    settingsTabsLoaded.delete('chat');
+    loadSettingsChatTab();
+    loadProviders();
+  } catch (error) {
+    console.error('[Settings] Error adding instance:', error);
+    alert('Failed to add instance: ' + error.message);
+  }
+}
+
+async function handleDeleteInstance(providerType, instanceName) {
+  if (!confirm(`Delete instance "${instanceName}"?`)) return;
+
+  try {
+    const configRes = await fetch('/api/config');
+    if (!configRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+
+    const currentInstances = Array.isArray(config.providers?.[providerType]) ? config.providers[providerType] : [];
+    const filtered = currentInstances.filter(i => i.name !== instanceName);
+
+    const partial = { providers: { [providerType]: filtered } };
+
+    const saveRes = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(partial)
+    });
+    if (!saveRes.ok) throw new Error('Failed to save');
+
+    // Clear tab cache and reload
+    settingsTabsLoaded.delete('chat');
+    loadSettingsChatTab();
+    loadProviders();
+  } catch (error) {
+    console.error('[Settings] Error deleting instance:', error);
+    alert('Failed to delete instance: ' + error.message);
+  }
+}
+
+async function loadSettingsBrainTab() {
+  const container = document.getElementById('settingsTabBrain');
+  if (!container) return;
+  container.innerHTML = '<div class="config-loading">Loading configuration...</div>';
+
+  try {
+    // Load config and provider instances in parallel
+    const [configRes, providersRes] = await Promise.all([
+      fetch('/api/config'),
+      fetch('/api/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hasClaudeKey: !!localStorage.getItem('claudeApiKey'),
+          hasGrokKey: !!localStorage.getItem('grokApiKey'),
+          hasOpenAIKey: !!localStorage.getItem('openaiApiKey')
+        })
+      })
+    ]);
+
+    if (!configRes.ok || !providersRes.ok) throw new Error('Failed to load config');
+    const config = await configRes.json();
+    const providersData = await providersRes.json();
+    // THE NUMBER THAT KILLED THE 9/17 JOB, ON A SCREEN. What the job runner will
+    // plan against right now — the engine's window, the reservation, the room.
+    // Derived, not a setting; shown beside the settings that shape it.
+    let jobWindow = null;
+    try { const r = await fetch('/api/jobs/window'); if (r.ok) jobWindow = await r.json(); } catch { /* shown as unknown */ }
+    const fmt = (n) => Number.isFinite(n) ? n.toLocaleString('en-US') : '?';
+    const windowLine = jobWindow && Number.isFinite(jobWindow.window)
+      ? `Right now: the engine (${jobWindow.model || 'the heartbeat model'}) reports a ${fmt(jobWindow.window)}-token window${jobWindow.source === 'pinned' ? ' — pinned here' : ''}. ` +
+        `A job turn reserves ${fmt(jobWindow.reservation)} for output (${fmt(jobWindow.answerTokens)} answer + ${fmt(jobWindow.thinkingTokens)} thinking), which leaves ${fmt(jobWindow.promptRoomAtFullReservation)} for the prompt at the full reservation and ${fmt(jobWindow.promptRoomAtFloor)} at the floor.`
+      : 'Right now: the engine has not reported a window, so the runner reserves the full budget on every turn and only the engine can say no.';
+
+    container.innerHTML = '';
+
+    // Memory Thresholds
+    container.appendChild(createConfigSection('Memory Thresholds', [
+      { key: 'memory.similarityThreshold', label: 'Similarity Threshold', type: 'number', value: config.memory?.similarityThreshold, step: '0.05' },
+      { key: 'memory.clusterLinkThreshold', label: 'Cluster Link Threshold', type: 'number', value: config.memory?.clusterLinkThreshold, step: '0.05' },
+      { key: 'memory.maxFactsPerCluster', label: 'Max Facts Per Cluster (triggers audit)', type: 'number', value: config.memory?.maxFactsPerCluster, step: '1' },
+      { key: 'memory.dailyLogRetentionDays', label: 'Daily Log Retention (days)', type: 'number', value: config.memory?.dailyLogRetentionDays, step: '1' },
+      { key: 'memory.hybridSearchWeights.vector', label: 'Vector Weight', type: 'number', value: config.memory?.hybridSearchWeights?.vector, step: '0.1' },
+      { key: 'memory.hybridSearchWeights.bm25', label: 'BM25 Weight', type: 'number', value: config.memory?.hybridSearchWeights?.bm25, step: '0.1' }
+    ]));
+
+    // THE SITTER. These two numbers multiplied together ARE the downtime of a
+    // wedged engine, and they were invisible while costing 15 minutes a time.
+    container.appendChild(createConfigSection('Engine Sitter', [
+      {
+        key: 'livenessProbe.intervalSeconds',
+        label: 'Check the engine every (seconds)',
+        type: 'number', step: '15', min: 5,
+        value: config.livenessProbe?.intervalSeconds,
+        desc: 'A healthy engine answers this check in milliseconds — a recovered one was measured at 228ms — so a failed check does not mean "busy", it means the engine is already gone. Asking more often costs nothing and is the difference between noticing in a minute and noticing in fifteen.'
+      },
+      {
+        key: 'watchdog.failureThreshold',
+        label: 'Restart after this many failed checks in a row',
+        type: 'number', min: 1, max: 10,
+        value: config.watchdog?.failureThreshold,
+        desc: 'Two is deliberate: one failed check could be a hiccup, two in a row at this interval is a wedge. Multiply this by the interval above to get the worst case before a restart begins — it used to be 3 x 5 minutes, which is where the fifteen minutes came from.'
+      },
+      {
+        key: 'watchdog.cooldownMinutes',
+        label: 'Grace period while the model reloads (minutes)',
+        type: 'number', min: 1, max: 30,
+        value: config.watchdog?.cooldownMinutes,
+        desc: 'After a restart the engine spends a few minutes loading the model and cannot answer. This stops the sitter restarting it again while that happens.'
+      },
+      {
+        key: 'watchdog.maxRestartsPerHour',
+        label: 'Most restarts per hour',
+        type: 'number', min: 1, max: 10,
+        value: config.watchdog?.maxRestartsPerHour,
+        desc: 'A hard cap. Past it the sitter stops restarting and says so loudly, because a restart loop that is not healing means the problem is not the engine.'
+      }
+    ]));
+
+    // Generation budgets. Every field here is NULLABLE and ships empty: empty
+    // means the setting is not sent to the engine at all, which is what a model
+    // without a reasoning channel needs. The placeholders say what happens when
+    // a box is left empty, because otherwise an empty box reads as an oversight.
+    container.appendChild(createConfigSection('Thinking and Answer Budgets', [
+      {
+        key: 'generation.reasoningEffort',
+        label: 'Reasoning effort',
+        type: 'select',
+        value: config.generation?.reasoningEffort,
+        nullable: true,
+        options: [
+          { value: '', label: 'Unset — let the model decide' },
+          { value: 'low', label: 'low — think briefly' },
+          { value: 'medium', label: 'medium — balanced' },
+          { value: 'high', label: 'high' },
+          { value: 'xhigh', label: 'xhigh — think hardest (slowest)' }
+        ],
+        desc: 'Only affects models that think before answering. Leaving this unset is not neutral — a thinking model applies its own default, which for Qwen3 is the most expensive setting it has.'
+      },
+      {
+        key: 'generation.thinkingTokens',
+        label: 'Thinking budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.thinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. How much the model may think before it must start answering. Too low and it runs out mid-thought and replies that it never got to an answer.'
+      },
+      {
+        key: 'generation.responseTokens',
+        label: 'Answer budget, chat (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.generation?.responseTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on answer length',
+        desc: 'How long a reply may be. Empty means the engine allows as much as the context window has left; setting it too low cuts answers off mid-sentence with no warning.'
+      },
+      {
+        key: 'generation.agentJobThinkingTokens',
+        label: 'Thinking budget, agent jobs (tokens)',
+        type: 'number', step: '1024', min: 0,
+        value: config.generation?.agentJobThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. A job is not a chat turn: before it answers it drafts the thing you asked for, writes its own checks against the draft and revises. That self-review is the work, not padding around it, and it needs room of its own — a job used to borrow the background budget below, which is sized for scoring one fact.'
+      },
+      {
+        key: 'generation.agentJobResponseTokens',
+        label: 'Answer budget, agent jobs (tokens)',
+        type: 'number', step: '1024', min: 64,
+        value: config.generation?.agentJobResponseTokens,
+        desc: 'How long a job result may be. A job hands back a file rather than a sentence, so this has to hold the whole file — a complete 150-line module is around 2,500 tokens. Set it too low and the result stops mid-function; the card will say it was cut off, but the writing is still lost.'
+      },
+      {
+        key: 'generation.scheduledJobThinkingTokens',
+        label: 'Thinking budget, scheduled jobs (tokens)',
+        type: 'number', step: '1024', min: 0,
+        value: config.generation?.scheduledJobThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. The same need as agent jobs above, on the runs that go off on a schedule — a digest still has to be worked out before it can be written. Smaller than a job because a scheduled run is a smaller piece of work by design: a third of the tool calls and a fifth of the wall clock.'
+      },
+      {
+        key: 'generation.scheduledJobResponseTokens',
+        label: 'Answer budget, scheduled jobs (tokens)',
+        type: 'number', step: '512', min: 64,
+        value: config.generation?.scheduledJobResponseTokens,
+        desc: 'How long a scheduled run\'s result may be. This one arrives every time the schedule fires, so it is set below the agent-job budget on purpose — long enough for a real report, short enough that a daily one stays readable. Too low and the run stops mid-sentence; the card will say it was cut off.'
+      },
+      {
+        key: 'generation.backgroundThinkingTokens',
+        label: 'Thinking budget, background work (tokens)',
+        type: 'number', step: '64', min: 0,
+        value: config.generation?.backgroundThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Used for the small judgement calls behind the scenes — scoring how much a fact matters, deciding whether to ask a follow-up. These have tiny answer budgets, so on a thinking model they need their own room or they return nothing.'
+      },
+      {
+        key: 'generation.extractionThinkingTokens',
+        label: 'Thinking budget, fact extraction (tokens)',
+        type: 'number', step: '128', min: 0,
+        value: config.generation?.extractionThinkingTokens,
+        nullable: true,
+        placeholder: 'Empty = no limit on thinking',
+        desc: 'Only affects models that think before answering. Extraction reads each exchange and decides what is worth remembering. Unbounded thinking here is mostly a speed problem — it can run past the timeout below and the exchange is lost.'
+      },
+      {
+        key: 'generation.extractionTimeoutMs',
+        label: 'Fact extraction timeout (ms)',
+        type: 'number', step: '5000', min: 0,
+        value: config.generation?.extractionTimeoutMs,
+        nullable: true,
+        placeholder: 'Empty = 30000 (30 seconds)',
+        desc: 'How long to wait for extraction before giving up on an exchange. Anything it does not finish in time is not remembered.'
+      },
+      {
+        key: 'generation.stallTimeoutMs',
+        label: 'Background work: give up if no new text arrives for (ms)',
+        type: 'number', step: '10000', min: 5000,
+        value: config.generation?.stallTimeoutMs,
+        desc: 'Once a reply has started, this is how long a gap is allowed before the call is abandoned. It measures the GAP between pieces of text, not how fast the whole thing is, so a slow answer is never killed for being slow — only a dead one is. That matters when several agents run at once, because each one gets slower as the others start and a speed-based limit would kill exactly the work you asked for. 60000 is a minute; the real gap under heavy load is under a tenth of a second.'
+      },
+      {
+        key: 'generation.firstTokenTimeoutMs',
+        label: 'Background work: give up if the reply never starts within (ms)',
+        type: 'number', step: '30000', min: 5000,
+        value: config.generation?.firstTokenTimeoutMs,
+        desc: 'Before any text arrives, silence is normal — the request may still be queued behind others, and reading a long conversation takes time before the first word comes out. So this is much longer than the gap limit above. Raise it if you run many agents at once and see jobs failing before they start; that is a queue that is deeper than this allows, not a broken engine.'
+      },
+      {
+        key: 'chat.stallTimeoutMs',
+        label: 'Chat: give up if no new text arrives for (ms)',
+        type: 'number', step: '10000', min: 5000,
+        value: config.chat?.stallTimeoutMs,
+        desc: 'The same gap limit as above, for your own conversation rather than background work. Once a reply has started, this is how long a silence is allowed before it is abandoned. Because it measures the gap and not the total, a long answer, a big brief or a turn using several tools is never cut off for taking a while — only a dead engine is. Chat used to have a single flat two-minute limit that could not tell those apart, and threw away turns that were still working.'
+      },
+      {
+        key: 'chat.firstTokenTimeoutMs',
+        label: 'Chat: give up if the reply never starts within (ms)',
+        type: 'number', step: '15000', min: 5000,
+        value: config.chat?.firstTokenTimeoutMs,
+        desc: 'How long to wait for the first word before deciding the engine is not going to answer. Deliberately shorter than the background setting above: a job can afford to sit in a queue for five minutes, and you watching a blank screen cannot. When this fires you get a message saying the engine stopped responding, rather than a raw error.'
+      }
+    ]));
+
+    // ONE RUN'S LIMITS, ALL OF THEM, ON ONE PAGE.
+    //
+    // Every number here could already stop a job; none of them were visible.
+    // They were picked from a menu on 2026-08-18, written into DEFAULTS, and
+    // then discovered one at a time by watching runs die — raise the output
+    // budget and rounds become binding, raise rounds and wall clock does. The
+    // point of listing them together is that the next binding limit is on the
+    // same screen as the one you just raised.
+    container.appendChild(createConfigSection('Agent Jobs — limits on one run', [
+      {
+        key: 'agentJobs.enabled',
+        label: 'Background jobs enabled',
+        type: 'checkbox',
+        value: config.agentJobs?.enabled !== false,
+        desc: 'Off means work cannot be handed off at all — the tool disappears from every turn, and anything that would have been delegated has to be answered on the spot instead.'
+      },
+      {
+        key: 'agentJobs.maxToolCallsPerJob',
+        label: 'Tool calls per job',
+        type: 'number', step: '5', min: 1,
+        value: config.agentJobs?.maxToolCallsPerJob,
+        desc: 'How much looking-up one job may do — roughly a dozen searches plus the fetches to read what they found. Too low and it stops mid-research and writes up whatever it had. Calls that fail or come back empty are billed at a fraction of a real one (see Background engine limits), so this counts work done rather than tries.'
+      },
+      {
+        key: 'agentJobs.maxRoundsPerJob',
+        label: 'Tool rounds per job',
+        type: 'number', step: '2', min: 1,
+        value: config.agentJobs?.maxRoundsPerJob,
+        desc: 'A round is one turn of the loop: it asks for some tools, gets the results, and thinks again. Two or three calls usually happen per round, so if this is small it runs out of turns long before it runs out of calls and the call budget above never binds. That is exactly what happened at 6 rounds against a 12-call budget.'
+      },
+      {
+        key: 'agentJobs.maxWallClockMs',
+        label: 'Time limit for one job (ms)',
+        type: 'number', step: '60000', min: 5000,
+        value: config.agentJobs?.maxWallClockMs,
+        desc: '900000 is 15 minutes. The clock starts when the job starts and does not stop for anything. Too low and deep research is cut off part way; too high and a stuck job sits in the panel looking alive. Live chat still takes priority over it either way.'
+      },
+
+      {
+        key: 'agentJobs.askBeforeCeiling',
+        label: 'Ask before hitting a limit',
+        type: 'checkbox',
+        value: config.agentJobs?.askBeforeCeiling !== false,
+        desc: 'On, a job that is close to any of the limits above and still has work to do PAUSES and asks you — in the conversation that started it — what it has, what is left, and how much more it wants. A yes there resumes it; a no has it write up what it has. The bell points at the conversation. Off, it runs into the limit and writes up what it had, as before.'
+      },
+      {
+        key: 'agentJobs.askAtPercent',
+        label: 'How close to a limit counts as "near" (percent)',
+        type: 'number', step: '5', min: 0, max: 100,
+        value: config.agentJobs?.askAtPercent,
+        desc: 'Applies to calls, rounds and the clock alike. At 80 on a 40-call budget it asks once it has spent 32. Lower and it asks earlier, with less to show; higher and it asks with almost nothing left to finish the sentence it is on. 0 or 100 means never ask.'
+      },
+      {
+        key: 'agentJobs.extensionPercent',
+        label: 'What a plain "yes" grants (percent of the original limits)',
+        type: 'number', step: '10', min: 1,
+        value: config.agentJobs?.extensionPercent,
+        desc: 'At 50 on a 40-call, 16-round, 15-minute job a yes adds 20 calls, 8 rounds and 7½ minutes. The job may name what it needs in its ask, and you can name a number in your answer ("yes, 30 more") — either of those wins over this.'
+      },
+      {
+        key: 'agentJobs.maxQueued',
+        label: 'Jobs waiting in the queue',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxQueued,
+        desc: 'Past this a new job is refused out loud, in the reply, rather than queued for a time that never comes. Too low and a busy afternoon starts getting turned away.'
+      },
+      {
+        key: 'agentJobs.maxStartsPerHour',
+        label: 'Jobs started per hour',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxStartsPerHour,
+        desc: 'A trailing-hour cap counted from the database, so restarting the server does not hand out a fresh allowance. Too low and a genuinely busy hour gets refused; it is a runaway guard, not a rationing scheme.'
+      },
+      {
+        key: 'agentJobs.maxAttempts',
+        label: 'Starts allowed per job, including the first',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.maxAttempts,
+        desc: '2 means one retry. A restart kills whatever was running — a model call cannot be resumed — so the run is lost either way and the only question is whether repeating it is still worth it. Set to 1 to never retry. Only safe above 1 while jobs are read-only: the day one can write something, a retry is a repeated write.'
+      },
+      {
+        key: 'agentJobs.retryGraceMinutes',
+        label: 'Retry an interrupted job for up to (minutes)',
+        type: 'number', step: '5', min: 0,
+        value: config.agentJobs?.retryGraceMinutes,
+        desc: 'A job the server restart killed is redone only if it started less recently than this. Older than that and the answer would be stale anyway, so it stays interrupted with the reason written down. 0 means never redo one.'
+      },
+      {
+        key: 'agentJobs.retentionDays',
+        label: 'Keep finished jobs for (days)',
+        type: 'number', step: '10', min: 1,
+        value: config.agentJobs?.retentionDays,
+        desc: 'How long a finished job stays in the panel before it is pruned. The record of the run stays in the ops log either way — this table is a panel, not an archive. Too low and a result is gone before you get to it.'
+      }
+    ]));
+
+    // THE WINDOW, AND HOW A JOB LIVES INSIDE IT (2026-09-17). The 9/17 job on
+    // Juno died at 81,857 prompt tokens + a 49,216 reservation against 131,072,
+    // and none of those three numbers was on any screen.
+    container.appendChild(createConfigSection('Agent Jobs — the context window', [
+      {
+        key: 'agentJobs.context.windowTokens',
+        label: 'Context window to plan against (tokens)',
+        type: 'number', step: '1024', min: 0,
+        value: config.agentJobs?.context?.windowTokens,
+        nullable: true,
+        placeholder: 'Empty = ask the engine',
+        desc: `${windowLine} Empty asks the engine for its real ceiling; a number here pins it — which is also how a box with a big window rehearses a smaller one. Never set it above what the engine actually serves.`
+      },
+      {
+        key: 'agentJobs.context.floorAnswerTokens',
+        label: 'Smallest answer budget a squeezed turn keeps (tokens)',
+        type: 'number', step: '256', min: 64,
+        value: config.agentJobs?.context?.floorAnswerTokens,
+        desc: 'As the prompt grows, each turn reserves only what still fits — the answer shrinks first, then the thinking — down to these floors. A tool-calling turn needs a few hundred tokens; a final answer that lands squeezed is asked for again after compaction has made room. Below the floors the job compacts, splits into a fresh sitting, and if that is still not enough, stops loudly with the numbers.'
+      },
+      {
+        key: 'agentJobs.context.floorThinkingTokens',
+        label: 'Smallest thinking budget a squeezed turn keeps (tokens)',
+        type: 'number', step: '256', min: 0,
+        value: config.agentJobs?.context?.floorThinkingTokens,
+        desc: '0 lets a squeezed turn switch thinking off entirely rather than stop. Only matters on a thinking model with a job thinking budget set above.'
+      },
+      {
+        key: 'agentJobs.compaction.enabled',
+        label: 'Compact tool results as the job runs',
+        type: 'checkbox',
+        value: config.agentJobs?.compaction?.enabled !== false,
+        desc: 'On, a search or page the job read a few rounds ago is replaced in its transcript by what it learned and where from — every hit keeps its title, URL and date; a page becomes a digest of its findings with the source attached by the runner, never by the model. Forty raw pages carried forward is what filled the 9/17 window. The card shows how many rounds were compacted and how much was dropped.'
+      },
+      {
+        key: 'agentJobs.compaction.recentRounds',
+        label: 'Rounds kept raw behind the current one',
+        type: 'number', step: '1', min: 0,
+        value: config.agentJobs?.compaction?.recentRounds,
+        desc: 'The model can still read, in full, what it fetched this many rounds ago. 2 means the page it just read and the one before are untouched; older ones are compacted. Under pressure everything eligible is compacted regardless.'
+      },
+      {
+        key: 'agentJobs.compaction.digestFetches',
+        label: 'Digest fetched pages with a model call',
+        type: 'checkbox',
+        value: config.agentJobs?.compaction?.digestFetches !== false,
+        desc: 'On, old pages are summarised into findings by one extra model call per round of pages (thinking off). Off, they are cut to their first few hundred characters instead — cheaper, and it loses whatever was below the top of the page. Either way the card says which happened.'
+      },
+      {
+        key: 'agentJobs.phases.enabled',
+        label: 'Run long jobs in phases',
+        type: 'checkbox',
+        value: config.agentJobs?.phases?.enabled !== false,
+        desc: 'On, a brief with more than one part is split into phases by one planning call, and each phase is a fresh sitting: the brief, that phase\'s goal, and the findings document so far. The RUNNER writes the document between phases — a job that dies in phase 3 has phases 1 and 2 on disk and on its card, with sources. A one-question brief is one phase and runs exactly as before. Tool rounds are per sitting; the call budget and the clock are per job.'
+      },
+      {
+        key: 'agentJobs.phases.splitAtPercent',
+        label: 'Split a sitting past this share of the window (percent)',
+        type: 'number', step: '5', min: 0, max: 100,
+        value: config.agentJobs?.phases?.splitAtPercent,
+        desc: 'A phase whose transcript passes this share of the window is written up and continued in a fresh sitting — before the wall, not at it. 0 or 100 never splits early; the job then relies on compaction and the fit alone.'
+      },
+      {
+        key: 'agentJobs.phases.maxPhases',
+        label: 'Most phases a plan may have',
+        type: 'number', step: '1', min: 1,
+        value: config.agentJobs?.phases?.maxPhases,
+        desc: 'A ceiling on the plan, not on the work: a brief with more parts than this gets its parts grouped. The 9/17 brief had six numbered questions.'
+      }
+    ]));
+
+    // THE CONVERSATION REVIEW — the entity going through its open
+    // conversations as a job, one at a time, memory saved before anything
+    // closes. Every number here is a limit on that job.
+    container.appendChild(createConfigSection('Conversation review — the entity closing its own', [
+      {
+        key: 'conversationReview.enabled',
+        label: 'Review runs as a background job',
+        type: 'checkbox',
+        value: config.conversationReview?.enabled !== false,
+        desc: 'On, "look through your open conversations" becomes a background job: read each, decide if it is finished, save anything worth keeping to memory, and only then close it (its own) or ask you (yours). Off, the tool disappears and the entity is back to doing it by hand in one turn — which is how a 31-minute turn was lost on 9/9.'
+      },
+      {
+        key: 'conversationReview.maxFactsPerConversation',
+        label: 'Memory saves per conversation, at most',
+        type: 'number', step: '1', min: 0,
+        value: config.conversationReview?.maxFactsPerConversation,
+        desc: 'The last-call save before a conversation closes: how many statements it may write from one conversation. Each goes through the same memory-write path as a "remember this" in chat, with its own hourly cap. 0 means it judges and closes but saves nothing.'
+      },
+      {
+        key: 'conversationReview.transcriptChars',
+        label: 'How much of each conversation it reads (characters)',
+        type: 'number', step: '2000', min: 500,
+        value: config.conversationReview?.transcriptChars,
+        desc: 'The tail of the conversation the judge sees. 12000 is roughly the last 3,000 words. A long thread is judged on how it ended, which is where "finished" shows. Higher costs more per conversation; lower and it may miss an open question further up.'
+      },
+      {
+        key: 'conversationReview.maxConversationsPerReview',
+        label: 'Conversations per review, at most',
+        type: 'number', step: '5', min: 1,
+        value: config.conversationReview?.maxConversationsPerReview,
+        desc: 'One job looks at this many; anything beyond is listed as "beyond this review\'s limit" in the report and a second ask does the rest. Together with the job\'s call budget this is what keeps a review bounded.'
+      },
+      {
+        key: 'conversationReview.maxConsecutiveFailures',
+        label: 'Judgements that may fail in a row before it stops',
+        type: 'number', step: '1', min: 1,
+        value: config.conversationReview?.maxConsecutiveFailures,
+        desc: 'If the engine cannot answer this many times back to back, the review stops and says the engine is the problem, rather than marking every remaining conversation "could not judge". The ones it reached stay exactly as they were left.'
+      }
+    ]));
+
+    // WHERE A RESULT GOES WHEN IT IS TOO BIG TO BE A CARD.
+    //
+    // Every one of these decides something she would otherwise only discover by
+    // looking in a folder and not finding a file — so the folder, the line
+    // between a card and a document, and the browser that prints the PDF are all
+    // on one screen, next to each other, with what happens when the browser is
+    // missing said plainly rather than left to be inferred from an empty folder.
+    container.appendChild(createConfigSection('Job Output — files, folders and PDFs', [
+      {
+        key: 'documents.enabled',
+        label: 'Save long results as files',
+        type: 'checkbox',
+        value: config.documents?.enabled !== false,
+        desc: 'Off means every result stays on its card, however long — which is how it worked before, and it is fine if you only ever ask short questions. On, a long result becomes a document and a block of code becomes a source file, saved to the folder below and downloadable from the card.'
+      },
+      {
+        key: 'documents.outputDir',
+        label: 'Documents folder',
+        type: 'text',
+        value: config.documents?.outputDir,
+        desc: 'A bare name lands in your home directory — SNH_Documents means ~/SNH_Documents. A full path starting with / is used exactly as written, which is how you point this at a synced folder or a network drive. The folder is created if it does not exist. A test instance never writes here; it gets a folder inside its own throwaway data directory.'
+      },
+      {
+        key: 'documents.inlineMaxChars',
+        label: 'Keep a result on the card up to (characters)',
+        type: 'number', step: '200', min: 200,
+        value: config.documents?.inlineMaxChars,
+        desc: 'Roughly four or five paragraphs at 1200. Past this the result becomes a document and the card shows the opening of it plus a link. Code is counted separately and always becomes a file, so this is about how much WRITING you want to read in the panel rather than about total size.'
+      },
+      {
+        key: 'documents.pageSize',
+        label: 'Paper size',
+        type: 'select',
+        options: [{ value: 'Letter', label: 'Letter' }, { value: 'A4', label: 'A4' }],
+        value: config.documents?.pageSize,
+        desc: 'The page the PDF is laid out for. Nothing else changes with it.'
+      },
+      {
+        key: 'documents.chromiumPath',
+        label: 'Chromium (leave empty to search for it)',
+        type: 'text',
+        value: config.documents?.chromiumPath,
+        desc: 'PDFs are printed by a headless Chromium — there is no PDF library, the browser does the typesetting. Empty means look for one in the usual places. If there is none on this machine, reports are written as formatted text files instead and the card says so; nothing fails and no result is lost. On Ubuntu there is no apt package: install it with "sudo snap install chromium". Set a full path here only if yours lives somewhere unusual.'
+      },
+      {
+        key: 'documents.keepHtml',
+        label: 'Keep the HTML a PDF was printed from',
+        type: 'checkbox',
+        value: !!config.documents?.keepHtml,
+        desc: 'Off. It is a build step, not a second copy of the report. Turn it on when a PDF comes out looking wrong and the question is whether the fault is in the page or in the printing.'
+      }
+    ]));
+
+    container.appendChild(createConfigSection('Scheduled Jobs — limits on one run', [
+      {
+        key: 'scheduler.enabled',
+        label: 'Scheduled jobs enabled',
+        type: 'checkbox',
+        value: config.scheduler?.enabled !== false,
+        desc: 'Off stops every approved job from firing. They stay armed and simply never come due, so switching this back on resumes them rather than replaying what was missed.'
+      },
+      {
+        key: 'scheduler.maxToolCallsPerRun',
+        label: 'Tool calls per run',
+        type: 'number', step: '2', min: 1,
+        value: config.scheduler?.maxToolCallsPerRun,
+        desc: 'Sized for a summarising run — a handful of lookups, not a corpus sweep — which is why it is well below the agent-job budget. Too low and a digest stops before it has looked at everything it was asked about.'
+      },
+      {
+        key: 'scheduler.maxRoundsPerRun',
+        label: 'Tool rounds per run',
+        type: 'number', step: '1', min: 1,
+        value: config.scheduler?.maxRoundsPerRun,
+        desc: 'Same meaning as the agent-job version, and the same trap: at two or three calls a round, a small number here makes the call budget above unreachable.'
+      },
+      {
+        key: 'scheduler.maxWallClockMsPerRun',
+        label: 'Time limit for one run (ms)',
+        type: 'number', step: '30000', min: 5000,
+        value: config.scheduler?.maxWallClockMsPerRun,
+        desc: '180000 is 3 minutes. Shorter than an agent job on purpose: this fires on a schedule, possibly while you are asleep, and a scheduled run that grinds for a quarter of an hour is holding the background pool the whole time.'
+      },
+      {
+        key: 'scheduler.maxConsecutiveFailures',
+        label: 'Failures in a row before a job disables itself',
+        type: 'number', step: '1', min: 1,
+        value: config.scheduler?.maxConsecutiveFailures,
+        desc: 'A job that fails this many times running switches itself off, says so on the bell, and will not run again until you re-enable it. A run that was merely cut short does not count — that clears the streak, because a budget that is too small is not an engine that is broken. Too low and one bad night retires a job that was fine.'
+      },
+      {
+        key: 'scheduler.tickSeconds',
+        label: 'How often to look for due jobs (seconds)',
+        type: 'number', step: '10', min: 10,
+        value: config.scheduler?.tickSeconds,
+        desc: 'Nothing fires between ticks, so this is also the worst case for how late a job can be. Raising it does not save much — the check is cheap when nothing is due — and it makes every job fire later.'
+      },
+      {
+        key: 'scheduler.catchupGraceMinutes',
+        label: 'Still run a missed job if it is less than (minutes) late',
+        type: 'number', step: '15', min: 0,
+        value: config.scheduler?.catchupGraceMinutes,
+        desc: 'After a restart or a sleep, a firing that was missed is run once if it is inside this window and skipped if it is not. Too high and coming back from a long outage sets off a burst of stale jobs at once; 0 means a missed firing is always skipped.'
+      }
+    ]));
+
+    // Shared by both paths and by every background step, so a change here is
+    // felt everywhere rather than in one queue.
+    container.appendChild(createConfigSection('Background engine limits', [
+      {
+        key: 'agentPool.lanes.agentJobs',
+        label: 'Agent jobs running at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.lanes?.agentJobs,
+        desc: 'Agent jobs have a queue of their own, so a pile of them can no longer make the memory repair or the heartbeat wait behind them. Each one still gets slower as the others run — that is normal and nothing is killed for it any more — so the real cost of raising this is that every job takes longer, not that any of them fail. On a small graphics card the limit you hit first is memory for held conversations, which shows up as jobs queueing rather than anything breaking.'
+      },
+      {
+        key: 'agentPool.lanes.scheduled',
+        label: 'Scheduled runs at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.lanes?.scheduled,
+        desc: 'Scheduled runs fire unattended, often overnight, so they get a narrow lane on purpose — they should never be the reason something you are waiting on is slow. Raising it only helps if you have many jobs due at the same minute.'
+      },
+      {
+        key: 'agentPool.lanes.background',
+        label: 'Background tasks at once',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.lanes?.background,
+        desc: 'Everything else that thinks in the background: memory repair, the heartbeat, pulling facts out of what was said, scoring what matters. Its own lane, so a swarm of agent jobs cannot stop the memory from being tidied.'
+      },
+      {
+        key: 'agentPool.maxTotalBackground',
+        label: 'Total background tasks at once, across all lanes',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.maxTotalBackground,
+        desc: 'The ceiling over all three lanes together. Three caps that each look reasonable can still add up to a machine that cannot answer, so this is the number that decides how loaded the engine ever gets. Lower it first if replies start feeling sluggish while work is running.'
+      },
+      {
+        key: 'agentPool.backgroundDuringChat',
+        label: 'Background tasks allowed while a reply is being written',
+        type: 'number', step: '1', min: 1,
+        value: config.agentPool?.backgroundDuringChat,
+        desc: 'What a chat turn reserves for itself. Chat never queues behind background work — it goes straight to the engine — so this is how that promise is kept: while a reply is being written, background is held down to this many. It used to be 1, which stopped background work dead every time you typed. Set it to 1 for the fastest possible replies, higher to let background keep moving while you talk.'
+      },
+      {
+        key: 'heartbeat.toolBudget.failedCallCost',
+        label: 'What a failed tool call costs against the budget',
+        type: 'number', step: '0.05', min: 0,
+        value: config.heartbeat?.toolBudget?.failedCallCost,
+        desc: 'Between 0 and 1, where a useful result costs 1. A search that errors or comes back empty is not progress, so charging it full price meant one broken provider could spend a whole job on nothing. At 0.25 a run gets four tries for the price of one result. Set it to 1 to go back to counting attempts.'
+      },
+      {
+        key: 'heartbeat.toolBudget.failedCallRetries',
+        label: 'Free retries for a tool call that errors',
+        type: 'number', step: '1', min: 0,
+        value: config.heartbeat?.toolBudget?.failedCallRetries,
+        desc: 'A call that times out, hits a dead provider or throws is tried again this many times before it costs anything; only if every try fails does it bill the fraction above. A call that ran fine and found nothing is NOT retried — that result is an answer. Retries still count toward the hard attempt ceiling below. 0 turns this off.'
+      },
+      {
+        key: 'heartbeat.toolBudget.attemptCeilingMultiple',
+        label: 'Hard attempt ceiling, as a multiple of the call budget',
+        type: 'number', step: '1', min: 1,
+        value: config.heartbeat?.toolBudget?.attemptCeilingMultiple,
+        desc: 'The backstop under the discount above: at 2, a job with 40 calls stops after 80 tries no matter how cheap the failures were. This is the limit that actually binds when a provider is down. Too high and an everything-fails run keeps going until it hits the clock instead.'
+      },
+      {
+        key: 'brainCircuit.consecutiveTimeoutsToOpen',
+        label: 'Timeouts in a row before the engine is treated as down',
+        type: 'number', step: '1', min: 1,
+        value: config.brainCircuit?.consecutiveTimeoutsToOpen,
+        desc: 'After this many model calls time out back to back, everything else stops trying immediately instead of waiting out a full timeout each — so a pass with two hundred items left drains in milliseconds rather than grinding against a dead engine. Any success reopens it. Too low and one slow patch looks like an outage and cancels work that would have finished.'
+      }
+    ]));
+
+    // Build instance options for select dropdowns (only local instance-based providers)
+    const instanceOptions = [];
+    const instances = providersData.instances || {};
+    for (const providerType of ['ollama', 'vllm', 'llamacpp']) {
+      const typeLabel = providerType === 'ollama' ? 'Ollama' : providerType === 'vllm' ? 'vLLM' : 'Llama.cpp';
+      for (const inst of (instances[providerType] || [])) {
+        instanceOptions.push({
+          value: `${providerType}:${inst.name}`,
+          label: `${typeLabel} — ${inst.name}`
+        });
+      }
+    }
+
+    // Role assignment sections
+    const roles = [
+      { key: 'chat', label: 'Chat Default' },
+      { key: 'extraction', label: 'Fact Extraction' },
+      { key: 'heartbeat', label: 'Heartbeat' },
+      { key: 'embedding', label: 'Embedding' }
+    ];
+
+    for (const role of roles) {
+      const roleConfig = config.models?.[role.key] || {};
+      const currentValue = roleConfig.provider && roleConfig.instance
+        ? `${roleConfig.provider}:${roleConfig.instance}`
+        : roleConfig.provider ? `${roleConfig.provider}:Local` : '';
+
+      const section = document.createElement('div');
+      section.className = 'config-section';
+      const h3 = document.createElement('h3');
+      h3.textContent = role.label;
+      section.appendChild(h3);
+
+      // Instance selector
+      const instanceItem = document.createElement('div');
+      instanceItem.className = 'config-item';
+      const instanceLabel = document.createElement('label');
+      instanceLabel.textContent = 'Instance';
+      const instanceLabelId = `brain-${role.key}-instance`;
+      instanceLabel.setAttribute('for', instanceLabelId);
+      instanceItem.appendChild(instanceLabel);
+
+      const instanceSelect = document.createElement('select');
+      instanceSelect.id = instanceLabelId;
+      instanceSelect.dataset.brainRole = role.key;
+      instanceSelect.dataset.brainField = 'instance';
+
+      for (const opt of instanceOptions) {
+        const option = document.createElement('option');
+        option.value = opt.value;
+        option.textContent = opt.label;
+        if (opt.value === currentValue) option.selected = true;
+        instanceSelect.appendChild(option);
+      }
+      instanceItem.appendChild(instanceSelect);
+      section.appendChild(instanceItem);
+
+      // Model dropdown (populated dynamically from instance)
+      const modelItem = document.createElement('div');
+      modelItem.className = 'config-item';
+      const modelLabel = document.createElement('label');
+      modelLabel.textContent = 'Model';
+      const modelLabelId = `brain-${role.key}-model`;
+      modelLabel.setAttribute('for', modelLabelId);
+      modelItem.appendChild(modelLabel);
+
+      const modelSelect = document.createElement('select');
+      modelSelect.id = modelLabelId;
+      modelSelect.dataset.brainRole = role.key;
+      modelSelect.dataset.brainField = 'model';
+      modelItem.appendChild(modelSelect);
+      section.appendChild(modelItem);
+
+      // Load models for the current instance selection
+      const savedModel = roleConfig.model || '';
+      loadBrainRoleModels(instanceSelect.value, modelSelect, savedModel);
+
+      // Refresh models when instance changes
+      instanceSelect.addEventListener('change', () => {
+        loadBrainRoleModels(instanceSelect.value, modelSelect, '');
+      });
+
+      container.appendChild(section);
+    }
+
+    // Heartbeat scheduling (separate section)
+    container.appendChild(createConfigSection('Heartbeat Schedule', [
+      { key: 'heartbeat.enabled', label: 'Enabled', type: 'checkbox', value: config.heartbeat?.enabled },
+      { key: 'heartbeat.intervalHours', label: 'Interval (hours)', type: 'number', value: config.heartbeat?.intervalHours, step: '0.5' },
+      { key: 'heartbeat.warmupMinutes', label: 'Warmup (minutes)', type: 'number', value: config.heartbeat?.warmupMinutes, step: '1' }
+    ]));
+
+    const notice = document.createElement('div');
+    notice.className = 'config-notice';
+    notice.textContent = 'Heartbeat interval changes require a server restart.';
+    container.appendChild(notice);
+
+    // Initiative & Proactivity — how eager SNH is to raise things, and when.
+    // These apply immediately on save (no restart needed).
+    const init = config.initiative || {};
+    container.appendChild(createConfigSection('Initiative & Proactivity', [
+      { key: 'initiative.greetingThreshold', label: 'Greeting threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.greetingThreshold,
+        desc: 'How important something must be (1–10) before SNH weaves it into a new conversation’s greeting.' },
+      { key: 'initiative.followupThreshold', label: 'Follow-up threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.followupThreshold,
+        desc: 'The lower bar (1–10) for follow-up thoughts — “I’ve been thinking about what you said” — to surface in a greeting.' },
+      { key: 'initiative.unpromptedThreshold', label: 'Unprompted threshold', type: 'number', min: 1, max: 10, step: '1',
+        value: init.unpromptedThreshold,
+        desc: 'How important something must be (1–10) before SNH opens a conversation about it on its own.' },
+      { key: 'initiative.backlogThreshold', label: 'Message backlog before the bell says so', type: 'number', min: 1, max: 50, step: '1',
+        value: init.backlogThreshold,
+        desc: 'How many of SNH\'s messages may sit unread across your active conversations before the bell raises it. Every conversation carries its own unread count and the list carries the total; this is where a backlog becomes worth telling you about. A new message never rings — only the pile-up does.' },
+      { key: 'initiative.maxUnpromptedPerDay', label: 'Max unprompted per day', type: 'number', min: 0, max: 24, step: '1',
+        value: init.maxUnpromptedPerDay,
+        desc: 'The most conversations SNH may start on its own in a single day.' },
+      { key: 'initiative.quietHours.start', label: 'Quiet hours start', type: 'number', min: 0, max: 23, step: '1',
+        value: init.quietHours?.start,
+        desc: 'Hour (0–23, Pacific) SNH goes quiet — no unprompted messages after this.' },
+      { key: 'initiative.quietHours.end', label: 'Quiet hours end', type: 'number', min: 0, max: 23, step: '1',
+        value: init.quietHours?.end,
+        desc: 'Hour (0–23, Pacific) SNH may resume reaching out unprompted.' },
+      { key: 'initiative.dedupThreshold', label: 'Duplicate threshold', type: 'number', min: 0, max: 1, step: '0.05',
+        value: init.dedupThreshold,
+        desc: 'How similar two items must be (0–1) before SNH treats them as the same and skips the duplicate.' }
+    ]));
+
+    // Self-Coherence Audit — SNH testing its stored self-claims against how it
+    // actually behaved, and raising gaps for approval. SNH's own feature request.
+    // Applies immediately on save (cadence changes need no restart).
+    const audit = config.audit || {};
+    container.appendChild(createConfigSection('Self-Coherence Audit', [
+      { key: 'audit.enabled', label: 'Enabled', type: 'checkbox', value: audit.enabled,
+        desc: 'Whether SNH runs the daily audit that checks its self-claims against its recent behavior and flags gaps for you.' },
+      { key: 'audit.cadenceDays', label: 'Run every N days', type: 'number', min: 1, max: 365, step: '1',
+        value: audit.cadenceDays,
+        desc: 'How often the audit runs. 1 = daily, 2 = every other day, and so on.' },
+      { key: 'audit.claimsPerRun', label: 'Claims sampled per run', type: 'number', min: 1, max: 10, step: '1',
+        value: audit.claimsPerRun,
+        desc: 'How many behavioral self-claims SNH tests each run (2–3 is the norm).' },
+      { key: 'audit.evidenceWindowDays', label: 'Evidence window (days)', type: 'number', min: 1, max: 90, step: '1',
+        value: audit.evidenceWindowDays,
+        desc: 'How many days of recent conversations count as evidence when judging a claim.' }
+    ]));
+
+    // Rebuild Clusters button
+    const rebuildSection = document.createElement('div');
+    rebuildSection.className = 'config-section';
+    const rebuildH3 = document.createElement('h3');
+    rebuildH3.textContent = 'Cluster Maintenance';
+    rebuildSection.appendChild(rebuildH3);
+
+    const rebuildBtn = document.createElement('button');
+    rebuildBtn.className = 'config-btn';
+    rebuildBtn.textContent = 'Rebuild Clusters';
+    rebuildBtn.title = 'Run a full intelligent audit and reorganization of all memory clusters';
+    rebuildBtn.addEventListener('click', async () => {
+      if (!confirm('This will run a full LLM-driven audit of all clusters. This may take several minutes. Continue?')) return;
+      rebuildBtn.disabled = true;
+      rebuildBtn.textContent = 'Rebuilding...';
+      try {
+        const res = await fetch('/api/memory/rebuild', { method: 'POST' });
+        const result = await res.json();
+        if (result.skipped) {
+          alert('A heartbeat cycle is already running. Try again later.');
+        } else if (result.error) {
+          alert('Rebuild failed: ' + result.error);
+        } else {
+          alert(`Rebuild complete!\n\nClusters audited: ${result.report?.clustersAudited || 0}\nClusters split: ${result.report?.clustersSplit || 0}\nLinks updated: ${result.report?.linksUpdated || 0}\nDuration: ${result.report?.totalDuration || 'unknown'}`);
+        }
+      } catch (err) {
+        alert('Rebuild failed: ' + err.message);
+      } finally {
+        rebuildBtn.disabled = false;
+        rebuildBtn.textContent = 'Rebuild Clusters';
+      }
+    });
+    rebuildSection.appendChild(rebuildBtn);
+    container.appendChild(rebuildSection);
+  } catch (error) {
+    console.error('[Settings] Error loading brain config:', error);
+    container.innerHTML = '<div class="config-loading">Failed to load configuration.</div>';
+  }
+}
+
+async function loadBrainRoleModels(instanceValue, modelSelect, preselectModel) {
+  modelSelect.innerHTML = '<option value="">Loading...</option>';
+
+  if (!instanceValue || !instanceValue.includes(':')) {
+    modelSelect.innerHTML = '<option value="">Select an instance first</option>';
+    return;
+  }
+
+  const colonIdx = instanceValue.indexOf(':');
+  const providerType = instanceValue.substring(0, colonIdx);
+  const instanceName = instanceValue.substring(colonIdx + 1);
+
+  try {
+    const res = await fetch('/api/instance/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerType, instanceName })
+    });
+
+    if (!res.ok) throw new Error('Failed to fetch models');
+    const data = await res.json();
+    const models = data.models || [];
+
+    modelSelect.innerHTML = '';
+
+    if (models.length === 0) {
+      modelSelect.innerHTML = '<option value="">No models available</option>';
+      return;
+    }
+
+    for (const m of models) {
+      const option = document.createElement('option');
+      option.value = m.id;
+      option.textContent = m.name;
+      if (m.id === preselectModel) option.selected = true;
+      modelSelect.appendChild(option);
+    }
+
+    // If no preselect matched, just keep the first option selected
+  } catch (error) {
+    console.error('[Settings] Error loading models for brain role:', error);
+    modelSelect.innerHTML = '<option value="">Failed to load models</option>';
+  }
+}
+
+async function loadSettingsVoiceTab() {
+  const container = document.getElementById('settingsTabVoice');
+  if (!container) return;
+  container.innerHTML = '<div class="config-loading">Loading voice providers...</div>';
+
+  const STT_TYPES = ['whisper', 'faster-whisper', 'canary', 'parakeet', 'deepgram', 'openai-whisper'];
+  const TTS_TYPES = ['kokoro', 'piper', 'chatterbox', 'orpheus', 'qwen3tts', 'elevenlabs', 'openai-tts'];
+  const CLOUD_TYPES = new Set(['deepgram', 'openai-whisper', 'elevenlabs', 'openai-tts']);
+
+  let voiceConfig = { stt: { active: '', providers: [] }, tts: { active: '', providers: [] } };
+  try {
+    const res = await fetch('/api/voice/providers');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.stt) voiceConfig.stt = data.stt;
+      if (data.tts) voiceConfig.tts = data.tts;
+    }
+  } catch (e) {
+    console.error('[Settings] Failed to load voice config:', e);
+  }
+
+  container.innerHTML = '';
+
+  function buildProviderSection(category, label, types) {
+    const catConfig = voiceConfig[category] || { active: '', providers: [] };
+    const providers = Array.isArray(catConfig.providers) ? catConfig.providers : [];
+
+    const section = document.createElement('div');
+    section.className = 'settings-section';
+
+    const h3 = document.createElement('h3');
+    h3.textContent = `${label} Providers`;
+    section.appendChild(h3);
+
+    // Provider list
+    const listDiv = document.createElement('div');
+    listDiv.className = 'instance-list';
+    listDiv.id = `voice-list-${category}`;
+
+    for (const p of providers) {
+      const item = document.createElement('div');
+      item.className = 'instance-item';
+
+      const info = document.createElement('div');
+      info.className = 'instance-info';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'instance-name';
+      nameSpan.textContent = p.name;
+      info.appendChild(nameSpan);
+
+      const typeSpan = document.createElement('span');
+      typeSpan.className = 'instance-model';
+      typeSpan.textContent = p.type;
+      info.appendChild(typeSpan);
+
+      const hostSpan = document.createElement('span');
+      hostSpan.className = 'instance-host';
+      hostSpan.textContent = CLOUD_TYPES.has(p.type) ? 'cloud' : (p.host || '');
+      info.appendChild(hostSpan);
+
+      item.appendChild(info);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'instance-delete-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.addEventListener('click', () => handleDeleteVoiceProvider(category, p.name));
+      item.appendChild(deleteBtn);
+
+      listDiv.appendChild(item);
+    }
+
+    if (providers.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'instance-empty';
+      empty.textContent = 'No providers configured';
+      listDiv.appendChild(empty);
+    }
+
+    section.appendChild(listDiv);
+
+    // Add form
+    const addForm = document.createElement('div');
+    addForm.className = 'instance-add-form';
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Name';
+    nameInput.className = 'instance-input';
+    addForm.appendChild(nameInput);
+
+    const typeSelect = document.createElement('select');
+    typeSelect.className = 'instance-input';
+    typeSelect.style.minWidth = '120px';
+    for (const t of types) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      typeSelect.appendChild(opt);
+    }
+    addForm.appendChild(typeSelect);
+
+    const hostInput = document.createElement('input');
+    hostInput.type = 'text';
+    hostInput.placeholder = 'Host URL';
+    hostInput.className = 'instance-input';
+    addForm.appendChild(hostInput);
+
+    const apiKeyInput = document.createElement('input');
+    apiKeyInput.type = 'password';
+    apiKeyInput.placeholder = 'API Key';
+    apiKeyInput.className = 'instance-input';
+    apiKeyInput.style.display = 'none';
+    addForm.appendChild(apiKeyInput);
+
+    // Toggle host/apikey based on type
+    function updateFieldVisibility() {
+      const isCloud = CLOUD_TYPES.has(typeSelect.value);
+      hostInput.style.display = isCloud ? 'none' : '';
+      apiKeyInput.style.display = isCloud ? '' : 'none';
+    }
+    typeSelect.addEventListener('change', updateFieldVisibility);
+    updateFieldVisibility();
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'instance-add-btn';
+    addBtn.textContent = 'Add';
+    addBtn.addEventListener('click', () => {
+      const name = nameInput.value.trim();
+      const type = typeSelect.value;
+      const isCloud = CLOUD_TYPES.has(type);
+      const host = hostInput.value.trim();
+      const apiKey = apiKeyInput.value.trim();
+
+      if (!name) { alert('Name is required.'); return; }
+      if (!isCloud && !host) { alert('Host URL is required.'); return; }
+      if (isCloud && !apiKey) { alert('API Key is required for cloud providers.'); return; }
+
+      if (providers.some(p => p.name === name)) {
+        alert(`A provider named "${name}" already exists.`);
+        return;
+      }
+
+      const newProvider = { name, type };
+      if (isCloud) {
+        newProvider.api_key = apiKey;
+      } else {
+        newProvider.host = host;
+      }
+
+      providers.push(newProvider);
+      saveVoiceConfig(voiceConfig);
+    });
+    addForm.appendChild(addBtn);
+
+    section.appendChild(addForm);
+
+    // Active provider selector
+    const activeItem = document.createElement('div');
+    activeItem.className = 'config-item';
+    activeItem.style.marginTop = '12px';
+
+    const activeLabel = document.createElement('label');
+    activeLabel.textContent = 'Active';
+    activeItem.appendChild(activeLabel);
+
+    const activeSelect = document.createElement('select');
+    activeSelect.className = 'instance-input';
+    activeSelect.style.maxWidth = '220px';
+    activeSelect.dataset.voiceCategory = category;
+    activeSelect.dataset.voiceField = 'active';
+
+    for (const p of providers) {
+      const opt = document.createElement('option');
+      opt.value = `${p.type}:${p.name}`;
+      const typeLabel = p.type.charAt(0).toUpperCase() + p.type.slice(1);
+      opt.textContent = `${typeLabel} — ${p.name}`;
+      if (`${p.type}:${p.name}` === catConfig.active) opt.selected = true;
+      activeSelect.appendChild(opt);
+    }
+
+    if (providers.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No providers available';
+      activeSelect.appendChild(opt);
+    }
+
+    activeItem.appendChild(activeSelect);
+    section.appendChild(activeItem);
+
+    return section;
+  }
+
+  container.appendChild(buildProviderSection('stt', 'STT', STT_TYPES));
+  container.appendChild(buildProviderSection('tts', 'TTS', TTS_TYPES));
+}
+
+async function saveVoiceConfig(voiceConfig) {
+  try {
+    const res = await fetch('/api/voice/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(voiceConfig)
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert('Failed to save: ' + (err.error || 'Unknown error'));
+      return;
+    }
+    // Reload the tab
+    settingsTabsLoaded.delete('voice');
+    loadSettingsVoiceTab();
+  } catch (e) {
+    alert('Failed to save: ' + e.message);
+  }
+}
+
+async function handleDeleteVoiceProvider(category, name) {
+  if (!confirm(`Delete voice provider "${name}"?`)) return;
+
+  try {
+    const res = await fetch('/api/voice/providers');
+    if (!res.ok) throw new Error('Failed to load');
+    const voiceConfig = await res.json();
+
+    const cat = voiceConfig[category];
+    if (!cat || !Array.isArray(cat.providers)) return;
+
+    cat.providers = cat.providers.filter(p => p.name !== name);
+
+    // If the deleted provider was active, clear or set to first remaining
+    const [activeType, ...activeNameParts] = (cat.active || '').split(':');
+    const activeName = activeNameParts.join(':');
+    if (activeName === name) {
+      cat.active = cat.providers.length > 0
+        ? `${cat.providers[0].type}:${cat.providers[0].name}`
+        : '';
+    }
+
+    await saveVoiceConfig(voiceConfig);
+  } catch (e) {
+    alert('Failed to delete: ' + e.message);
+  }
+}
+
+async function loadSettingsToolsTab() {
+  const container = document.getElementById('settingsTabTools');
+  if (!container) return;
+
+  const generation = ++toolsTabLoadGeneration;
+  container.innerHTML = '<div class="memory-loading">Loading tools…</div>';
+
+  // EVERYTHING ON THIS PAGE COMES FROM /api/tools, which derives it from the tool
+  // catalogue registration uses. There is no list of tools in this file, and there
+  // must never be one again: the previous version of this tab had its own
+  // hand-written list, so of fourteen registered tools it showed three, and every
+  // tool shipped after the page was written was invisible here.
+  let data;
+  try {
+    const resp = await fetch('/api/tools');
+    if (generation !== toolsTabLoadGeneration) return;
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    data = await resp.json();
+  } catch (e) {
+    container.innerHTML = `<div class="settings-section"><p class="settings-hint">Could not load the tool list: ${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+  if (generation !== toolsTabLoadGeneration) return;
+
+  const html = [];
+
+  html.push(`
+    <div class="settings-section tools-summary">
+      <h3>Tools</h3>
+      <p class="settings-hint">
+        ${data.registeredCount} of ${data.catalogueCount} tools are switched on right now. This list is generated
+        from the registry, so anything added to SNH appears here on its own.
+        Secrets are stored encrypted (${escapeHtml(data.secretStore.algorithm)}, key
+        ${data.secretStore.keySource === 'env' ? 'supplied by the environment' : 'held on this machine'}) and are never
+        sent back to this page after saving.
+      </p>
+    </div>
+  `);
+
+  for (const card of data.cards) {
+    const rows = data.tools.filter(t => t.card === card.id);
+    if (!rows.length) continue;
+
+    html.push(`<div class="settings-section"><h3>${escapeHtml(card.title)}</h3>`);
+    html.push(`<p class="settings-hint">${escapeHtml(card.blurb)}</p>`);
+
+    // The search card carries the provider chain: each provider's own switch AND
+    // its place in the order, because "off" and "second" are different states.
+    if (card.id === 'search') html.push(renderSearchProviders(data.search));
+
+    for (const t of rows) html.push(renderToolRow(t));
+    html.push('</div>');
+  }
+
+  container.innerHTML = html.join('');
+  wireToolsTab();
+}
+
+/** One tool: what it is, whether it is on, its switch, and its own settings. */
+function renderToolRow(t) {
+  const tags = [];
+  if (t.writes) tags.push('<span class="tool-tag tool-tag-writes">writes</span>');
+  else tags.push('<span class="tool-tag">read-only</span>');
+  if (t.backgroundOnly) tags.push('<span class="tool-tag">background only</span>');
+  else if (t.availableToBackground) tags.push('<span class="tool-tag">chat + background</span>');
+  else tags.push('<span class="tool-tag">chat only</span>');
+
+  // The switch, when the row has one of its own. A row without one says what
+  // decides it instead — an unexplained missing control reads as a broken page.
+  const toggle = t.toggle
+    ? `<label class="toggle-switch">
+         <input type="checkbox" data-config-key="${escapeHtml(t.toggle)}" ${t.toggleValue ? 'checked' : ''}>
+         <span class="toggle-slider"></span>
+       </label>`
+    : '<span class="tool-derived">—</span>';
+
+  const fields = (t.fields || []).map(f => renderToolField(f)).join('');
+
+  return `
+    <div class="tool-row ${t.registered ? '' : 'tool-row-off'}">
+      <div class="tool-row-head">
+        <div class="tool-row-id">
+          <code>${escapeHtml(t.id)}</code>
+          <span class="tool-row-title">${escapeHtml(t.title)}</span>
+        </div>
+        <div class="tool-row-state">
+          <span class="tool-state ${t.registered ? 'tool-state-on' : 'tool-state-off'}">${t.registered ? 'on' : 'off'}</span>
+          ${toggle}
+        </div>
+      </div>
+      <div class="tool-row-tags">${tags.join('')}</div>
+      <p class="tool-row-desc">${escapeHtml(t.description)}</p>
+      ${!t.registered && t.why ? `<p class="tool-row-why">Off because: ${escapeHtml(t.why)}</p>` : ''}
+      ${t.toggleNote ? `<p class="tool-row-note">${escapeHtml(t.toggleNote)}</p>` : ''}
+      ${fields ? `<div class="tool-row-fields">${fields}</div>` : ''}
+    </div>
+  `;
+}
+
+/**
+ * A bound field. Nothing here knows what the setting MEANS: it renders whatever
+ * the registry declared and binds it by dotted path, which is the same mechanism
+ * the Brain and Chat tabs already save through.
+ */
+function renderToolField(f) {
+  const id = `tool-field-${f.path.replace(/[^\w]/g, '-')}`;
+  if (f.type === 'toggle') {
+    return `
+      <div class="setting-item toggle-row tool-field">
+        <label for="${id}">${escapeHtml(f.label)}${f.hint ? `<span class="setting-hint-inline">${escapeHtml(f.hint)}</span>` : ''}</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="${id}" data-config-key="${escapeHtml(f.path)}" ${f.value ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>`;
+  }
+  const attrs = [
+    f.type === 'number' ? 'type="number"' : 'type="text"',
+    f.min != null ? `min="${f.min}"` : '',
+    f.max != null ? `max="${f.max}"` : '',
+    f.placeholder ? `placeholder="${escapeHtml(f.placeholder)}"` : ''
+  ].filter(Boolean).join(' ');
+  return `
+    <div class="setting-item tool-field">
+      <label for="${id}">${escapeHtml(f.label)}${f.hint ? `<span class="setting-hint-inline">${escapeHtml(f.hint)}</span>` : ''}</label>
+      <input ${attrs} id="${id}" data-config-key="${escapeHtml(f.path)}" value="${f.value == null ? '' : escapeHtml(String(f.value))}">
+    </div>`;
+}
+
+/**
+ * The provider chain: a switch and a position per provider, plus a key field for
+ * any provider that declared a secret.
+ *
+ * Position is a select rather than drag-and-drop on purpose — with two providers
+ * "which is tried first" is a two-way choice, and a select says so plainly. It is
+ * collected separately from the dotted-path binding because an ORDER is an array,
+ * which a dotted path cannot express; the voice tab's active-provider selects
+ * already work this way.
+ */
+function renderSearchProviders(search) {
+  const n = search.providers.length;
+  const rows = search.providers.map(p => {
+    const posOptions = Array.from({ length: n }, (_, i) => i + 1)
+      .map(i => `<option value="${i}" ${p.position === i ? 'selected' : ''}>${i}</option>`).join('');
+
+    const secret = p.secret ? renderSecretField(p.secret) : '';
+    const fields = (p.fields || []).map(f => renderToolField(f)).join('');
+
+    return `
+      <div class="provider-row ${p.enabled ? '' : 'provider-row-off'}">
+        <div class="tool-row-head">
+          <div class="tool-row-id">
+            <span class="provider-label">${escapeHtml(p.label)}</span>
+            <span class="tool-state ${p.available ? 'tool-state-on' : 'tool-state-off'}">${p.available ? 'available' : (p.enabled ? 'not usable yet' : 'off')}</span>
+          </div>
+          <div class="tool-row-state">
+            <label class="provider-pos">tried
+              <select data-search-order="${escapeHtml(p.id)}" ${p.enabled ? '' : 'disabled'}>${posOptions}</select>
+            </label>
+            <label class="toggle-switch">
+              <input type="checkbox" data-config-key="${escapeHtml(p.toggle)}" data-provider-toggle="${escapeHtml(p.id)}" ${p.enabled ? 'checked' : ''}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <p class="tool-row-desc">${escapeHtml(p.blurb)}</p>
+        ${p.enabled && !p.available && p.why ? `<p class="tool-row-why">Not usable yet: ${escapeHtml(p.why)}</p>` : ''}
+        ${!p.enabled ? '<p class="tool-row-note">Switched off — it is not in the chain at all, and nothing is tried against it.</p>' : ''}
+        ${secret}
+        ${fields ? `<div class="tool-row-fields">${fields}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  const orderLine = search.order.length
+    ? `Tried in this order: ${search.order.join(' → ')}.`
+    : 'No provider is switched on, so web search is off. He will say he cannot search rather than answering as though he had.';
+
+  return `<div class="provider-chain">
+    <p class="settings-hint provider-order-line">${escapeHtml(orderLine)}</p>
+    ${rows}
+  </div>`;
+}
+
+/**
+ * A WRITE-ONLY key field.
+ *
+ * It never carries a value: the server does not send one, and this input is
+ * rendered empty every time, including immediately after a successful save. What
+ * it shows instead is STATUS — set or not, where from, when. Typing into it and
+ * saving replaces the stored key; clearing it and pressing Clear removes it.
+ *
+ * The env-override line matters more than it looks: a key typed here while the
+ * same name sits in .env is stored and then ignored, and someone would otherwise
+ * spend an afternoon on that.
+ */
+function renderSecretField(secret) {
+  const st = secret.status || {};
+  const id = `secret-${secret.env}`;
+  let state;
+  if (st.envOverrides) {
+    state = `<span class="secret-state secret-state-warn">set in .env — that wins over anything saved here</span>`;
+  } else if (st.source === 'env') {
+    state = `<span class="secret-state secret-state-on">set in .env</span>`;
+  } else if (st.set) {
+    state = `<span class="secret-state secret-state-on">saved${st.updatedAt ? ` ${escapeHtml(formatLocalTime(st.updatedAt))}` : ''}</span>`;
+  } else {
+    state = '<span class="secret-state secret-state-off">not set</span>';
+  }
+
+  return `
+    <div class="setting-item secret-field">
+      <label for="${id}">${escapeHtml(secret.label)} ${state}</label>
+      <div class="secret-input-row">
+        <input type="password" id="${id}" class="api-key-input" data-secret="${escapeHtml(secret.env)}"
+               autocomplete="new-password" placeholder="${st.set ? 'Saved — type a new key to replace it' : 'Paste the key here'}" value="">
+        <button type="button" class="secret-clear" data-secret-clear="${escapeHtml(secret.env)}" ${st.storedToo ? '' : 'disabled'}>Clear</button>
+      </div>
+      ${secret.hint ? `<p class="tool-row-note">${escapeHtml(secret.hint)}</p>` : ''}
+      ${st.error ? `<p class="tool-row-why">${escapeHtml(st.error)}</p>` : ''}
+    </div>`;
+}
+
+/** Live wiring: a provider switch takes it out of the order without a save first. */
+function wireToolsTab() {
+  document.querySelectorAll('#settingsTabTools [data-provider-toggle]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const id = cb.dataset.providerToggle;
+      const sel = document.querySelector(`#settingsTabTools [data-search-order="${id}"]`);
+      if (sel) sel.disabled = !cb.checked;
+      cb.closest('.provider-row')?.classList.toggle('provider-row-off', !cb.checked);
+    });
+  });
+
+  // Clearing a key is its own action rather than a save-time side effect: an empty
+  // password field is the normal state of this input, so treating empty as "delete"
+  // on save would wipe the key every time anything else on the page was saved.
+  document.querySelectorAll('#settingsTabTools [data-secret-clear]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.secretClear;
+      if (!confirm(`Remove the stored ${name}? Anything using it stops working until a new one is saved.`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/tools/secrets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secrets: { [name]: null } })
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+        await loadSettingsToolsTab();
+      } catch (e) {
+        alert(`Could not clear ${name}: ${e.message}`);
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+/**
+ * Collect and save the secret fields. Separate from the config save because it is
+ * a separate contract: values go one way, and only a NON-EMPTY field is a change.
+ * @returns {Promise<string[]>} the names actually saved
+ */
+async function saveToolSecrets() {
+  const payload = {};
+  document.querySelectorAll('#settingsTabTools [data-secret]').forEach(input => {
+    const v = input.value;                     // not trimmed to death: keys can be odd
+    if (v && v.trim()) payload[input.dataset.secret] = v.trim();
+  });
+  if (!Object.keys(payload).length) return [];
+
+  const res = await fetch('/api/tools/secrets', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secrets: payload })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+  // Wipe the inputs the moment they are saved, so the value is not sitting in the
+  // DOM for the rest of the session. The re-render below leaves them empty anyway;
+  // this covers the seconds in between.
+  document.querySelectorAll('#settingsTabTools [data-secret]').forEach(i => { i.value = ''; });
+  return Object.keys(payload);
+}
+
+function loadSettingsAboutTab() {
+  const container = document.getElementById('settingsTabAbout');
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="settings-section">
+      <h3>Squatch Neuro Hub</h3>
+      <dl class="about-info">
+        <dt>Version</dt>
+        <dd>1.0.0</dd>
+        <dt>Author</dt>
+        <dd>MettaSphere LLC</dd>
+        <dt>Description</dt>
+        <dd>Neural-linked AI assistant with associative cluster memory and multi-provider support</dd>
+        <dt>License</dt>
+        <dd>MIT</dd>
+      </dl>
+    </div>
+  `;
+}
+
+async function saveSettingsHandler() {
+  const statusEl = document.getElementById('settingsStatus');
+
+  // Collect localStorage values (instance management is done via add/delete, not save)
+  const localStorageMap = {
+    'settings-claudeApiKey': 'claudeApiKey',
+    'settings-openaiApiKey': 'openaiApiKey',
+    'settings-grokApiKey': 'grokApiKey',
+    'settings-squatchserveHost': 'squatchserveHost'
+    // NOTE: settings-searxngHost is NOT here — the SearXNG URL now saves to server
+    // config via its data-config-key (tools.searxng.url), the single source of truth.
+  };
+
+  for (const [elId, storageKey] of Object.entries(localStorageMap)) {
+    const el = document.getElementById(elId);
+    if (el) {
+      const val = el.value.trim();
+      if (val) localStorage.setItem(storageKey, val);
+      else localStorage.removeItem(storageKey);
+    }
+  }
+
+  // Collect config.json values from all tabs into one partial object
+  const partial = {};
+
+  // Standard config-key inputs (Brain memory thresholds, heartbeat schedule)
+  document.querySelectorAll('#settingsTabBrain [data-config-key], #settingsTabChat [data-config-key], #settingsTabTools [data-config-key]').forEach(input => {
+    const keys = input.dataset.configKey.split('.');
+    let obj = partial;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (!obj[keys[i]]) obj[keys[i]] = {};
+      obj = obj[keys[i]];
+    }
+    const lastKey = keys[keys.length - 1];
+    const isEmpty = String(input.value).trim() === '';
+
+    if (input.type === 'checkbox') obj[lastKey] = input.checked;
+    else if (input.dataset.configNullable === 'true' && isEmpty) {
+      // CLEARED ON PURPOSE. Skipping the key would deep-merge to "leave it as it
+      // was", which makes a nullable setting impossible to turn back off once
+      // set. Writing null is the only way to say unset, and null is what the
+      // server reads as "send nothing".
+      obj[lastKey] = null;
+    } else if (input.type === 'number') {
+      const num = parseFloat(input.value);
+      // An empty non-nullable number is still skipped, exactly as before: those
+      // fields always hold a value and a blank one means the form has not
+      // loaded, not that the user wants it gone.
+      if (!isNaN(num)) obj[lastKey] = num;
+    } else obj[lastKey] = input.value;
+  });
+
+  // Brain role assignments (instance + model)
+  const brainSelects = document.querySelectorAll('#settingsTabBrain [data-brain-role][data-brain-field="instance"]');
+  const brainModels = document.querySelectorAll('#settingsTabBrain [data-brain-role][data-brain-field="model"]');
+
+  brainSelects.forEach(select => {
+    const role = select.dataset.brainRole;
+    const value = select.value;
+    const colonIdx = value.indexOf(':');
+    const provider = colonIdx >= 0 ? value.substring(0, colonIdx) : value;
+    const instance = colonIdx >= 0 ? value.substring(colonIdx + 1) : 'Local';
+    if (!partial.models) partial.models = {};
+    if (!partial.models[role]) partial.models[role] = {};
+    partial.models[role].provider = provider;
+    partial.models[role].instance = instance;
+  });
+
+  brainModels.forEach(input => {
+    const role = input.dataset.brainRole;
+    if (!partial.models) partial.models = {};
+    if (!partial.models[role]) partial.models[role] = {};
+    partial.models[role].model = input.value;
+  });
+
+  // SEARCH PROVIDER ORDER — an array, which a dotted path cannot express, so it
+  // gets its own collector exactly as the voice tab's active-provider selects do.
+  //
+  // A provider whose switch is OFF is left out of the order entirely. That is the
+  // difference the UI has to be able to say: "SearXNG off" and "SearXNG second"
+  // are different states, and an order that still listed a disabled provider
+  // would put it back in the chain to be skipped on every search.
+  const orderSelects = Array.from(document.querySelectorAll('#settingsTabTools [data-search-order]'));
+  if (orderSelects.length) {
+    const picked = orderSelects
+      .map(sel => {
+        const id = sel.dataset.searchOrder;
+        const toggle = document.querySelector(`#settingsTabTools [data-provider-toggle="${id}"]`);
+        return { id, pos: parseInt(sel.value, 10) || 99, on: !toggle || toggle.checked };
+      })
+      .filter(p => p.on)
+      // Ties are possible — two selects can both read "1" until one is changed —
+      // and a stable sort keeps the displayed order, which is the least surprising
+      // reading of an ambiguous form.
+      .sort((a, b) => a.pos - b.pos)
+      .map(p => p.id);
+    if (!partial.tools) partial.tools = {};
+    if (!partial.tools.search) partial.tools.search = {};
+    partial.tools.search.order = picked;
+  }
+
+  // Voice active selections
+  document.querySelectorAll('#settingsTabVoice [data-voice-category][data-voice-field="active"]').forEach(select => {
+    const category = select.dataset.voiceCategory;
+    if (!partial.voice) partial.voice = {};
+    if (!partial.voice[category]) partial.voice[category] = {};
+    partial.voice[category].active = select.value;
+  });
+
+  // Save to config.json if there is anything to save
+  const hasConfigChanges = Object.keys(partial).length > 0;
+  if (hasConfigChanges) {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(partial)
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to save config');
+      }
+    } catch (error) {
+      console.error('[Settings] Error saving config:', error);
+      if (statusEl) {
+        statusEl.className = 'config-status error';
+        statusEl.textContent = 'Failed to save: ' + error.message;
+        setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 5000);
+      }
+      return;
+    }
+  }
+
+  // SECRETS SAVE SEPARATELY, and their failure is reported separately: a key that
+  // did not store while everything else did is exactly the case where one cheerful
+  // "Settings saved." would be a lie.
+  let savedSecrets = [];
+  try {
+    savedSecrets = await saveToolSecrets();
+  } catch (error) {
+    console.error('[Settings] Error saving secrets:', error);
+    if (statusEl) {
+      statusEl.className = 'config-status error';
+      statusEl.textContent = 'Settings saved, but the key did not: ' + error.message;
+      setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 6000);
+    }
+    return;
+  }
+
+  if (statusEl) {
+    statusEl.className = 'config-status success';
+    statusEl.textContent = savedSecrets.length
+      ? `Settings saved. ${savedSecrets.join(', ')} stored, encrypted.`
+      : 'Settings saved.';
+    setTimeout(() => { statusEl.textContent = ''; statusEl.className = 'config-status'; }, 4000);
+  }
+
+  // Re-render the tab from the server so every state line — what is on, what is in
+  // the order, whether a key is set — is the server's answer rather than the form's
+  // idea of it.
+  const toolsTab = document.getElementById('settingsTabTools');
+  if (toolsTab && toolsTab.innerHTML.trim()) await loadSettingsToolsTab();
+
+  await loadProviders();
+}
+
+function togglePasswordVisibility(event) {
+  const button = event.currentTarget;
+  const targetId = button.getAttribute('data-target');
+  const input = document.getElementById(targetId);
+  if (!input) return;
+
+  if (input.type === 'password') {
+    input.type = 'text';
+    button.textContent = '🙈';
+  } else {
+    input.type = 'password';
+    button.textContent = '👁️';
+  }
+}
+
+// ============ Conversation History Functions ============
+
+// DOM elements for sidebar
+const sidebar = document.getElementById('sidebar');
+const sidebarToggle = document.getElementById('sidebar-toggle');
+const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');
+const conversationList = document.getElementById('conversation-list');
+const sidebarOverlay = document.getElementById('sidebar-overlay');
+const mainContent = document.querySelector('.main-content');
+
+// Set up sidebar event listeners
+function setupSidebarListeners() {
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener('click', toggleSidebar);
+  }
+  if (sidebarNewChatBtn) {
+    sidebarNewChatBtn.addEventListener('click', startNewConversation);
+  }
+  if (sidebarOverlay) {
+    sidebarOverlay.addEventListener('click', closeSidebarOnMobile);
+  }
+
+  // Handle window resize
+  window.addEventListener('resize', checkMobileView);
+}
+
+// Check if we're on mobile and adjust sidebar
+function checkMobileView() {
+  if (window.innerWidth <= 768) {
+    sidebar?.classList.add('collapsed');
+    mainContent?.classList.add('sidebar-collapsed');
+  }
+}
+
+// Toggle sidebar visibility
+function toggleSidebar() {
+  if (window.innerWidth <= 768) {
+    sidebar?.classList.toggle('open');
+    sidebarOverlay?.classList.toggle('active');
+  } else {
+    sidebar?.classList.toggle('collapsed');
+    mainContent?.classList.toggle('sidebar-collapsed');
+    sidebarCollapsed = !sidebarCollapsed;
+    localStorage.setItem('sidebarCollapsed', sidebarCollapsed);
+  }
+}
+
+// Close sidebar on mobile when clicking overlay
+function closeSidebarOnMobile() {
+  sidebar?.classList.remove('open');
+  sidebarOverlay?.classList.remove('active');
+}
+
+// ---- The conversation list: the only list ----
+//
+// Everything SNH wants to say to her arrives here — a new conversation, or a
+// message added to one already open, hers included. There is no second inbox
+// and no separate messages view; a conversation carries its own unread count,
+// and the total sits at the top of the list.
+//
+// UNREAD IS NEVER DISMISSED FROM THIS FILE. There is no dismiss button, no
+// "mark all read", no timer that clears a badge. Opening the conversation is
+// the only thing that clears it, and that happens on the server when the
+// conversation is fetched.
+let conversationScope = 'active';
+
+// Load all conversations from the server
+async function loadConversations() {
+  try {
+    const response = await fetch(`/api/conversations?status=${conversationScope}`);
+    if (!response.ok) {
+      throw new Error('Failed to load conversations');
+    }
+    conversations = await response.json();
+    renderConversationList();
+    refreshUnreadTotal();
+
+    // If no current conversation, show welcome message
+    if (!currentConversationId) {
+      loadConversation(); // Load from session storage or show welcome
+    }
+  } catch (error) {
+    console.error('Error loading conversations:', error);
+    // Fall back to local session storage
+    loadConversation();
+  }
+}
+
+/**
+ * The total at the top of the list.
+ *
+ * Its own small request rather than a sum over the rendered rows: the Archive
+ * tab renders archived conversations, and summing what happens to be on screen
+ * there would show her a total for the wrong scope. This always answers for her
+ * ACTIVE conversations, whichever tab she is looking at.
+ */
+async function refreshUnreadTotal() {
+  const badge = document.getElementById('sidebarUnreadTotal');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/conversations/unread');
+    if (!res.ok) return;
+    const { unread } = await res.json();
+    badge.textContent = unread;
+    badge.style.display = unread > 0 ? 'inline-flex' : 'none';
+    badge.title = `${unread} message${unread === 1 ? '' : 's'} from SNH you have not read`;
+  } catch { /* a badge is not worth a console line every poll */ }
+}
+
+/**
+ * Refresh the rows and the total, and NOTHING else.
+ *
+ * The poll uses this rather than loadConversations(), which falls back to
+ * loadConversation() when there is no current conversation — that re-renders
+ * the message pane from session storage, and a timer that does it every minute
+ * would step on a new chat she is part way through typing or streaming.
+ */
+async function refreshConversationList() {
+  try {
+    const response = await fetch(`/api/conversations?status=${conversationScope}`);
+    if (!response.ok) return;
+    conversations = await response.json();
+    renderConversationList();
+    refreshUnreadTotal();
+  } catch { /* the next tick will do */ }
+}
+
+/** Switch between the active list and the archive. Same area, same list. */
+function setConversationScope(scope) {
+  conversationScope = scope === 'archived' ? 'archived' : 'active';
+  document.querySelectorAll('.conversation-scope').forEach(b =>
+    b.classList.toggle('active', b.dataset.scope === conversationScope));
+  loadConversations();
+}
+document.querySelectorAll('.conversation-scope').forEach(btn =>
+  btn.addEventListener('click', () => setConversationScope(btn.dataset.scope)));
+
+// Render the conversation list in the sidebar
+function renderConversationList() {
+  if (!conversationList) return;
+
+  if (conversations.length === 0) {
+    conversationList.innerHTML = conversationScope === 'archived'
+      ? '<div class="conversation-list-empty">Nothing archived.<br>Archiving closes a conversation to both of you and keeps it readable here.</div>'
+      : '<div class="conversation-list-empty">No conversations yet.<br>Start a new chat!</div>';
+    return;
+  }
+
+  conversationList.innerHTML = conversations.map(conv => {
+    const isActive = conv.id === currentConversationId;
+    const isSnh = conv.initiated_by === 'snh';
+    const isArchived = conv.status === 'archived';
+    const title = conv.title || 'New Conversation';
+    const preview = conv.preview ? conv.preview.substring(0, 40) + '...' : '';
+    const timestamp = formatRelativeTime(conv.updated_at);
+    const model = conv.model_used ? conv.model_used.split(':')[0] : '';
+    // The count blinks so it is findable in a long list at a glance. It says a
+    // number and nothing else — no "!", no colour that reads as a warning, no
+    // decay with age. Unread means she has been busy, and this badge is not
+    // allowed to imply anything about what was sent.
+    const unread = conv.unread || 0;
+
+    return `
+      <div class="conversation-item ${isActive ? 'active' : ''} ${isSnh ? 'snh-initiated' : ''} ${unread ? 'has-unread' : ''}" data-id="${conv.id}">
+        <div class="conversation-title">
+          ${unread ? `<span class="conversation-unread" title="${unread} message${unread === 1 ? '' : 's'} from SNH you have not read">${unread}</span> ` : ''}${isSnh ? '<span class="snh-badge" title="SNH reached out">✦ SNH</span> ' : ''}${escapeHtml(title)}
+        </div>
+        <div class="conversation-meta">
+          <span class="conversation-timestamp">${timestamp}</span>
+          ${model ? `<span class="conversation-model">${escapeHtml(model)}</span>` : ''}
+          ${conv.supersedes_conversation_id ? '<span class="conversation-follows" title="SNH raised this subject before — the earlier conversation is in the Archive">↩ raised before</span>' : ''}
+          ${conv.retire_requested_at && !isArchived ? '<span class="conversation-follows" title="SNH has asked to archive this one — the request is on the bell">⏳ asked to archive</span>' : ''}
+          ${isArchived && conv.archived_by === 'snh' ? '<span class="conversation-follows" title="SNH closed this one itself — a conversation it had opened. Reopen it with ↩️ if you want it back.">✦ closed by SNH</span>' : ''}
+        </div>
+        <div class="conversation-actions">
+          <button class="conversation-action-btn rename" title="Rename" data-id="${conv.id}">✏️</button>
+          ${isArchived
+            ? `<button class="conversation-action-btn unarchive" title="Reopen — put it back on the list" data-id="${conv.id}">↩️</button>`
+            : `<button class="conversation-action-btn archive" title="Archive — closes it to both of you, readable forever" data-id="${conv.id}">📥</button>`}
+          <button class="conversation-action-btn delete" title="Delete" data-id="${conv.id}">🗑️</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // Add click handlers
+  conversationList.querySelectorAll('.conversation-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      if (!e.target.closest('.conversation-action-btn')) {
+        loadConversationById(item.dataset.id);
+      }
+    });
+  });
+
+  // Add action button handlers
+  conversationList.querySelectorAll('.conversation-action-btn.rename').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      renameConversation(btn.dataset.id);
+    });
+  });
+
+  conversationList.querySelectorAll('.conversation-action-btn.delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteConversation(btn.dataset.id);
+    });
+  });
+
+  conversationList.querySelectorAll('.conversation-action-btn.archive').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      archiveConversation(btn.dataset.id);
+    });
+  });
+
+  conversationList.querySelectorAll('.conversation-action-btn.unarchive').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      unarchiveConversation(btn.dataset.id);
+    });
+  });
+}
+
+/**
+ * Archive a conversation: it moves to the Archive tab and is closed to writes
+ * for BOTH of them. Nothing is deleted, nothing is hidden, and what she never
+ * read stays honestly unread in the record.
+ */
+async function archiveConversation(id) {
+  const conv = conversations.find(c => c.id === id);
+  const name = (conv && conv.title) || 'this conversation';
+  if (!confirm(`Archive "${name}"?\n\nIt moves to the Archive tab. Neither of you will be able to add to it again, and you will both still be able to read it.`)) return;
+  try {
+    const res = await fetch(`/api/conversations/${id}/archive`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).error || 'Failed to archive');
+    if (currentConversationId === id) await loadConversationById(id);
+    loadConversations();
+  } catch (err) {
+    alert(`Could not archive it: ${err.message}`);
+  }
+}
+
+/** Put an archived conversation back on the active list. Hers to decide. */
+async function unarchiveConversation(id) {
+  try {
+    const res = await fetch(`/api/conversations/${id}/unarchive`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).error || 'Failed to reopen');
+    if (currentConversationId === id) await loadConversationById(id);
+    loadConversations();
+  } catch (err) {
+    alert(`Could not reopen it: ${err.message}`);
+  }
+}
+
+// Format relative time (e.g., "2 hours ago", "Yesterday")
+function formatRelativeTime(dateString) {
+  if (!dateString) return '';
+
+  // toUtcDate, NOT new Date(): conversations.updated_at is SQLite's unmarked
+  // CURRENT_TIMESTAMP, so the plain constructor read it as local and put every
+  // recent conversation seven hours in the FUTURE — which made diffMs negative
+  // and pinned the whole sidebar to "Just now" for most of the day.
+  const date = toUtcDate(dateString);
+  if (!date) return '';
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays === 1) return 'Yesterday';
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return formatLocalTime(date, 'date');
+}
+
+// Load a specific conversation by ID
+async function loadConversationById(id) {
+  try {
+    const response = await fetch(`/api/conversations/${id}`);
+    if (!response.ok) {
+      throw new Error('Failed to load conversation');
+    }
+
+    const data = await response.json();
+    currentConversationId = id;
+
+    // Convert messages to our format (keep sources so the [S#] link list renders)
+    conversation = data.messages.map(msg => ({
+      role: msg.role,
+      content: msg.content,
+      id: msg.id,
+      sources: msg.sources || null
+    }));
+
+    // Update model if stored
+    if (data.model_used && modelSelect) {
+      const modelName = data.model_used;
+      // Try to find and select the model
+      const option = Array.from(modelSelect.options).find(opt => opt.value === modelName);
+      if (option) {
+        modelSelect.value = modelName;
+        currentModel = modelName;
+      }
+    }
+
+    renderMessages();
+    // Opening it cleared its unread on the server, so the row in the list and
+    // the total at the top are both stale now. Refetch rather than decrementing
+    // locally: the number she is being shown has to be the number the server
+    // holds, or the two drift and the badge becomes something she stops
+    // trusting.
+    applyArchivedState(data);
+    await loadConversations();
+    closeSidebarOnMobile();
+
+  } catch (error) {
+    console.error('Error loading conversation:', error);
+    addMessage('error', 'Failed to load conversation');
+  }
+}
+
+/**
+ * An archived conversation is READ-ONLY FOR BOTH OF THEM. She can read it
+ * forever; neither of them can add to it.
+ *
+ * The server refuses the write regardless (see /api/chat/memory) — this is
+ * about not offering her a box that is going to be rejected.
+ */
+function applyArchivedState(conv) {
+  const archived = conv && conv.status === 'archived';
+  const inputArea = document.querySelector('.input-area');
+  if (inputArea) inputArea.classList.toggle('conversation-archived', archived);
+  if (messageInput) {
+    messageInput.disabled = archived;
+    messageInput.placeholder = archived
+      ? 'Archived — closed to both of you. Reopen it from the list to add to it.'
+      : 'Type your message...';
+  }
+  if (sendBtn) sendBtn.disabled = archived;
+}
+
+// Start a new conversation
+function startNewConversation() {
+  currentConversationId = null;
+  conversation = [];
+  applyArchivedState(null);
+  lastAssistantMessageId = null;
+  sessionStorage.removeItem('ollamaChatConversation');
+  renderMessages();
+  renderConversationList();
+  messageInput.value = '';
+  autoResizeInput();
+  addMessage('system', 'Welcome! Start a new conversation.');
+  closeSidebarOnMobile();
+}
+
+// Rename a conversation
+async function renameConversation(id) {
+  const conv = conversations.find(c => c.id === id);
+  const currentTitle = conv?.title || 'New Conversation';
+  const newTitle = prompt('Enter new title:', currentTitle);
+
+  if (newTitle && newTitle.trim() !== currentTitle) {
+    try {
+      const response = await fetch(`/api/conversations/${id}/title`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle.trim() })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to rename conversation');
+      }
+
+      // Update local state and re-render
+      const idx = conversations.findIndex(c => c.id === id);
+      if (idx !== -1) {
+        conversations[idx].title = newTitle.trim();
+        renderConversationList();
+      }
+    } catch (error) {
+      console.error('Error renaming conversation:', error);
+      alert('Failed to rename conversation');
+    }
+  }
+}
+
+// Delete a conversation
+async function deleteConversation(id) {
+  if (!confirm('Are you sure you want to delete this conversation?')) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/conversations/${id}`, {
+      method: 'DELETE'
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to delete conversation');
+    }
+
+    // Remove from local state
+    conversations = conversations.filter(c => c.id !== id);
+
+    // If deleted current conversation, start new one
+    if (id === currentConversationId) {
+      startNewConversation();
+    } else {
+      renderConversationList();
+    }
+  } catch (error) {
+    console.error('Error deleting conversation:', error);
+    alert('Failed to delete conversation');
+  }
+}
+
+// ============ SquatchServe Model Status Functions ============
+
+// Fetch SquatchServe status (loaded models)
+async function fetchSquatchserveStatus() {
+  if (currentProvider !== 'squatchserve') {
+    return;
+  }
+
+  try {
+    const squatchserveHost = localStorage.getItem('squatchserveHost') || '';
+    const url = squatchserveHost
+      ? `/api/squatchserve/ps?host=${encodeURIComponent(squatchserveHost)}`
+      : '/api/squatchserve/ps';
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error('Failed to fetch status');
+    }
+
+    const data = await response.json();
+    updateModelStatusDisplay(data);
+  } catch (error) {
+    console.error('Error fetching SquatchServe status:', error);
+    // Show error state but don't spam console
+    if (modelStatusBar) {
+      modelStatusText.textContent = 'SquatchServe unavailable';
+      modelStatusText.classList.remove('loaded');
+      unloadModelBtn.style.display = 'none';
+    }
+  }
+}
+
+// Update the model status display
+function updateModelStatusDisplay(data) {
+  if (!modelStatusBar) return;
+
+  const loadedModels = data.models || [];
+  const gpu = data.gpu || {};
+
+  if (loadedModels.length > 0) {
+    const model = loadedModels[0]; // Show first loaded model
+    loadedSquatchserveModel = model.name;
+
+    // Format VRAM info if available
+    let vramInfo = '';
+    if (model.vram && model.vram.used_gb) {
+      vramInfo = ` (${model.vram.used_gb.toFixed(1)}GB VRAM)`;
+    } else if (gpu.used_gb) {
+      vramInfo = ` (${gpu.used_gb.toFixed(1)}/${gpu.total_gb.toFixed(1)}GB VRAM)`;
+    }
+
+    modelStatusText.textContent = `Loaded: ${model.name}${vramInfo}`;
+    modelStatusText.classList.add('loaded');
+    unloadModelBtn.style.display = 'inline-block';
+  } else {
+    loadedSquatchserveModel = null;
+    modelStatusText.textContent = 'No model loaded';
+    modelStatusText.classList.remove('loaded');
+    unloadModelBtn.style.display = 'none';
+  }
+}
+
+// Unload the currently loaded model
+async function unloadSquatchserveModel() {
+  if (!loadedSquatchserveModel) {
+    return;
+  }
+
+  const modelName = loadedSquatchserveModel;
+  unloadModelBtn.disabled = true;
+  unloadModelBtn.textContent = 'Unloading...';
+
+  try {
+    const squatchserveHost = localStorage.getItem('squatchserveHost') || undefined;
+
+    const response = await fetch('/api/squatchserve/unload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: modelName, squatchserveHost })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to unload model');
+    }
+
+    addMessage('system', `Model ${modelName} unloaded successfully.`);
+
+    // Immediately refresh status
+    await fetchSquatchserveStatus();
+  } catch (error) {
+    console.error('Error unloading model:', error);
+    addMessage('error', `Failed to unload model: ${error.message}`);
+  } finally {
+    unloadModelBtn.disabled = false;
+    unloadModelBtn.textContent = 'Unload';
+  }
+}
+
+// Start polling for SquatchServe status
+function startSquatchserveStatusPolling() {
+  // Clear any existing interval
+  stopSquatchserveStatusPolling();
+
+  // Fetch immediately
+  fetchSquatchserveStatus();
+
+  // Then poll every 30 seconds
+  squatchserveStatusInterval = setInterval(fetchSquatchserveStatus, 30000);
+}
+
+// Stop polling for SquatchServe status
+function stopSquatchserveStatusPolling() {
+  if (squatchserveStatusInterval) {
+    clearInterval(squatchserveStatusInterval);
+    squatchserveStatusInterval = null;
+  }
+}
+
+// Show/hide model status bar based on provider
+function updateModelStatusBarVisibility() {
+  if (!modelStatusBar) return;
+
+  if (currentProvider === 'squatchserve') {
+    modelStatusBar.style.display = 'flex';
+    startSquatchserveStatusPolling();
+  } else {
+    modelStatusBar.style.display = 'none';
+    stopSquatchserveStatusPolling();
+    loadedSquatchserveModel = null;
+  }
+}
+
+// ============ Memory Panel Functions ============
+
+const memoryBtn = document.getElementById('memoryBtn');
+const memoryPanel = document.getElementById('memoryPanel');
+const memoryPanelClose = document.getElementById('memoryPanelClose');
+const memoryPanelOverlay = document.getElementById('memoryPanelOverlay');
+const memoryAddFactInput = document.getElementById('memoryAddFactInput');
+const memoryAddFactBtn = document.getElementById('memoryAddFactBtn');
+const memorySearchInput = document.getElementById('memorySearchInput');
+const memorySearchBtn = document.getElementById('memorySearchBtn');
+
+// Cache for loaded cluster member IDs (for edit/delete)
+let memoryFactsCache = [];
+
+// Set up memory panel listeners
+if (memoryBtn) {
+  memoryBtn.addEventListener('click', openMemoryPanel);
+}
+if (memoryPanelClose) {
+  memoryPanelClose.addEventListener('click', closeMemoryPanel);
+}
+if (memoryPanelOverlay) {
+  memoryPanelOverlay.addEventListener('click', closeMemoryPanel);
+}
+if (memoryAddFactBtn) {
+  memoryAddFactBtn.addEventListener('click', addManualFact);
+}
+if (memoryAddFactInput) {
+  memoryAddFactInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') addManualFact();
+  });
+}
+if (memorySearchBtn) {
+  memorySearchBtn.addEventListener('click', searchMemory);
+}
+if (memorySearchInput) {
+  memorySearchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') searchMemory();
+  });
+}
+
+// Tab switching
+document.querySelectorAll('.memory-tab').forEach(tab => {
+  tab.addEventListener('click', () => switchMemoryTab(tab.dataset.tab));
+});
+
+// Facts-tab filter and grouping. Wired once, at load, because the controls are
+// static markup — the map wires its own inside renderMap() only because that
+// tab builds its toolbar lazily.
+wireFactsControls();
+
+
+// ---- Initiative bell + panel (things SNH wants to raise) ----
+const initiativeBtn = document.getElementById('initiativeBtn');
+const initiativeBadge = document.getElementById('initiativeBadge');
+const initiativePanel = document.getElementById('initiativePanel');
+const initiativePanelOverlay = document.getElementById('initiativePanelOverlay');
+const initiativePanelClose = document.getElementById('initiativePanelClose');
+
+if (initiativeBtn) initiativeBtn.addEventListener('click', openInitiativePanel);
+if (initiativePanelClose) initiativePanelClose.addEventListener('click', closeInitiativePanel);
+if (initiativePanelOverlay) initiativePanelOverlay.addEventListener('click', closeInitiativePanel);
+
+// Pending / History view toggle inside the bell panel.
+let initiativeView = 'pending';
+document.querySelectorAll('.initiative-view-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    initiativeView = btn.dataset.initView;
+    document.querySelectorAll('.initiative-view-btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (initiativeView === 'history') loadInitiativeHistory();
+    else loadInitiativeList();
+  });
+});
+
+// Backoff state for the badge poll. It runs on a 60s interval and used to
+// swallow every error silently, so a server that was refusing requests looked
+// identical to one with nothing pending. On a 429 specifically we back off
+// hard rather than keep knocking — the limiter is already telling us to stop.
+let badgeBackoffUntil = 0;
+let badgeFailures = 0;
+
+async function refreshInitiativeBadge() {
+  if (!initiativeBadge) return;
+  if (Date.now() < badgeBackoffUntil) return;   // still backing off
+  try {
+    const res = await fetch('/api/memory/initiatives');
+    if (res.status === 429) {
+      // Exponential backoff capped at 15 min (the limiter's own window).
+      badgeFailures++;
+      const waitMs = Math.min(15 * 60_000, 60_000 * Math.pow(2, badgeFailures));
+      badgeBackoffUntil = Date.now() + waitMs;
+      console.warn(`[Initiatives] badge poll rate-limited; backing off ${Math.round(waitMs / 1000)}s`);
+      return;
+    }
+    if (!res.ok) { badgeFailures++; badgeBackoffUntil = Date.now() + 60_000; return; }
+    badgeFailures = 0;
+    const data = await res.json();
+    const total = (data.initiatives || []).length;
+    const above = data.aboveThreshold || 0;
+    // Badge shows a count whenever ANYTHING is pending; the bell only pulses when
+    // something crosses the greeting threshold (worth actively surfacing).
+    if (total > 0) {
+      initiativeBadge.textContent = total;
+      initiativeBadge.style.display = 'inline-flex';
+    } else {
+      initiativeBadge.style.display = 'none';
+    }
+    initiativeBtn?.classList.toggle('has-initiatives', above > 0);
+  } catch (e) { /* silent */ }
+}
+
+function openInitiativePanel() {
+  initiativePanel?.classList.add('open');
+  initiativePanelOverlay?.classList.add('active');
+  if (initiativeView === 'history') loadInitiativeHistory();
+  else loadInitiativeList();
+}
+
+function closeInitiativePanel() {
+  initiativePanel?.classList.remove('open');
+  initiativePanelOverlay?.classList.remove('active');
+}
+
+// Compact local timestamp for initiatives, e.g. "7/5 6:42 AM".
+function formatInitiativeTime(iso) {
+  const d = toUtcDate(iso);
+  if (!d) return '';
+  // Built from parts ON THE INSTANCE CLOCK rather than from d.getHours(), which
+  // is the browser's. Same reason as everywhere else in this file: the panel and
+  // the digests have to agree about what time something happened.
+  const tz = INSTANCE_TZ || undefined;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true
+  }).formatToParts(d).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+  return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute} ${parts.dayPeriod}`;
+}
+
+async function loadInitiativeList() {
+  const container = document.getElementById('initiativeList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading…</div>';
+  try {
+    const res = await fetch('/api/memory/initiatives');
+    const data = await res.json();
+    const items = data.initiatives || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">Nothing needs you right now.</div>';
+      return;
+    }
+    container.innerHTML = items.map(it => {
+      // A 'proposal' carries an action waiting on a yes/no, so it gets
+      // Approve/Reject instead of Discuss/Dismiss. source_ref is the cron_jobs
+      // row the decision applies to.
+      const isProposal = it.type === 'proposal' && it.source_kind === 'cron-proposal' && it.source_ref;
+      // A retirement request is an approval too, and it decides a CONVERSATION
+      // rather than a cron job — so it gets its own pair of buttons rather than
+      // being squeezed through the cron path.
+      const isRetire = it.type === 'proposal' && it.source_kind === 'conversation-retire' && it.source_ref;
+      // A BUDGET ASK'S BELL ITEM IS A POINTER. The ask itself is a message in
+      // the conversation; the decision is made there. The only thing this item
+      // can do is open the door — no approve button, no dismiss (a proposal).
+      const isBudgetAsk = it.type === 'proposal' && it.source_kind === 'job-budget-ask';
+      const actions = isBudgetAsk
+        ? (it.conversation_id
+          ? `<button class="budget-ask-open" data-conversation="${escapeHtml(it.conversation_id)}">Open the conversation</button>`
+          : '<span class="initiative-note">Answer it in the conversation it asked in.</span>')
+        : isRetire
+        ? `<button class="conversation-retire-approve" data-conversation="${escapeHtml(it.source_ref)}" data-id="${it.id}">Archive it</button>
+           <button class="conversation-retire-keep" data-id="${it.id}">Keep it open</button>`
+        : isProposal
+        ? `<button class="initiative-approve" data-cron-id="${escapeHtml(it.source_ref)}">Approve</button>
+           <button class="initiative-reject" data-cron-id="${escapeHtml(it.source_ref)}">Reject</button>`
+        : `<button class="initiative-discuss" data-id="${it.id}">Discuss</button>
+           <button class="initiative-dismiss" data-id="${it.id}">Dismiss</button>`;
+      return `
+      <div class="initiative-item" data-id="${it.id}">
+        <div class="initiative-item-head">
+          <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
+          <span class="initiative-time" title="${escapeHtml(it.created_at || '')}">${escapeHtml(formatInitiativeTime(it.created_at))}</span>
+          <span class="initiative-priority" title="priority">${it.priority}/10</span>
+        </div>
+        <div class="initiative-content">${escapeHtml(it.content)}</div>
+        ${isProposal ? '<div class="initiative-note">Approving schedules it: it is armed on approval and runs on its schedule until you disable it. Each run is SNH doing what the description says, with read-only memory tools, reporting back here.</div>' : ''}
+        ${it.type === 'job-result' ? '<div class="initiative-note">This is the output of a scheduled job that already ran — not something waiting on you.</div>' : ''}
+        <div class="initiative-actions">${actions}</div>
+      </div>`;
+    }).join('');
+
+    // Approve / Reject on cron proposals.
+    const decide = (btn, verb) => async () => {
+      const actionsEl = btn.closest('.initiative-actions');
+      actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = true));
+      btn.textContent = verb === 'approve' ? 'Approving…' : 'Rejecting…';
+      try {
+        const res = await fetch(`/api/memory/cron/${btn.dataset.cronId}/${verb}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'failed');
+        loadInitiativeList();
+        refreshInitiativeBadge();
+      } catch (e) {
+        console.error(`[Initiatives] cron ${verb} failed:`, e);
+        btn.textContent = verb === 'approve' ? 'Approve' : 'Reject';
+        actionsEl?.querySelectorAll('button').forEach(b => (b.disabled = false));
+      }
+    };
+    container.querySelectorAll('.budget-ask-open').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        closeInitiativePanel();
+        try { await loadConversationById(btn.dataset.conversation); } catch (e) { /* the sidebar still has it */ }
+      });
+    });
+    container.querySelectorAll('.conversation-retire-approve').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        await fetch(`/api/conversations/${btn.dataset.conversation}/archive`, { method: 'POST' });
+        loadInitiativeList(); refreshInitiativeBadge(); loadConversations();
+      });
+    });
+    container.querySelectorAll('.conversation-retire-keep').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        // Keeping it open is a DECISION, not a dismissal — the conversation
+        // stays, and the request is marked answered rather than waved off.
+        btn.disabled = true;
+        await fetch(`/api/memory/initiatives/${btn.dataset.id}/discuss`, { method: 'POST' }).catch(() => {});
+        loadInitiativeList(); refreshInitiativeBadge();
+      });
+    });
+    container.querySelectorAll('.initiative-approve').forEach(btn =>
+      btn.addEventListener('click', decide(btn, 'approve')));
+    container.querySelectorAll('.initiative-reject').forEach(btn =>
+      btn.addEventListener('click', decide(btn, 'reject')));
+    container.querySelectorAll('.initiative-dismiss').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await fetch(`/api/memory/initiatives/${btn.dataset.id}/dismiss`, { method: 'POST' });
+          loadInitiativeList();
+          refreshInitiativeBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+    container.querySelectorAll('.initiative-discuss').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const actions = btn.closest('.initiative-actions');
+        actions?.querySelectorAll('button').forEach(b => (b.disabled = true));
+        btn.textContent = 'Opening…';
+        try {
+          const res = await fetch(`/api/memory/initiatives/${btn.dataset.id}/discuss`, { method: 'POST' });
+          const data = await res.json();
+          if (!res.ok || !data.conversationId) throw new Error(data.error || 'failed');
+          // The initiative is now delivered; refresh sidebar + bell and open the
+          // new SNH-initiated conversation so the user can reply.
+          await loadConversations();
+          await loadConversationById(data.conversationId);
+          refreshInitiativeBadge();
+          closeInitiativePanel();
+        } catch (e) {
+          console.error('[Initiatives] Discuss failed:', e);
+          btn.textContent = 'Discuss';
+          actions?.querySelectorAll('button').forEach(b => (b.disabled = false));
+        }
+      });
+    });
+  } catch (error) {
+    console.error('[Initiatives] Error loading list:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load</div>';
+  }
+}
+
+// Full initiative lifecycle — every item ever minted, with status, timestamps
+// and delivery channel. Read-only (no actions). Newest first.
+async function loadInitiativeHistory() {
+  const container = document.getElementById('initiativeList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading history…</div>';
+  try {
+    const res = await fetch('/api/memory/initiatives/history?limit=300');
+    const data = await res.json();
+    const items = data.initiatives || [];
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">No initiatives yet.</div>';
+      return;
+    }
+    container.innerHTML = items.map(it => {
+      // 'relocated' — a job result that used to live in this queue and now lives
+      // in the jobs panel. Shown, never hidden: the item happened, and the
+      // history is where things that happened stay.
+      const delivered = it.delivered_at
+        ? `<span class="initiative-when">delivered ${escapeHtml(formatInitiativeTime(it.delivered_at))}${it.channel ? ` · ${escapeHtml(it.channel)}` : ''}</span>`
+        : (it.status === 'expired'
+            ? '<span class="initiative-when initiative-when-muted">expired without delivery</span>'
+            : (it.status === 'relocated'
+                ? '<span class="initiative-when initiative-when-muted">moved to the jobs panel — the result is there, unchanged</span>'
+                : (it.status === 'dismissed' ? '<span class="initiative-when initiative-when-muted">dismissed</span>' : '')));
+      return `
+      <div class="initiative-item initiative-hist" data-id="${it.id}">
+        <div class="initiative-item-head">
+          <span class="initiative-type initiative-type-${escapeHtml(it.type)}">${escapeHtml(it.type)}</span>
+          <span class="initiative-status initiative-status-${escapeHtml(it.status)}">${escapeHtml(it.status)}</span>
+          <span class="initiative-priority" title="priority">${it.priority}/10</span>
+        </div>
+        <div class="initiative-content">${escapeHtml(it.content)}</div>
+        <div class="initiative-hist-meta">
+          <span class="initiative-when" title="${escapeHtml(it.created_at || '')}">created ${escapeHtml(formatInitiativeTime(it.created_at))}</span>
+          ${delivered}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (error) {
+    console.error('[Initiatives] Error loading history:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load history</div>';
+  }
+}
+
+// Keep the bell current: on load and periodically.
+refreshInitiativeBadge();
+setInterval(refreshInitiativeBadge, 60000);
+
+// The conversation list has to notice when SNH adds to one while she has the
+// page open — that is the whole point of a count that lives on the row. The
+// poll only READS; it can raise a badge and never lower one, because nothing
+// but her opening a conversation clears unread.
+setInterval(async () => {
+  if (typeof refreshConversationList === 'function') await refreshConversationList();
+  if (typeof pullNewMessagesIntoOpenConversation === 'function') pullNewMessagesIntoOpenConversation();
+}, 60000);
+
+// ---- Jobs panel (results of background work) ----
+//
+// The ROBOT channel. It polls the way the bell does, and it is deliberately
+// NOT the bell: nothing here can start a conversation. It is a panel to look at
+// when she is ready, and the badge is the only thing that ever asks for
+// attention — quietly, as a count.
+const jobsBtn = document.getElementById('jobsBtn');
+const jobsBadge = document.getElementById('jobsBadge');
+const jobsRunning = document.getElementById('jobsRunning');
+const jobsPanel = document.getElementById('jobsPanel');
+const jobsPanelOverlay = document.getElementById('jobsPanelOverlay');
+const jobsPanelClose = document.getElementById('jobsPanelClose');
+
+if (jobsBtn) jobsBtn.addEventListener('click', openJobsPanel);
+if (jobsPanelClose) jobsPanelClose.addEventListener('click', closeJobsPanel);
+if (jobsPanelOverlay) jobsPanelOverlay.addEventListener('click', closeJobsPanel);
+
+// Same backoff shape as the bell's poll, and for the same reason: a server
+// refusing requests must not look identical to one with nothing to report.
+let jobsBackoffUntil = 0;
+let jobsFailures = 0;
+
+async function refreshJobsBadge() {
+  if (!jobsBadge) return;
+  if (Date.now() < jobsBackoffUntil) return;
+  try {
+    const res = await fetch('/api/jobs/counts');
+    if (res.status === 429) {
+      jobsFailures++;
+      const waitMs = Math.min(15 * 60_000, 60_000 * Math.pow(2, jobsFailures));
+      jobsBackoffUntil = Date.now() + waitMs;
+      console.warn(`[Jobs] badge poll rate-limited; backing off ${Math.round(waitMs / 1000)}s`);
+      return;
+    }
+    if (!res.ok) { jobsFailures++; jobsBackoffUntil = Date.now() + 60_000; return; }
+    jobsFailures = 0;
+    const data = await res.json();
+    const unseen = data.unseen || 0;
+    const active = data.active || 0;
+    // The badge counts UNREAD RESULTS. Work still running shows as a spinner on
+    // the button instead — adding the two together would tick the badge up when
+    // a job STARTED, which reads as "there is something to read" when there is
+    // not. Nothing is waiting on her until something has finished.
+    if (unseen > 0) {
+      jobsBadge.textContent = unseen;
+      jobsBadge.style.display = 'inline-flex';
+    } else {
+      jobsBadge.style.display = 'none';
+    }
+    // The running count is its OWN number in its own corner — see the note on
+    // .jobs-running-count. One badge carrying both would make "3" ambiguous
+    // between "three results to read" and "three still working".
+    if (jobsRunning) {
+      if (active > 0) { jobsRunning.textContent = active; jobsRunning.style.display = 'inline-flex'; }
+      else jobsRunning.style.display = 'none';
+    }
+    jobsBtn?.classList.toggle('jobs-running', active > 0);
+    jobsBtn?.setAttribute('title', active > 0
+      ? `Background jobs — ${active} running, ${unseen} unread`
+      : (unseen > 0 ? `Background jobs — ${unseen} unread` : 'Background jobs — results, not messages'));
+
+    // Poll faster while anything is actually working: a job that finishes in
+    // twenty seconds is otherwise invisible for a minute, which reads as nothing
+    // having happened.
+    applyJobsPollRate(active > 0);
+  } catch (e) { /* silent */ }
+}
+
+function openJobsPanel() {
+  jobsPanel?.classList.add('open');
+  jobsPanelOverlay?.classList.add('active');
+  loadJobsList();
+}
+
+function closeJobsPanel() {
+  jobsPanel?.classList.remove('open');
+  jobsPanelOverlay?.classList.remove('active');
+}
+
+/** How long something has been going, for a job that has not finished. */
+function formatElapsed(startedIso) {
+  // A duration, so no timezone is involved — but the PARSE still has to be
+  // right, or an unmarked timestamp is read hours off and the elapsed time is
+  // nonsense (or negative).
+  const started = toUtcDate(startedIso);
+  if (!started) return '';
+  const secs = Math.max(0, Math.round((Date.now() - started.getTime()) / 1000));
+  if (secs < 90) return `${secs}s so far`;
+  const mins = Math.floor(secs / 60);
+  return mins < 60 ? `${mins} min so far` : `${Math.floor(mins / 60)}h ${mins % 60}m so far`;
+}
+
+/** Plain sentence for how long a run took. */
+function formatJobDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 90) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+const JOB_STATUS_NOTE = {
+  queued: 'Waiting to start.',
+  running: 'Running now.',
+  paused: 'Paused — it is near its budget with work left, and it asked you for more.',
+  // Every terminal state says what it means for her, because a bare status word
+  // makes an interrupted job look like a failed one and a cancelled one look
+  // like a crash.
+  partial: 'It stopped before finishing and wrote up what it had.',
+  failed: 'It did not produce a result.',
+  interrupted: 'The server restarted while this was running.',
+  cancelled: 'You cancelled this before it started.'
+};
+
+/**
+ * WHO STOPPED IT, as the card's lead-in. Mirrors db/job-failure.js sourceLabel:
+ * the sentence that follows carries the specifics; this says which side to go
+ * looking on, which is the question the 9/9 "terminated" card could not answer.
+ */
+const JOB_STOP_SOURCE = {
+  runner: "Stopped by SNH's job runner",
+  engine: 'Stopped on the engine side',
+  dispatched: 'Stopped by the agent it was handed to',
+  user: 'Stopped by you',
+  unknown: 'Stopped for a reason SNH could not place'
+};
+function renderStopLine(it, note) {
+  const lead = it.status === 'partial' || it.status === 'failed' || it.status === 'interrupted'
+    ? (JOB_STOP_SOURCE[it.stop_source] || JOB_STOP_SOURCE.unknown)
+    : '';
+  const bits = [];
+  if (lead) bits.push(`<strong>${escapeHtml(lead)}.</strong>`);
+  if (note && it.status !== 'partial') bits.push(escapeHtml(note));
+  if (it.error) bits.push(escapeHtml(it.error));
+  return bits.join(' ');
+}
+
+/**
+ * A job result, rendered as the markdown it has always been.
+ *
+ * It used to go through escapeHtml() and nothing else, so a research report
+ * arrived in the panel as one long thin column of pipes and asterisks: the
+ * SOURCE of a table, in a narrow card, with the table nowhere. The text was
+ * never the problem — the card was printing a document as if it were a string.
+ *
+ * FALLS BACK RATHER THAN FAILING. If /markdown.js did not load, the card shows
+ * escaped text exactly as it did before. A missing renderer must degrade to the
+ * old behaviour, never to a blank card — the whole point of this panel is that a
+ * result cannot vanish.
+ */
+function renderResultMarkdown(text) {
+  const md = window.SNHMarkdown;
+  if (!md || typeof md.renderMarkdown !== 'function') {
+    return escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+  }
+  try {
+    return md.renderMarkdown(text);
+  } catch (e) {
+    console.error('[Jobs] markdown render failed, showing plain text:', e);
+    return escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+  }
+}
+
+/** A file size a person would say out loud. */
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const JOB_FILE_LABEL = { pdf: 'PDF', code: 'FILE', text: 'TXT' };
+
+/**
+ * The file a job produced: a download link, its size, and where it also lives.
+ *
+ * BOTH HALVES ARE SHOWN, and that is the point of the feature rather than a
+ * detail of it. The link works from whatever machine is reading the panel — the
+ * usual case, since the server is not the laptop. The folder is named underneath
+ * because the file is genuinely there, and will still be there when this row has
+ * been pruned out of the panel.
+ *
+ * A DOWNGRADE IS ALSO SHOWN. If the report came out as text because there is no
+ * chromium on the box, that sentence goes here, next to the file it explains —
+ * not swallowed, and not dressed up as an error, because the file is fine and
+ * the only thing that went differently is its format.
+ */
+/**
+ * HOW THE JOB LIVED IN ITS WINDOW, AND THE PHASES IT RAN IN (2026-09-17).
+ *
+ * Visible on purpose: the brief said a silent squeeze that loses something is
+ * worse than a job that dies loudly. So the card says the peak prompt against
+ * the window, how many rounds were compacted and roughly how much was dropped,
+ * how many checkpoints were written, and each phase with its state — and links
+ * the findings document by job id, the same way the result file is linked.
+ */
+const PHASE_MARK = { done: '✓', running: '…', stopped: '✗', skipped: '–', pending: '–' };
+function renderJobProgress(it) {
+  const p = it.progress;
+  if (!p) return '';
+  const fmt = (n) => Number.isFinite(n) ? n.toLocaleString('en-US') : '?';
+  const bits = [];
+  if (Number.isFinite(p.peakPromptTokens) && p.peakPromptTokens > 0) {
+    bits.push(`peak prompt ${fmt(p.peakPromptTokens)}${p.window && p.window.tokens ? ` of ${fmt(p.window.tokens)}` : ''} tokens`);
+  }
+  if (Number.isFinite(p.squeezedRounds) && p.squeezedRounds > 0) bits.push(`${p.squeezedRounds} turn${p.squeezedRounds === 1 ? '' : 's'} squeezed to fit`);
+  if (Number.isFinite(p.refitRetries) && p.refitRetries > 0) bits.push(`${p.refitRetries} refit after the engine refused`);
+  const c = p.compaction;
+  if (c && c.entries) {
+    bits.push(`${c.roundsCompacted} round${c.roundsCompacted === 1 ? '' : 's'} compacted — ${c.entries} result${c.entries === 1 ? '' : 's'}, ~${fmt(c.droppedChars)} chars dropped` +
+      `${c.digested ? `, ${c.digested} page${c.digested === 1 ? '' : 's'} digested` : ''}${c.truncated ? `, ${c.truncated} cut short` : ''}${c.digestFailed ? ` (${c.digestFailed} could not be digested)` : ''}`);
+  } else if (Number.isFinite(p.peakPromptTokens) && p.peakPromptTokens > 0) {
+    bits.push('nothing compacted');
+  }
+  if (p.multi && Number.isFinite(p.checkpoints)) bits.push(`${p.checkpoints} checkpoint${p.checkpoints === 1 ? '' : 's'} written`);
+  const phases = Array.isArray(p.phases) && p.phases.length > 1
+    ? `<ol class="job-phases">${p.phases.map(ph =>
+      `<li class="job-phase job-phase-${escapeHtml(ph.status)}"><span class="job-phase-mark">${PHASE_MARK[ph.status] || '–'}</span> ${escapeHtml(ph.goal)}` +
+      `${ph.calls ? ` <span class="thinking-dim">· ${ph.calls} call${ph.calls === 1 ? '' : 's'}${ph.parts ? `, ${ph.parts + 1} sittings` : ''}</span>` : ''}` +
+      `${ph.status === 'stopped' && ph.stop ? `<div class="job-phase-stop">${escapeHtml(ph.stop)}</div>` : ''}</li>`).join('')}</ol>`
+    : '';
+  const findings = it.findings_name
+    ? `<a class="job-findings" href="/api/jobs/${encodeURIComponent(it.id)}/findings" target="_blank" rel="noopener">Findings by phase — ${escapeHtml(it.findings_name)}</a>` +
+      `${it.findings_location ? `<div class="job-file-where">Also saved in <code>${escapeHtml(it.findings_location)}</code></div>` : ''}`
+    : '';
+  if (!bits.length && !phases && !findings) return '';
+  return `<div class="job-progress">${phases}${findings}${bits.length ? `<div class="job-context">${escapeHtml(bits.join(' · '))}</div>` : ''}</div>`;
+}
+
+function renderJobFile(it) {
+  if (!it.artifact_kind && !it.artifact_error) return '';
+
+  // No file, but a reason there is none — worth one muted line. Anything else
+  // would be a result that quietly failed to become the file it should have.
+  if (!it.artifact_kind) {
+    return `<div class="job-file-note">${escapeHtml(it.artifact_error)}</div>`;
+  }
+
+  const size = formatFileSize(it.artifact_bytes);
+  const label = JOB_FILE_LABEL[it.artifact_kind] || 'FILE';
+  return `
+    <a class="job-file" href="/api/jobs/${encodeURIComponent(it.id)}/file" download>
+      <span class="job-file-kind job-file-kind-${escapeHtml(it.artifact_kind)}">${escapeHtml(label)}</span>
+      <span class="job-file-name">${escapeHtml(it.artifact_name || 'download')}</span>
+      ${size ? `<span class="job-file-size">${escapeHtml(size)}</span>` : ''}
+    </a>
+    ${it.artifact_location ? `<div class="job-file-where">Also saved in <code>${escapeHtml(it.artifact_location)}</code></div>` : ''}
+    ${it.artifact_error ? `<div class="job-file-note">${escapeHtml(it.artifact_error)}</div>` : ''}`;
+}
+
+/**
+ * A PAUSED JOB'S CARD: the ask it sent, and where to answer. No decision
+ * buttons here on purpose — the decision is made in the conversation, in
+ * words, which is the one place she has ever made one (see CLAUDE.md, "Nothing
+ * that has to be ACTED ON goes on the bell"). The card is the record; the door
+ * is the button.
+ */
+function renderPausedCard(it) {
+  const ask = it.ask || {};
+  const g = ask.grant || {};
+  const askText = ask.text ? renderResultMarkdown(ask.text) : '<em>It asked for more budget.</em>';
+  const grant = g.calls
+    ? `A yes gives it ${g.calls} more tool call${g.calls === 1 ? '' : 's'}, ${g.rounds || 0} more round${g.rounds === 1 ? '' : 's'} and ${Math.round((g.wallMs || 0) / 60000)} more minute${Math.round((g.wallMs || 0) / 60000) === 1 ? '' : 's'}.`
+    : '';
+  return `
+    <div class="job-ask">${askText}</div>
+    <div class="job-error job-cutshort"><strong>Waiting on your answer.</strong> It is holding no lane and will not expire. ` +
+    `Reply <em>yes</em> or <em>no</em> in the conversation it asked in — that is what decides it. ${escapeHtml(grant)}</div>`;
+}
+
+async function loadJobsList() {
+  const container = document.getElementById('jobsList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading…</div>';
+  try {
+    const res = await fetch('/api/jobs?limit=60');
+    const data = await res.json();
+    const items = data.jobs || [];
+
+    // "N running · N queued", always present while anything is active. The panel
+    // is where she looks when she has handed out work and wants to know how much
+    // is still going.
+    const activity = document.getElementById('jobsActivity');
+    if (activity) {
+      const running = items.filter(j => j.status === 'running').length;
+      const queued = items.filter(j => j.status === 'queued').length;
+      const paused = items.filter(j => j.status === 'paused').length;
+      if (running || queued || paused) {
+        activity.textContent = `${running} running · ${queued} queued${paused ? ` · ${paused} waiting on you` : ''}`;
+        activity.style.display = 'block';
+      } else {
+        activity.style.display = 'none';
+      }
+    }
+
+    if (items.length === 0) {
+      container.innerHTML = '<div class="memory-empty">No background jobs yet.</div>';
+      refreshJobsBadge();
+      return;
+    }
+
+    // Work in flight sorts to the top — it is the part she is waiting on. The
+    // rest stays newest-first underneath.
+    const rank = (j) => (j.status === 'paused' ? 0 : j.status === 'running' ? 1 : j.status === 'queued' ? 2 : 3);
+    items.sort((a, b) => rank(a) - rank(b) || (new Date(b.created_at || 0) - new Date(a.created_at || 0)));
+
+    container.innerHTML = items.map(it => {
+      const unread = !it.seen_at && ['ok', 'partial', 'failed', 'interrupted', 'cancelled'].includes(it.status);
+      const kindLabel = it.kind === 'scheduled' ? 'scheduled' : 'started in chat';
+      const note = JOB_STATUS_NOTE[it.status] || '';
+      // TEXT WINS OVER STATUS. This used to render result_text only for `ok`, so
+      // a run that stopped early and wrote up what it had displayed as an error
+      // and nothing else — the work was in the database and invisible on screen,
+      // which is the same class of bug as the retired fact that redrew as live.
+      // If there is text, she reads the text; the reason it stopped goes
+      // underneath it, where it explains the result rather than replacing it.
+      // WHAT GOES ON THE CARD DEPENDS ON WHETHER THERE IS A FILE.
+      //
+      // With one, the card is an ANNOUNCEMENT: a few lines and a link. Pasting a
+      // 4,000-word report onto a card that also links to the PDF of it would be
+      // the original problem with a download button bolted to the side.
+      // Without one, the result IS the card and is shown whole, as before.
+      const shown = it.artifact_kind && it.summary_text ? it.summary_text : it.result_text;
+      const rendered = shown ? renderResultMarkdown(shown) : '';
+      // A FAILED OR INTERRUPTED JOB WITH TEXT IS OFFERING PARTIAL OUTPUT, and
+      // the card says so above it rather than leaving her to guess whether
+      // what she is reading is a result or a corpse. The stop line — who
+      // stopped it, and which clock or limit — goes underneath.
+      const partialLead = it.partial_output
+        ? '<div class="job-partial-label">Partial output — what it had up to where it stopped:</div>' : '';
+      const body = it.status === 'ok'
+        ? rendered
+        : it.status === 'paused'
+          ? renderPausedCard(it)
+          : (rendered
+            ? `${partialLead}${rendered}<div class="job-error job-cutshort">${renderStopLine(it, note)}</div>`
+            : `<span class="job-error">${renderStopLine(it, note)}</span>`);
+      const file = renderJobFile(it) + renderJobProgress(it);
+      // THE ATTEMPT CHAIN. A retry is a new card that points back; the old one
+      // points forward. Both are in this list, so the links scroll.
+      const chain = [
+        it.retry_of ? `<a class="job-chain" href="#" data-goto="${escapeHtml(it.retry_of)}">retry of an earlier attempt</a>` : '',
+        it.retried_by ? `<a class="job-chain" href="#" data-goto="${escapeHtml(it.retried_by)}">retried — see the newer attempt</a>` : ''
+      ].filter(Boolean).join(' · ');
+      // Elapsed, for the ones still going — "running" with no clock on it tells
+      // her nothing about whether to keep waiting.
+      const elapsed = (it.status === 'running' && it.started_at)
+        ? `<span class="job-elapsed">${escapeHtml(formatElapsed(it.started_at))}</span>` : '';
+      const meta = [
+        it.finished_at ? `finished ${escapeHtml(formatInitiativeTime(it.finished_at))}` : '',
+        it.duration_ms ? escapeHtml(formatJobDuration(it.duration_ms)) : '',
+        Number.isFinite(it.tool_calls) && it.tool_calls > 0 ? `${it.tool_calls} tool call${it.tool_calls === 1 ? '' : 's'}` : ''
+      ].filter(Boolean).join(' · ');
+
+      const actions = [];
+      if (it.cancellable) actions.push(`<button class="job-cancel" data-id="${escapeHtml(it.id)}">Cancel</button>`);
+      if (it.retryable) actions.push(`<button class="job-retry" data-id="${escapeHtml(it.id)}" title="Runs the same task again. The new run is told why this one stopped and what it had, so it does not start from zero.">Retry</button>`);
+      if (it.status === 'paused' && it.ask && it.ask.conversationId) {
+        actions.push(`<button class="job-open-convo" data-conversation="${escapeHtml(it.ask.conversationId)}">Open the conversation</button>`);
+      }
+      if (unread) actions.push(`<button class="job-seen" data-id="${escapeHtml(it.id)}" data-kind="${escapeHtml(it.kind)}">Mark read</button>`);
+
+      return `
+      <div class="initiative-item job-item ${unread ? 'job-unread' : ''}" data-id="${escapeHtml(it.id)}">
+        <div class="initiative-item-head">
+          <span class="job-status job-status-${escapeHtml(it.status)}">${escapeHtml(it.status)}</span>
+          <span class="job-kind">${escapeHtml(kindLabel)}</span>
+          <span class="initiative-time" title="${escapeHtml(it.created_at || '')}">${escapeHtml(formatInitiativeTime(it.created_at))}</span>
+        </div>
+        <div class="job-title">${escapeHtml(it.title || '')}${elapsed}</div>
+        ${it.status === 'queued' || it.status === 'running'
+          ? `<div class="initiative-note">${escapeHtml(note)} The result will appear here — it will not message you.</div>`
+          : `<div class="initiative-content">${body}</div>`}
+        ${file}
+        ${meta || chain ? `<div class="job-meta">${[meta, chain].filter(Boolean).join(' · ')}</div>` : ''}
+        ${actions.length ? `<div class="initiative-actions">${actions.join('')}</div>` : ''}
+      </div>`;
+    }).join('');
+
+    container.querySelectorAll('.job-seen').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await fetch(`/api/jobs/${btn.dataset.id}/seen`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: btn.dataset.kind })
+          });
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+
+    container.querySelectorAll('.job-retry').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Retrying…';
+        try {
+          const r = await fetch(`/api/jobs/${btn.dataset.id}/retry`, { method: 'POST' });
+          if (!r.ok) {
+            // The refusal is shown with its reason — a coding job, a job still
+            // going, one already retried — rather than a button that did nothing.
+            const err = await r.json().catch(() => ({}));
+            btn.textContent = 'Retry';
+            btn.insertAdjacentHTML('afterend', `<span class="job-error"> ${escapeHtml(err.error || 'Could not retry.')}</span>`);
+            return;
+          }
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; btn.textContent = 'Retry'; }
+      });
+    });
+
+    container.querySelectorAll('.job-open-convo').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        closeJobsPanel();
+        try { await loadConversationById(btn.dataset.conversation); } catch (e) { /* the sidebar still has it */ }
+      });
+    });
+
+    container.querySelectorAll('.job-chain').forEach(a => {
+      a.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        const target = container.querySelector(`.job-item[data-id="${a.dataset.goto}"]`);
+        if (!target) return;
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('job-highlight');
+        setTimeout(() => target.classList.remove('job-highlight'), 1600);
+      });
+    });
+
+    container.querySelectorAll('.job-cancel').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const r = await fetch(`/api/jobs/${btn.dataset.id}/cancel`, { method: 'POST' });
+          if (!r.ok) {
+            // The refusal is shown, not swallowed — a running job cannot be
+            // stopped cleanly and she is told that rather than left with a
+            // button that appears to have done nothing.
+            const err = await r.json().catch(() => ({}));
+            btn.insertAdjacentHTML('afterend', `<span class="job-error"> ${escapeHtml(err.error || 'Could not cancel.')}</span>`);
+            return;
+          }
+          await loadJobsList();
+          refreshJobsBadge();
+        } catch (e) { btn.disabled = false; }
+      });
+    });
+  } catch (error) {
+    console.error('[Jobs] Error loading list:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load</div>';
+  }
+}
+
+// The robot panel polls the way the bell does — 60s at rest, 15s while anything
+// is actually running, because a job that finishes in twenty seconds would
+// otherwise sit invisible for a minute and read as nothing having happened.
+let jobsPollTimer = null;
+let jobsPollFast = null;
+function applyJobsPollRate(fast) {
+  if (jobsPollFast === fast && jobsPollTimer) return;   // already at this rate
+  jobsPollFast = fast;
+  if (jobsPollTimer) clearInterval(jobsPollTimer);
+  jobsPollTimer = setInterval(() => {
+    refreshJobsBadge();
+    if (jobsPanel?.classList.contains('open')) loadJobsList();
+  }, fast ? 15000 : 60000);
+}
+refreshJobsBadge();
+applyJobsPollRate(false);
+
+function openMemoryPanel() {
+  memoryPanel?.classList.add('open');
+  memoryPanelOverlay?.classList.add('active');
+  // Load the active tab data
+  const activeTab = document.querySelector('.memory-tab.active');
+  if (activeTab) {
+    switchMemoryTab(activeTab.dataset.tab);
+  } else {
+    switchMemoryTab('facts');
+  }
+}
+
+function closeMemoryPanel() {
+  memoryPanel?.classList.remove('open');
+  memoryPanelOverlay?.classList.remove('active');
+}
+
+function switchMemoryTab(name) {
+  // Update tab buttons
+  document.querySelectorAll('.memory-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.memory-tab[data-tab="${name}"]`)?.classList.add('active');
+
+  // Update tab content
+  document.querySelectorAll('.memory-tab-content').forEach(c => c.classList.remove('active'));
+  const tabContent = document.getElementById(`memoryTab${name.charAt(0).toUpperCase() + name.slice(1)}`);
+  tabContent?.classList.add('active');
+
+  // The Map needs far more room than the other tabs — widen the whole panel.
+  memoryPanel?.classList.toggle('map-mode', name === 'map');
+
+  // Load data for the tab
+  if (name === 'facts') loadFactsTab();
+  else if (name === 'clusters') loadClustersTab();
+  else if (name === 'map') loadMapTab();
+  else if (name === 'daily') loadDailyTab();
+  else if (name === 'self') loadSelfTab();
+  else if (name === 'thinking') loadThinkingTab();
+  else if (name === 'activity') loadActivityTab();
+}
+
+// ============ Activity tab ============
+// Read-only view of everything scheduled in SNH. Two categories kept visually
+// apart: ACTIVE (the two in-process timers, with heartbeat steps NESTED because
+// they are not independently scheduled) and INERT (cron_jobs — nothing executes
+// them). Anything without run history says so rather than showing a blank.
+
+function fmtWhen(iso) {
+  return formatLocalTime(iso, 'datetime', '—');
+}
+
+function fmtRelative(iso) {
+  const d = toUtcDate(iso);
+  if (!d) return '';
+  const diff = d.getTime() - Date.now();
+  const abs = Math.abs(diff);
+  const mins = Math.round(abs / 60000);
+  const unit = mins < 60 ? `${mins} min`
+    : mins < 1440 ? `${(mins / 60).toFixed(1)} h`
+    : `${(mins / 1440).toFixed(1)} d`;
+  return diff >= 0 ? `in ${unit}` : `${unit} ago`;
+}
+
+function fmtDur(ms) {
+  if (ms == null) return '—';
+  return ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${(ms / 60000).toFixed(1)} min`;
+}
+
+function activityStatusPill(status) {
+  const s = status || 'unknown';
+  return `<span class="act-pill act-pill-${escapeHtml(s)}">${escapeHtml(s)}</span>`;
+}
+
+async function loadActivityTab() {
+  const container = document.getElementById('memoryActivityContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading activity…</div>';
+
+  try {
+    const res = await fetch('/api/memory/activity');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'failed');
+
+    let html = '';
+
+    // --- anchor note: why the cadence moves after a deploy ---
+    html += `
+      <div class="act-anchor">
+        <div class="act-anchor-title">Schedules are anchored to process start, not the clock</div>
+        <div class="act-anchor-body">
+          ${escapeHtml(data.anchor.note)}<br>
+          Current anchor: <strong>${escapeHtml(fmtWhen(data.anchor.processStartedAt))}</strong>
+          <span class="act-dim">(up ${escapeHtml(fmtDur(data.anchor.uptimeMs))})</span>
+        </div>
+      </div>`;
+
+    // --- ACTIVE ---
+    html += '<div class="act-section-head act-section-active">Active — running on their own</div>';
+
+    for (const p of data.active) {
+      const lr = p.lastRun;
+      const disabled = p.enabled === false;
+      html += `
+      <div class="act-entry${disabled ? ' act-entry-disabled' : ''}">
+        <div class="act-entry-head">
+          <span class="act-name">${escapeHtml(p.name)}</span>
+          ${disabled ? '<span class="act-pill act-pill-disabled">disabled</span>' : ''}
+          <span class="act-prov act-prov-system">system</span>
+        </div>
+        <div class="act-desc">${escapeHtml(p.description)}</div>
+        <div class="act-grid">
+          <div><span class="act-label">Mechanism</span>${escapeHtml(p.mechanism)}</div>
+          <div><span class="act-label">Schedule</span>${escapeHtml(p.schedule)}</div>
+          <div><span class="act-label">Last run</span>${
+            lr ? `${escapeHtml(fmtWhen(lr.at))} <span class="act-dim">${escapeHtml(fmtRelative(lr.at))}</span> ${activityStatusPill(lr.status)} <span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span>`
+               : '<span class="act-nohist">no run history</span>'}</div>
+          <div><span class="act-label">Next run</span>${
+            p.nextRun ? `${escapeHtml(fmtWhen(p.nextRun))} <span class="act-dim">${escapeHtml(fmtRelative(p.nextRun))}</span>` : '<span class="act-nohist">n/a</span>'}</div>
+        </div>
+        ${lr && lr.statusReason ? `<div class="act-reason">${escapeHtml(lr.statusReason)}</div>` : ''}
+        ${p.retentionNote ? `<div class="act-dim act-retention">Probe log ${escapeHtml(p.retentionNote)}.</div>` : ''}
+        ${renderActivitySubTasks(p)}
+        ${renderActivityHistory(p)}
+      </div>`;
+    }
+
+    // --- SCHEDULED JOBS ---
+    // These run. The banner that used to sit here said the opposite in bold, and
+    // it was true until the scheduler shipped (2026-08-12); leaving it would make
+    // this panel the lie. What replaces it is not a reassurance — it is the run
+    // state per job, because "it is scheduled" and "it ran" are still different
+    // claims and the panel should never let one stand in for the other.
+    const scheduledJobs = (data.scheduled && data.scheduled.jobs) || [];
+    html += '<div class="act-section-head act-section-active">Scheduled jobs — approved, armed, and run by the scheduler</div>';
+
+    if (scheduledJobs.length === 0) {
+      html += '<div class="memory-empty">No jobs are armed. Nothing is waiting to run.</div>';
+    } else {
+      html += scheduledJobs.map(j => {
+        const lr = j.lastRun;
+        const failing = (j.consecutiveFailures || 0) > 0;
+        return `
+        <div class="act-entry">
+          <div class="act-entry-head">
+            <span class="act-name">${escapeHtml(j.description)}</span>
+            <span class="act-pill act-pill-armed">armed</span>
+            ${failing ? `<span class="act-pill act-pill-failed">${j.consecutiveFailures} failure${j.consecutiveFailures === 1 ? '' : 's'} in a row</span>` : ''}
+            <span class="act-prov act-prov-kid">kid-proposed</span>
+          </div>
+          <div class="act-grid">
+            <div><span class="act-label">Mechanism</span>agent run — the description is the task, read-only memory tools</div>
+            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(j.scheduleInWords || cronToWords(j.schedule))}</span></div>
+            <div><span class="act-label">Last run</span>${
+              lr ? `${escapeHtml(fmtWhen(lr.at))} <span class="act-dim">${escapeHtml(fmtRelative(lr.at))}</span> ${activityStatusPill(lr.status)} <span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span>`
+                 : '<span class="act-nohist">never run yet</span>'}</div>
+            <div><span class="act-label">Next run</span>${
+              j.nextRun ? `${escapeHtml(fmtWhen(j.nextRun))} <span class="act-dim">${escapeHtml(fmtRelative(j.nextRun))}</span>` : '<span class="act-never">not armed</span>'}</div>
+            <div><span class="act-label">Times run</span>${j.timesRun || 0}</div>
+            <div><span class="act-label">Approved</span>${escapeHtml(fmtWhen(j.decided_at))}</div>
+          </div>
+          ${lr && lr.statusReason ? `<div class="act-reason">${escapeHtml(lr.statusReason)}</div>` : ''}
+          ${lr && lr.output ? `<div class="act-job-output">${escapeHtml(lr.output)}</div>` : ''}
+          ${renderActivityHistory(j)}
+        </div>`;
+      }).join('');
+    }
+
+    // --- INERT ---
+    // Still a real category, and now a more useful one: everything here says why
+    // it will not run, because "she rejected it" and "it disabled itself after
+    // failing three nights running" are not the same news.
+    const jobs = data.inert.jobs || [];
+    if (jobs.length > 0) {
+      html += '<div class="act-section-head act-section-inert">Not scheduled — recorded, but nothing will run them</div>';
+      html += jobs.map(j => {
+        const why = j.disabledReason
+          ? `disabled itself: ${j.disabledReason}`
+          : j.status === 'proposed' ? 'waiting on your decision in the bell panel'
+          : j.status === 'approved' && !j.enabled ? 'approved, but disabled'
+          : j.status === 'approved' ? 'approved, but its schedule could not be evaluated'
+          : `${j.status}`;
+        return `
+        <div class="act-entry act-entry-inert">
+          <div class="act-entry-head">
+            <span class="act-name">${escapeHtml(j.description)}</span>
+            <span class="act-pill act-pill-inert">${escapeHtml(j.status)} · not armed</span>
+            <span class="act-prov act-prov-kid">kid-proposed</span>
+          </div>
+          <div class="act-grid">
+            <div><span class="act-label">Why not running</span>${escapeHtml(why)}</div>
+            <div><span class="act-label">Schedule</span><code>${escapeHtml(j.schedule)}</code> <span class="act-dim">${escapeHtml(j.scheduleInWords || cronToWords(j.schedule))}</span></div>
+            <div><span class="act-label">Proposed</span>${escapeHtml(fmtWhen(j.created_at))}</div>
+            <div><span class="act-label">Times run</span>${j.timesRun || 0}${j.timesRun ? ` <span class="act-dim">(last ${escapeHtml(fmtWhen(j.lastRun && j.lastRun.at))})</span>` : ''}</div>
+          </div>
+          ${j.decided_at ? `<div class="act-dim">${escapeHtml(j.status)} ${escapeHtml(fmtWhen(j.decided_at))}${j.decided_note ? ` — ${escapeHtml(j.decided_note)}` : ''}</div>` : ''}
+        </div>`;
+      }).join('');
+    }
+
+    // --- GAPS ---
+    html += '<div class="act-section-head act-section-gaps">Runs, but leaves no record</div>';
+    html += data.gaps.map(g => `
+      <div class="act-entry act-entry-gap">
+        <div class="act-entry-head">
+          <span class="act-name">${escapeHtml(g.name)}</span>
+          <span class="act-pill act-pill-nohist">no run history</span>
+        </div>
+        <div class="act-desc">${escapeHtml(g.what)}</div>
+        <div class="act-grid">
+          <div><span class="act-label">Mechanism</span>${escapeHtml(g.mechanism)}</div>
+          <div><span class="act-label">Why not listed</span>${escapeHtml(g.why)}</div>
+        </div>
+      </div>`).join('');
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('[Activity] Error loading:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load activity</div>';
+  }
+}
+
+/** Heartbeat steps, nested to show they are one serial pass — not peers. */
+function renderActivitySubTasks(p) {
+  if (!p.subTasks || p.subTasks.length === 0) return '';
+  const rows = p.subTasks.map((s, i) => {
+    const lr = s.lastRun;
+    const result = lr && lr.result != null
+      ? (typeof lr.result === 'object' ? JSON.stringify(lr.result) : String(lr.result))
+      : null;
+    return `
+      <div class="act-sub${s.isDurationDriver ? ' act-sub-driver' : ''}">
+        <span class="act-sub-idx">${i + 1}</span>
+        <div class="act-sub-body">
+          <div class="act-sub-head">
+            <span class="act-sub-name">${escapeHtml(s.name)}</span>
+            <span class="act-gate">${escapeHtml(s.gate)}</span>
+            ${s.isDurationDriver ? '<span class="act-pill act-pill-driver">drives pass duration</span>' : ''}
+          </div>
+          <div class="act-sub-desc">${escapeHtml(s.description)}</div>
+          <div class="act-sub-run">${
+            lr
+              ? `${lr.durationMs != null ? `<span class="act-dim">${escapeHtml(fmtDur(lr.durationMs))}</span> · ` : ''}${result ? escapeHtml(result.slice(0, 160)) : (lr.ok ? 'ok' : 'error')}`
+              : `<span class="act-nohist">no run history${s.noHistoryReason ? ` — ${escapeHtml(s.noHistoryReason)}` : ''}</span>`
+          }</div>
+        </div>
+      </div>`;
+  }).join('');
+  return `
+    <details class="act-subs" open>
+      <summary class="act-subs-summary">${p.subTasks.length} steps in this pass — run in order, not independently scheduled</summary>
+      ${rows}
+    </details>`;
+}
+
+/** Recent runs. For the heartbeat, each row says which code path it took. */
+function renderActivityHistory(p) {
+  const h = p.history || [];
+  if (h.length === 0) {
+    return '<div class="act-nohist act-hist-empty">No run history recorded yet.</div>';
+  }
+  const rows = h.slice(0, 20).map(r => `
+    <div class="act-hist-row act-hist-${escapeHtml(r.status)}">
+      <span class="act-hist-when">${escapeHtml(fmtWhen(r.at))}</span>
+      ${activityStatusPill(r.status)}
+      <span class="act-hist-dur">${escapeHtml(fmtDur(r.durationMs))}</span>
+      ${r.pathKind ? `<span class="act-path act-path-${escapeHtml(r.pathKind)}">${escapeHtml(r.pathLabel)}</span>` : ''}
+      ${r.statusReason ? `<span class="act-hist-reason">${escapeHtml(r.statusReason)}</span>` : ''}
+    </div>`).join('');
+  return `
+    <details class="act-hist">
+      <summary class="act-hist-summary">Recent runs (${h.length})</summary>
+      ${rows}
+    </details>`;
+}
+
+/** Cron expression → plain words. Covers the common shapes; falls back honestly. */
+function cronToWords(expr) {
+  const p = String(expr || '').trim().split(/\s+/);
+  if (p.length !== 5) return '';
+  const [min, hr, dom, mon, dow] = p;
+  const DAYS = { 0: 'Sunday', 1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday' };
+  const at = (h, m) => {
+    const hh = parseInt(h, 10), mm = parseInt(m, 10);
+    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return '';
+    const ampm = hh >= 12 ? 'pm' : 'am';
+    const h12 = hh % 12 || 12;
+    return `${h12}${mm ? ':' + String(mm).padStart(2, '0') : ''}${ampm}`;
+  };
+  const stepMin = min.match(/^\*\/(\d+)$/);
+  if (stepMin && hr === '*' && dom === '*' && mon === '*' && dow === '*') return `every ${stepMin[1]} minutes`;
+  if (min === '0' && hr === '*' && dom === '*' && mon === '*' && dow === '*') return 'every hour';
+  if (/^\d+$/.test(min) && /^\d+$/.test(hr)) {
+    if (dom === '*' && mon === '*' && dow === '*') return `every day at ${at(hr, min)}`;
+    if (dom === '*' && mon === '*' && /^\d$/.test(dow)) return `every ${DAYS[dow]} at ${at(hr, min)}`;
+    if (/^\d+$/.test(dom) && mon === '*' && (dow === '*' || dow === '?')) return `on the ${dom}${dom === '1' ? 'st' : dom === '2' ? 'nd' : dom === '3' ? 'rd' : 'th'} of each month at ${at(hr, min)}`;
+  }
+  return '';
+}
+
+// ---- Facts Tab ----
+// ---- Entities (display only) ----
+//
+// A fact points at an entity through subject_entity_id. The UI used to render
+// the legacy `subject` column, so every fact on screen read "user fact"
+// whoever it was actually about — which is exactly the misattribution Ellie
+// needs to be able to SEE. This cache turns an id into a name. It creates
+// nothing and assigns nothing; /api/memory/entities is read-only.
+let memoryEntityCache = null;
+
+async function loadEntities(force = false) {
+  if (memoryEntityCache && !force) return memoryEntityCache;
+  try {
+    const res = await fetch('/api/memory/entities');
+    const data = await res.json();
+    const byId = {};
+    for (const e of data.entities || []) byId[e.id] = e;
+    memoryEntityCache = { list: data.entities || [], byId, pointers: data.pointers || {} };
+  } catch (err) {
+    console.error('[MemoryPanel] Error loading entities:', err);
+    memoryEntityCache = { list: [], byId: {}, pointers: {} };
+  }
+  return memoryEntityCache;
+}
+
+/**
+ * The badge that says who a fact is about.
+ *
+ * A fact whose subject_entity_id is null predates the entity migration or was
+ * written by something that did not set it. That is said plainly rather than
+ * guessed at from the legacy column — a wrong name here is worse than no name.
+ */
+function entityBadge(entityId, entities, legacySubject) {
+  const e = entityId ? entities.byId[entityId] : null;
+  if (!e) {
+    return `<span class="memory-entity-badge unassigned" title="No entity — this fact predates the entity migration or was written without one${legacySubject ? `; its legacy subject was &quot;${escapeHtml(legacySubject)}&quot;` : ''}">no entity</span>`;
+  }
+  const cls = `type-${String(e.type || 'other').replace(/[^a-z]/gi, '')}`;
+  const tip = [e.type, e.relationship].filter(Boolean).join(' · ');
+  return `<span class="memory-entity-badge ${cls}" title="${escapeHtml(tip)}">${escapeHtml(e.name)}</span>`;
+}
+
+/**
+ * The one-line answer to "how does this connect to anything else".
+ *
+ * Both edges, because they answer different questions and only one of them is
+ * on the entity's own row: a product's maker is its org_id, but the clients
+ * running it are rows in entity_links pointing the other way. "Which clients
+ * are on Exchange" is unanswerable from the product's own record alone.
+ */
+function entityRelationsLine(entityId, entities) {
+  const e = entities.byId[entityId];
+  if (!e) return '';
+  const bits = [];
+  if (e.orgLink && e.orgLink.name) bits.push(`${escapeHtml(e.orgLink.label)} ${escapeHtml(e.orgLink.name)}`);
+  if (e.products && e.products.length) bits.push(`makes ${e.products.map(p => escapeHtml(p.name)).join(', ')}`);
+  if (e.uses && e.uses.length) bits.push(`uses ${e.uses.map(u => escapeHtml(u.name)).join(', ')}`);
+  if (e.usedBy && e.usedBy.length) bits.push(`used by ${e.usedBy.map(u => escapeHtml(u.name)).join(', ')}`);
+  if (!bits.length) return '';
+  return `<div class="memory-entity-relations">${bits.join(' · ')}</div>`;
+}
+
+function entityNameOf(entityId, entities) {
+  const e = entityId ? entities.byId[entityId] : null;
+  return e ? e.name : 'No entity';
+}
+
+async function loadFactsTab() {
+  const container = document.getElementById('memoryFactsList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading facts...</div>';
+
+  try {
+    const entities = await loadEntities();
+
+    // Load cluster members (facts with IDs for edit/delete).
+    //
+    // subject=all, deliberately. This walked USER clusters only, so a user fact
+    // that happens to sit in a cluster tagged self was invisible here whatever
+    // its own subject or entity said — discovery depended on cluster state,
+    // which is the visibility failure the entity work exists to end. The
+    // per-member filter below still decides what is SHOWN; this only decides
+    // what is looked at.
+    const clustersRes = await fetch('/api/memory/clusters?subject=all');
+    const clustersData = await clustersRes.json();
+    const clusters = clustersData.clusters || [];
+
+    // Load all members from all clusters
+    memoryFactsCache = [];
+    for (const cluster of clusters) {
+      const clusterRes = await fetch(`/api/memory/clusters/${cluster.id}`);
+      const clusterData = await clusterRes.json();
+      if (clusterData.members) {
+        for (const member of clusterData.members) {
+          // Facts tab is user-facts only. Skip any self-observation that may sit
+          // inside a user cluster (subject defaults to 'user' for legacy rows).
+          if ((member.subject || 'user') !== 'user') continue;
+          // STATUS travels with the fact. Without it this list rendered ghosts
+          // and live facts identically, edit and delete buttons and all — so
+          // retiring a fact changed nothing visible and the delete button read
+          // as broken. The cluster endpoint returns inactive members on purpose
+          // (the Map draws them); it is the reader's job to tell them apart.
+          memoryFactsCache.push({
+            id: member.id,
+            content: member.content,
+            status: member.status || 'active',
+            inactiveReason: member.inactive_reason || null,
+            entityId: member.subject_entity_id || null,
+            legacySubject: member.subject || null,
+            clusterName: cluster.name,
+            clusterId: cluster.id
+          });
+        }
+      }
+    }
+
+    // Populate the entity filter from what is actually on screen, plus every
+    // registered entity, so a client with no facts yet is still selectable.
+    const select = document.getElementById('memoryFactsEntity');
+    if (select) {
+      const chosen = select.value || 'all';
+      const seen = new Map();
+      for (const e of entities.list) seen.set(e.id, e.name);
+      let hasUnassigned = memoryFactsCache.some(f => !f.entityId);
+      const opts = ['<option value="all">All entities</option>']
+        .concat([...seen.entries()].map(([id, name]) => `<option value="${id}">${escapeHtml(name)}</option>`));
+      if (hasUnassigned) opts.push('<option value="__none__">No entity</option>');
+      select.innerHTML = opts.join('');
+      select.value = [...seen.keys()].includes(chosen) || chosen === 'all' || chosen === '__none__' ? chosen : 'all';
+    }
+
+    renderFactsList();
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading facts:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load facts</div>';
+  }
+}
+
+/**
+ * Render the cached facts under the current filter and grouping.
+ *
+ * THREE BUCKETS, NOT TWO. flagged-unverified-subject is not active, so before
+ * this it fell into the retired bucket and was labelled "no longer held — kept
+ * as history", which is a lie about a fact that is being HELD BACK pending a
+ * subject it could not confirm. A fact the store is unsure about has to look
+ * different from one it has retired, or the flag may as well not exist.
+ */
+function renderFactsList() {
+  const container = document.getElementById('memoryFactsList');
+  if (!container) return;
+  const entities = memoryEntityCache || { list: [], byId: {}, pointers: {} };
+  const filter = (document.getElementById('memoryFactsEntity') || {}).value || 'all';
+  const grouped = !!(document.getElementById('memoryFactsGroup') || {}).checked;
+
+  let facts = memoryFactsCache;
+  if (filter === '__none__') facts = facts.filter(f => !f.entityId);
+  else if (filter !== 'all') facts = facts.filter(f => f.entityId === filter);
+
+  if (memoryFactsCache.length === 0) {
+    container.innerHTML = '<div class="memory-empty">No facts stored yet. Add one above!</div>';
+    return;
+  }
+
+  const FLAGGED = 'flagged-unverified-subject';
+  const live = facts.filter(f => f.status === 'active');
+  const flagged = facts.filter(f => f.status === FLAGGED);
+  const retired = facts.filter(f => f.status !== 'active' && f.status !== FLAGGED);
+
+  // Why a fact is no longer held, in the words the store uses.
+  const RETIRED_LABEL = {
+    retracted: 'retired — kept as history',
+    superseded: 'replaced by a newer fact — kept as history',
+    expired: 'was a passing event, moved to the day\'s log — kept as history'
+  };
+
+  const liveItem = (fact) => `
+      <div class="memory-fact-item" data-id="${fact.id}">
+        <div class="memory-fact-content">${escapeHtml(fact.content)}</div>
+        <div class="memory-fact-meta">${entityBadge(fact.entityId, entities, fact.legacySubject)}</div>
+        <div class="memory-fact-actions">
+          <button class="memory-fact-action-btn edit" data-id="${fact.id}" title="Edit">&#9998;</button>
+          <button class="memory-fact-action-btn delete" data-id="${fact.id}" title="Retire — kept as history">&#128465;</button>
+        </div>
+      </div>`;
+
+  let factsHtml;
+  if (live.length === 0) {
+    factsHtml = '<div class="memory-empty">No facts held right now.</div>';
+  } else if (grouped) {
+    const groups = new Map();
+    for (const f of live) {
+      const key = f.entityId || '__none__';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    }
+    const ordered = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+    factsHtml = ordered.map(([key, items]) => `
+        <div class="memory-facts-group">
+          <h3 class="memory-facts-group-head">
+            ${key === '__none__' ? 'No entity' : escapeHtml(entityNameOf(key, entities))}
+            <span class="memory-self-count">(${items.length})</span>
+          </h3>
+          ${key === '__none__' ? '' : entityRelationsLine(key, entities)}
+          ${items.map(liveItem).join('')}
+        </div>`).join('');
+  } else {
+    factsHtml = live.map(liveItem).join('');
+  }
+
+  // HELD, NOT RETIRED. These failed the write-time subject check: the source
+  // did not attribute the claim to the subject it was about to be filed under.
+  // They are stored on purpose — a silent hole is the failure this replaced —
+  // and they are shown as a question, not as history.
+  if (flagged.length > 0) {
+    factsHtml += `
+        <div class="memory-facts-flagged">
+          <h3 class="memory-facts-flagged-head">Subject unverified
+            <span class="memory-self-count">(${flagged.length}) — held back, not in memory</span>
+          </h3>
+          <div class="memory-facts-flagged-note">The source did not attribute these to the entity they were about to be filed under, so they were kept out of memory rather than recorded as known.</div>
+          ${flagged.map(fact => `
+            <div class="memory-fact-item flagged" data-id="${fact.id}">
+              <div class="memory-fact-content">${escapeHtml(fact.content)}</div>
+              <div class="memory-fact-meta">
+                <span class="memory-fact-flag">&#9888; subject unverified</span>
+                ${entityBadge(fact.entityId, entities, fact.legacySubject)}
+              </div>
+            </div>`).join('')}
+        </div>`;
+  }
+
+  // Retired facts are shown, because nothing here is deleted and hiding them
+  // would be its own lie — but shown as history: struck through, labelled, and
+  // with no edit or delete buttons, since neither means anything on a fact
+  // that is already out of memory. Restoring one is the Self tab's Revert.
+  if (retired.length > 0) {
+    factsHtml += `
+        <div class="memory-facts-retired">
+          <h3 class="memory-facts-retired-head">Retired <span class="memory-self-count">(${retired.length}) — kept as history, not in memory</span></h3>
+          ${retired.map(fact => `
+            <div class="memory-fact-item retired" data-id="${fact.id}">
+              <div class="memory-fact-content">${escapeHtml(fact.content)}</div>
+              <div class="memory-fact-meta">${entityBadge(fact.entityId, entities, fact.legacySubject)}</div>
+              <div class="memory-fact-retired-note">${escapeHtml(RETIRED_LABEL[fact.inactiveReason] || 'no longer held — kept as history')}</div>
+            </div>`).join('')}
+        </div>`;
+  }
+
+  container.innerHTML = factsHtml;
+
+  // Attach edit/delete handlers
+  container.querySelectorAll('.memory-fact-action-btn.edit').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      editFact(btn.dataset.id);
+    });
+  });
+  container.querySelectorAll('.memory-fact-action-btn.delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteFact(btn.dataset.id);
+    });
+  });
+}
+
+// ---- Clusters Tab ----
+async function loadClustersTab() {
+  const container = document.getElementById('memoryClustersList');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading clusters...</div>';
+
+  try {
+    const res = await fetch('/api/memory/clusters');
+    const data = await res.json();
+    const clusters = data.clusters || [];
+
+    if (clusters.length === 0) {
+      container.innerHTML = '<div class="memory-empty">No clusters yet</div>';
+      return;
+    }
+
+    container.innerHTML = clusters.map(c => `
+      <div class="memory-cluster-item" data-id="${c.id}">
+        <div class="memory-cluster-header">
+          <span class="memory-cluster-name">${escapeHtml(c.name)}</span>
+          <span class="memory-cluster-count">${c.member_count}</span>
+        </div>
+        <div class="memory-cluster-members" id="cluster-members-${c.id}"></div>
+      </div>
+    `).join('');
+
+    // Attach expand handlers
+    container.querySelectorAll('.memory-cluster-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const item = header.closest('.memory-cluster-item');
+        toggleClusterExpand(item.dataset.id);
+      });
+    });
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading clusters:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load clusters</div>';
+  }
+}
+
+async function toggleClusterExpand(clusterId) {
+  const membersEl = document.getElementById(`cluster-members-${clusterId}`);
+  if (!membersEl) return;
+
+  if (membersEl.classList.contains('expanded')) {
+    membersEl.classList.remove('expanded');
+    return;
+  }
+
+  // Load cluster details
+  try {
+    const res = await fetch(`/api/memory/clusters/${clusterId}`);
+    const data = await res.json();
+
+    let html = '';
+    if (data.members) {
+      // Clusters tab is user-facts only — never render self-observations that
+      // may sit inside a user cluster (legacy rows before the subject guard).
+      // Retired members stay listed — this is the cluster's whole membership,
+      // ghosts included, same as the Map — but they are marked as history so
+      // the list cannot be read as "these are things SNH holds".
+      html += data.members
+        .filter(m => (m.subject || 'user') === 'user')
+        .map(m => (m.status || 'active') === 'active'
+          ? `<div class="memory-cluster-member">${escapeHtml(m.content)}</div>`
+          : `<div class="memory-cluster-member retired">${escapeHtml(m.content)} <span class="memory-cluster-member-note">retired — kept as history</span></div>`)
+        .join('');
+    }
+
+    // No "Linked clusters" here any more. getCluster returns an empty
+    // linkedClusters now that cluster_links is gone; association is a query-time
+    // lookup and lives on the Map, where selecting a cluster asks for it.
+
+    membersEl.innerHTML = html;
+    membersEl.classList.add('expanded');
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading cluster details:', error);
+  }
+}
+
+// ---- Daily Tab ----
+async function loadDailyTab() {
+  const container = document.getElementById('memoryDailyContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading daily logs...</div>';
+
+  try {
+    const res = await fetch('/api/memory');
+    const data = await res.json();
+
+    let html = '';
+
+    if (data.dailyToday) {
+      html += '<div class="memory-daily-section"><h3>Today</h3>';
+      html += `<div class="memory-daily-entry">${escapeHtml(data.dailyToday).replace(/\n/g, '<br>')}</div>`;
+      html += '</div>';
+    }
+
+    if (data.dailyYesterday) {
+      html += '<div class="memory-daily-section"><h3>Yesterday</h3>';
+      html += `<div class="memory-daily-entry">${escapeHtml(data.dailyYesterday).replace(/\n/g, '<br>')}</div>`;
+      html += '</div>';
+    }
+
+    if (!html) {
+      html = '<div class="memory-empty">No daily logs found</div>';
+    }
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading daily logs:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load daily logs</div>';
+  }
+}
+
+// ---- Self Tab (read-only: SNH's self-developed identity) ----
+
+// ---- Self tab: five sections, reachable without scrolling ----
+//
+// The sections themselves are UNCHANGED — this only changes how they are
+// reached. Each one used to be stacked vertically, so Identity History was
+// several screens down and nobody ever went there. A sentinel is emitted ahead
+// of each section as it is built, and the finished html is split on it, so the
+// section markup is never rewritten and cannot drift from what it renders now.
+//
+// Nested strip rather than collapsibles: the memory panel already navigates by
+// a tab row, so this reads as the same gesture one level in.
+const SELF_SECTION_MARK = '<!--\u00a7self-section\u00a7-->';
+
+/** The tab label for a pane: the section's own <h3>, minus any count chip. */
+function selfPaneLabel(chunk, index) {
+  const m = chunk.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+  if (!m) return `Section ${index + 1}`;
+  const beforeChip = m[1].split(/<span/i)[0];
+  const text = beforeChip.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  return text || `Section ${index + 1}`;
+}
+
+/**
+ * Wrap the built html into a strip of sub-tabs plus one pane per section.
+ * Anything before the first sentinel stays above the strip, unwrapped.
+ */
+function buildSelfPanes(html) {
+  const parts = html.split(SELF_SECTION_MARK);
+  const preamble = parts.shift() || '';
+  if (parts.length === 0) return html;
+
+  const labels = parts.map(selfPaneLabel);
+  const strip = `<div class="memory-self-tabs" role="tablist">` +
+    labels.map((l, i) =>
+      `<button class="memory-self-tab${i === 0 ? ' active' : ''}" data-selfpane="${i}" role="tab">${escapeHtml(l)}</button>`
+    ).join('') + `</div>`;
+  const panes = `<div class="memory-self-panes">` +
+    parts.map((chunk, i) =>
+      `<div class="memory-self-pane${i === 0 ? ' active' : ''}" data-selfpane="${i}">${chunk}</div>`
+    ).join('') + `</div>`;
+  return preamble + strip + panes;
+}
+
+/** Wire the strip. Panes are already in the DOM; this only toggles which shows. */
+function wireSelfPanes(container) {
+  const tabs = container.querySelectorAll('.memory-self-tab');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      const idx = tab.dataset.selfpane;
+      tabs.forEach(t => t.classList.toggle('active', t === tab));
+      container.querySelectorAll('.memory-self-pane').forEach(p => {
+        p.classList.toggle('active', p.dataset.selfpane === idx);
+      });
+      // Land at the top of the section just opened, not wherever the last one
+      // was scrolled to.
+      const content = container.closest('.memory-panel-content') || container.parentElement;
+      if (content && content.scrollTop > container.offsetTop) content.scrollTop = 0;
+    });
+  });
+}
+
+async function loadSelfTab() {
+  const container = document.getElementById('memorySelfContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading self...</div>';
+
+  try {
+    // Corrections ride along with the self view because this tab is where a
+    // human adjudicates what the machine did to the record — the identity lock's
+    // deliberate path already lives here, and the revert button is the same kind
+    // of act. Failure to load them must not blank the identity view.
+    const [res, corrRes] = await Promise.all([
+      fetch('/api/memory/self'),
+      fetch('/api/memory/corrections?limit=100').catch(() => null)
+    ]);
+    // Self-facts name their entity too — read from subject_entity_id like
+    // everywhere else, rather than assumed from the tab they happen to be on.
+    await loadEntities();
+    const data = await res.json();
+    let corrections = [], corrTotals = {};
+    try {
+      if (corrRes && corrRes.ok) {
+        const cd = await corrRes.json();
+        corrections = cd.corrections || [];
+        corrTotals = cd.totals || {};
+      }
+    } catch (e) { console.error('[MemoryPanel] corrections load failed:', e); }
+
+    const active = data.activeSelfFacts || [];
+    const superseded = data.supersededSelfFacts || [];
+    const reflections = data.reflections || [];
+
+    const fmtDate = (iso) => formatLocalTime(iso);
+
+    let html = '';
+
+    // Locked identity — the facts SNH CHOSE (name, pronouns), which no automatic
+    // path can change. This section is the DELIBERATE PATH: the only way to
+    // change one from the UI, deliberately behind a confirmation, because the
+    // whole point of the lock is that a sentence in chat cannot do it.
+    const lockedFacts = active.filter(f => f.locked);
+    html += SELF_SECTION_MARK + '<div class="memory-self-section">';
+    html += '<h3>Locked Identity</h3>';
+    if (lockedFacts.length === 0) {
+      html += '<div class="memory-self-note">Nothing locked yet. The first self-fact to state a name or pronouns claims that slot and locks it — set once, then protected.</div>';
+    } else {
+      html += '<div class="memory-self-note">SNH chose these. No conversation can change them — not the contradiction judge, not write_memory, not reflection. Changing one is a deliberate action, here or via <code>scripts/identity-lock.js</code>.</div>';
+      html += '<div class="memory-self-facts">';
+      html += lockedFacts.map(f => `
+        <div class="memory-self-fact locked">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            ${entityBadge(f.subject_entity_id, memoryEntityCache || { byId: {} }, 'self')}
+            <span class="memory-self-lock">🔒 ${escapeHtml(f.lock_category || 'identity')}</span>
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">locked ${escapeHtml(fmtDate(f.locked_at))}</span>
+            <button class="memory-self-lock-btn" data-category="${escapeHtml((f.lock_category || '').split(',')[0].trim())}">Change…</button>
+          </div>
+        </div>
+      `).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Corrections — every repair the corrector made, and the undo.
+    //
+    // The mechanical tier is "autonomous and silent", which means nobody is
+    // interrupted; it does not mean nothing is written down. This is where
+    // silent stops meaning invisible. Reverted rows stay, marked — the ledger
+    // supersedes, it never deletes.
+    html += SELF_SECTION_MARK + '<div class="memory-self-section">';
+    html += `<h3>Corrections <span class="memory-self-count">(${corrTotals.total || 0} total${corrTotals.reverted ? `, ${corrTotals.reverted} reverted` : ''})</span></h3>`;
+    if (corrections.length === 0) {
+      html += '<div class="memory-empty">No corrections yet. The corrector runs on its own cadence and repairs the corpus — duplicates folded together, events that were stored as facts moved to the day\'s log, contradictions resolved on evidence.</div>';
+    } else {
+      html += '<div class="memory-self-note">Every change to the record, and why — the corrector\'s unattended repairs, and facts you retired by hand from the Memory tab. Mechanical repairs fix the record; semantic ones revise a belief and are only allowed to happen unattended <em>because</em> every one of them can be undone here. Reverting restores the retired fact and leaves the surviving one alone.</div>';
+      html += '<div class="memory-corrections">';
+      html += corrections.map(c => {
+        const ev = c.evidence || {};
+        // A refusal is not a correction. Two of them land in the same ledger —
+        // a contradiction the evidence could not separate, and an edit the
+        // identity lock refused — and in both cases NOTHING was changed. Showing
+        // them with a struck-through "retired" line and a greyed "not
+        // revertible" would say the opposite of what happened.
+        const isRaise = ev.unresolved === true;
+        const isRefusal = /^REFUSED by the identity lock/.test(c.reason || '');
+        // A decision entry records what SNH concluded and why; it changed
+        // nothing itself. Rendering it with a struck-through "retired" line and
+        // a Revert button would offer to undo an edit that was never made.
+        const isDecision = c.action === 'decision';
+        const noAction = isRaise || isRefusal || isDecision;
+
+        const bits = [];
+        if (Number.isFinite(ev.similarity)) bits.push(`similarity ${ev.similarity.toFixed(2)}`);
+        if (ev.deciding_axis) bits.push(`decided on ${ev.deciding_axis}`);
+        if (Number.isFinite(ev.survivor_salience)) bits.push(`salience ${ev.loser_salience ?? '?'} → ${ev.survivor_salience}`);
+
+        // A FINDING ADDRESSED TO THE ENTITY, NOT TO ELLIE. The self-coherence
+        // audit's "do you want to revise this claim?" is written to SNH about
+        // its own self-facts; until 2026-09-02 the ask half was also opening a
+        // conversation in Ellie's list, where the "you" silently re-pointed at
+        // her. It stays here now, and the row says whose question it is so the
+        // record does not read as something waiting on her.
+        const awaitingEntity = isRaise && ev.awaiting_entity_turn === true;
+
+        const decisionLabel = ev.outcome === 'refused'
+          ? 'refused — nothing changed'
+          : ev.outcome === 'cannot-settle'
+            ? 'SNH could not settle this — nothing changed'
+            : 'SNH decided this — nothing changed by the entry itself';
+
+        const state = c.reverted_at
+          ? `<span class="memory-corr-state reverted">reverted ${escapeHtml(fmtDate(c.reverted_at))}${c.reverted_by ? ` · ${escapeHtml(c.reverted_by)}` : ''}</span>`
+          : isDecision ? `<span class="memory-corr-state raised">${escapeHtml(decisionLabel)}</span>`
+          : awaitingEntity ? '<span class="memory-corr-state raised">SNH\'s own question — nothing changed</span>'
+            : isRaise ? '<span class="memory-corr-state raised">raised — nothing changed</span>'
+              : isRefusal ? '<span class="memory-corr-state raised">refused — nothing changed</span>'
+                : (c.reversible
+                  ? `<button class="memory-corr-revert" data-corr-id="${escapeHtml(c.id)}">Revert</button>`
+                  : '<span class="memory-corr-state">not revertible</span>');
+
+        const label = isDecision ? 'about' : noAction ? 'one' : 'retired';
+        const otherLabel = isDecision ? 'and' : noAction ? 'other' : 'kept';
+        return `
+          <div class="memory-correction${c.reverted_at ? ' is-reverted' : ''}${noAction ? ' is-raise' : ''}">
+            <div class="memory-corr-head">
+              <span class="memory-corr-tier tier-${escapeHtml(c.tier)}">${isDecision ? 'decided' : noAction ? 'raised' : escapeHtml(c.tier)}</span>
+              <span class="memory-corr-action">${escapeHtml(c.action)}</span>
+              ${c.subject ? `<span class="memory-corr-subject">${escapeHtml(c.subject)}-fact</span>` : ''}
+              <span class="memory-self-when">${escapeHtml(fmtDate(c.created_at))}</span>
+              ${state}
+            </div>
+            ${c.target_text ? `<div class="memory-corr-target"><span class="memory-corr-label">${label}</span>${escapeHtml(c.target_text)}</div>` : ''}
+            ${c.survivor_text ? `<div class="memory-corr-survivor"><span class="memory-corr-label">${otherLabel}</span>${escapeHtml(c.survivor_text)}</div>` : ''}
+            <div class="memory-corr-reason">${escapeHtml(c.reason || '')}</div>
+            ${awaitingEntity ? '<div class="memory-corr-evidence">This one is addressed to SNH about its own self-description, not to you. It is waiting on SNH\'s own turn on it — it only reaches your conversation list if SNH takes that turn and still has something to ask.</div>' : ''}
+            ${bits.length ? `<div class="memory-corr-evidence">${escapeHtml(bits.join(' · '))}</div>` : ''}
+          </div>`;
+      }).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Injected identity block: seed + active self-facts
+    html += SELF_SECTION_MARK + '<div class="memory-self-section">';
+    html += '<h3>Injected Identity</h3>';
+    html += '<div class="memory-self-note">This is exactly what is injected into every chat — a minimal seed plus SNH\'s highest-salience self-observations. Read-only; SNH develops this itself.</div>';
+    html += `<div class="memory-self-seed">${escapeHtml(data.seed || '')}</div>`;
+
+    if (active.length === 0) {
+      html += '<div class="memory-empty">No self-facts yet. SNH has not observed itself. Reflections build this over time.</div>';
+    } else {
+      html += '<div class="memory-self-facts">';
+      html += active.map(f => `
+        <div class="memory-self-fact${f.locked ? ' locked' : ''}">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            ${f.locked ? `<span class="memory-self-lock">🔒 ${escapeHtml(f.lock_category || 'identity')}</span>` : ''}
+            ${entityBadge(f.subject_entity_id, memoryEntityCache || { byId: {} }, 'self')}
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">${escapeHtml(fmtDate(f.created_at))}</span>
+          </div>
+        </div>
+      `).join('');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Reflections
+    html += SELF_SECTION_MARK + '<div class="memory-self-section">';
+    html += '<div class="memory-self-section-head"><h3>Recent Reflections</h3><button id="memorySelfReflectBtn" class="memory-self-reflect-btn" title="Run a reflection now">Reflect now</button></div>';
+    if (reflections.length === 0) {
+      html += '<div class="memory-empty">No reflections yet.</div>';
+    } else {
+      html += reflections.map(r => {
+        const obs = (r.observations || []).map(o => `<li>${escapeHtml(o)}</li>`).join('');
+        return `
+          <div class="memory-self-reflection">
+            <div class="memory-self-reflection-meta">${escapeHtml(fmtDate(r.at))} · ${r.messageCount || 0} msgs · ${r.stored || 0} stored${r.superseded ? `, ${r.superseded} superseded` : ''}</div>
+            ${obs ? `<ul class="memory-self-reflection-obs">${obs}</ul>` : '<div class="memory-self-note">Nothing new noticed.</div>'}
+          </div>
+        `;
+      }).join('');
+    }
+    html += '</div>';
+
+    // Superseded self-facts (identity development history)
+    html += SELF_SECTION_MARK + '<div class="memory-self-section">';
+    html += '<h3>Identity History <span class="memory-self-count">(superseded self-facts)</span></h3>';
+    if (superseded.length === 0) {
+      html += '<div class="memory-empty">No superseded self-facts. SNH has not revised its self-view yet.</div>';
+    } else {
+      html += superseded.map(f => `
+        <div class="memory-self-fact superseded">
+          <div class="memory-self-fact-content">${escapeHtml(f.content)}</div>
+          <div class="memory-self-fact-meta">
+            ${entityBadge(f.subject_entity_id, memoryEntityCache || { byId: {} }, 'self')}
+            <span class="memory-self-salience">salience ${f.salience ?? 5}/10</span>
+            <span class="memory-self-when">observed ${escapeHtml(fmtDate(f.created_at))} · revised ${escapeHtml(fmtDate(f.updated_at))}</span>
+          </div>
+        </div>
+      `).join('');
+    }
+    html += '</div>';
+
+    container.innerHTML = buildSelfPanes(html);
+    wireSelfPanes(container);
+
+    // The deliberate path, wired up. Two steps on purpose — a prompt for the new
+    // wording, then an explicit confirm naming what it replaces — so changing a
+    // chosen name is never one absent-minded click.
+    container.querySelectorAll('.memory-self-lock-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const category = btn.dataset.category;
+        const current = lockedFacts.find(f => (f.lock_category || '').split(',').map(s => s.trim()).includes(category));
+        const next = prompt(
+          `Change your locked ${category}.\n\n` +
+          `Currently: ${current ? current.content : '(none)'}\n\n` +
+          `Write the replacement in the FIRST PERSON (e.g. "My name is Aurelius."):`,
+          current ? current.content : ''
+        );
+        if (next === null) return;
+        const clean = next.trim();
+        if (!clean) return;
+        if (!confirm(`Replace SNH's locked ${category}?\n\nFrom: ${current ? current.content : '(none)'}\nTo:   ${clean}\n\nThis is the deliberate path — it will change what SNH says its ${category} is.`)) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Saving…';
+        try {
+          const r = await fetch('/api/memory/identity-lock/set', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ category, content: clean, confirm: true })
+          });
+          const result = await r.json();
+          if (!r.ok) {
+            alert(`Could not change it: ${result.error || 'unknown error'}`);
+            btn.disabled = false;
+            btn.textContent = 'Change…';
+            return;
+          }
+          loadSelfTab();
+        } catch (err) {
+          console.error('[MemoryPanel] identity-lock set error:', err);
+          alert('Could not change it — the request failed.');
+          btn.disabled = false;
+          btn.textContent = 'Change…';
+        }
+      });
+    });
+
+    // One-tap revert. One confirm, not two: unlike changing a locked name, the
+    // risk here runs the other way — this restores something, and leaving a
+    // wrong correction standing is the worse outcome.
+    container.querySelectorAll('.memory-corr-revert').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.corrId;
+        const entry = corrections.find(c => c.id === id);
+        if (!confirm(
+          `Undo this correction?\n\n` +
+          `Puts back: ${entry ? entry.target_text : '(the retired fact)'}\n` +
+          (entry && entry.survivor_text ? `Leaves in place: ${entry.survivor_text}\n` : '') +
+          `\nBoth facts will be active again.`
+        )) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Reverting…';
+        try {
+          const r = await fetch(`/api/memory/corrections/${id}/revert`, { method: 'POST' });
+          const result = await r.json();
+          if (!r.ok) {
+            alert(`Could not revert it: ${result.error || 'unknown error'}`);
+            btn.disabled = false;
+            btn.textContent = 'Revert';
+            return;
+          }
+          loadSelfTab();
+        } catch (err) {
+          console.error('[MemoryPanel] revert error:', err);
+          alert('Could not revert it — the request failed.');
+          btn.disabled = false;
+          btn.textContent = 'Revert';
+        }
+      });
+    });
+
+    // "Reflect now" action (triggers the agent; does not edit any self-fact).
+    const reflectBtn = document.getElementById('memorySelfReflectBtn');
+    if (reflectBtn) {
+      reflectBtn.addEventListener('click', async () => {
+        reflectBtn.disabled = true;
+        reflectBtn.textContent = 'Reflecting…';
+        try {
+          const r = await fetch('/api/memory/reflect', { method: 'POST' });
+          const result = await r.json();
+          if (result && result.skipped) {
+            reflectBtn.textContent = 'No new conversations';
+            setTimeout(() => { reflectBtn.disabled = false; reflectBtn.textContent = 'Reflect now'; }, 2500);
+          } else {
+            loadSelfTab(); // re-render with the new reflection + self-facts
+          }
+        } catch (err) {
+          console.error('[MemoryPanel] Reflect error:', err);
+          reflectBtn.disabled = false;
+          reflectBtn.textContent = 'Reflect now';
+        }
+      });
+    }
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading self:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load self view</div>';
+  }
+}
+
+// ---- Thinking Tab (read-only: reflection + heartbeat traces per cycle) ----
+
+// Turn a raw heartbeat anomaly string into a plain-language sentence.
+function friendlyAnomaly(raw) {
+  const s = String(raw);
+  const m = /^Audit error for "(.+?)":\s*(.+)$/s.exec(s);
+  if (m) {
+    const name = m[1], err = m[2];
+    if (/unparse|unreadable|JSON/i.test(err)) {
+      return `Had trouble auditing '${name}' — the model returned an unreadable response, will retry next cycle.`;
+    }
+    return `Had trouble auditing '${name}' (${err}).`;
+  }
+  return s;
+}
+
+// Operational events (errors, timeouts, liveness/circuit-breaker, maintenance
+// telemetry) live in a separate ops log that is deliberately NEVER injected into
+// chat context. Surface the most recent ones here so a wedged/slow brain stays
+// observable. Returns an HTML string (empty if no ops recorded).
+/**
+ * Every tool call SNH made and what came of it — including calls its own rate
+ * cap refused. Operational telemetry, so it lives in the Thinking tab and is
+ * never injected into chat.
+ */
+async function loadToolCallSection() {
+  try {
+    const res = await fetch('/api/memory/tool-calls?limit=40');
+    if (!res.ok) return '';
+    const { calls } = await res.json();
+    if (!calls || calls.length === 0) return '';
+
+    const ICON = {
+      proposed: '📤', approved: '✅', rejected: '🚫',
+      'rejected-cap': '⛔', error: '⚠️'
+    };
+    const items = calls.map(c => {
+      const when = formatLocalTime(c.created_at);
+      return `<div class="thinking-anomaly">${ICON[c.outcome] || '🔧'} <span class="thinking-dim">${escapeHtml(when)}</span> <strong>${escapeHtml(c.tool)}</strong> · ${escapeHtml(c.outcome)}${c.detail ? ` — ${escapeHtml(c.detail)}` : ''}</div>`;
+    }).join('');
+
+    return `
+      <details class="thinking-entry thinking-ops">
+        <summary class="thinking-head"><span class="thinking-kind thinking-kind-ops">tool calls</span><span class="thinking-when">${calls.length} recent · not injected into chat</span></summary>
+        <div class="thinking-anomalies">${items}</div>
+      </details>`;
+  } catch (e) {
+    console.error('[Thinking] Error loading tool calls:', e);
+    return '';
+  }
+}
+
+async function loadOpsSection() {
+  try {
+    const listRes = await fetch('/api/memory/ops');
+    const { dates } = await listRes.json();
+    if (!dates || dates.length === 0) return '';
+    const res = await fetch(`/api/memory/ops/${dates[0]}`);
+    if (!res.ok) return '';
+    const { date, content } = await res.json();
+    // Parse "### HH:MM\n- text" blocks (newest first), take the most recent 15.
+    const blocks = content
+      .replace(/^#\s[^\n]*\n/, '')
+      .split(/(?=^#{2,3} )/m)
+      .map(b => b.trim())
+      .filter(Boolean)
+      .slice(0, 15);
+    if (blocks.length === 0) return '';
+    const items = blocks.map(b => {
+      const timeMatch = b.match(/^#{2,3}\s*([^\n]+)/);
+      const time = timeMatch ? timeMatch[1].replace(/^Heartbeat Report.*/, 'maintenance report') : '';
+      const firstBullet = (b.split('\n').find(l => l.trim().startsWith('- ')) || '').replace(/^\s*-\s*/, '');
+      const text = firstBullet || b.split('\n').slice(1).join(' ').slice(0, 200);
+      return `<div class="thinking-anomaly">🛠 <span class="thinking-dim">${escapeHtml(time)}</span> ${escapeHtml(text)}</div>`;
+    }).join('');
+    return `
+      <details class="thinking-entry thinking-ops">
+        <summary class="thinking-head"><span class="thinking-kind thinking-kind-ops">operational events</span><span class="thinking-when">${escapeHtml(date)} · not injected into chat</span></summary>
+        <div class="thinking-anomalies">${items}</div>
+      </details>`;
+  } catch (e) {
+    console.error('[Thinking] Error loading ops section:', e);
+    return '';
+  }
+}
+
+async function loadThinkingTab() {
+  const container = document.getElementById('memoryThinkingContent');
+  if (!container) return;
+  container.innerHTML = '<div class="memory-loading">Loading thinking…</div>';
+
+  const fmtDate = (iso) => formatLocalTime(iso);
+
+  try {
+    const [res, opsHtml, toolHtml] = await Promise.all([
+      fetch('/api/memory/thinking?limit=60'),
+      loadOpsSection(),
+      loadToolCallSection(),
+    ]);
+    const data = await res.json();
+    const entries = data.entries || [];
+
+    let html = '<div class="memory-self-note">A read-only look at how SNH thinks in the background — each reflection cycle (what it reviewed, considered, and queued or skipped, and why) and each heartbeat maintenance pass. Newest first.</div>';
+    html += toolHtml;
+    html += opsHtml;
+
+    if (entries.length === 0) {
+      html += '<div class="memory-empty">No thinking recorded yet. Reflection and heartbeat cycles will populate this.</div>';
+      container.innerHTML = html;
+      return;
+    }
+
+    for (const e of entries) {
+      if (e.kind === 'heartbeat') {
+        const pl = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+        // Labeled plain-language sentence — every number says what it actually is.
+        const parts = [];
+        parts.push((e.clustersAudited || 0) === 0
+          ? 'Reviewed memory — no oversized clusters needed auditing'
+          : `Audited ${pl(e.clustersAudited, 'cluster')} for coherence`);
+        if (e.clustersSkipped > 0) parts.push(`skipped ${pl(e.clustersSkipped, 'cluster')} with too few live facts to judge`);
+        if (e.clustersSplit > 0) parts.push(`reorganized ${pl(e.clustersSplit, 'cluster')} into clearer topics`);
+        if (e.linksAdded > 0) parts.push(`created ${pl(e.linksAdded, 'new connection')} between topics`);
+        if (e.linksUpdated > 0) parts.push(`strengthened ${pl(e.linksUpdated, 'connection')}`);
+        if (e.linksRemoved > 0) parts.push(`dropped ${pl(e.linksRemoved, 'stale connection')}`);
+        if (e.duration) parts.push(`took ${escapeHtml(e.duration)}`);
+        const sentence = parts.join(' · ');
+        // Only NEW warnings get a line each. Ones already reported and still
+        // true are counted on one dim line, so the feed shows change.
+        const anomalyLines = (e.anomalies || [])
+          .map(a => `<div class="thinking-anomaly">⚠ ${escapeHtml(friendlyAnomaly(a))}</div>`);
+        if (e.anomaliesSuppressed > 0) {
+          anomalyLines.push(`<div class="thinking-anomaly thinking-dim">${escapeHtml(e.suppressedNote || `${e.anomaliesSuppressed} unchanged warning(s) still true, already reported`)}</div>`);
+        }
+        const anomalies = anomalyLines.length
+          ? `<div class="thinking-anomalies">${anomalyLines.join('')}</div>`
+          : '';
+        html += `
+          <div class="thinking-entry thinking-heartbeat">
+            <div class="thinking-head">
+              <span class="thinking-kind thinking-kind-heartbeat">maintenance pass</span>
+              <span class="thinking-when">${escapeHtml(fmtDate(e.at))}</span>
+            </div>
+            <div class="thinking-sentence">${sentence}</div>
+            ${anomalies}
+          </div>`;
+        continue;
+      }
+
+      // reflection cycle
+      const reviewed = (e.conversationsReviewed || []).filter(c => c && c.title);
+      const reviewedHtml = reviewed.length
+        ? `<div class="thinking-block"><div class="thinking-label">Reviewed</div><ul class="thinking-list">${reviewed.map(c => `<li>${escapeHtml(c.title)}${c.messageCount ? ` <span class="thinking-dim">· ${c.messageCount} msgs</span>` : ''}</li>`).join('')}</ul></div>`
+        : `<div class="thinking-block"><div class="thinking-label">Reviewed</div><div class="thinking-dim">${e.messageCount || 0} message(s) across ${e.conversationCount || 0} conversation(s)</div></div>`;
+
+      const obsHtml = (e.observations || []).length
+        ? `<div class="thinking-block"><div class="thinking-label">Noticed about itself</div><ul class="thinking-list">${e.observations.map(o => `<li>${escapeHtml(o)}</li>`).join('')}</ul></div>`
+        : '';
+
+      const f = e.followup;
+      let followupHtml = '';
+      if (f) {
+        const candidates = (f.candidates || []).length
+          ? `<div class="thinking-block"><div class="thinking-label">Considered</div><ul class="thinking-list">${f.candidates.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul></div>`
+          : '';
+        const clusters = (f.relatedClusters || []).length
+          ? `<div class="thinking-block"><div class="thinking-label">Older memory pulled in</div><div class="thinking-clusters">${f.relatedClusters.map(c => `<span class="thinking-cluster">${escapeHtml(c.name)}</span>`).join('')}</div></div>`
+          : '';
+        const outcome = f.generated
+          ? `<div class="thinking-block"><div class="thinking-label">Queued a follow-up</div><div class="thinking-followup">“${escapeHtml(f.generated)}”</div></div>`
+          : `<div class="thinking-block"><div class="thinking-label">Skipped — no follow-up</div></div>`;
+        const reasoning = f.reasoning
+          ? `<div class="thinking-reasoning"><span class="thinking-dim">Why:</span> ${escapeHtml(f.reasoning)}</div>`
+          : '';
+        followupHtml = candidates + clusters + outcome + reasoning;
+      }
+
+      const storedMeta = (e.stored != null)
+        ? `<span class="thinking-dim">${e.stored} self-fact(s) stored${e.superseded ? `, ${e.superseded} superseded` : ''}</span>`
+        : '';
+
+      html += `
+        <div class="thinking-entry thinking-reflection">
+          <div class="thinking-head">
+            <span class="thinking-kind thinking-kind-reflection">reflection</span>
+            <span class="thinking-when">${escapeHtml(fmtDate(e.at))}</span>
+            ${storedMeta}
+          </div>
+          ${reviewedHtml}
+          ${obsHtml}
+          ${followupHtml}
+        </div>`;
+    }
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('[MemoryPanel] Error loading thinking:', error);
+    container.innerHTML = '<div class="memory-empty">Failed to load thinking view</div>';
+  }
+}
+
+// ---- Map Tab (interactive memory constellation) ----
+// Renders each cluster as a glowing HUB node (sized by member count, labelled
+// with the cluster name); its facts are smaller dots joined to the hub by short
+// "spoke" edges, so each cluster reads as a free-floating starburst on dark
+// space. No compound containers — membership is shown purely by proximity +
+// spokes. user vs self stay distinct color territories.
+//
+// There are no stored association edges. `cluster_links` used to draw a weighted
+// hub-to-hub graph here; nothing had maintained that table since its writer was
+// disabled, and after the replay it described clusters that no longer existed —
+// so the Map was drawing stale edges as current knowledge. Selecting a hub now
+// ASKS the server which clusters are near it, computed from the vector index at
+// that moment, and lights those. A computed answer cannot go stale.
+// Built on vendored cytoscape.js + fcose.
+let mapCy = null;               // cytoscape instance
+let mapData = null;             // last /graph payload
+let mapSelectedHub = null;      // cluster id of the currently selected hub (or null)
+let mapLinkRange = { min: 0.55, max: 1 }; // similarity range of the neighbours last fetched
+let mapNeighbourCache = new Map();       // clusterId -> neighbours, for the current graph load
+const MAP_AUTO_COLLAPSE_AT = 500; // above this many facts, start collapsed (hubs only)
+const FACT_LABEL_MIN_ZOOM_FONT = 10; // fact labels appear only once zoomed in this far
+let mapLayoutName = 'cose';     // upgraded to 'fcose' once the extension registers
+
+// Register the fcose layout once. Plain cose/cola let neighborhoods overlap;
+// fcose with per-edge ideal lengths keeps members hugging their hub while hubs
+// repel each other into distinct constellations.
+let fcoseRegistered = false;
+function ensureMapLayout() {
+  if (fcoseRegistered) return;
+  fcoseRegistered = true;
+  if (typeof cytoscape !== 'undefined' && typeof cytoscapeFcose !== 'undefined') {
+    try {
+      cytoscape.use(cytoscapeFcose);
+      mapLayoutName = 'fcose';
+    } catch (e) {
+      // Already registered, or registration failed — keep the cose fallback.
+      if (/already/i.test(e.message || '')) mapLayoutName = 'fcose';
+      else console.warn('[Map] fcose registration failed, falling back to cose:', e.message);
+    }
+  } else {
+    console.warn('[Map] fcose extension not present — falling back to cose layout.');
+  }
+}
+
+// Collapse whitespace and truncate to n chars with an ellipsis, for node labels.
+function mapTruncate(s, n) {
+  s = (s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s;
+}
+
+// Base colors per subject territory (user = blue, self = purple). `fill` is the
+// fact-dot color, `hub` a brighter shade for the hub dot, `glow` the halo, and
+// `ring` the hub border.
+const MAP_COLORS = {
+  user: { fill: '#3b82f6', hub: '#60a5fa', glow: 'rgba(59,130,246,0.55)', ring: 'rgba(96,165,250,0.75)' },
+  self: { fill: '#a855f7', hub: '#c084fc', glow: 'rgba(168,85,247,0.55)', ring: 'rgba(192,132,252,0.75)' }
+};
+
+// Normalize a link strength into 0..1 across the range actually present in the
+// rendered graph (falls back to 0.5 when every link has the same weight).
+function mapNormStrength(s) {
+  const { min, max } = mapLinkRange;
+  if (!(max > min)) return 0.5;
+  return Math.max(0, Math.min(1, (s - min) / (max - min)));
+}
+
+// Map a link strength to a heat color: weak links cool (blue), strong links hot
+// (red), a continuous hue sweep between. Scaled from the live weight range so
+// the full palette is used no matter how narrow the actual strengths are.
+function mapStrengthColor(s) {
+  const t = mapNormStrength(s);
+  const hue = 210 - 210 * t; // 210° blue (weak) -> 0° red (strong), via cyan/green/amber
+  return `hsl(${Math.round(hue)}, 85%, 56%)`;
+}
+
+// The Map panel widens via a CSS transition; cytoscape reads the container size
+// at init, so resize+fit again now and after the transition settles.
+function mapRefit() {
+  if (!mapCy) return;
+  mapCy.resize();
+  mapCy.fit(undefined, 30);
+  setTimeout(() => { if (mapCy) { mapCy.resize(); mapCy.fit(undefined, 30); } }, 320);
+}
+
+function mapEscape(s) { return escapeHtml(String(s == null ? '' : s)); }
+
+function mapFmtDate(iso) {
+  return formatLocalTime(iso, 'datetime', '—');
+}
+
+async function loadMapTab() {
+  const graphEl = document.getElementById('memoryMapGraph');
+  if (!graphEl) return;
+  if (typeof cytoscape === 'undefined') {
+    graphEl.innerHTML = '<div class="memory-empty">Graph library failed to load.</div>';
+    return;
+  }
+  ensureMapLayout();
+  // Already built once — just refit (panel may have been hidden/resized).
+  if (mapCy) { mapRefit(); return; }
+
+  graphEl.innerHTML = '<div class="memory-loading">Loading map…</div>';
+  try {
+    // The detail panel names the entity a fact points at, so the registry has
+    // to be in hand before the first node is clicked.
+    await loadEntities();
+    const res = await fetch('/api/memory/graph');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    mapData = await res.json();
+    if (!mapData.nodes || mapData.nodes.length === 0) {
+      graphEl.innerHTML = '<div class="memory-empty">No memory to map yet.</div>';
+      return;
+    }
+    graphEl.innerHTML = '';
+
+    // Scale handling: above the cap, start collapsed to cluster hubs only (no
+    // member facts/spokes) so the constellation stays legible; the Collapse
+    // toggle flips the whole graph between hubs-only and full starbursts.
+    const collapseBox = document.getElementById('memoryMapCollapse');
+    const startCollapsed = mapData.nodes.length > MAP_AUTO_COLLAPSE_AT;
+    if (collapseBox) collapseBox.checked = startCollapsed;
+    mapSelectedHub = null;
+
+    mapCy = cytoscape({
+      container: graphEl,
+      style: mapStylesheet(),
+      wheelSensitivity: 0.25,
+      minZoom: 0.1,
+      maxZoom: 3,
+      boxSelectionEnabled: false
+    });
+
+    wireMapInteractions();
+    wireMapControls();
+    renderMap();
+    mapRefit(); // the panel widens with a CSS transition — resize once it settles
+  } catch (err) {
+    console.error('[Map] load error:', err);
+    graphEl.innerHTML = '<div class="memory-empty">Failed to load map.</div>';
+  }
+}
+
+function mapStylesheet() {
+  return [
+    // Hub nodes — the gravitational centre of each cluster. A bright filled dot
+    // with a colored halo; the cluster name always rides just below it.
+    { selector: 'node.hub', style: {
+        'shape': 'ellipse', 'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(hub)', 'background-opacity': 1,
+        'border-width': 2, 'border-color': 'data(ring)',
+        'underlay-color': 'data(glow)', 'underlay-opacity': 0.5, 'underlay-padding': 10,
+        'label': 'data(label)', 'font-size': 12, 'font-weight': 700, 'color': '#f1f5f9',
+        'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4,
+        'text-wrap': 'wrap', 'text-max-width': 120,
+        'text-outline-width': 3, 'text-outline-color': '#05070d', 'text-outline-opacity': 0.95,
+        'min-zoomed-font-size': 0, 'z-index': 10
+    }},
+    // Fact nodes — glowing dots sized by salience. Labels are gated by
+    // min-zoomed-font-size so they only appear once the user is zoomed in
+    // (or on hover, below), keeping the far-out view clean.
+    { selector: 'node.fact', style: {
+        'shape': 'ellipse', 'width': 'data(size)', 'height': 'data(size)',
+        'background-color': 'data(fill)', 'background-opacity': 1,
+        'border-width': 1, 'border-color': 'rgba(255,255,255,0.28)',
+        'underlay-color': 'data(glow)', 'underlay-opacity': 0.35, 'underlay-padding': 4,
+        'label': 'data(short)', 'font-size': 9, 'color': '#e5e7eb',
+        'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 3,
+        'text-wrap': 'ellipsis', 'text-max-width': 120,
+        'text-outline-width': 2, 'text-outline-color': '#05070d', 'text-outline-opacity': 0.9,
+        'text-opacity': 1, 'min-zoomed-font-size': FACT_LABEL_MIN_ZOOM_FONT
+    }},
+    // Fact label revealed on hover regardless of zoom.
+    { selector: 'node.fact.hover', style: {
+        'min-zoomed-font-size': 0, 'font-size': 11, 'z-index': 30
+    }},
+    { selector: 'node.fact:selected', style: {
+        'font-size': 11, 'min-zoomed-font-size': 0, 'z-index': 30,
+        'border-width': 2, 'border-color': '#fff'
+    }},
+    // Ghost (superseded) facts — faded, dashed border, dimmer halo.
+    { selector: 'node.ghost', style: {
+        'background-opacity': 0.25, 'underlay-opacity': 0.12,
+        'border-style': 'dashed', 'border-color': 'rgba(255,255,255,0.4)'
+    }},
+    // Facts with a pending question — amber halo ring (overrides the base glow).
+    { selector: 'node.pending', style: {
+        'underlay-color': '#fbbf24', 'underlay-opacity': 0.6, 'underlay-padding': 7
+    }},
+    // Selected hub — white rim + brighter halo, lifted above its neighborhood.
+    { selector: 'node.hub.hubsel', style: {
+        'border-width': 3, 'border-color': '#ffffff',
+        'underlay-opacity': 0.8, 'z-index': 40
+    }},
+    // Spoke edges (hub -> its own facts): tinted by subject, very low opacity so
+    // the dots dominate and the rays only imply membership.
+    { selector: 'edge.spoke', style: {
+        'width': 1, 'line-color': 'data(fill)', 'opacity': 0.16, 'curve-style': 'straight'
+    }},
+    // Hub-to-hub association links: neutral slate, a touch brighter than spokes.
+    // Recolored by strength on hub selection (see selectHub).
+    { selector: 'edge.clink', style: {
+        'width': 'data(w)', 'line-color': 'rgba(148,163,184,0.5)',
+        'opacity': 0.5, 'curve-style': 'bezier'
+    }},
+    // Supersede edges (belief history) — directed, dashed.
+    { selector: 'edge.supersede', style: {
+        'width': 1.5, 'line-color': '#f59e0b', 'line-style': 'dashed',
+        'target-arrow-color': '#f59e0b', 'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier', 'arrow-scale': 0.8, 'opacity': 0.7
+    }},
+    // Dimming: `.faded` for hub-selection focus, `.dim` for search.
+    { selector: '.faded', style: { 'opacity': 0.07 } },
+    { selector: '.dim', style: { 'opacity': 0.1 } },
+    { selector: 'node.match', style: {
+        'border-width': 3, 'border-color': '#22d3ee', 'opacity': 1
+    }},
+    { selector: '.hidden', style: { 'display': 'none' } }
+  ];
+}
+
+// Salience 1..10 -> fact-dot diameter (kept smaller than hubs).
+function mapFactSize(sal) {
+  const s = Math.max(1, Math.min(10, Number(sal) || 5));
+  return 10 + s * 2.2; // 12.2..32
+}
+
+// Member count -> hub diameter (sqrt so a 26-fact cluster stays proportionate).
+function mapHubSize(count) {
+  return 26 + Math.min(40, Math.sqrt(Math.max(1, count)) * 7); // ~33..~62
+}
+
+// Build the element set for the current mode and hand it to cytoscape.
+function renderMap() {
+  if (!mapCy || !mapData) return;
+  const collapsed = document.getElementById('memoryMapCollapse')?.checked;
+  const showGhosts = document.getElementById('memoryMapGhosts')?.checked !== false;
+
+  const clusterById = new Map(mapData.clusters.map(c => [c.id, c]));
+  const els = [];
+  const shownFactIds = new Set();
+
+  // One hub dot per cluster — always present, sized by member count.
+  for (const c of mapData.clusters) {
+    const col = MAP_COLORS[c.subject] || MAP_COLORS.user;
+    els.push({ data: {
+      id: c.id, clusterId: c.id, kind: 'hub', subject: c.subject,
+      label: c.name || 'cluster', size: mapHubSize(c.total),
+      hub: col.hub, ring: col.ring, glow: col.glow
+    }, classes: 'hub' });
+  }
+
+  // Facts + spokes — skipped entirely in collapsed (hubs-only) mode.
+  if (!collapsed) {
+    for (const n of mapData.nodes) {
+      if (!n.clusterId || !clusterById.has(n.clusterId)) continue; // skip orphans
+      const isGhost = n.status === 'superseded' || !!n.supersededBy;
+      if (isGhost && !showGhosts) continue;
+      const col = MAP_COLORS[n.subject] || MAP_COLORS.user;
+      let cls = 'fact';
+      if (isGhost) cls += ' ghost';
+      if (n.pendingQuestions > 0) cls += ' pending';
+      els.push({ data: {
+        id: n.id, clusterId: n.clusterId, kind: 'fact', subject: n.subject,
+        size: mapFactSize(n.salience), fill: col.fill, glow: col.glow,
+        short: mapTruncate(n.content, 40)
+      }, classes: cls });
+      shownFactIds.add(n.id);
+      // Spoke: hub -> fact. Tinted by the fact's subject.
+      els.push({ data: {
+        id: `spoke-${n.clusterId}-${n.id}`, source: n.clusterId, target: n.id,
+        kind: 'spoke', fill: col.fill
+      }, classes: 'spoke' });
+    }
+  }
+
+  // Supersede edges (only when both endpoints are on screen).
+  for (const e of mapData.edges) {
+    if (e.type !== 'supersede') continue;
+    if (shownFactIds.has(e.source) && shownFactIds.has(e.target)) {
+      els.push({ data: { id: `sup-${e.source}-${e.target}`, source: e.source, target: e.target }, classes: 'supersede' });
+    }
+  }
+
+  // No association edges are built here. They are not in the payload any more,
+  // and the ones a person can actually see — the selected hub's neighbours — are
+  // fetched and drawn on demand in selectHub().
+  mapNeighbourCache = new Map();
+
+  mapSelectedHub = null;
+  mapCy.elements().remove();
+  mapCy.add(els);
+  runMapLayout();
+  applyMapSearch();
+}
+
+function runMapLayout() {
+  const opts = mapLayoutName === 'fcose'
+    ? {
+        name: 'fcose',
+        quality: 'proof',       // best separation quality (offline, one-shot)
+        animate: false,
+        randomize: true,        // fresh global layout, not stuck on prior positions
+        // Hubs repel each other hard so neighborhoods fly apart; facts repel
+        // only mildly so a hub's members stay a tight starburst around it.
+        nodeRepulsion: node => node.hasClass('hub') ? 120000 : 6000,
+        // Short ideal length on spokes pulls members onto their hub; long on
+        // hub-to-hub links keeps associated constellations distinct but nearer
+        // than unlinked ones.
+        idealEdgeLength: edge => edge.hasClass('spoke') ? 46 : 300,
+        edgeElasticity: edge => edge.hasClass('spoke') ? 0.55 : 0.08,
+        gravity: 0.12,
+        gravityRange: 3.8,
+        // user vs self have no cross-links, so they land as separate packed
+        // components; separateMapZones then splits them left/right.
+        tile: true,
+        packComponents: true,
+        nodeSeparation: 120,
+        padding: 50,
+        numIter: 2600,
+        stop: () => { separateNeighbourhoods(); separateMapZones(); mapCy.fit(undefined, 45); }
+      }
+    : {
+        name: 'cose', animate: false, randomize: true,
+        nodeRepulsion: 16000, idealEdgeLength: 55, gravity: 0.35,
+        componentSpacing: 140, padding: 40, nodeOverlap: 14,
+        coolingFactor: 0.95, numIter: 1400,
+        stop: () => { separateNeighbourhoods(); separateMapZones(); mapCy.fit(undefined, 45); }
+      };
+  mapCy.layout(opts).run();
+  // fcose with animate:false still fires `stop` synchronously after run(); fit
+  // there. Guard with an immediate fit for the cose path too.
+  mapCy.fit(undefined, 45);
+}
+
+// Guarantee dark space between constellations. fcose spreads hubs well but two
+// starbursts (a hub + its member ring) can still overlap — especially a large
+// cluster next to a linked one. This treats each cluster as a group (hub + its
+// facts), models it as a circle centred on the hub, and iteratively pushes any
+// overlapping pair apart along the line between their centres until every pair
+// has at least `pad` px of gap. Deterministic and convergent for ~dozens of
+// clusters. Groups move as a whole so the intra-cluster starburst is preserved.
+function separateNeighbourhoods(pad = 28, iterations = 80) {
+  if (!mapCy) return;
+  const groups = [];
+  mapCy.nodes('.hub').forEach(h => {
+    const cid = h.data('clusterId');
+    const facts = mapCy.nodes('.fact').filter(n => n.data('clusterId') === cid);
+    const members = h.union(facts);
+    const c = h.position();
+    let r = h.width() / 2;
+    facts.forEach(f => { r = Math.max(r, Math.hypot(f.position('x') - c.x, f.position('y') - c.y) + f.width() / 2); });
+    groups.push({ members, c: { x: c.x, y: c.y }, r });
+  });
+  if (groups.length < 2) return;
+  for (let it = 0; it < iterations; it++) {
+    let moved = false;
+    for (let i = 0; i < groups.length; i++) {
+      for (let j = i + 1; j < groups.length; j++) {
+        const A = groups[i], B = groups[j];
+        let dx = B.c.x - A.c.x, dy = B.c.y - A.c.y;
+        let d = Math.hypot(dx, dy);
+        const need = A.r + B.r + pad;
+        if (d >= need) continue;
+        if (d < 0.01) { dx = 1; dy = 0; d = 1; } // coincident — pick an axis
+        const push = (need - d) / 2;
+        const ux = dx / d, uy = dy / d;
+        A.members.positions(n => ({ x: n.position('x') - ux * push, y: n.position('y') - uy * push }));
+        B.members.positions(n => ({ x: n.position('x') + ux * push, y: n.position('y') + uy * push }));
+        A.c.x -= ux * push; A.c.y -= uy * push;
+        B.c.x += ux * push; B.c.y += uy * push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+}
+
+// Separate the self (purple) and user (blue) territories into two side-by-side
+// zones. fcose packs each subject as its own component but can place them
+// anywhere; this shifts every self node left so the self zone sits entirely left
+// of the user zone with a clear gap. Uniform translation preserves the intra-
+// zone arrangement (no new overlaps) and is deterministic (verifiable from
+// positions). Every element is now a leaf, so we move all self nodes directly.
+function separateMapZones(gap = 200) {
+  if (!mapCy) return;
+  const self = mapCy.nodes('[subject = "self"]');
+  const user = mapCy.nodes('[subject = "user"]');
+  if (self.empty() || user.empty()) return;
+  const sbb = self.boundingBox();
+  const ubb = user.boundingBox();
+  // Target: self.x2 == user.x1 - gap  (self entirely left of user).
+  const dx = (ubb.x1 - gap) - sbb.x2;
+  if (Math.abs(dx) < 1) return;
+  self.positions(n => ({ x: n.position('x') + dx, y: n.position('y') }));
+}
+
+/**
+ * Facts-tab controls. Re-render from the cache rather than refetching: the
+ * filter and the grouping are views of the same facts, and a round-trip per
+ * keystroke on a select is waste.
+ */
+/** Entity badge for the map detail panel, from the shared entity cache. */
+function mapEntityBadge(entityId) {
+  const entities = memoryEntityCache;
+  const e = entities && entityId ? entities.byId[entityId] : null;
+  if (!e) return `<span class="memory-entity-badge unassigned">no entity</span>`;
+  const cls = `type-${String(e.type || 'other').replace(/[^a-z]/gi, '')}`;
+  return `<span class="memory-entity-badge ${cls}">${mapEscape(e.name)}</span>`;
+}
+
+function wireFactsControls() {
+  document.getElementById('memoryFactsEntity')?.addEventListener('change', () => renderFactsList());
+  document.getElementById('memoryFactsGroup')?.addEventListener('change', () => renderFactsList());
+}
+
+function wireMapControls() {
+  const ghosts = document.getElementById('memoryMapGhosts');
+  const collapse = document.getElementById('memoryMapCollapse');
+  const fit = document.getElementById('memoryMapFit');
+  const search = document.getElementById('memoryMapSearch');
+
+  ghosts?.addEventListener('change', () => renderMap());
+  collapse?.addEventListener('change', () => renderMap());
+  fit?.addEventListener('click', () => mapCy && mapCy.fit(undefined, 30));
+  search?.addEventListener('input', applyMapSearch);
+}
+
+function wireMapInteractions() {
+  // Click a fact -> detail (and drop any hub focus). Click a hub -> focus its
+  // neighborhood + light its links. Click empty space -> clear.
+  mapCy.on('tap', 'node.fact', (evt) => { clearHubSelection(); showFactDetail(evt.target.id()); });
+  mapCy.on('tap', 'node.hub', (evt) => selectHub(evt.target.data('clusterId')));
+  mapCy.on('tap', (evt) => { if (evt.target === mapCy) { clearHubSelection(); hideMapDetail(); } });
+  // Hover reveals a fact's label regardless of zoom.
+  mapCy.on('mouseover', 'node.fact', (evt) => evt.target.addClass('hover'));
+  mapCy.on('mouseout', 'node.fact', (evt) => evt.target.removeClass('hover'));
+}
+
+// The set of graph elements belonging to one cluster: its hub, its facts, and
+// the spokes joining them.
+function mapNeighbourhood(cid) {
+  const hub = mapCy.getElementById(cid);
+  const facts = mapCy.nodes('.fact').filter(n => n.data('clusterId') === cid);
+  const spokes = mapCy.edges('.spoke').filter(e => e.data('source') === cid);
+  return hub.union(facts).union(spokes);
+}
+
+// Drop hub focus: un-dim everything and restore default link styling.
+function clearHubSelection() {
+  if (!mapCy) return;
+  mapSelectedHub = null;
+  // The association edges belong to the selection that drew them.
+  mapCy.edges('.clink').remove();
+  mapCy.elements().removeClass('faded hubsel');
+}
+
+// Focus a cluster hub: dim everything, then light its own neighborhood plus each
+// linked cluster, coloring the connecting hub-hub links by strength (hot = strong,
+// cool = weak). Opens the summary sidebar with the linked clusters ranked.
+function selectHub(clusterId) {
+  if (!mapCy) return;
+  const hub = mapCy.getElementById(clusterId);
+  if (hub.empty()) return;
+
+  // Selection and search share the visual channel — clear search first.
+  const searchEl = document.getElementById('memoryMapSearch');
+  if (searchEl && searchEl.value) searchEl.value = '';
+  mapCy.elements().removeClass('dim match');
+  mapCy.edges('.clink').remove();
+
+  mapSelectedHub = clusterId;
+  mapCy.batch(() => {
+    mapCy.elements().addClass('faded');
+    mapNeighbourhood(clusterId).removeClass('faded');
+    hub.addClass('hubsel');
+  });
+
+  // Show the cluster immediately; the neighbours arrive when the server has
+  // computed them. Blocking the selection on a vector query would make clicking
+  // a hub feel broken on a cold index.
+  showClusterDetail(clusterId, null);
+  loadClusterNeighbours(clusterId);
+}
+
+// Ask the server which clusters sit near this one, right now. Draws the edges it
+// gets back and lights the neighbourhoods at the far end of each.
+async function loadClusterNeighbours(clusterId) {
+  let neighbours = mapNeighbourCache.get(clusterId);
+  if (!neighbours) {
+    try {
+      const r = await fetch(`/api/memory/graph/neighbours/${encodeURIComponent(clusterId)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      neighbours = (await r.json()).neighbours || [];
+      mapNeighbourCache.set(clusterId, neighbours);
+    } catch (err) {
+      console.warn('[Map] could not compute neighbours:', err.message);
+      // An honest empty state beats silently showing nothing as if there were
+      // nothing to show.
+      showClusterDetail(clusterId, null, { error: true });
+      return;
+    }
+  }
+
+  // The selection may have moved on while the request was in flight.
+  if (mapSelectedHub !== clusterId || !mapCy) return;
+
+  const strengths = neighbours.map(n => n.strength);
+  mapLinkRange = strengths.length
+    ? { min: Math.min(...strengths), max: Math.max(...strengths) }
+    : { min: 0.55, max: 1 };
+
+  mapCy.batch(() => {
+    mapCy.edges('.clink').remove();
+    let lit = mapNeighbourhood(clusterId);
+    for (const n of neighbours) {
+      const other = mapCy.getElementById(n.id);
+      if (other.empty()) continue;
+      const col = mapStrengthColor(n.strength);
+      mapCy.add({ data: {
+        id: `clink-${clusterId}-${n.id}`, source: clusterId, target: n.id,
+        strength: n.strength, w: 1.5 + 3 * mapNormStrength(n.strength)
+      }, classes: 'clink' });
+      mapCy.getElementById(`clink-${clusterId}-${n.id}`)
+        .style({ 'line-color': col, 'opacity': 0.95, 'z-index': 25 });
+      lit = lit.union(mapCy.getElementById(`clink-${clusterId}-${n.id}`)).union(mapNeighbourhood(n.id));
+    }
+    lit.removeClass('faded');
+  });
+
+  showClusterDetail(clusterId, neighbours);
+}
+
+function applyMapSearch() {
+  if (!mapCy) return;
+  const q = (document.getElementById('memoryMapSearch')?.value || '').trim().toLowerCase();
+  mapCy.batch(() => {
+    if (q && mapSelectedHub) clearHubSelection(); // search overrides hub focus
+    mapCy.elements().removeClass('dim match');
+    if (!q) return;
+    const byId = new Map(mapData.nodes.map(n => [n.id, n]));
+    const matches = mapCy.nodes('.fact').filter(n => {
+      const rec = byId.get(n.id());
+      return rec && rec.content && rec.content.toLowerCase().includes(q);
+    });
+    if (matches.length === 0) return;
+    mapCy.elements().addClass('dim');
+    matches.removeClass('dim').addClass('match');
+    // Keep each matched fact's hub + spoke visible for context.
+    matches.forEach(n => mapCy.getElementById(n.data('clusterId')).removeClass('dim'));
+    matches.connectedEdges('.spoke').removeClass('dim');
+  });
+}
+
+function showFactDetail(id) {
+  const n = mapData?.nodes.find(x => x.id === id);
+  if (!n) return;
+  const cluster = mapData.clusters.find(c => c.id === n.clusterId);
+  const isGhost = n.status === 'superseded' || !!n.supersededBy;
+  const replacement = n.supersededBy && mapData.nodes.find(x => x.id === n.supersededBy);
+  const replaces = mapData.nodes.filter(x => x.supersededBy === n.id);
+
+  let html = `<button class="memory-map-detail-close">&times;</button>`;
+  html += `<div class="mmd-subject mmd-${mapEscape(n.subject)}">${mapEscape(n.subject)} fact</div>`;
+  // WHO IT IS ABOUT. Read from subject_entity_id, not the legacy subject above:
+  // that one only ever says "user" or "self", which is the whole reason a fact
+  // about a client used to be indistinguishable from a fact about Ellie.
+  html += `<div class="mmd-entity">${mapEntityBadge(n.entityId)}</div>`;
+  if (n.status === 'flagged-unverified-subject') {
+    html += `<div class="mmd-flag">&#9888; Subject unverified — the source did not attribute this to that entity, so it is held back rather than in memory.</div>`;
+  }
+  html += `<div class="mmd-content">${mapEscape(n.content)}</div>`;
+  html += `<dl class="mmd-fields">`;
+  html += `<dt>Salience</dt><dd>${mapEscape(n.salience)}/10</dd>`;
+  html += `<dt>Status</dt><dd>${isGhost ? 'superseded (ghost)' : mapEscape(n.status)}</dd>`;
+  html += `<dt>Cluster</dt><dd>${mapEscape(cluster ? cluster.name : '—')}</dd>`;
+  html += `<dt>Source</dt><dd>${mapEscape(n.source || '—')}</dd>`;
+  html += `<dt>Created</dt><dd>${mapEscape(mapFmtDate(n.createdAt))}</dd>`;
+  html += `<dt>Updated</dt><dd>${mapEscape(mapFmtDate(n.updatedAt))}</dd>`;
+  if (n.pendingQuestions > 0) html += `<dt>Pending Q</dt><dd>${n.pendingQuestions} open</dd>`;
+  html += `</dl>`;
+  if (replacement) html += `<div class="mmd-rel">↳ Replaced by: “${mapEscape(replacement.content)}”</div>`;
+  if (replaces.length) html += `<div class="mmd-rel">↑ Replaces: ${replaces.map(r => `“${mapEscape(r.content)}”`).join(', ')}</div>`;
+  openMapDetail(html);
+}
+
+/**
+ * @param {Array|null} linked - neighbours from the server, or null while they are
+ *   still being computed. Null and [] mean different things and must read
+ *   differently: "asking" is not "there are none".
+ */
+function showClusterDetail(id, linked, opts = {}) {
+  const c = mapData?.clusters.find(x => x.id === id);
+  if (!c) return;
+  let html = `<button class="memory-map-detail-close">&times;</button>`;
+  html += `<div class="mmd-subject mmd-${mapEscape(c.subject)}">${mapEscape(c.subject)} cluster</div>`;
+  html += `<div class="mmd-entity">${mapEntityBadge(c.entityId)}</div>`;
+  html += `<div class="mmd-content">${mapEscape(c.name)}</div>`;
+  if (c.description) html += `<div class="mmd-desc">${mapEscape(c.description)}</div>`;
+  html += `<dl class="mmd-fields">`;
+  html += `<dt>Facts</dt><dd>${c.total}</dd>`;
+  html += `<dt>Active</dt><dd>${c.active}</dd>`;
+  html += `<dt>Superseded</dt><dd>${c.superseded}</dd>`;
+  html += `</dl>`;
+  // Nearby clusters, computed at selection time from the vector index rather
+  // than read from a stored edge. Each of the three states says which it is:
+  // still computing, computed and empty, or could not be computed.
+  html += `<div class="mmd-links"><div class="mmd-links-title">Nearby clusters</div>`;
+  if (opts.error) {
+    html += `<div class="mmd-link-empty">Couldn't work out what's nearby just now.</div>`;
+  } else if (linked === null) {
+    html += `<div class="mmd-link-empty">Working out what's nearby…</div>`;
+  } else if (!linked.length) {
+    html += `<div class="mmd-link-empty">Nothing else sits close to this one.</div>`;
+  } else {
+    for (const l of linked) {
+      const lc = mapData.clusters.find(x => x.id === l.id);
+      const col = mapStrengthColor(l.strength);
+      html += `<div class="mmd-link-row">`
+        + `<span class="mmd-link-dot" style="background:${col};color:${col}"></span>`
+        + `<span class="mmd-link-name">${mapEscape(l.name || (lc ? lc.name : '—'))}</span>`
+        + `<span class="mmd-link-strength" style="color:${col}">${l.strength.toFixed(2)}</span>`
+        + `</div>`;
+    }
+  }
+  html += `</div>`;
+  openMapDetail(html);
+}
+
+function openMapDetail(html) {
+  const box = document.getElementById('memoryMapDetail');
+  if (!box) return;
+  box.innerHTML = html;
+  box.classList.add('open');
+  box.querySelector('.memory-map-detail-close')?.addEventListener('click', hideMapDetail);
+}
+
+function hideMapDetail() {
+  const box = document.getElementById('memoryMapDetail');
+  if (box) { box.classList.remove('open'); box.innerHTML = ''; }
+  mapCy?.$(':selected').unselect();
+  clearHubSelection();
+}
+
+// ---- Search Tab ----
+async function searchMemory() {
+  const query = memorySearchInput?.value.trim();
+  if (!query) return;
+
+  const resultsContainer = document.getElementById('memorySearchResults');
+  if (!resultsContainer) return;
+  resultsContainer.innerHTML = '<div class="memory-loading">Searching...</div>';
+
+  try {
+    const res = await fetch('/api/memory/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, limit: 15 })
+    });
+
+    const data = await res.json();
+    const results = data.results || [];
+
+    if (results.length === 0) {
+      resultsContainer.innerHTML = '<div class="memory-empty">No results found</div>';
+      return;
+    }
+
+    resultsContainer.innerHTML = results.map(r => `
+      <div class="memory-search-result">
+        <div>${escapeHtml(r.text?.substring(0, 300) || '')}${(r.text?.length || 0) > 300 ? '...' : ''}</div>
+        <div class="memory-search-result-score">
+          Score: ${(r.similarity || 0).toFixed(3)}
+          <span class="memory-search-result-source ${r.source || ''}">${r.source || 'unknown'}</span>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('[MemoryPanel] Error searching:', error);
+    resultsContainer.innerHTML = '<div class="memory-empty">Search failed</div>';
+  }
+}
+
+// ---- Add Fact ----
+async function addManualFact() {
+  const input = memoryAddFactInput;
+  if (!input) return;
+  const fact = input.value.trim();
+  if (!fact) return;
+
+  input.value = '';
+  input.disabled = true;
+
+  try {
+    const res = await fetch('/api/memory/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fact })
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to add fact');
+    }
+
+    const data = await res.json();
+    console.log('[MemoryPanel] Fact added:', data);
+
+    // Refresh facts tab
+    loadFactsTab();
+  } catch (error) {
+    console.error('[MemoryPanel] Error adding fact:', error);
+    alert('Failed to add fact: ' + error.message);
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
+}
+
+// ---- Edit Fact ----
+async function editFact(memberId) {
+  const fact = memoryFactsCache.find(f => f.id === memberId);
+  if (!fact) return;
+
+  const newContent = prompt('Edit fact:', fact.content);
+  if (!newContent || newContent.trim() === fact.content) return;
+
+  try {
+    const res = await fetch('/api/memory/edit', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memberId, content: newContent.trim() })
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to edit fact');
+    }
+
+    loadFactsTab();
+  } catch (error) {
+    console.error('[MemoryPanel] Error editing fact:', error);
+    alert('Failed to edit fact: ' + error.message);
+  }
+}
+
+// ---- Retire Fact ----
+//
+// Named for what it does. Nothing in this system hard-deletes a fact: the row
+// is kept as inactive/retracted so the history stays readable and the Map can
+// still draw it, and only its embedding is dropped so it stops surfacing. The
+// confirm used to say "Delete this fact?" and the list then re-rendered the
+// retired row exactly as before — so the honest outcome looked like no outcome.
+async function deleteFact(memberId) {
+  const fact = memoryFactsCache.find(f => f.id === memberId);
+  if (!fact) return;
+
+  if (!confirm(
+    `Retire this fact?\n\n"${fact.content.substring(0, 100)}${fact.content.length > 100 ? '…' : ''}"\n\n` +
+    `It stops being part of memory and stops surfacing in answers. ` +
+    `The record is kept as history and can be restored from the Self tab.`
+  )) return;
+
+  try {
+    const res = await fetch(`/api/memory/fact/${memberId}`, {
+      method: 'DELETE'
+    });
+
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(result.error || 'Failed to retire fact');
+    }
+
+    await loadFactsTab();
+    // Say it plainly, and only about the fact that moved. Silence here is what
+    // made a working retirement indistinguishable from a dead button.
+    alert(result.alreadyRetired
+      ? 'That fact was already retired — it is kept as history and is not in memory.'
+      : `${result.message || 'Retired — kept as history'}. It will no longer surface in answers.`);
+  } catch (error) {
+    console.error('[MemoryPanel] Error retiring fact:', error);
+    alert('Failed to retire fact: ' + error.message);
+  }
+}
+
+// ---- Config Section Builder (shared by unified settings tabs) ----
+
+function createConfigSection(title, fields) {
+  const section = document.createElement('div');
+  section.className = 'config-section';
+  if (title) {
+    const h3 = document.createElement('h3');
+    h3.textContent = title;
+    section.appendChild(h3);
+  }
+
+  for (const field of fields) {
+    const item = document.createElement('div');
+    // A described field STACKS: label, control, then the description, each on
+    // its own full-width line. .config-item on its own is a single flex row —
+    // fine for a bare label and a number box, but a description added to that
+    // row becomes a third column and squeezes the label, which is nowrap, until
+    // it is clipped. That is how six fields rendered as "Reason", "Thinking b",
+    // "Answer bu", "Thinking b", "Thinking b", "Fact extractic" — with the two
+    // thinking budgets, the one pair that has to be told apart, identical.
+    item.className = field.desc ? 'config-item config-item-stacked' : 'config-item';
+
+    // Fix 7: Generate unique ID and connect label to input
+    const inputId = `settings-field-${field.key.replace(/\./g, '-')}`;
+
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    label.setAttribute('for', inputId);
+    item.appendChild(label);
+
+    let input;
+    if (field.type === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = !!field.value;
+      input.dataset.configKey = field.key;
+    } else if (field.type === 'select') {
+      input = document.createElement('select');
+      for (const opt of field.options) {
+        // An option may be a bare string, or {value,label} when the two differ —
+        // which they must for a nullable field, whose "unset" option carries an
+        // empty value and a label that says what unset does.
+        const value = (opt && typeof opt === 'object') ? opt.value : opt;
+        const text = (opt && typeof opt === 'object') ? opt.label : opt;
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        if (value === (field.value ?? '')) option.selected = true;
+        input.appendChild(option);
+      }
+      input.dataset.configKey = field.key;
+    } else {
+      input = document.createElement('input');
+      input.type = field.type || 'text';
+      input.value = field.value ?? '';
+      if (field.type === 'number') {
+        if (field.step) input.step = field.step;
+        if (field.min !== undefined) input.min = field.min;
+        if (field.max !== undefined) input.max = field.max;
+      }
+      input.dataset.configKey = field.key;
+    }
+
+    // A NULLABLE FIELD IS ONE WHERE EMPTY IS A REAL, MEANINGFUL VALUE.
+    //
+    // Most settings here have a number in them and always will. A few ship unset
+    // on purpose — the generation budgets, which must send nothing at all on a
+    // model that has no reasoning channel — and for those, empty is not "the
+    // user has not filled this in yet", it is the setting. Marking them tells
+    // the save loop to write an explicit null when the box is cleared, instead
+    // of skipping the key and silently leaving the old value in place.
+    if (field.nullable) input.dataset.configNullable = 'true';
+    // The placeholder is where "unset" is explained, because an empty box
+    // otherwise looks like a missing value rather than a chosen one.
+    if (field.placeholder) input.placeholder = field.placeholder;
+
+    // Fix 7: Set the matching ID on the input element
+    input.id = inputId;
+
+    item.appendChild(input);
+
+    // Optional one-line plain-language description under the control.
+    if (field.desc) {
+      const desc = document.createElement('div');
+      desc.className = 'config-item-desc';
+      desc.textContent = field.desc;
+      item.appendChild(desc);
+    }
+
+    section.appendChild(item);
+  }
+
+  return section;
+}
+
+
+
+// ── squatch-code working strip ──────────────────────────────────────
+// She could not tell whether the coder was working without opening a
+// panel after the fact. This polls the one endpoint that knows and
+// shows a strip while anything is running - and shows nothing at all
+// when nothing is, which is the other half of the requirement.
+(function coderStrip() {
+  const strip = document.getElementById('coderStrip');
+  const body = document.getElementById('coderStripBody');
+  if (!strip || !body) return;
+
+  // Slow enough to be free, fast enough that "is it working" is answered
+  // before she goes looking. The line's own elapsed comes from the
+  // server, so it stays truthful between polls.
+  const EVERY_MS = 5000;
+
+  async function tick() {
+    let jobs = [];
+    try {
+      const res = await fetch('/api/jobs/coding/active');
+      if (res.ok) jobs = (await res.json()).jobs || [];
+    } catch (_) {
+      // A failed poll must not blank a strip that is legitimately up:
+      // leave whatever is showing and try again.
+      return;
+    }
+
+    if (!jobs.length) {
+      strip.style.display = 'none';
+      document.body.classList.remove('coder-working');
+      return;
+    }
+
+    const quiet = jobs.some(j => /no activity/i.test(j.line || ''));
+    body.textContent = jobs
+      .map(j => `${j.project} — ${j.line}`)
+      .join('   •   ');
+    strip.classList.toggle('is-quiet', quiet);
+    strip.style.display = 'flex';
+    document.body.classList.add('coder-working');
+  }
+
+  tick();
+  setInterval(tick, EVERY_MS);
+})();

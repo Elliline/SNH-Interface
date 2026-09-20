@@ -1,0 +1,30 @@
+{
+  "name": "squatch-neuro-hub",
+  "version": "1.0.0",
+  "description": "Squatch Neuro Hub - Neural-linked AI assistant with associative cluster memory, multi-provider support, and heartbeat automation. Part of the Coastal Squatch AI ecosystem.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.6.0",
+    "cytoscape-fcose": "^2.2.0",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.2.1",
+    "vectordb": "^0.4.10"
+  },
+  "keywords": [
+    "squatch-neuro-hub",
+    "coastal-squatch",
+    "ai",
+    "memory",
+    "multi-provider",
+    "ollama",
+    "claude",
+    "msp"
+  ],
+  "author": "MettaSphere LLC",
+  "license": "MIT"
+}

@@ -1,0 +1,3972 @@
+/* Global styles */
+:root {
+  --primary-color: #9E7FFF;
+  --secondary-color: #38bdf8;
+  --accent-color: #f472b6;
+  --background-color: #171717;
+  --surface-color: #262626;
+  --text-color: #FFFFFF;
+  --text-secondary: #A3A3A3;
+  --border-color: #2F2F2F;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --error-color: #ef4444;
+  --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --border-radius: 8px;
+  /* Fix 1: consolidated color variables */
+  --surface-dark: #1e1e1e;
+  --surface-hover: #333333;
+  --surface-mid: #2a2a2a;
+  --primary-hover: #8a66ff;
+  --btn-bg: #374151;
+  --btn-hover: #4b5563;
+  --active-green: #059669;
+  --recording-red: #dc2626;
+  --active-highlight: #2d2540;
+}
+
+/* Fix 10: Focus visible outlines */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 2px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background-color: var(--background-color);
+  color: var(--text-color);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.container {
+  max-width: 1000px;
+  margin: 0 auto;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+}
+
+/* Header styles */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 20px;
+}
+
+.header h1 {
+  font-size: 1.8rem;
+  font-weight: 600;
+  background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.provider-select,
+.model-select {
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 0.9rem;
+  min-width: 150px;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+
+.provider-select:focus,
+.model-select:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.settings-btn {
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.2rem;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+  transform: rotate(90deg);
+}
+
+.new-chat-btn {
+  padding: 8px 16px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 0.2s ease;
+}
+
+.new-chat-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+/* Model Status Bar (SquatchServe) */
+.model-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  margin-top: 10px;
+  font-size: 0.85rem;
+}
+
+.model-status-text {
+  color: var(--text-secondary);
+}
+
+.model-status-text.loaded {
+  color: var(--success-color);
+}
+
+.model-status-bar .vram-info {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-left: auto;
+}
+
+.unload-btn {
+  padding: 4px 10px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--error-color);
+  background-color: transparent;
+  color: var(--error-color);
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.2s ease;
+}
+
+.unload-btn:hover {
+  background-color: var(--error-color);
+  color: var(--text-color);
+}
+
+.unload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Chat container */
+.chat-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 15px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  margin-bottom: 20px;
+  /* Fix 9: Firefox scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary-color) var(--background-color);
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.message {
+  max-width: 80%;
+  padding: 12px 16px;
+  border-radius: var(--border-radius);
+  line-height: 1.5;
+  position: relative;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.message.user {
+  align-self: flex-end;
+  background-color: var(--primary-color);
+  border-bottom-right-radius: 0;
+}
+
+.message.assistant {
+  align-self: flex-start;
+  background-color: var(--surface-color);
+  border-bottom-left-radius: 0;
+}
+
+.message.system {
+  align-self: center;
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  margin: 10px 0;
+  padding: 10px 15px;
+}
+
+.message.error {
+  align-self: center;
+  background-color: var(--error-color);
+  border-radius: var(--border-radius);
+  margin: 10px 0;
+  padding: 10px 15px;
+}
+
+.message-content {
+  font-size: 1rem;
+  word-wrap: break-word;
+}
+
+/* Saved search sources rendered under a message — compact clickable [S#] list. */
+.message-sources {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(127, 127, 127, 0.2);
+  font-size: 0.8rem;
+  line-height: 1.7;
+  opacity: 0.85;
+}
+.message-sources-label {
+  font-weight: 600;
+  margin-right: 4px;
+  opacity: 0.7;
+}
+.msg-source {
+  display: inline-block;
+  margin-right: 8px;
+  color: #4a9eff;
+  text-decoration: none;
+  white-space: nowrap;
+  max-width: 22em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+a.msg-source:hover {
+  text-decoration: underline;
+}
+
+.message-content strong {
+  font-weight: 600;
+}
+
+.message-content em {
+  font-style: italic;
+}
+
+.message-content code {
+  background-color: rgba(255, 255, 255, 0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: monospace;
+}
+
+/* Input area */
+.input-area {
+  display: flex;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.message-input {
+  flex: 1;
+  padding: 12px 16px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 1rem;
+  resize: none;
+  min-height: 50px;
+  max-height: 200px;
+  transition: border-color 0.2s ease;
+}
+
+.message-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.send-btn {
+  padding: 12px 20px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: all 0.2s ease;
+  align-self: flex-end;
+}
+
+.send-btn:hover {
+  background-color: var(--primary-hover);
+  transform: translateY(-2px);
+}
+
+/* Fix 6: Disabled send button */
+.send-btn:disabled,
+.send-btn.btn-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.send-btn:disabled:hover,
+.send-btn.btn-disabled:hover {
+  background-color: var(--primary-color);
+  transform: none;
+}
+
+/* Typing indicator */
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  padding: 10px 15px;
+  background-color: var(--surface-color);
+  border-radius: var(--border-radius);
+  align-self: flex-start;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-color);
+}
+
+.typing-dot {
+  width: 8px;
+  height: 8px;
+  background-color: var(--text-secondary);
+  border-radius: 50%;
+  margin: 0 3px;
+  animation: bounce 1.5s infinite;
+}
+
+.typing-status {
+  margin-left: 10px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  align-self: center;
+}
+.typing-status .typing-hint {
+  color: var(--secondary-color, var(--text-secondary));
+  opacity: 0.9;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+/* Scrollbar styling */
+.chat-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-container::-webkit-scrollbar-track {
+  background: var(--background-color);
+}
+
+.chat-container::-webkit-scrollbar-thumb {
+  background: var(--primary-color);
+  border-radius: 3px;
+}
+
+.chat-container::-webkit-scrollbar-thumb:hover {
+  background: var(--primary-hover);
+}
+
+/* Fix 2: Voice controls — unified button style */
+.mic-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 10px 15px;
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-color);
+}
+
+.mic-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.mic-btn.recording {
+  background-color: var(--recording-red);
+  border-color: var(--recording-red);
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.speaker-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 8px 12px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-color);
+}
+
+.speaker-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.speaker-btn.enabled {
+  background-color: var(--success-color);
+  border-color: var(--success-color);
+}
+
+.convo-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 10px 15px;
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-color);
+}
+
+.convo-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.convo-btn.active {
+  background-color: var(--success-color);
+  border-color: var(--success-color);
+}
+
+.search-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 8px 12px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-color);
+}
+
+.search-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.search-btn.active {
+  background-color: var(--success-color);
+  border-color: var(--success-color);
+}
+
+/* Modal styles */
+.modal {
+  display: none;
+  position: fixed;
+  z-index: 1000;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.7);
+  justify-content: center;
+  align-items: center;
+  animation: fadeIn 0.2s ease;
+}
+
+/* Unified Settings Panel */
+.unified-settings {
+  background-color: var(--surface-color);
+  border-radius: var(--border-radius);
+  width: 90%;
+  max-width: 700px;
+  height: 80vh;
+  max-height: 600px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  animation: slideIn 0.3s ease;
+  overflow: hidden;
+}
+
+.unified-settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.unified-settings-header h2 {
+  margin: 0;
+  font-size: 1.3rem;
+  background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.unified-settings-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.settings-nav {
+  width: 140px;
+  flex-shrink: 0;
+  background-color: var(--background-color);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 8px 0;
+}
+
+.settings-nav-item {
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  border-left: 3px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.9rem;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.settings-nav-item:hover {
+  color: var(--text-color);
+  background-color: rgba(158, 127, 255, 0.1);
+}
+
+.settings-nav-item.active {
+  color: var(--primary-color);
+  border-left-color: var(--primary-color);
+  background-color: rgba(158, 127, 255, 0.08);
+}
+
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  /* Fix 9: Firefox scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary-color) var(--surface-color);
+}
+
+.settings-tab-content {
+  display: none;
+}
+
+.settings-tab-content.active {
+  display: block;
+}
+
+.unified-settings-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
+  gap: 12px;
+}
+
+.unified-settings-footer .config-status {
+  flex: 1;
+  text-align: left;
+  font-size: 0.82rem;
+  margin-top: 0;
+  padding: 0;
+}
+
+/* Settings content scrollbar */
+.settings-content::-webkit-scrollbar {
+  width: 6px;
+}
+.settings-content::-webkit-scrollbar-track {
+  background: var(--surface-color);
+}
+.settings-content::-webkit-scrollbar-thumb {
+  background: var(--primary-color);
+  border-radius: 3px;
+}
+
+/* About tab */
+.about-info {
+  line-height: 1.8;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+.about-info dt {
+  color: var(--text-color);
+  font-weight: 500;
+  margin-top: 12px;
+}
+.about-info dd {
+  margin-left: 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-color);
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 2rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.2s ease;
+  line-height: 1;
+  padding: 0;
+  width: 30px;
+  height: 30px;
+}
+
+.close-btn:hover {
+  color: var(--error-color);
+}
+
+.settings-section {
+  margin-bottom: 20px;
+}
+
+.settings-section h3 {
+  font-size: 1.2rem;
+  margin-bottom: 10px;
+  color: var(--text-color);
+}
+
+.settings-hint {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.setting-item {
+  margin-bottom: 20px;
+}
+
+.setting-item label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-color);
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toggle-row label:first-child {
+  margin-bottom: 0;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 24px;
+  margin-bottom: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 24px;
+  transition: background-color 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 2px;
+  bottom: 2px;
+  background-color: var(--text-secondary);
+  border-radius: 50%;
+  transition: transform 0.2s, background-color 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(22px);
+  background-color: #fff;
+}
+
+.api-key-input-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.api-key-input {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-size: 0.95rem;
+  font-family: monospace;
+  transition: border-color 0.2s ease;
+}
+
+.api-key-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.toggle-visibility-btn {
+  padding: 10px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1rem;
+  transition: all 0.2s ease;
+  min-width: 45px;
+}
+
+.toggle-visibility-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.save-btn {
+  padding: 10px 24px;
+  border-radius: var(--border-radius);
+  border: none;
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.save-btn:hover {
+  background-color: var(--primary-hover);
+  transform: translateY(-2px);
+}
+
+/* ============ Sidebar Styles ============ */
+.sidebar {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 260px;
+  height: 100vh;
+  background-color: var(--surface-dark);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.3s ease, width 0.3s ease;
+  z-index: 100;
+  overflow: hidden;
+}
+
+.sidebar.collapsed {
+  transform: translateX(-260px);
+}
+
+.sidebar-header {
+  padding: 20px 15px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.sidebar-new-chat-btn {
+  width: 100%;
+  padding: 12px 16px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.sidebar-new-chat-btn:hover {
+  background-color: var(--primary-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(158, 127, 255, 0.3);
+}
+
+.conversation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 8px;
+  /* Fix 9: Firefox scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary-color) var(--surface-dark);
+}
+
+.conversation-item {
+  padding: 12px 12px;
+  margin-bottom: 8px;
+  border-radius: var(--border-radius);
+  background-color: var(--surface-mid);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+}
+
+.conversation-item:hover {
+  background-color: var(--surface-hover);
+  border-color: var(--border-color);
+}
+
+.conversation-item.active {
+  background-color: var(--active-highlight);
+  border-color: var(--primary-color);
+}
+
+.conversation-item:hover .conversation-actions {
+  opacity: 1;
+}
+
+.conversation-title {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-color);
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 60px;
+}
+
+.conversation-meta {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.conversation-model {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  background-color: rgba(158, 127, 255, 0.2);
+  border-radius: 4px;
+  color: var(--primary-color);
+  font-size: 0.7rem;
+}
+
+.conversation-timestamp {
+  color: var(--text-secondary);
+}
+
+.conversation-actions {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.conversation-action-btn {
+  padding: 4px 8px;
+  border: none;
+  background-color: rgba(0, 0, 0, 0.4);
+  color: var(--text-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.2s ease;
+}
+
+.conversation-action-btn:hover {
+  background-color: rgba(0, 0, 0, 0.6);
+  color: var(--text-color);
+}
+
+.conversation-action-btn.delete:hover {
+  background-color: var(--error-color);
+  color: white;
+}
+
+.conversation-action-btn.rename:hover {
+  background-color: var(--primary-color);
+  color: white;
+}
+
+/* Sidebar Toggle Button */
+.sidebar-toggle {
+  position: fixed;
+  left: 270px;
+  top: 20px;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 101;
+  transition: all 0.3s ease;
+}
+
+.sidebar-toggle:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.sidebar.collapsed ~ .sidebar-toggle {
+  left: 20px;
+}
+
+/* Main Content Area */
+.main-content {
+  margin-left: 260px;
+  transition: margin-left 0.3s ease;
+  min-height: 100vh;
+}
+
+.main-content.sidebar-collapsed {
+  margin-left: 0;
+}
+
+/* Scrollbar for conversation list */
+.conversation-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.conversation-list::-webkit-scrollbar-track {
+  background: var(--surface-dark);
+}
+
+.conversation-list::-webkit-scrollbar-thumb {
+  background: var(--primary-color);
+  border-radius: 3px;
+}
+
+.conversation-list::-webkit-scrollbar-thumb:hover {
+  background: var(--primary-hover);
+}
+
+/* Empty state for conversation list */
+.conversation-list-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+/* Sidebar Overlay for Mobile */
+.sidebar-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+  display: none;
+}
+
+.sidebar-overlay.active {
+  display: block;
+}
+
+/* Memory context indicator */
+.memory-context-indicator {
+  font-size: 0.75rem;
+  color: var(--primary-color);
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background-color: rgba(158, 127, 255, 0.1);
+  border-radius: var(--border-radius);
+  border-left: 3px solid var(--primary-color);
+}
+
+/* Search results indicator */
+.search-results-indicator {
+  font-size: 0.75rem;
+  color: var(--secondary-color);
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background-color: rgba(56, 189, 248, 0.1);
+  border-radius: var(--border-radius);
+  border-left: 3px solid var(--secondary-color);
+}
+
+/* ============ Memory Panel Styles ============ */
+
+.memory-panel-btn {
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.2rem;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.memory-panel-btn:hover {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+}
+
+.memory-panel {
+  position: fixed;
+  right: 0;
+  top: 0;
+  /* 380px was too cramped to read facts, clusters or the Activity tab in.
+     Scales with the viewport and stops growing on very wide screens. */
+  width: min(620px, 94vw);
+  height: 100vh;
+  background-color: var(--surface-dark);
+  border-left: 1px solid var(--border-color);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+  overflow: hidden;
+}
+
+.memory-panel.open {
+  transform: translateX(0);
+}
+
+/* Map tab needs far more room than the 380px slide-out. */
+.memory-panel.map-mode {
+  width: min(1200px, 96vw);
+  transition: transform 0.3s ease, width 0.25s ease;
+}
+/* Let the Map tab content stretch to fill the panel height. */
+.memory-panel.map-mode .memory-panel-content { display: flex; }
+.memory-panel.map-mode #memoryTabMap.active {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---- Memory Map (graph) ---- */
+.memory-map-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.memory-map-search {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-mid);
+  color: var(--text-color);
+  font-size: 0.85rem;
+}
+.memory-map-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.memory-map-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.memory-map-btn:hover { background: var(--surface-hover); color: var(--text-color); }
+.memory-map-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.memory-map-graph {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(59,130,246,0.06), transparent 60%),
+    radial-gradient(circle at 75% 80%, rgba(168,85,247,0.06), transparent 60%),
+    var(--surface-darker, #0b0f17);
+}
+.memory-map-graph .memory-loading,
+.memory-map-graph .memory-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+/* Slide-in detail sidebar over the graph. */
+.memory-map-detail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 300px;
+  max-width: 80%;
+  height: 100%;
+  background: var(--surface-dark);
+  border-left: 1px solid var(--border-color);
+  padding: 16px;
+  overflow-y: auto;
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+  box-shadow: -8px 0 24px rgba(0,0,0,0.3);
+}
+.memory-map-detail.open { transform: translateX(0); }
+.memory-map-detail-close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 1.3rem;
+  cursor: pointer;
+  line-height: 1;
+}
+.mmd-subject {
+  display: inline-block;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+.mmd-user { background: rgba(59,130,246,0.18); color: #93c5fd; }
+.mmd-self { background: rgba(168,85,247,0.18); color: #d8b4fe; }
+.mmd-content {
+  font-size: 0.95rem;
+  line-height: 1.4;
+  color: var(--text-color);
+  margin-bottom: 10px;
+}
+.mmd-desc { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 10px; }
+.mmd-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 0.8rem;
+  margin: 0 0 10px;
+}
+.mmd-fields dt { color: var(--text-secondary); }
+.mmd-fields dd { margin: 0; color: var(--text-color); }
+.mmd-rel {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-color);
+  padding-top: 8px;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+/* Linked-cluster list in the hub summary — strength-ranked, color-coded. */
+.mmd-links {
+  border-top: 1px solid var(--border-color);
+  padding-top: 10px;
+  margin-top: 4px;
+}
+.mmd-links-title {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.mmd-link-empty {
+  /* Says which of the three states this is — computing, empty, or failed — so an
+     absence never reads as a result. */
+  font-size: 0.82rem;
+  color: var(--text-muted, #94a3b8);
+  font-style: italic;
+  padding: 2px 0;
+}
+
+.mmd-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 0.82rem;
+}
+.mmd-link-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 6px 1px currentColor;
+}
+.mmd-link-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-color);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mmd-link-strength {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+/* Legend chips over the graph. */
+.memory-map-legend {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  display: flex;
+  gap: 12px;
+  padding: 6px 10px;
+  background: rgba(0,0,0,0.45);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  pointer-events: none;
+}
+.memory-map-legend .lg { display: inline-flex; align-items: center; gap: 5px; }
+.memory-map-legend .lg::before {
+  content: '';
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.memory-map-legend .lg-user::before { background: #3b82f6; }
+.memory-map-legend .lg-self::before { background: #a855f7; }
+.memory-map-legend .lg-ghost::before { background: #64748b; opacity: 0.5; }
+.memory-map-legend .lg-pending::before { background: #fbbf24; box-shadow: 0 0 5px 2px rgba(251,191,36,0.6); }
+/* Link-strength ramp: cool (weak) -> hot (strong), matching mapStrengthColor. */
+.memory-map-legend .lg-strength::before { display: none; }
+.memory-map-legend .lg-strength { gap: 6px; }
+.memory-map-legend .lg-strength-bar {
+  width: 46px;
+  height: 8px;
+  border-radius: 4px;
+  display: inline-block;
+  background: linear-gradient(90deg,
+    hsl(210,85%,56%), hsl(140,85%,56%), hsl(60,85%,56%), hsl(0,85%,56%));
+}
+
+.memory-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.memory-panel-header h2 {
+  margin: 0;
+  font-size: 1.3rem;
+  background: linear-gradient(90deg, var(--primary-color), var(--accent-color));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Tabs must all stay reachable. With `flex: 1` on 8 tabs in a 380px panel each
+   got ~47px, so labels truncated and the last tab (Search) was clipped off the
+   edge with no way to reach it. Tabs now keep their natural width and the strip
+   scrolls horizontally instead of crushing them. */
+.memory-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+}
+/* Keep the strip slim — the scrollbar shouldn't eat the tab row. */
+.memory-panel-tabs::-webkit-scrollbar { height: 3px; }
+.memory-panel-tabs::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.memory-tab {
+  flex: 0 0 auto;          /* natural width; scroll rather than shrink */
+  white-space: nowrap;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: color 0.2s ease, background-color 0.2s ease;
+  scroll-snap-align: start;
+}
+
+.memory-tab:hover {
+  color: var(--text-color);
+  background-color: rgba(158, 127, 255, 0.1);
+}
+
+.memory-tab.active {
+  color: var(--primary-color);
+  border-bottom-color: var(--primary-color);
+}
+
+.memory-panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+  /* Fix 9: Firefox scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary-color) var(--surface-dark);
+}
+
+.memory-tab-content {
+  display: none;
+  padding: 12px 16px;
+}
+
+.memory-tab-content.active {
+  display: block;
+}
+
+/* Add fact input */
+.memory-add-fact {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.memory-add-fact input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-size: 0.85rem;
+}
+
+.memory-add-fact input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.memory-add-fact button {
+  padding: 8px 14px;
+  border-radius: var(--border-radius);
+  border: none;
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: bold;
+  transition: background-color 0.2s;
+}
+
+.memory-add-fact button:hover {
+  background-color: var(--primary-hover);
+}
+
+/* Fact items */
+.memory-fact-item {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background-color: var(--surface-color);
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  position: relative;
+  transition: border-color 0.2s;
+}
+
+.memory-fact-item:hover {
+  border-color: var(--primary-color);
+}
+
+/* Retired facts read as history, not as memory. Same treatment as a superseded
+   self-fact, and deliberately without hover actions — there is nothing to edit
+   or delete on a fact that is already out of memory. */
+.memory-facts-retired {
+  margin-top: 18px;
+}
+
+.memory-facts-retired-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}
+
+.memory-fact-item.retired {
+  opacity: 0.6;
+}
+
+.memory-fact-item.retired:hover {
+  border-color: var(--border-color);
+}
+
+.memory-fact-item.retired .memory-fact-content {
+  padding-right: 0;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-fact-retired-note {
+  margin-top: 5px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.memory-fact-item:hover .memory-fact-actions {
+  opacity: 1;
+}
+
+.memory-fact-content {
+  padding-right: 50px;
+  word-break: break-word;
+}
+
+.memory-fact-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.memory-fact-action-btn {
+  padding: 3px 6px;
+  border: none;
+  background-color: rgba(0, 0, 0, 0.4);
+  color: var(--text-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  transition: all 0.2s;
+}
+
+.memory-fact-action-btn:hover {
+  background-color: rgba(0, 0, 0, 0.6);
+  color: var(--text-color);
+}
+
+.memory-fact-action-btn.delete:hover {
+  background-color: var(--error-color);
+  color: white;
+}
+
+/* Cluster items */
+.memory-cluster-item {
+  margin-bottom: 8px;
+  background-color: var(--surface-color);
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+
+.memory-cluster-item:hover {
+  border-color: var(--primary-color);
+}
+
+.memory-cluster-header {
+  padding: 10px 12px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.memory-cluster-name {
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+.memory-cluster-count {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background-color: rgba(158, 127, 255, 0.2);
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.memory-cluster-members {
+  display: none;
+  padding: 0 12px 10px;
+  border-top: 1px solid var(--border-color);
+}
+
+.memory-cluster-members.expanded {
+  display: block;
+}
+
+.memory-cluster-member {
+  padding: 6px 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.memory-cluster-member:last-child {
+  border-bottom: none;
+}
+
+.memory-cluster-member.retired {
+  opacity: 0.55;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-cluster-member-note {
+  text-decoration: none;
+  display: inline-block;
+  font-size: 0.7rem;
+  font-style: italic;
+}
+
+.memory-cluster-linked {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+}
+
+.memory-cluster-linked-title {
+  font-size: 0.75rem;
+  color: var(--primary-color);
+  margin-bottom: 4px;
+}
+
+/* Search */
+.memory-search-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.memory-search-bar input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-size: 0.85rem;
+}
+
+.memory-search-bar input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.memory-search-bar button {
+  padding: 8px 16px;
+  border-radius: var(--border-radius);
+  border: none;
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: background-color 0.2s;
+}
+
+.memory-search-bar button:hover {
+  background-color: var(--primary-hover);
+}
+
+.memory-search-result {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background-color: var(--surface-color);
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+}
+
+.memory-search-result-score {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.memory-search-result-source {
+  display: inline-block;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+}
+
+.memory-search-result-source.vector {
+  background-color: rgba(16, 185, 129, 0.2);
+  color: var(--success-color);
+}
+
+.memory-search-result-source.bm25 {
+  background-color: rgba(245, 158, 11, 0.2);
+  color: var(--warning-color);
+}
+
+.memory-search-result-source.hybrid {
+  background-color: rgba(158, 127, 255, 0.2);
+  color: var(--primary-color);
+}
+
+/* Daily content */
+.memory-daily-content h3 {
+  font-size: 0.95rem;
+  margin: 12px 0 8px;
+  color: var(--primary-color);
+}
+
+.memory-daily-section {
+  margin-bottom: 16px;
+}
+
+.memory-daily-entry {
+  padding: 6px 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+/* Loading state */
+.memory-loading {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 20px;
+  font-size: 0.85rem;
+}
+
+.memory-empty {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 20px;
+  font-size: 0.85rem;
+}
+
+/* ---- Self tab (read-only identity view) ---- */
+.memory-self-section {
+  margin-bottom: 22px;
+}
+
+.memory-self-section h3 {
+  font-size: 0.9rem;
+  margin: 0 0 8px 0;
+  color: var(--text-color);
+}
+
+.memory-self-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.memory-self-section-head h3 { margin: 0; }
+
+.memory-self-count {
+  font-weight: normal;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.memory-self-note {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  margin-bottom: 10px;
+}
+
+.memory-self-seed {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-color);
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-color);
+  background: var(--surface-mid);
+  border-radius: 4px;
+  margin-bottom: 12px;
+  font-style: italic;
+}
+
+.memory-self-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-self-fact {
+  padding: 8px 10px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.memory-self-fact.superseded {
+  opacity: 0.6;
+}
+.memory-self-fact.superseded .memory-self-fact-content {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-secondary);
+}
+
+.memory-self-fact-content {
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--text-color);
+}
+
+.memory-self-fact-meta {
+  display: flex;
+  gap: 10px;
+  margin-top: 5px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.memory-self-salience {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+/* Locked identity facts — the things SNH chose, which no automatic path may
+   change. Marked distinctly so it's obvious at a glance which self-facts are
+   settled and which are still evolving. */
+.memory-self-fact.locked {
+  border-color: var(--accent-color);
+  background: var(--surface-mid);
+}
+
+.memory-self-lock {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.memory-self-lock-btn {
+  margin-left: auto;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-self-lock-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.memory-self-lock-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Corrections — what the corrector did to the record, and the undo it is
+   allowed to act unattended because of. A reverted entry stays visible and
+   greyed rather than disappearing: the ledger supersedes, it never deletes. */
+.memory-corrections {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-correction {
+  padding: 8px 10px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.memory-correction.is-reverted {
+  opacity: 0.55;
+}
+
+.memory-corr-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.memory-corr-tier {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-color);
+}
+/* Mechanical repairs the record; semantic revises a belief. The colour
+   difference is the tier difference — the second one is the one to look at. */
+.memory-corr-tier.tier-mechanical { color: var(--text-secondary); }
+.memory-corr-tier.tier-semantic {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.memory-corr-action { font-weight: 600; color: var(--text-color); }
+
+.memory-corr-target,
+.memory-corr-survivor {
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-color);
+  margin-bottom: 3px;
+}
+.memory-corr-target { text-decoration: line-through; text-decoration-color: var(--text-secondary); }
+/* A raise or a refusal changed nothing, so neither fact is struck through. */
+.memory-correction.is-raise .memory-corr-target { text-decoration: none; }
+
+.memory-corr-label {
+  display: inline-block;
+  min-width: 52px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.memory-corr-reason {
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  margin-top: 5px;
+}
+
+.memory-corr-evidence {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+  font-family: var(--mono-font, monospace);
+}
+
+.memory-corr-state { margin-left: auto; }
+.memory-corr-state.reverted { color: var(--accent-color); }
+.memory-corr-state.raised { color: var(--warning-color); font-weight: 600; }
+
+.memory-corr-revert {
+  margin-left: auto;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-corr-revert:hover:not(:disabled) { background: var(--surface-hover); }
+.memory-corr-revert:disabled { opacity: 0.5; cursor: default; }
+
+.memory-self-reflect-btn {
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-color);
+  cursor: pointer;
+}
+.memory-self-reflect-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.memory-self-reflect-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.memory-self-reflection {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+.memory-self-reflection-meta {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.memory-self-reflection-obs {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-color);
+}
+.memory-self-reflection-obs li {
+  margin: 2px 0;
+}
+
+/* ---- Initiative bell + badge ---- */
+.initiative-btn {
+  position: relative;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: all 0.2s ease;
+}
+.initiative-btn:hover { background-color: var(--surface-hover); }
+.initiative-btn.has-initiatives {
+  border-color: var(--accent-color);
+  animation: initiative-pulse 2s ease-in-out infinite;
+}
+@keyframes initiative-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 180, 60, 0.0); }
+  50% { box-shadow: 0 0 0 3px rgba(255, 180, 60, 0.25); }
+}
+.initiative-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent-color);
+  color: #1a1a1a;
+  font-size: 0.68rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+
+/* ---- SNH-initiated conversation badge ---- */
+.conversation-item.snh-initiated {
+  border-left: 2px solid var(--accent-color);
+}
+.snh-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--accent-color);
+  letter-spacing: 0.02em;
+}
+
+/* ---- Initiative panel ---- */
+.initiative-panel {
+  position: fixed;
+  right: 0;
+  top: 0;
+  width: 360px;
+  max-width: 90vw;
+  height: 100vh;
+  background-color: var(--surface-dark);
+  border-left: 1px solid var(--border-color);
+  z-index: 210;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+  overflow: hidden;
+}
+.initiative-panel.open { transform: translateX(0); }
+.initiative-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.initiative-panel-header h2 {
+  margin: 0;
+  font-size: 1.25rem;
+  background: linear-gradient(90deg, var(--primary-color), var(--accent-color));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.initiative-panel-note {
+  padding: 10px 20px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  border-bottom: 1px solid var(--border-color);
+}
+.initiative-list {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+.initiative-panel-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 209;
+}
+.initiative-panel-overlay.active { display: block; }
+
+.initiative-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-bottom: 10px;
+}
+.initiative-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.initiative-type {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+}
+.initiative-type-alert { color: var(--error-color); }
+.initiative-type-question { color: var(--primary-color); }
+.initiative-type-reflection-insight { color: var(--accent-color); }
+.initiative-time {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  margin-left: auto;
+  margin-right: 8px;
+  white-space: nowrap;
+}
+.initiative-priority {
+  font-size: 0.72rem;
+  color: var(--accent-color);
+  font-weight: 600;
+}
+.initiative-content {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-color);
+  margin-bottom: 8px;
+}
+.initiative-actions {
+  display: flex;
+  gap: 8px;
+}
+.initiative-dismiss,
+.initiative-discuss {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.initiative-dismiss:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-color); }
+.initiative-dismiss:disabled,
+.initiative-discuss:disabled { opacity: 0.5; cursor: default; }
+.initiative-discuss {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+.initiative-discuss:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
+.initiative-type-observation { color: var(--secondary-color); }
+.initiative-type-followup { color: var(--success-color); }
+.initiative-type-proposal { color: var(--accent-color); }
+/* A job result is not a candidate SNH is raising — it is the output of
+   something that already ran, so it reads as a delivered record rather than an
+   ask. */
+.initiative-type-job-result { color: var(--success-color); }
+
+/* Cron proposals: a decision, not a read. Approve is affirmative, Reject is
+   neutral-destructive, and the note under the content states plainly that
+   approving records the job rather than scheduling it. */
+.initiative-note {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  margin: 4px 0 6px;
+}
+.initiative-approve,
+.initiative-reject {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  cursor: pointer;
+}
+.initiative-approve {
+  border-color: var(--success-color);
+  color: var(--success-color);
+}
+.initiative-approve:hover:not(:disabled) { background: var(--success-color); color: #fff; }
+.initiative-reject {
+  border-color: var(--error-color);
+  color: var(--error-color);
+}
+.initiative-reject:hover:not(:disabled) { background: var(--error-color); color: #fff; }
+.initiative-approve:disabled,
+.initiative-reject:disabled { opacity: 0.5; cursor: default; }
+/* A budget ask's bell item has one action: the door to the conversation. */
+.budget-ask-open {
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  border: 1px solid var(--secondary-color);
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--secondary-color);
+  cursor: pointer;
+}
+.budget-ask-open:hover:not(:disabled) { background: var(--secondary-color); color: #fff; }
+
+/* Config item plain-language description */
+.config-item-desc {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+  margin-top: 3px;
+}
+
+/* Initiative panel: Pending / History view toggle */
+.initiative-view-toggle {
+  display: flex;
+  gap: 6px;
+  padding: 10px 16px 0;
+}
+.initiative-view-btn {
+  font-size: 0.74rem;
+  padding: 4px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.initiative-view-btn.active {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+  color: #fff;
+}
+
+/* Initiative history rows (read-only lifecycle) */
+.initiative-status {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  color: var(--text-secondary);
+  margin-left: 8px;
+}
+.initiative-status-pending   { color: var(--warning-color); }
+.initiative-status-delivered { color: var(--success-color); }
+.initiative-status-dismissed { color: var(--text-secondary); }
+.initiative-status-expired   { color: var(--error-color); }
+.initiative-hist .initiative-priority { margin-left: auto; }
+.initiative-hist-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.initiative-when-muted { font-style: italic; opacity: 0.85; }
+
+/* Thinking tab — reflection + heartbeat traces per cycle */
+.memory-thinking-content { padding: 4px 2px 20px; }
+.thinking-entry {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: var(--surface-dark);
+}
+.thinking-reflection { border-left: 3px solid var(--accent-color); }
+.thinking-heartbeat  { border-left: 3px solid var(--secondary-color); }
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.thinking-kind {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface-mid);
+  font-weight: 600;
+}
+.thinking-kind-reflection { color: var(--accent-color); }
+.thinking-kind-heartbeat  { color: var(--secondary-color); }
+.thinking-kind-ops        { color: var(--text-secondary); }
+.thinking-ops { cursor: pointer; }
+.thinking-ops summary { list-style: none; }
+.thinking-ops summary::-webkit-details-marker { display: none; }
+.thinking-when { font-size: 0.72rem; color: var(--text-secondary); }
+.thinking-dur {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+.thinking-block { margin: 8px 0; }
+.thinking-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 3px;
+}
+.thinking-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-color);
+}
+.thinking-list li { margin-bottom: 2px; }
+.thinking-dim { color: var(--text-secondary); font-size: 0.9em; }
+.thinking-followup {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-color);
+  padding: 6px 10px;
+  border-left: 2px solid var(--success-color);
+  background: var(--surface-mid);
+  border-radius: 4px;
+}
+.thinking-reasoning {
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text-color);
+  margin-top: 6px;
+}
+.thinking-clusters { display: flex; flex-wrap: wrap; gap: 6px; }
+.thinking-cluster {
+  font-size: 0.74rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-mid);
+  color: var(--secondary-color);
+  border: 1px solid var(--border-color);
+}
+.thinking-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.8rem;
+  color: var(--text-color);
+}
+.thinking-sentence {
+  font-size: 0.84rem;
+  line-height: 1.5;
+  color: var(--text-color);
+}
+.thinking-anomalies { margin-top: 8px; }
+.thinking-anomaly {
+  font-size: 0.76rem;
+  color: var(--warning-color);
+  line-height: 1.4;
+}
+
+/* Memory panel overlay */
+.memory-panel-overlay {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 199;
+}
+
+.memory-panel-overlay.active {
+  display: block;
+}
+
+/* Memory indicator (persistent, clickable) */
+.memory-indicator-persistent {
+  font-size: 0.75rem;
+  color: var(--primary-color);
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background-color: rgba(158, 127, 255, 0.1);
+  border-radius: var(--border-radius);
+  border-left: 3px solid var(--primary-color);
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.memory-indicator-persistent:hover {
+  background-color: rgba(158, 127, 255, 0.2);
+}
+
+.memory-indicator-details {
+  display: none;
+  margin-top: 4px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.memory-indicator-persistent.expanded .memory-indicator-details {
+  display: block;
+}
+
+/* Config settings (Settings tab in memory panel) */
+.config-settings {
+  padding: 4px 0;
+}
+
+.config-loading {
+  color: var(--text-secondary);
+  font-style: italic;
+  text-align: center;
+  padding: 24px 0;
+}
+
+.config-section {
+  margin-bottom: 20px;
+  border-left: 3px solid var(--primary-color);
+  padding-left: 12px;
+}
+
+.config-section h3 {
+  font-size: 0.9rem;
+  color: var(--primary-color);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.config-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+
+.config-item label {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.config-item input[type="text"],
+.config-item input[type="number"] {
+  flex: 1;
+  max-width: 180px;
+  padding: 5px 8px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-family: monospace;
+  font-size: 0.82rem;
+}
+
+.config-item input[type="text"]:focus,
+.config-item input[type="number"]:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.config-item input[type="checkbox"] {
+  accent-color: var(--primary-color);
+  width: 16px;
+  height: 16px;
+}
+
+.config-item select {
+  flex: 1;
+  max-width: 180px;
+  padding: 5px 8px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-family: monospace;
+  font-size: 0.82rem;
+}
+
+.config-item select:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+/* A described field stacks instead of sitting in one row.
+   .config-item is a flex row built for "label ....... [input]". Adding a
+   description to that row makes it a third column, and because the label is
+   white-space: nowrap with flex-shrink: 1 it gets squeezed to a few characters
+   rather than wrapping — which is what truncated the generation budget labels
+   to "Thinking b" twice over. Stacked, every part gets the full panel width. */
+.config-item-stacked {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+/* The label may now use as many lines as it needs. */
+.config-item-stacked label {
+  white-space: normal;
+  flex-shrink: 0;
+  font-weight: 500;
+  color: var(--text-color);
+}
+
+/* The control is full width here rather than capped at the 180px that suits a
+   right-aligned number box in a row. */
+.config-item-stacked input[type="text"],
+.config-item-stacked input[type="number"],
+.config-item-stacked select {
+  max-width: 100%;
+  width: 100%;
+  flex: none;
+}
+
+.config-item-stacked .config-item-desc {
+  margin-top: 0;
+  max-width: 60ch;
+}
+
+
+.config-save-btn {
+  width: 100%;
+  padding: 10px;
+  margin-top: 16px;
+  border-radius: var(--border-radius);
+  border: none;
+  background-color: var(--primary-color);
+  color: white;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.config-save-btn:hover {
+  background-color: var(--primary-hover);
+}
+
+.config-notice {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  margin-top: 8px;
+  text-align: center;
+}
+
+.config-btn {
+  padding: 8px 16px;
+  cursor: pointer;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #555);
+  background: var(--accent-color, #4a9eff);
+  color: #fff;
+  font-size: 0.9rem;
+  margin-top: 8px;
+  transition: opacity 0.2s;
+}
+
+.config-btn:hover {
+  opacity: 0.85;
+}
+
+.config-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.config-status {
+  text-align: center;
+  padding: 8px;
+  margin-top: 8px;
+  border-radius: var(--border-radius);
+  font-size: 0.82rem;
+}
+
+.config-status.success {
+  color: var(--success-color);
+  background-color: rgba(16, 185, 129, 0.1);
+}
+
+.config-status.error {
+  color: var(--error-color);
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+/* Scrollbar for memory panel */
+.memory-panel-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.memory-panel-content::-webkit-scrollbar-track {
+  background: var(--surface-dark);
+}
+
+.memory-panel-content::-webkit-scrollbar-thumb {
+  background: var(--primary-color);
+  border-radius: 3px;
+}
+
+/* ============ Instance Manager ============ */
+
+.instance-list {
+  margin-bottom: 8px;
+}
+
+.instance-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background-color: var(--background-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  gap: 8px;
+}
+
+.instance-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.instance-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-color);
+}
+
+.instance-host {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-family: monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.instance-model {
+  font-size: 0.75rem;
+  color: var(--primary-color);
+  font-family: monospace;
+}
+
+.instance-delete-btn {
+  padding: 4px 10px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--error-color);
+  background-color: transparent;
+  color: var(--error-color);
+  cursor: pointer;
+  font-size: 0.75rem;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.instance-delete-btn:hover {
+  background-color: var(--error-color);
+  color: white;
+}
+
+.instance-add-form {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.instance-input {
+  padding: 6px 10px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--background-color);
+  color: var(--text-color);
+  font-size: 0.82rem;
+  flex: 1;
+  min-width: 80px;
+}
+
+.instance-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.instance-add-btn {
+  padding: 6px 14px;
+  border-radius: var(--border-radius);
+  border: none;
+  background-color: var(--primary-color);
+  color: white;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 500;
+  transition: background-color 0.2s;
+  flex-shrink: 0;
+}
+
+.instance-add-btn:hover {
+  background-color: var(--primary-hover);
+}
+
+.instance-empty {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+/* ============ Consolidated Media Queries ============ */
+
+/* Fix 3+4+5: Single consolidated @media (max-width: 768px) block */
+@media (max-width: 768px) {
+  /* Container and header */
+  .container {
+    padding: 10px;
+  }
+
+  .header {
+    flex-direction: column;
+    gap: 15px;
+    align-items: stretch;
+  }
+
+  .header h1 {
+    font-size: 1.5rem;
+  }
+
+  /* Fix 4: Mobile header controls — wrap instead of column */
+  .controls {
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  /* Fix 4: Full-width selects on mobile */
+  .provider-select,
+  .model-select {
+    width: 100%;
+    min-width: auto;
+  }
+
+  .message {
+    max-width: 90%;
+  }
+
+  /* Fix 5: Mobile input area — wrap instead of column */
+  .input-area {
+    flex-wrap: wrap;
+  }
+
+  .message-input {
+    flex: 1 1 100%;
+  }
+
+  .send-btn {
+    flex: 1;
+    align-self: auto;
+  }
+
+  /* Sidebar mobile */
+  .sidebar {
+    transform: translateX(-260px);
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .sidebar-toggle {
+    left: 20px;
+    display: flex;
+  }
+
+  .sidebar.open ~ .sidebar-toggle {
+    left: 270px;
+  }
+
+  .main-content {
+    margin-left: 0;
+  }
+
+  /* Settings modal mobile */
+  .unified-settings {
+    width: 95%;
+    height: 90vh;
+    max-height: none;
+  }
+
+  .unified-settings-body {
+    flex-direction: column;
+  }
+
+  .settings-nav {
+    width: 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+    padding: 0;
+  }
+
+  .settings-nav-item {
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    white-space: nowrap;
+    font-size: 0.82rem;
+  }
+
+  .settings-nav-item.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--primary-color);
+  }
+
+  /* Memory panel full width on mobile */
+  .memory-panel {
+    width: 100%;
+  }
+}
+
+/* Fix 3: Single consolidated @media (min-width: 769px) block */
+@media (min-width: 769px) {
+  .sidebar-toggle {
+    display: flex;
+  }
+}
+
+/* ============ Activity tab ============
+   Read-only view of everything scheduled. The load-bearing distinction is
+   ACTIVE (really runs) vs INERT (cron_jobs — recorded, never executed), so the
+   two are given different section treatments rather than differing by a label. */
+
+.memory-activity-content { padding: 4px 2px 24px; }
+
+.act-anchor {
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--secondary-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 14px;
+  background: var(--surface-mid);
+}
+.act-anchor-title { font-size: 0.76rem; font-weight: 600; margin-bottom: 3px; }
+.act-anchor-body { font-size: 0.72rem; color: var(--text-secondary); line-height: 1.5; }
+
+.act-section-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 20px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+.act-section-active { color: var(--success-color); }
+.act-section-inert  { color: var(--text-secondary); }
+.act-section-gaps   { color: var(--text-secondary); }
+
+/* The no-scheduler fact is the section's banner, not a footnote. */
+.act-banner {
+  border: 1px solid var(--error-color);
+  border-radius: 4px;
+  padding: 9px 11px;
+  margin-bottom: 12px;
+  font-size: 0.73rem;
+  line-height: 1.55;
+  color: var(--text-color);
+  background: color-mix(in srgb, var(--error-color) 8%, transparent);
+}
+.act-banner code { font-size: 0.72rem; }
+
+.act-entry {
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--surface-mid);
+}
+.act-entry-disabled { opacity: 0.6; }
+/* Inert entries are visually muted and dashed — they must never read as live. */
+.act-entry-inert {
+  border-style: dashed;
+  background: transparent;
+  opacity: 0.85;
+}
+.act-entry-gap { border-style: dashed; background: transparent; }
+
+.act-entry-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.act-name { font-size: 0.82rem; font-weight: 600; }
+.act-desc { font-size: 0.73rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
+
+.act-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 4px 16px;
+  font-size: 0.72rem;
+}
+.act-grid > div { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.act-label {
+  color: var(--text-secondary);
+  min-width: 76px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+}
+.act-dim { color: var(--text-secondary); }
+.act-reason { font-size: 0.71rem; color: var(--error-color); margin-top: 5px; }
+.act-retention { font-size: 0.68rem; margin-top: 5px; }
+.act-never { color: var(--error-color); font-weight: 600; }
+
+.act-nohist { color: var(--text-secondary); font-style: italic; }
+.act-hist-empty { font-size: 0.72rem; margin-top: 6px; display: block; }
+
+/* pills */
+.act-pill {
+  font-size: 0.62rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-color);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.act-pill-ok       { color: var(--success-color); border-color: var(--success-color); }
+.act-pill-failed,
+.act-pill-aborted  { color: var(--error-color);   border-color: var(--error-color); }
+.act-pill-skipped  { color: var(--text-secondary); }
+.act-pill-unknown  { color: var(--text-secondary); }
+.act-pill-disabled { color: var(--text-secondary); }
+.act-pill-nohist   { color: var(--text-secondary); font-style: italic; }
+.act-pill-inert    { color: var(--error-color); border-color: var(--error-color); }
+.act-pill-driver   { color: var(--accent-color); border-color: var(--accent-color); }
+.act-pill-armed    { color: var(--success-color); border-color: var(--success-color); }
+.act-pill-running,
+.act-pill-deferred { color: var(--text-secondary); }
+
+/* What a scheduled job actually wrote, shown under its last run: the panel
+   should not make anyone open a database to see the output of a thing it says
+   ran. Clipped, because a digest is read in the bell, not here. */
+.act-job-output {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-left: 2px solid var(--success-color);
+  background: var(--bg-secondary, rgba(127,127,127,0.06));
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 8.5em;
+  overflow-y: auto;
+}
+
+.act-prov { font-size: 0.62rem; margin-left: auto; text-transform: uppercase; letter-spacing: 0.04em; }
+.act-prov-system { color: var(--text-secondary); }
+.act-prov-kid    { color: var(--accent-color); }
+
+/* nested steps — indented + rail, so they read as parts of one pass */
+.act-subs { margin-top: 10px; }
+.act-subs-summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  padding: 3px 0;
+}
+.act-sub {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0 6px 10px;
+  margin-left: 6px;
+  border-left: 2px solid var(--border-color);
+}
+.act-sub-driver { border-left-color: var(--accent-color); }
+.act-sub-idx {
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  min-width: 14px;
+  padding-top: 2px;
+}
+.act-sub-body { flex: 1; min-width: 0; }
+.act-sub-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.act-sub-name { font-size: 0.74rem; font-weight: 600; }
+.act-gate {
+  font-size: 0.63rem;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+  border-radius: 3px;
+  padding: 0 5px;
+}
+.act-sub-desc { font-size: 0.69rem; color: var(--text-secondary); line-height: 1.45; margin: 2px 0; }
+.act-sub-run { font-size: 0.69rem; font-family: ui-monospace, monospace; word-break: break-word; }
+
+/* run history */
+.act-hist { margin-top: 8px; }
+.act-hist-summary { cursor: pointer; font-size: 0.7rem; color: var(--text-secondary); padding: 3px 0; }
+.act-hist-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.69rem;
+  padding: 3px 0 3px 10px;
+  margin-left: 6px;
+  border-left: 2px solid var(--border-color);
+}
+.act-hist-aborted, .act-hist-failed { border-left-color: var(--error-color); }
+.act-hist-when { color: var(--text-secondary); min-width: 150px; }
+.act-hist-dur { font-family: ui-monospace, monospace; min-width: 60px; }
+.act-hist-reason { color: var(--error-color); }
+
+/* the bimodal-duration explainer */
+.act-path { font-size: 0.65rem; padding: 0 5px; border-radius: 3px; }
+.act-path-heavy   { color: var(--accent-color); background: color-mix(in srgb, var(--accent-color) 12%, transparent); }
+.act-path-light   { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 12%, transparent); }
+.act-path-unknown { color: var(--text-secondary); font-style: italic; }
+
+/* ---- Memory panel at phone width ----
+   Full-bleed panel (a 620px slide-out on a 390px screen would be off-canvas),
+   and slightly tighter tabs so more of the strip is visible before scrolling.
+   The strip still scrolls, so every tab including Search stays reachable. */
+@media (max-width: 640px) {
+  .memory-panel { width: 100vw; }
+  .memory-panel.map-mode { width: 100vw; }
+  .memory-tab { padding: 10px 10px; font-size: 0.8rem; }
+  .act-grid { grid-template-columns: 1fr; }
+  .act-hist-when { min-width: 0; }
+  .act-label { min-width: 64px; }
+}
+
+/* ── The model's thinking, beside its answer ──────────────────────────────
+   A reasoning model streams its working out on a separate channel from the
+   reply (delta.reasoning / delta.reasoning_content). It is shown here rather
+   than concatenated into the answer, and collapsed by default: it explains the
+   reply, it is not the reply. Reuses the Thinking tab's vocabulary so the two
+   read as the same kind of thing. */
+.message-reasoning {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: var(--surface-dark);
+  opacity: 0.85;
+}
+.message-reasoning > summary {
+  cursor: pointer;
+  margin-bottom: 0;
+  list-style: none;
+}
+.message-reasoning[open] > summary { margin-bottom: 8px; }
+.message-reasoning > summary::-webkit-details-marker { display: none; }
+.message-reasoning > summary::before {
+  content: '▸';
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+}
+.message-reasoning[open] > summary::before { content: '▾'; }
+.message-reasoning .reasoning-body {
+  white-space: pre-wrap;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+
+/* ============ Jobs panel — the ROBOT channel ============
+   Deliberately quieter than the bell. The bell pulses because it holds things
+   SNH wants to SAY; this holds results, which wait. The only motion here is a
+   slow breathe while work is actually running, and the badge counts unread
+   results rather than everything in the list. */
+.jobs-btn {
+  position: relative;
+  padding: 8px 12px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: all 0.2s ease;
+}
+.jobs-btn:hover { background-color: var(--surface-hover); }
+.jobs-btn.jobs-running {
+  border-color: var(--secondary-color);
+  animation: jobs-breathe 2.4s ease-in-out infinite;
+}
+@keyframes jobs-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.jobs-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--secondary-color);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+
+.job-item { position: relative; }
+/* Unread is a left edge, not a colour wash: the result text has to stay
+   readable, and "unread" is a property of the row rather than of the finding. */
+.job-unread { border-left: 3px solid var(--secondary-color); }
+.job-title { font-weight: 600; margin: 2px 0 6px; font-size: 0.86rem; }
+.job-kind {
+  font-size: 0.66rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.job-meta { font-size: 0.66rem; color: var(--text-secondary); margin-top: 6px; }
+.job-status {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.job-status-ok { color: var(--success-color); }
+.job-status-running { color: var(--secondary-color); }
+.job-status-queued { color: var(--text-secondary); }
+/* Failed, interrupted and cancelled are three different things and are coloured
+   as three different things — an interrupted run is not a fault of the job, and
+   a cancelled one is hers. */
+.job-status-failed { color: var(--error-color); }
+.job-status-interrupted { color: var(--warning-color); }
+.job-status-cancelled { color: var(--text-secondary); }
+/* PARTIAL is a result, not a fault: it reads as a caution beside the ok green,
+   never as the red of a job that produced nothing. */
+.job-status-partial { color: var(--warning-color); }
+.job-error { color: var(--error-color); font-size: 0.76rem; }
+/* Why a partial run stopped, under the text it did write. Muted and separated,
+   because the RESULT is the thing she is reading and this only explains it. */
+.job-cutshort {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-color);
+  color: var(--warning-color);
+  font-size: 0.72rem;
+}
+/* PAUSED is neither running nor a result: it is waiting on her, and reads as
+   the same caution colour as partial — attention, not alarm. */
+.job-status-paused { color: var(--warning-color); }
+/* The label over a failed job's text: what follows is offered as PARTIAL, so
+   she knows she is reading what it had rather than a finished answer. */
+.job-partial-label {
+  font-size: 0.72rem;
+  color: var(--warning-color);
+  margin-bottom: 6px;
+  letter-spacing: 0.02em;
+}
+.job-ask { font-size: 0.82rem; }
+/* A message the entity added to the conversation she has OPEN, pulled in by
+   the poll. The strip says it is new; the row's count keeps blinking until she
+   replies or clicks it, because seen and acknowledged are different things. */
+.message.arrived-live { outline: 1px dashed var(--warning-color); outline-offset: 4px; border-radius: var(--border-radius); cursor: pointer; }
+.message-arrived {
+  font-size: 0.7rem;
+  color: var(--warning-color);
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+/* A link to another conversation, inside a message — the review's report. */
+a.convo-link { color: var(--secondary-color); text-decoration: underline dotted; }
+a.convo-link:hover { text-decoration: underline; }
+.job-chain { color: var(--secondary-color); text-decoration: none; }
+.job-chain:hover { text-decoration: underline; }
+.job-item.job-highlight { outline: 2px solid var(--secondary-color); outline-offset: 2px; transition: outline 0.3s; }
+.job-seen, .job-cancel, .job-retry, .job-open-convo {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.job-seen:hover:not(:disabled), .job-cancel:hover:not(:disabled), .job-retry:hover:not(:disabled), .job-open-convo:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-color);
+}
+.job-seen:disabled, .job-cancel:disabled, .job-retry:disabled { opacity: 0.5; cursor: default; }
+
+
+/* Running count — a SECOND number, and deliberately not the badge's.
+   The badge (top-right, accent) counts unread RESULTS: something to read. This
+   one (bottom-left, secondary) counts jobs still working: nothing to do yet.
+   Same corner or same colour would make "3" ambiguous, which is the one thing
+   this must not be. */
+.jobs-running-count {
+  position: absolute;
+  bottom: -4px;
+  left: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--surface-color);
+  border: 1px solid var(--secondary-color);
+  color: var(--secondary-color);
+  font-size: 0.62rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  display: inline-flex;
+}
+.jobs-activity {
+  padding: 8px 14px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--secondary-color);
+  border-bottom: 1px solid var(--border-color);
+}
+.job-elapsed { font-size: 0.66rem; color: var(--secondary-color); margin-left: 6px; }
+
+/* ============ Tools tab: registry-generated rows ============ */
+/* One row per registered-or-not tool, plus the search provider chain. Everything
+   here is laid out for a list that GROWS — a tool added to the registry lands on
+   this page with no CSS written for it. */
+
+.tools-summary .settings-hint { margin-bottom: 0; }
+
+.tool-row, .provider-row {
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background-color: var(--background-color);
+}
+
+/* A switched-off row stays fully legible — it is the row you came here to turn
+   back on. Dimmed, never hidden. */
+.tool-row-off, .provider-row-off { opacity: 0.72; }
+
+.tool-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tool-row-id { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tool-row-id code {
+  font-family: monospace;
+  font-size: 0.86rem;
+  color: var(--text-color);
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.tool-row-title { font-size: 0.95rem; font-weight: 500; color: var(--text-color); }
+.provider-label { font-size: 1rem; font-weight: 600; color: var(--text-color); }
+
+.tool-row-state { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+.tool-state {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tool-state-on { color: var(--success-color); }
+.tool-state-off { color: var(--text-secondary); }
+
+/* A row whose switch lives elsewhere shows this instead of a dead toggle — an
+   unexplained missing control reads as a broken page. */
+.tool-derived { color: var(--text-secondary); font-size: 0.9rem; padding: 0 12px; }
+
+.tool-row-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.tool-tag {
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.tool-tag-writes { color: var(--warning-color); border-color: var(--warning-color); }
+
+/* The model's own description, verbatim. Small, because it is reference material
+   rather than the thing being decided. */
+.tool-row-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin: 8px 0 0;
+  line-height: 1.45;
+}
+.tool-row-why { font-size: 0.78rem; color: var(--warning-color); margin: 6px 0 0; }
+.tool-row-note { font-size: 0.76rem; color: var(--text-secondary); margin: 6px 0 0; font-style: italic; }
+
+.tool-row-fields {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-color);
+}
+.tool-field { margin-bottom: 12px; }
+.tool-field:last-child { margin-bottom: 0; }
+.tool-field input[type="text"], .tool-field input[type="number"] {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 0.9rem;
+}
+.setting-hint-inline {
+  display: block;
+  font-weight: 400;
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+}
+
+.provider-chain { margin-bottom: 18px; }
+.provider-order-line { margin-bottom: 10px; font-weight: 500; }
+.provider-pos { font-size: 0.76rem; color: var(--text-secondary); margin-bottom: 0; display: flex; align-items: center; gap: 5px; }
+.provider-pos select {
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  font-size: 0.8rem;
+}
+.provider-pos select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* A write-only key field. It renders empty every time, including right after a
+   successful save — the state line beside the label is the only thing that says
+   whether one is held. */
+.secret-field { margin-top: 12px; }
+.secret-input-row { display: flex; gap: 8px; align-items: center; }
+.secret-clear {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.secret-clear:hover:not(:disabled) { color: var(--error-color); border-color: var(--error-color); }
+.secret-clear:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.secret-state {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: 6px;
+}
+.secret-state-on { color: var(--success-color); }
+.secret-state-off { color: var(--text-secondary); }
+.secret-state-warn { color: var(--warning-color); }
+
+/* ===========================================================================
+   Rendered markdown (db/markdown.js)
+
+   Scoped to .initiative-content so it applies where a result is READ and cannot
+   leak into the chat pane, which still has its own formatter.
+
+   THE PANEL IS NARROW AND MUST STAY NARROW. That is the whole constraint here:
+   a report with a six-column table used to render as raw pipes, and the fix
+   cannot be "let the table set the width" — that just trades an unreadable
+   column for a panel that scrolls sideways as a whole. So every wide thing
+   (tables, code, long URLs) is given its own scroll box and the card keeps its
+   width.
+   =========================================================================== */
+.initiative-content .md-p { margin: 0 0 0.65em; }
+.initiative-content .md-p:last-child { margin-bottom: 0; }
+
+/* Headings step down in size but stay close to body text — this is a card, not
+   a page, and an h1 sized like an h1 would dwarf the result under it. */
+.initiative-content .md-h {
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 1em 0 0.4em;
+  color: var(--text-color);
+}
+.initiative-content .md-h:first-child { margin-top: 0; }
+.initiative-content .md-h1 { font-size: 1.02rem; }
+.initiative-content .md-h2 { font-size: 0.95rem; }
+.initiative-content .md-h3 { font-size: 0.89rem; }
+.initiative-content .md-h4,
+.initiative-content .md-h5,
+.initiative-content .md-h6 {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.initiative-content .md-list { margin: 0 0 0.65em; padding-left: 1.3em; }
+.initiative-content .md-list .md-list { margin-bottom: 0; }
+.initiative-content .md-list li { margin: 0.15em 0; }
+.initiative-content .md-task { list-style: none; margin-left: -1.1em; }
+.initiative-content .md-task input { margin-right: 0.4em; vertical-align: -1px; }
+
+.initiative-content blockquote.md-quote {
+  margin: 0 0 0.65em;
+  padding: 0.1em 0 0.1em 0.75em;
+  border-left: 2px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.initiative-content code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: var(--surface-mid);
+  border-radius: 3px;
+  padding: 0.1em 0.32em;
+  /* A long identifier or URL in a code span would otherwise be the one thing
+     that widens the panel. */
+  overflow-wrap: anywhere;
+}
+.initiative-content pre.md-code {
+  margin: 0 0 0.65em;
+  padding: 0.6em 0.7em;
+  background: var(--surface-mid);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  overflow-x: auto;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+/* Inside a block, the span styling would double the background and the padding. */
+.initiative-content pre.md-code code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+/* The language, when the fence named one — it is the difference between reading
+   a result and guessing at it. */
+.initiative-content pre.md-code[data-lang]::before {
+  content: attr(data-lang);
+  display: block;
+  margin-bottom: 0.4em;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+.initiative-content .md-table-wrap {
+  overflow-x: auto;
+  margin: 0 0 0.65em;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+}
+.initiative-content table.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.78rem;
+}
+.initiative-content table.md-table th,
+.initiative-content table.md-table td {
+  padding: 0.35em 0.6em;
+  border-bottom: 1px solid var(--border-color);
+  text-align: left;
+  white-space: nowrap;
+}
+.initiative-content table.md-table th {
+  background: var(--surface-mid);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  letter-spacing: 0.03em;
+}
+.initiative-content table.md-table tbody tr:last-child td { border-bottom: none; }
+
+.initiative-content hr.md-hr {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 0.9em 0;
+}
+.initiative-content a { color: var(--secondary-color); overflow-wrap: anywhere; }
+.initiative-content img { max-width: 100%; height: auto; border-radius: 4px; }
+
+/* --- The file a job produced --------------------------------------------- */
+/* A link, not a button: it goes somewhere, and a middle-click should open it
+   the way any other link does. */
+.job-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--surface-mid);
+  text-decoration: none;
+  color: var(--text-color);
+}
+.job-file:hover { border-color: var(--secondary-color); }
+.job-file-kind {
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 5px;
+  border-radius: 3px;
+  color: #fff;
+  background: var(--text-secondary);
+  flex-shrink: 0;
+}
+/* A PDF and a source file are different enough things to be told apart at a
+   glance — she is usually looking for one or the other, not for "a file". */
+.job-file-kind-pdf { background: #c0392b; }
+.job-file-kind-code { background: #2a78d6; }
+.job-file-kind-text { background: #6b6a66; }
+.job-file-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  flex: 1;
+}
+.job-file-size { font-size: 0.68rem; color: var(--text-secondary); flex-shrink: 0; }
+/* The folder on the server. Muted, because it is the half she cannot click. */
+.job-file-where { font-size: 0.66rem; color: var(--text-secondary); margin-top: 4px; }
+/* How a job lived in its window, and its phases (2026-09-17). */
+.job-progress { margin-top: 8px; }
+.job-phases { margin: 4px 0 6px; padding-left: 1.2em; font-size: 0.78rem; }
+.job-phase { margin: 2px 0; }
+.job-phase-mark { display: inline-block; width: 1em; font-weight: 600; }
+.job-phase-done .job-phase-mark { color: var(--accent, #4a9); }
+.job-phase-stopped .job-phase-mark { color: #c55; }
+.job-phase-skipped, .job-phase-pending { color: var(--text-secondary); }
+.job-phase-stop { font-size: 0.7rem; color: var(--text-secondary); margin-left: 1.2em; }
+.job-findings { display: inline-block; font-size: 0.78rem; margin-top: 2px; }
+.job-context { font-size: 0.66rem; color: var(--text-secondary); margin-top: 4px; }
+.job-file-where code { font-size: 0.95em; overflow-wrap: anywhere; }
+/* Why there is no file, or why it is a text file and not a PDF. Amber rather
+   than red: in almost every case the result is intact and only its format is
+   not what was intended. */
+.job-file-note {
+  font-size: 0.7rem;
+  color: var(--warning-color);
+  margin-top: 6px;
+  line-height: 1.35;
+}
+
+
+/* ── squatch-code working strip ───────────────────────────────────────
+   Ellie could not tell, from the conversation, whether the coder was
+   working. This is the glanceable answer: present means working, absent
+   means nothing is running. It carries the last thing the job did and
+   how long it has been going - never a percentage, which the run cannot
+   know. */
+.coder-strip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+  color: #06281c;
+  background: linear-gradient(90deg, #7ee2b8, #4fc99a);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
+}
+.coder-strip-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: #06281c;
+  flex: none;
+  animation: coder-pulse 1.4s ease-in-out infinite;
+}
+@keyframes coder-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(0.75); }
+}
+.coder-strip-label { font-weight: 700; letter-spacing: 0.02em; flex: none; }
+.coder-strip-body { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A job that has gone quiet is a different fact from one that is
+   working, and must not look the same. */
+.coder-strip.is-quiet {
+  background: linear-gradient(90deg, #f6d365, #f0a63a);
+  color: #3a2400;
+}
+.coder-strip.is-quiet .coder-strip-dot { animation: none; background: #3a2400; }
+
+/* The strip is fixed, so the page needs room for it. */
+body.coder-working { padding-top: 1.9rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  .coder-strip-dot { animation: none; }
+}
+
+/* ── System notices ───────────────────────────────────────────────────────
+   Server-authored, attached to the turn, and NEVER part of the message.
+   Deliberately unlike a message bubble: the entire reason this channel
+   exists is that a correction printed in the model's own text could be
+   written by the model, so it must not be mistakable for one. */
+.system-notice {
+  margin: 0.75rem 0 0.75rem auto;
+  max-width: 90%;
+  border-left: 3px solid var(--warning, #d08770);
+  background: color-mix(in srgb, var(--warning, #d08770) 8%, transparent);
+  border-radius: 0 6px 6px 0;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.9rem;
+}
+.system-notice-label {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.75;
+  margin-bottom: 0.3rem;
+  font-weight: 600;
+}
+.system-notice-body p:first-child { margin-top: 0; }
+.system-notice-body p:last-child { margin-bottom: 0; }
+/* Something was put right: the same channel, read as good news. */
+.system-notice.notice-sent-after-claim,
+.system-notice.notice-job-queued {
+  border-left-color: var(--success, #a3be8c);
+  background: color-mix(in srgb, var(--success, #a3be8c) 8%, transparent);
+}
+
+/* The running-tool rail. Tool execution emits no tokens, so without this a
+   multi-round turn shows nothing at all while the work happens. */
+.tool-rail { margin: 0 0 6px 0; display: flex; flex-direction: column; gap: 2px; }
+.tool-rail-row {
+  font-size: 0.78rem; line-height: 1.5; opacity: 0.85;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 1px 8px; border-left: 2px solid currentColor;
+}
+.tool-rail-row.running { color: #c98a2b; }
+.tool-rail-row.running::after { content: ""; animation: toolDots 1.2s steps(4,end) infinite; }
+.tool-rail-row.done { color: #6a8f5f; opacity: 0.7; }
+@keyframes toolDots { 0%{content:""} 25%{content:"."} 50%{content:".."} 75%{content:"..."} }
+.tool-rail-row.failed { color: #b4544a; opacity: 0.85; }
+
+/* ============================================================
+   ENTITIES IN THE UI (2026-09-01)
+
+   A fact points at an entity through subject_entity_id. Until now the panel
+   rendered the legacy `subject` column, so every fact read "user fact"
+   whoever it was actually about — which is the misattribution Ellie needs to
+   be able to see for herself. Palette follows the Map legend: user blue,
+   self purple, everything else neutral, so the badge and the graph agree.
+   ============================================================ */
+
+.memory-facts-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.memory-facts-entity-select {
+  background: var(--surface-color);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  max-width: 60%;
+}
+.memory-facts-entity-select:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.memory-fact-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.memory-entity-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.18);
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+.memory-entity-badge.type-user   { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
+.memory-entity-badge.type-self   { background: rgba(168, 85, 247, 0.18); color: #d8b4fe; }
+.memory-entity-badge.type-org    { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
+.memory-entity-badge.type-person { background: rgba(236, 72, 153, 0.18); color: #f9a8d4; }
+.memory-entity-badge.type-device { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+/* A fact with no entity says so rather than being labelled with a guess. */
+.memory-entity-badge.unassigned {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+}
+
+/* Grouped view: one heading per entity. Nearly pointless with two entities,
+   which is the point — it is the view that matters at twenty clients. */
+.memory-facts-group { margin-bottom: 16px; }
+.memory-facts-group-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-color);
+  margin: 0 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+/* HELD BACK, NOT RETIRED. A fact that failed the write-time subject check is
+   not history and must not look like it: history is struck through and faded,
+   this is amber and legible, because it is a question waiting on an answer. */
+.memory-facts-flagged { margin-top: 18px; }
+.memory-facts-flagged-head {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fcd34d;
+  margin: 0 0 6px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(245, 158, 11, 0.35);
+}
+.memory-facts-flagged-note {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.memory-fact-item.flagged {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.06);
+}
+.memory-fact-item.flagged:hover { border-color: rgba(245, 158, 11, 0.9); }
+.memory-fact-flag {
+  display: inline-block;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.18);
+  color: #fcd34d;
+  white-space: nowrap;
+}
+
+/* Map detail panel */
+.mmd-entity { margin-bottom: 10px; }
+.mmd-flag {
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: var(--border-radius);
+  padding: 6px 8px;
+  margin-bottom: 10px;
+}
+
+/* ============================================================
+   SELF TAB — five sections, reachable without scrolling.
+
+   Same gesture as the memory panel's own tab row, one level in, rather than a
+   new pattern. Section CONTENT is unchanged; only how it is reached.
+   ============================================================ */
+
+.memory-self-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 12px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+.memory-self-tabs::-webkit-scrollbar { height: 3px; }
+.memory-self-tabs::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.memory-self-tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 7px 10px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: color 0.2s ease, background-color 0.2s ease;
+}
+.memory-self-tab:hover {
+  color: var(--text-color);
+  background-color: rgba(158, 127, 255, 0.1);
+}
+.memory-self-tab.active {
+  color: var(--primary-color);
+  border-bottom-color: var(--primary-color);
+}
+
+.memory-self-pane { display: none; }
+.memory-self-pane.active { display: block; }
+/* The pane already provides the spacing the stacked layout got from the
+   section's own top margin. */
+.memory-self-pane > .memory-self-section { margin-top: 0; }
+
+/* Both edges of an entity's connections, on one line under its heading. */
+.memory-entity-relations {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin: -4px 0 8px;
+}
+
+/* ============================================================
+   THE CONVERSATION LIST — one list, and the only list.
+
+   What the entity says to her arrives here, so the sidebar row
+   carries the unread count and the header carries the total.
+   The Messages panel these styles replaced is gone.
+   ============================================================ */
+
+/* Active | Archive. The archive is the same area, not another place. */
+.conversation-scopes {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.conversation-scope {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-family: inherit;
+  padding: 5px 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.conversation-scope:hover { border-color: var(--primary-color); }
+.conversation-scope.active {
+  color: var(--text-color);
+  border-color: var(--primary-color);
+  background: rgba(158, 127, 255, 0.10);
+}
+
+/* The total, beside "Conversations". Same blink as the per-row count, because
+   it is the same fact at a different scope. */
+.sidebar-unread-total {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(59, 130, 246, 0.28);
+  color: #bfdbfe;
+  font-size: 0.65rem;
+  font-weight: 600;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+
+/* THE PER-CONVERSATION COUNT. A number and nothing else — no exclamation
+   mark, no red, no fading with age. It says "she has not got to this yet",
+   and it is not permitted to imply anything about what was sent. */
+.conversation-unread {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(59, 130, 246, 0.28);
+  color: #bfdbfe;
+  font-size: 0.65rem;
+  font-weight: 600;
+  vertical-align: middle;
+  animation: unread-blink 1.6s ease-in-out infinite;
+}
+
+/* Blink, not flash: the count has to be findable in a long list without
+   turning the sidebar into an alarm. Opacity only, so it never moves the row. */
+@keyframes unread-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* Anyone who has asked their browser not to animate gets a steady badge.
+   The count still has to be legible — it is the notice. */
+@media (prefers-reduced-motion: reduce) {
+  .conversation-unread,
+  .sidebar-unread-total { animation: none; }
+}
+
+.conversation-item.has-unread .conversation-title { font-weight: 600; }
+
+/* "raised before" and "asked to archive" — quiet notes on the row. */
+.conversation-follows {
+  font-size: 0.63rem;
+  color: var(--text-secondary);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+/* An archived conversation is readable and closed to writes for both. The
+   input says so rather than silently doing nothing. */
+.input-area.conversation-archived {
+  opacity: 0.7;
+}
+.input-area.conversation-archived .message-input {
+  cursor: not-allowed;
+  font-style: italic;
+}

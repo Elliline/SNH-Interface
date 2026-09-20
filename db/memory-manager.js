@@ -1,0 +1,3595 @@
+/**
+ * Memory Manager Heartbeat
+ * Scheduled background job that maintains the memory system.
+ *
+ * The cluster pipeline runs ONLY when a cluster is oversized; on an idle memory
+ * the pass does no model work at all. (Before 2026-08-02 the cross-link audit ran
+ * unconditionally and dominated pass duration; it and cleanupFacts are gone —
+ * see the tombstones below.)
+ *   Step 1: auditClusterCoherence — per-cluster LLM coherence check, flags splits
+ *   Step 2: executeSplits         — apply flagged splits, re-embed moved facts
+ *   Step 3: generateReport        — build report object, log to console + ops file
+ *   Task B2: sweepPendingQuestions — retire pending questions memory already answers
+ *   Task C: summarizeDailyLogs    — archive daily logs older than retention window
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { randomUUID, createHash } = require('crypto');
+const { getConfig, getProviderInstance } = require('./config');
+const { getCurrentDateTimeString, getLocalDateStamp } = require('./datetime');
+const reasoningChannel = require('./reasoning-channel');
+
+const { getSqliteDb, getClusterEmbeddingsTable } = require('./database');
+const memoryClusters = require('./memory-clusters');
+const factExtractor = require('./fact-extractor');
+const agentPool = require('./agent-pool');
+const initiativeEngine = require('./initiative-engine');
+const selfAudit = require('./self-audit');
+const selfFactSelection = require('./self-fact-selection');
+const brainWatchdog = require('./brain-watchdog');
+// Shared so the probe's ops line and the watchdog's alert cannot describe the
+// same engine state in two different ways.
+const { describeQueue } = brainWatchdog;
+
+const MEMORY_DIR = require('./database').getMemoryDir();
+const DAILY_DIR = path.join(MEMORY_DIR, 'daily');
+// Operational events (liveness/heartbeat failures, circuit-breaker trips,
+// maintenance-pass telemetry) go here — surfaced in the Thinking tab, never
+// injected into chat context. Keeps the daily log cognitively meaningful.
+const OPS_DIR = path.join(MEMORY_DIR, 'ops');
+const ARCHIVE_DIR = path.join(DAILY_DIR, 'archive');
+
+let heartbeatTimer = null;
+let warmupTimer = null;
+let livenessTimer = null;
+let schedulerTimer = null;
+// Start optimistic — only write a daily-log warning on the transition from
+// answering to not-answering (and a recovery note on the way back), so a wedged
+// engine produces one alert rather than a warning every probe interval.
+let lastLivenessOk = true;
+let isRunning = false;
+
+// Mid-cycle circuit breaker. The preflight probe in runMaintenance catches a
+// brain that's already down when a cycle starts; this catches one that wedges
+// PART WAY THROUGH. After this many consecutive callLLM timeouts the circuit
+// opens: subsequent callLLM calls fast-fail (so an in-flight pass — e.g. a
+// 231-pair cross-link audit — drains in milliseconds instead of grinding every
+// remaining task against a dead engine), and runMaintenance aborts the cycle.
+// Any successful call or a successful liveness probe closes it again.
+/**
+ * Read per trip-check rather than captured at load, so raising it in Settings
+ * takes effect on a wedged engine without a restart — which is exactly when
+ * nobody wants to be restarting the server to change a number.
+ */
+function circuitThreshold() {
+  try {
+    const n = (getConfig().brainCircuit || {}).consecutiveTimeoutsToOpen;
+    return Number.isFinite(n) && n > 0 ? n : 3;
+  } catch { return 3; }
+}
+let consecutiveTimeouts = 0;
+let circuitOpen = false;
+
+function isTimeoutError(err) {
+  return !!err && (err.name === 'TimeoutError' || err.name === 'AbortError' || /abort|timeout/i.test(err.message || ''));
+}
+
+/** Reset the mid-cycle breaker — brain is reachable again. */
+function closeCircuit() {
+  consecutiveTimeouts = 0;
+  circuitOpen = false;
+}
+// Serializes reflection so a manual "Reflect now" can't run concurrently with a
+// scheduled heartbeat cycle (or another manual trigger). Both paths call
+// runReflection, which advances the watermark only at the END of a cycle — so
+// without this lock two overlapping runs both read the same old watermark, both
+// review the same conversations, and both store facts + queue followups (the
+// "reflection stutter"). The check+set is atomic in Node (no await between them).
+let isReflecting = false;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Safely build a LanceDB delete filter for member_id, validating UUID format first */
+function memberIdFilter(id) {
+  if (!UUID_RE.test(id)) throw new Error(`Invalid member_id format: ${id}`);
+  return `member_id = "${id}"`;
+}
+
+// ============ Background tool budget ============
+
+/**
+ * WHAT ONE TOOL CALL COST, and why the answer is not always 1.
+ *
+ * Pure and exported so the rule is testable without a model in the loop, and so
+ * "a search that found nothing is not progress" is a line of code rather than an
+ * intention. Deliberately NARROW — three cases, each with a reason:
+ *
+ *   - A result carrying `error` is a call that did not happen. Any tool.
+ *   - An empty SEARCH is a call that happened and answered nothing: web_search
+ *     with no results, memory_search with no matches. Both are the shape the
+ *     failing job spent its whole budget on.
+ *   - Everything else bills in full, and memory_count is the case that shows why
+ *     the rule has to be narrow: `count: 0` is not a failure, it is the ANSWER,
+ *     and discounting it would pay a job to ask questions whose answer is zero.
+ *
+ * The memory_search exception has an exception of its own. A search with no
+ * ACTIVE matches but a note about inactive ones ("you no longer hold this, and
+ * here is what replaced it") has told him something true and useful, so it bills
+ * in full.
+ *
+ * @param {string} name - the tool called
+ * @param {Object} result - what it returned
+ * @param {number} failedCost - what an unproductive call bills
+ * @returns {{cost: number, productive: boolean, why: string}}
+ */
+function toolCallCost(name, result, failedCost = 0.25) {
+  const r = result || {};
+  if (r.error) return { cost: failedCost, productive: false, why: 'the call returned an error' };
+
+  if (name === 'web_search') {
+    const n = Array.isArray(r.results) ? r.results.length : 0;
+    if (n === 0) return { cost: failedCost, productive: false, why: 'the search returned no results' };
+  }
+
+  if (name === 'memory_search') {
+    const n = Array.isArray(r.results) ? r.results.length : 0;
+    const toldSomethingAnyway = !!r.note || (r.also_inactive || 0) > 0;
+    if (n === 0 && !toldSomethingAnyway) {
+      return { cost: failedCost, productive: false, why: 'nothing in memory matched' };
+    }
+  }
+
+  return { cost: 1, productive: true, why: 'a usable result' };
+}
+
+/**
+ * A per-step tool budget.
+ *
+ * Created by runStep when a step declares a tool allowlist, and threaded into
+ * callLLM. Nothing declares one today: this is the scaffold the corrector
+ * (Phase 2c) inherits, built now so the first consumer is not also the thing
+ * that invents its own bounds.
+ *
+ * Two limits, both enforced. A call cap alone lets a step spend twenty minutes
+ * on three slow lookups; a wall clock alone lets a fast loop make two hundred
+ * calls. When either binds, the step keeps running — it just stops being offered
+ * tools — and the fact that it was cut short is recorded rather than inferred
+ * from a suspiciously thin result.
+ */
+function createToolSession(stepName, allowedTools = [], overrides = {}) {
+  const cfg = (getConfig().heartbeat && getConfig().heartbeat.toolBudget) || {};
+  const maxCalls = Math.max(1, overrides.maxCalls ?? cfg.maxCallsPerStep ?? 12);
+  return {
+    stepName,
+    allowedTools,
+    // Overrides exist for the corrector, which legitimately makes far more calls
+    // than any other background role. A single shared number would either starve
+    // it or over-grant everything else, so its budget lives in corrector.* and is
+    // handed in here — one session, one set of limits, no second accounting.
+    maxCalls,
+    maxWallMs: Math.max(1000, overrides.maxWallMs ?? cfg.maxWallClockMsPerStep ?? 120000),
+    maxRounds: Math.max(1, overrides.maxRounds ?? cfg.maxRoundsPerCall ?? 5),
+    // A FAILED CALL IS NOT PROGRESS, AND IS NOT PRICED LIKE IT (2026-08-18).
+    //
+    // A background job spent its whole allowance of 12 calls on searches that
+    // all failed with the same broken-URL error, and stopped having learned
+    // nothing. Charging a dead call what a real result costs makes the budget
+    // measure ATTEMPTS when the thing worth bounding is WORK DONE.
+    //
+    // So the budget is billed in units: a usable result costs 1, an error or an
+    // empty search costs `failedCallCost`. And because a discount alone would
+    // let an everything-fails loop run four times as long, there is a hard raw
+    // ceiling on attempts underneath it (`maxAttempts`) — that is the limit that
+    // binds when a provider is down, and it binds on the count of what actually
+    // happened rather than on what it was worth.
+    failedCallCost: Math.min(1, Math.max(0, overrides.failedCallCost ?? cfg.failedCallCost ?? 0.25)),
+    maxAttempts: Math.max(1, overrides.maxAttempts ?? Math.ceil(maxCalls * (cfg.attemptCeilingMultiple ?? 2))),
+    // ONE FREE RETRY FOR A CALL THAT ERRORED (2026-09-10). A call that times
+    // out, hits a dead provider or throws is tried again once before it is
+    // billed at all; only if the retry ALSO fails does the pair cost
+    // `failedCallCost`. A call that ran fine and found nothing is not retried
+    // and is not free — an empty result is an answer, and asking the same
+    // question again would not change it. The retry counts toward the raw
+    // attempt ceiling (it is a real request against a possibly-dead provider)
+    // but not toward `calls`, which stays what the model asked for.
+    failedCallRetries: Math.max(0, Math.floor(overrides.failedCallRetries ?? cfg.failedCallRetries ?? 1)),
+    // `calls` stays the RAW count of calls made — it is what the logs, the panel
+    // and every existing reader mean by "tool calls", and a billed figure in that
+    // field would quietly change what those numbers say. `billed` is the budget.
+    calls: 0,
+    billed: 0,
+    failedCalls: 0,
+    retries: 0,
+    roundsUsed: 0,
+    startedMs: Date.now(),
+    exhaustedReason: null,
+    // How much a "yes" added, if the job asked for more mid-run — so the
+    // summary can say "40 + 20 calls" rather than presenting 60 as the setting.
+    extended: null,
+
+    /** @returns {string|null} the reason the budget is spent, or null */
+    spent() {
+      if (this.billed >= this.maxCalls) {
+        const spentOn = this.failedCalls
+          ? `${this.calls} call(s), ${this.failedCalls} of them empty or failed`
+          : `${this.calls} call(s)`;
+        return `call budget spent (${this.billed.toFixed(2)}/${this.maxCalls} billed over ${spentOn})`;
+      }
+      if (this.calls + this.retries >= this.maxAttempts) {
+        return `attempt ceiling reached (${this.calls + this.retries}/${this.maxAttempts} calls, ${this.failedCalls} of them empty or failed — nothing is coming back, so it stopped trying)`;
+      }
+      const elapsed = Date.now() - this.startedMs;
+      if (elapsed >= this.maxWallMs) return `time budget spent (${Math.round(elapsed / 1000)}s of ${Math.round(this.maxWallMs / 1000)}s)`;
+      return null;
+    },
+
+    /**
+     * NEAR THE CEILING, WITH WORK LEFT — the moment a job should ASK rather
+     * than run into the wall. `pct` is the share of any one limit (calls,
+     * rounds, wall clock) past which this returns the limit that is near.
+     * Called only when the model has just asked for more tools, because that
+     * is the only evidence there is that work remains. Returns null when
+     * nothing is near, or when asking is switched off (pct <= 0 or >= 100 is
+     * "never ask" — the hard stop behaves as it always did).
+     */
+    nearing(pct) {
+      const share = Number(pct);
+      if (!Number.isFinite(share) || share <= 0 || share >= 100) return null;
+      const f = share / 100;
+      const elapsed = Date.now() - this.startedMs;
+      if (this.billed >= this.maxCalls * f) {
+        return { limit: 'calls', used: Math.round(this.billed * 100) / 100, max: this.maxCalls, calls: this.calls };
+      }
+      if (this.roundsUsed >= this.maxRounds * f) {
+        return { limit: 'rounds', used: this.roundsUsed, max: this.maxRounds };
+      }
+      if (elapsed >= this.maxWallMs * f) {
+        return { limit: 'time', used: elapsed, max: this.maxWallMs };
+      }
+      return null;
+    },
+
+    /**
+     * She said yes: raise the limits by these amounts. Additive, and recorded,
+     * so the card can say what was granted rather than what was configured.
+     */
+    extend({ calls = 0, rounds = 0, wallMs = 0 } = {}) {
+      const add = { calls: Math.max(0, calls | 0), rounds: Math.max(0, rounds | 0), wallMs: Math.max(0, wallMs | 0) };
+      this.maxCalls += add.calls;
+      this.maxAttempts += Math.ceil(add.calls * (cfg.attemptCeilingMultiple ?? 2));
+      this.maxRounds += add.rounds;
+      this.maxWallMs += add.wallMs;
+      this.exhaustedReason = null;
+      const prev = this.extended || { calls: 0, rounds: 0, wallMs: 0, times: 0 };
+      this.extended = { calls: prev.calls + add.calls, rounds: prev.rounds + add.rounds, wallMs: prev.wallMs + add.wallMs, times: prev.times + 1 };
+      return this.extended;
+    },
+
+    /**
+     * THE COUNTERS, AS A CHECKPOINT. Elapsed time is stored as a duration, not
+     * a start time, so a paused job's clock stops while it waits for her.
+     */
+    state() {
+      return {
+        calls: this.calls, billed: this.billed, failedCalls: this.failedCalls, retries: this.retries,
+        roundsUsed: this.roundsUsed, elapsedMs: Date.now() - this.startedMs,
+        maxCalls: this.maxCalls, maxAttempts: this.maxAttempts, maxRounds: this.maxRounds, maxWallMs: this.maxWallMs,
+        extended: this.extended
+      };
+    },
+    restore(st) {
+      if (!st || typeof st !== 'object') return this;
+      for (const k of ['calls', 'billed', 'failedCalls', 'retries', 'roundsUsed', 'maxCalls', 'maxAttempts', 'maxRounds', 'maxWallMs']) {
+        if (Number.isFinite(st[k])) this[k] = st[k];
+      }
+      if (Number.isFinite(st.elapsedMs)) this.startedMs = Date.now() - st.elapsedMs;
+      if (st.extended) this.extended = st.extended;
+      return this;
+    },
+
+    /**
+     * Bill one completed call. Named and separate so what a call COST is
+     * decided in one place and is testable without a model in the loop.
+     */
+    charge(name, result) {
+      const { cost, productive } = toolCallCost(name, result, this.failedCallCost);
+      this.billed += cost;
+      if (!productive) this.failedCalls++;
+      return cost;
+    },
+
+    /** Record that the budget bound. Loud by construction — never silent. */
+    exhaust(reason) {
+      if (this.exhaustedReason) return;
+      this.exhaustedReason = reason;
+      const line = `Heartbeat step "${this.stepName}" hit its tool budget: ${reason}. It carried on without tools for the rest of the step.`;
+      console.warn(`[Heartbeat] ${line}`);
+      try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch (e) { /* console line is the floor */ }
+    },
+
+    summary() {
+      return {
+        step: this.stepName,
+        tools: this.allowedTools,
+        calls: this.calls,
+        maxCalls: this.maxCalls,
+        // Both numbers, always: "12 calls" and "12 calls of which 9 were dead"
+        // are different reports, and only the second one explains a thin result.
+        billed: Math.round(this.billed * 100) / 100,
+        failedCalls: this.failedCalls,
+        retries: this.retries,
+        maxAttempts: this.maxAttempts,
+        rounds: this.roundsUsed,
+        maxRounds: this.maxRounds,
+        elapsedMs: Date.now() - this.startedMs,
+        maxWallMs: this.maxWallMs,
+        extended: this.extended,
+        exhausted: this.exhaustedReason
+      };
+    }
+  };
+}
+
+/**
+ * Execute one tool call on behalf of a background step.
+ *
+ * Routed through the SHARED MCP registry, so a background step calls the exact
+ * same tool implementation the chat path does — the spec's rule for INSPECT is
+ * "same tools, same contract", and two implementations would be two contracts.
+ * The allowlist is intersected with MCPClient.BACKGROUND_TOOLS, which is
+ * read-only: a background agent that can write is one that can change what the
+ * entity believes about itself with nobody in the room.
+ */
+async function executeBackgroundTool(session, name, args) {
+  const MCPClient = require('../mcp/mcp-client');
+  const client = MCPClient.shared();
+  if (!session.allowedTools.includes(name)) {
+    // Not billed and not counted: nothing was called. A refusal by the allowlist
+    // is a fact about the step's declaration, not about its budget.
+    return { error: `Tool "${name}" is not available to this background step.` };
+  }
+  session.calls++;
+  const attempt = async () => {
+    try {
+      return await client.executeTool(name, args, { caller: session.stepName });
+    } catch (err) {
+      return { error: `Tool execution failed: ${err.message}` };
+    }
+  };
+  let result = await attempt();
+  // ONE FREE RETRY FOR AN ERROR. A timeout, a dead provider, a thrown tool —
+  // anything that comes back as `error` — is tried again before it is billed.
+  // An EMPTY result is not an error and is not retried: it is the answer.
+  // The retry counts toward the raw attempt ceiling (it is a real request) so
+  // a dead provider still cannot double the runaway allowance.
+  let retried = false;
+  for (let r = 0; r < session.failedCallRetries && result && result.error; r++) {
+    if (session.calls + session.retries >= session.maxAttempts) break;
+    session.retries++;
+    retried = true;
+    console.log(`[Heartbeat] ${session.stepName} ${name} errored (${String(result.error).slice(0, 120)}) — retrying once, free`);
+    await new Promise(res => setTimeout(res, RETRY_PAUSE_MS));
+    result = await attempt();
+  }
+  if (result && typeof result === 'object' && retried) {
+    try { Object.defineProperty(result, '_retried', { value: true, enumerable: false }); } catch { /* frozen */ }
+  }
+  // BILLED HERE, once, from the actual result — never at the call site. A caller
+  // that decides its own cost is a caller that can forget to.
+  const cost = session.charge(name, result);
+  if (cost < 1) {
+    console.log(`[Heartbeat] ${session.stepName} ${name} was unproductive (${toolCallCost(name, result, session.failedCallCost).why}${retried ? ', after a free retry' : ''}) — billed ${cost}, ${session.billed.toFixed(2)}/${session.maxCalls}`);
+  } else if (retried) {
+    console.log(`[Heartbeat] ${session.stepName} ${name} succeeded on the free retry — billed ${cost} as a usable result`);
+  }
+  return result;
+}
+
+/** The pause before a free retry. Long enough for a hiccup, short enough not to matter. */
+const RETRY_PAUSE_MS = 1000;
+
+/**
+ * Strip channel/control markers from a tool-loop response.
+ *
+ * Observed on the live engine (vLLM serving Gemma-4-26B-A4B-NVFP4, 2026-08-03):
+ * a plain callLLM returns "OK.", but the same model answering after a tool call
+ * returns "<|channel>thought\n<channel|>I hold 6 active facts…". The markers
+ * appear only on the tool path, so nothing upstream ever had to handle them —
+ * and the corrector will be parsing this content, where a stray control token is
+ * the difference between a parsed verdict and a skipped one.
+ *
+ * Deliberately narrow: only angle-bracket control tokens carrying a pipe. Real
+ * prose does not contain "<|…>" and a broader strip would eat comparisons.
+ */
+function stripChannelMarkers(text) {
+  return String(text || '')
+    // The whole header span, name included: "<|channel>thought\n<channel|>".
+    // Stripping only the two markers would leave the bare channel name
+    // ("thought") glued to the front of the answer, which reads as content.
+    .replace(/<\|channel>[\s\S]{0,40}?<channel\|>/g, '')
+    // Any remaining lone control token.
+    .replace(/<\|[^>|]*\|?>/g, '')
+    .replace(/<[^<>|\s]*\|>/g, '')
+    .trim();
+}
+
+/**
+ * A RETIRED KEY THAT SURVIVES IN A BOX'S OWN CONFIG IS THE TRAP.
+ *
+ * generation.llmTimeoutTokensPerSecond and llmTimeoutFloorMs were removed from
+ * DEFAULTS when stall detection landed, but any box that ever saved its settings
+ * while they existed has them written into data/config.json — where they read as
+ * live knobs governing how a call is killed, and govern nothing. Said once per
+ * process, the same way the two retired output-token keys are.
+ */
+let warnedRetiredRateKnobs = false;
+function warnRetiredRateKnobs(gen) {
+  if (warnedRetiredRateKnobs) return;
+  const stale = ['llmTimeoutTokensPerSecond', 'llmTimeoutFloorMs'].filter(k => gen[k] !== undefined);
+  if (!stale.length) return;
+  warnedRetiredRateKnobs = true;
+  const line =
+    `generation.${stale.join(' and generation.')} in data/config.json ${stale.length > 1 ? 'are' : 'is'} ` +
+    `NO LONGER READ — calls are killed on a STALL now (generation.stallTimeoutMs / firstTokenTimeoutMs), ` +
+    `not on a duration predicted from a tokens-per-second rate. Delete the old key${stale.length > 1 ? 's' : ''}; ` +
+    `${stale.length > 1 ? 'they do' : 'it does'} nothing.`;
+  console.warn(`[Heartbeat] ${line}`);
+  try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* console is the floor */ }
+}
+
+/**
+ * ONE STREAMED CHAT COMPLETION, KILLED ON A STALL RATHER THAN ON A PREDICTION.
+ *
+ * The background path used to send `stream: false` under a timeout computed from
+ * an assumed tokens-per-second rate. That rate is not a property of the engine —
+ * it is a property of how many streams are running. Measured on this GB10 at
+ * 8-bit, per stream: 33.3 tok/s alone, 19.7 at 8 concurrent, 15.6 at 64, 10.6 at
+ * 128. So the more agents run at once, the more likely each one is killed for
+ * being slow, and a memory system whose whole point is parallel background work
+ * was punishing itself for doing it. That is why the concurrency cap sat at 2.
+ *
+ * A STALL DOES NOT CARE HOW MANY STREAMS ARE RUNNING. If tokens are still
+ * arriving the job is working, however slowly; if none have arrived for a minute
+ * the engine is wedged, which is the failure this ever existed to catch. It also
+ * catches it far sooner: the old formula gave an 8192+16384-token job 1,229s
+ * before it would notice a dead engine. This notices in 60.
+ *
+ * TWO LIMITS, BECAUSE "NOTHING YET" MEANS DIFFERENT THINGS AT DIFFERENT TIMES.
+ *   firstTokenMs — before the first token, silence is NORMAL. It covers queue
+ *     wait as well as prefill: past --max-num-seqs vLLM holds requests in
+ *     `waiting` by design, and that wait is bounded by the queue, not by us.
+ *     Generous on purpose (measured TTFT here: 0.13s alone, 1.24s at 128).
+ *   stallMs — after the first token, silence means something is wrong. At the
+ *     worst measured load a token arrives every ~95ms, so 60s is ~630x the gap.
+ *
+ * WHAT COUNTS AS PROGRESS is deliberately narrow: content, reasoning, or tool-call
+ * deltas. A bare keep-alive does NOT reset the clock — an engine sending
+ * heartbeats while producing nothing is precisely the stall being detected.
+ * Bursty delivery is fine and is the reason this measures GAPS rather than rate:
+ * fifty tokens, ten seconds of nothing, fifty more reads as a 10s gap.
+ *
+ * Returns a body in the NON-STREAMING SHAPE. Every reader downstream —
+ * provider.extract, reasoningFromResponse, extractFinishReason, and
+ * runToolLoop's own `data.choices[0].message` — is unchanged and cannot tell
+ * this happened. The risk of the conversion is confined to this function.
+ *
+ * @returns {Promise<object>} { choices: [{ message, finish_reason }] } or
+ *                            { message, done_reason } for the Ollama shape
+ */
+/**
+ * `onFrame` — OPTIONAL, and the reason multi-round turns stopped looking hung.
+ *
+ * A tool round streams from the engine exactly like the final round does, but
+ * this function consumed that stream privately and handed back the
+ * non-streaming shape, so nothing reached the browser until the LAST round
+ * began. Athena's second turn spent 168s generating across five rounds and the
+ * UI showed dead air for the first ~183s of it: the work was happening and
+ * invisible. Callers that own a client connection now pass onFrame and get the
+ * reasoning tokens as they land. Callers that do not pass it are unchanged.
+ */
+async function streamChat({ url, body, openAiStyle, firstTokenMs, stallMs, label, onFrame, abortSignal }) {
+  const controller = new AbortController();
+  // WHEN THE READER LEAVES, THE ENGINE SHOULD STOP. A round used to be an
+  // internal request with no relationship to the client, so closing the tab
+  // left it generating to the end for nobody. Now that rounds ARE the visible
+  // turn, the caller's signal is chained onto this one.
+  if (abortSignal) {
+    if (abortSignal.aborted) controller.abort();
+    else abortSignal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  let lastProgress = Date.now();
+  let sawFirstToken = false;
+  let killReason = null;
+
+  // A 1s watchdog rather than a race of timers: one place decides, and the
+  // deadline it applies changes the moment the first token lands.
+  const watchdog = setInterval(() => {
+    const idle = Date.now() - lastProgress;
+    const limit = sawFirstToken ? stallMs : firstTokenMs;
+    if (idle >= limit) {
+      killReason = sawFirstToken
+        ? `stalled — no tokens for ${Math.round(idle / 1000)}s (limit ${Math.round(stallMs / 1000)}s)`
+        : `timed out waiting for the first token after ${Math.round(idle / 1000)}s (limit ${Math.round(firstTokenMs / 1000)}s)`;
+      controller.abort();
+    }
+  }, 1000);
+
+  const progress = () => { lastProgress = Date.now(); sawFirstToken = true; };
+
+  let content = '';
+  let reasoning = '';
+  let finishReason = '';
+  // WHAT THE ENGINE COUNTED. vLLM sends a final chunk carrying `usage` when
+  // asked (stream_options.include_usage); Ollama puts prompt_eval_count on its
+  // last object. Until 2026-09-17 nothing asked, so the runner never knew its
+  // own prompt size until the engine refused one at 81,857 tokens.
+  let usage = null;
+  const toolAcc = new Map();   // call index -> the call being assembled
+
+  try {
+    const wire = { ...body, stream: true };
+    if (openAiStyle) wire.stream_options = { ...(body.stream_options || {}), include_usage: true };
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(wire),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      // THE STATUS IS CARRIED, NOT JUST THE MESSAGE. The chat path retries a
+      // round without its forced tool_choice when the engine REFUSES the
+      // request, and it decides that on the status code. Throwing a bare
+      // `HTTP 400` string would have made it parse the message back out —
+      // which is how a refusal quietly becomes a lost turn the first time
+      // the wording changes. The message text is unchanged, so the
+      // circuit-breaker classifier and every existing log line still match.
+      const body = await response.text().catch(() => '');
+      const e = new Error(`HTTP ${response.status}`);
+      e.status = response.status;
+      e.body = body;
+      throw e;
+    }
+    if (!response.body) throw new Error('no response body to stream');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Both wire formats are line-delimited; the difference is only whether a
+      // line carries an SSE `data: ` prefix. Split on newlines and keep the
+      // trailing fragment, because a chunk can end mid-line.
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        let payload = line;
+        if (openAiStyle) {
+          if (!line.startsWith('data:')) continue;   // SSE comments/keep-alives
+          payload = line.slice(5).trim();
+          if (payload === '[DONE]') continue;
+        }
+
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+
+        const delta = openAiStyle ? (obj.choices?.[0]?.delta || {}) : (obj.message || {});
+        const fr = openAiStyle ? obj.choices?.[0]?.finish_reason : obj.done_reason;
+        if (fr) finishReason = fr;
+        if (openAiStyle && obj.usage && Number.isFinite(obj.usage.prompt_tokens)) {
+          usage = { promptTokens: obj.usage.prompt_tokens, completionTokens: obj.usage.completion_tokens ?? null };
+        } else if (!openAiStyle && Number.isFinite(obj.prompt_eval_count)) {
+          usage = { promptTokens: obj.prompt_eval_count, completionTokens: obj.eval_count ?? null };
+        }
+
+        if (typeof delta.content === 'string' && delta.content.length) {
+          content += delta.content;
+          progress();
+          // The ANSWER of a round, relayed as it lands. A round that calls no
+          // tool is the final answer, so without this the turn streams its
+          // thinking and then goes silent with nothing to show for it.
+          if (onFrame) {
+            try { onFrame(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: delta.content }, finish_reason: null }] })}\n\n`); }
+            catch { /* a broken client must not kill the turn */ }
+          }
+        }
+        const r = reasoningChannel.extractReasoning(delta);
+        if (r) { reasoning += r; progress(); }
+
+        // Relay the thinking of a round as it lands, on its own channel so the
+        // UI's thinking panel works from round one rather than only the last.
+        if (onFrame && r) {
+          try { onFrame(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning: r }, finish_reason: null }] })}\n\n`); }
+          catch { /* a broken client must not kill the turn */ }
+        }
+
+        // TOOL CALLS ARRIVE IN PIECES on the OpenAI wire: one fragment per
+        // chunk, keyed by `index`, with `arguments` split across as many chunks
+        // as the JSON needs. `name` normally lands whole in the first fragment,
+        // but it is APPENDED rather than assigned so a build that splits it is
+        // handled too — appending is a no-op in the common case and the only
+        // thing that works in the uncommon one. Ollama sends them whole.
+        const deltaCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+        for (let i = 0; i < deltaCalls.length; i++) {
+          const tc = deltaCalls[i];
+          const idx = Number.isInteger(tc.index) ? tc.index : i;
+          const cur = toolAcc.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) cur.id = tc.id;
+          if (tc.type) cur.type = tc.type;
+          if (tc.function?.name) cur.function.name += tc.function.name;
+          if (tc.function?.arguments !== undefined && tc.function.arguments !== null) {
+            // Ollama hands back an object here rather than a string fragment.
+            cur.function.arguments = typeof tc.function.arguments === 'string'
+              ? cur.function.arguments + tc.function.arguments
+              : tc.function.arguments;
+          }
+          toolAcc.set(idx, cur);
+          progress();
+        }
+      }
+    }
+
+    // THE ABORT MAY LAND AS A CLEAN CLOSE rather than a rejection, depending on
+    // how the runtime tears the stream down. Without this the function would
+    // return whatever it had accumulated before the stall, as a finished answer
+    // — the exact "looks complete and is not" failure the partial-result work
+    // exists to prevent, reintroduced one layer lower. If the watchdog fired,
+    // this call failed, however the reader chose to end.
+    if (killReason) throw new Error(killReason);
+  } catch (err) {
+    // WHAT HAD ARRIVED BEFORE IT BROKE travels with the error. A stream cut off
+    // mid-writeup used to lose every token it had streamed; the caller writing
+    // the failure card now gets the text up to the cut, labelled as partial.
+    const partial = { content, reasoningChars: reasoning.length, toolCallsSoFar: toolAcc.size };
+    if (killReason) {
+      // Named so the log says which limit bound, and typed so the existing
+      // circuit-breaker classifier still counts it as a timeout — a wedge has to
+      // keep tripping the breaker exactly as it did before.
+      const e = new Error(`${label ? `${label}: ` : ''}${killReason}`);
+      e.name = 'TimeoutError';
+      e.partial = partial;
+      throw e;
+    }
+    if (err && typeof err === 'object') { try { err.partial = partial; } catch { /* frozen error */ } }
+    throw err;
+  } finally {
+    clearInterval(watchdog);
+  }
+
+  const toolCalls = [...toolAcc.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+  const message = { role: 'assistant', content };
+  if (reasoning) message.reasoning = reasoning;
+  if (toolCalls.length) message.tool_calls = toolCalls;
+
+  return openAiStyle
+    ? { choices: [{ message, finish_reason: finishReason }], usage }
+    : { message, done_reason: finishReason, usage };
+}
+
+/**
+ * The background tool loop.
+ *
+ * Same shape as the chat path's loop, deliberately: model turn → tool calls →
+ * results appended → model turn again, until it stops asking or the budget
+ * binds. Kept here rather than shared with server.js because the two differ in
+ * every way that matters — no streaming, no per-tool sub-caps, no user-visible
+ * source cards — and a shared abstraction would have to be told which of those
+ * it was doing on every call.
+ *
+ * When the budget binds mid-loop the tools are withdrawn and ONE more turn runs
+ * without them, so the step gets an answer built from what it managed to look up
+ * rather than nothing at all.
+ */
+async function runToolLoop({ session, openAiStyle, url, body, messages, timeouts, providerName,
+                             resume = null, checkpoint = null, pauseWhen = null,
+                             window = null, compactor = null, splitWhen = null }) {
+  const MCPClient = require('../mcp/mcp-client');
+  const client = MCPClient.shared();
+  const specs = client.getToolsForOpenAISubset(session.allowedTools);
+  const jobWindow = require('./job-window');
+
+  // THE WINDOW, WHEN THE CALLER KNOWS IT. `window` is { window, fit } from the
+  // job path: the engine's ceiling and the budget halves to fit into it. With
+  // it, every round's max_tokens is sized to what the window has left (see
+  // db/job-window.fitReservation) rather than the full budget, and a 400 on
+  // context length is read, refitted and retried once before it is a failure.
+  // Without it the loop sends exactly what it always sent.
+  const win = window && Number.isFinite(window.window) && window.window > 0 ? window : null;
+  const fitCfg = (win && win.fit) || {};
+  const calibrator = jobWindow.createCalibrator(fitCfg.charsPerToken);
+  if (resume && resume.calibration) calibrator.restore(resume.calibration);
+  const stats = {
+    window: win ? win.window : null,
+    peakPromptTokens: resume && resume.stats && Number.isFinite(resume.stats.peakPromptTokens) ? resume.stats.peakPromptTokens : 0,
+    peakCompletionTokens: resume && resume.stats && Number.isFinite(resume.stats.peakCompletionTokens) ? resume.stats.peakCompletionTokens : 0,
+    squeezedRounds: resume && resume.stats ? (resume.stats.squeezedRounds | 0) : 0,
+    refitRetries: resume && resume.stats ? (resume.stats.refitRetries | 0) : 0,
+    rounds: []
+  };
+  const compaction = { total: resume && resume.compaction ? resume.compaction : null, last: null };
+  const specsChars = jobWindow.specsChars(specs);
+  const promptEstimate = (msgs, withTools) => calibrator.estimate(jobWindow.transcriptChars(msgs) + (withTools ? specsChars : 0));
+  const noteUsage = (data, msgs, withTools, round, maxTokens) => {
+    const u = data && data.usage;
+    const chars = jobWindow.transcriptChars(msgs) + (withTools ? specsChars : 0);
+    if (u && Number.isFinite(u.promptTokens)) {
+      calibrator.observe(chars, u.promptTokens);
+      stats.peakPromptTokens = Math.max(stats.peakPromptTokens, u.promptTokens);
+      if (Number.isFinite(u.completionTokens)) stats.peakCompletionTokens = Math.max(stats.peakCompletionTokens, u.completionTokens);
+    }
+    stats.rounds.push({ round, promptTokens: u && Number.isFinite(u.promptTokens) ? u.promptTokens : null,
+      completionTokens: u && Number.isFinite(u.completionTokens) ? u.completionTokens : null, chars, maxTokens });
+    stats.calibration = calibrator.state();
+  };
+  // A round's body, with max_tokens fitted to the room left. Returns null when
+  // even the floor does not fit — the caller compacts, and if that is not
+  // enough, stops loudly.
+  const fitBody = (base, msgs, withTools, round) => {
+    const rb = { ...base, messages: msgs };
+    if (withTools) rb.tools = specs;
+    if (!win) return { body: rb, fit: null, promptTokens: null };
+    const promptTokens = promptEstimate(msgs, withTools);
+    // The two halves as the body already carries them: the caller may have
+    // left the job's thinking budget null and inherited the background one,
+    // and the fit must see what is actually on the wire.
+    const baseThinking = Number.isFinite(base.thinking_token_budget) && base.thinking_token_budget > 0 ? base.thinking_token_budget : 0;
+    const thinkingTokens = Number.isFinite(fitCfg.thinkingTokens) ? fitCfg.thinkingTokens : (baseThinking || null);
+    const answerTokens = Number.isFinite(fitCfg.answerTokens) ? fitCfg.answerTokens : Math.max(1, (base.max_tokens ?? 1024) - baseThinking);
+    const fit = jobWindow.fitReservation({
+      window: win.window, promptTokens, answerTokens, thinkingTokens,
+      floorAnswer: fitCfg.floorAnswer, floorThinking: fitCfg.floorThinking, margin: fitCfg.margin
+    });
+    if (!fit.fits) return { body: null, fit, promptTokens };
+    rb.max_tokens = fit.maxTokens;
+    if (openAiStyle && thinkingTokens) {
+      if (fit.thinking && fit.thinking > 0) rb.thinking_token_budget = fit.thinking;
+      else {
+        delete rb.thinking_token_budget;
+        rb.chat_template_kwargs = { ...(rb.chat_template_kwargs || {}), enable_thinking: false };
+      }
+    }
+    if (fit.squeezed) {
+      stats.squeezedRounds++;
+      console.log(`[Heartbeat] ${session.stepName} round ${round}: prompt ~${promptTokens} of ${win.window} — ${fit.why}`);
+    }
+    return { body: rb, fit, promptTokens };
+  };
+  // Compact, then refit. `hard` is pressure mode: everything eligible.
+  const compactNow = async (msgs, round, hard) => {
+    if (typeof compactor !== 'function') return { changed: false };
+    let r;
+    try { r = await compactor(msgs, { round, hard, window: win ? win.window : null, promptTokens: promptEstimate(msgs, true) }); }
+    catch (e) { console.warn(`[Heartbeat] ${session.stepName} compaction failed: ${e.message}`); return { changed: false }; }
+    if (!r || !Array.isArray(r.convo)) return { changed: false };
+    const changed = r.report && (r.report.entries || r.report.reasoningDropped);
+    if (changed) {
+      msgs.splice(0, msgs.length, ...r.convo);
+      compaction.total = require('./job-compaction').addReport(compaction.total, r.report);
+      compaction.last = r.report;
+      console.log(`[Heartbeat] ${session.stepName} round ${round}: compacted ${r.report.entries} result(s) from ${r.report.roundsCompacted.length} round(s) ` +
+        `(${r.report.digested} digested, ${r.report.trimmed} trimmed, ${r.report.truncated} truncated; ${r.report.charsBefore - r.report.charsAfter} chars dropped${hard ? '; pressure' : ''})`);
+    }
+    return { changed: !!changed, report: r.report };
+  };
+  const compactionSummary = () => require('./job-compaction').reportSummary(compaction.total);
+  // A RESUMED RUN PICKS UP ITS OWN TRANSCRIPT. `resume.convo` is the message
+  // array a checkpoint saved — the same system prompt, the same tool results —
+  // so the model continues from where it stopped rather than from zero.
+  const convo = resume && Array.isArray(resume.convo) && resume.convo.length ? [...resume.convo] : [...messages];
+  const toolCalls = resume && Array.isArray(resume.toolCalls) ? [...resume.toolCalls] : [];
+
+  // WHERE A RUN'S TIME ACTUALLY WENT — measured, not inferred.
+  //
+  // Added 2026-08-27, after a history_search run took 192s on a store of 103
+  // messages and nothing in the record could say why. The row kept a duration
+  // and a tool-call count; both were innocent (4 calls, and the SQLite behind
+  // them costs single-digit milliseconds). The cost was in the engine, spread
+  // across rounds, and invisible: this loop returned `content` and never told
+  // anyone how much of the wall clock had gone into reasoning nobody read.
+  //
+  // Purely additive — a count of characters and a list of round durations, on
+  // every return path. No caller has to read it, and the two that do (agent
+  // jobs, history search) write it into the row so the next person tuning a
+  // budget starts from a number rather than from a guess.
+  let reasoningChars = 0;
+  const roundMs = [];
+
+  if (specs.length === 0) {
+    session.exhaust('no allowed tools are registered');
+  }
+
+  // THE RECORD ON DISK, AFTER EVERY STEP THAT CHANGES IT. A crash cannot write
+  // anything after the fact, so the transcript is written as it grows: after
+  // every tool result and every round. The caller decides where; this loop
+  // only says when. Never allowed to fail the run.
+  const save = (extra = {}) => {
+    if (typeof checkpoint !== 'function') return;
+    try { checkpoint({ convo, toolCalls, session: session.state(), stats, compaction: compaction.total, calibration: calibrator.state(), ...extra }); }
+    catch (e) { console.warn(`[Heartbeat] ${session.stepName} checkpoint failed: ${e.message}`); }
+  };
+  // AND THE STATE TRAVELS WITH A THROW. The in-process failure path (the
+  // stream cut mid-round, a wedged engine) used to lose the whole tool record
+  // because it lived only in this frame. Attached to the error, the caller
+  // writing the failure card has the same record the checkpoint has.
+  const attach = (err, round) => {
+    if (err && typeof err === 'object') {
+      try { err.toolCalls = toolCalls; err.convo = convo; err.round = round; err.budget = session.summary(); err.stats = stats; err.compaction = compactionSummary(); } catch { /* frozen */ }
+    }
+    return err;
+  };
+  // ONE REQUEST, WITH THE WINDOW RESPECTED. Fits the body; when nothing fits,
+  // compacts under pressure and fits again; when the engine still refuses on
+  // context length, reads its numbers, recalibrates, and retries once. Any
+  // other error is the caller's, unchanged.
+  const request = async (base, msgs, withTools, round, label) => {
+    let fitted = fitBody(base, msgs, withTools, round);
+    if (!fitted.body) {
+      await compactNow(msgs, round, true);
+      fitted = fitBody(base, msgs, withTools, round);
+    }
+    if (!fitted.body) {
+      const e = new Error(jobWindow.refusalSentence({ window: win.window, promptTokens: fitted.promptTokens, floor: (fitCfg.floorThinking || 0) + (fitCfg.floorAnswer || 0) }));
+      e.name = 'ContextWindowError'; e.kind = 'context-window';
+      e.promptTokens = fitted.promptTokens; e.window = win.window;
+      throw e;
+    }
+    try {
+      const data = await streamChat({ url, body: fitted.body, openAiStyle, firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs, label });
+      noteUsage(data, msgs, withTools, round, fitted.body.max_tokens);
+      return data;
+    } catch (err) {
+      if (!win || !jobWindow.isContextRefusal(err)) throw err;
+      const said = jobWindow.parseContextRefusal(err.body || err.message) || {};
+      if (Number.isFinite(said.prompt)) calibrator.observe(jobWindow.transcriptChars(msgs) + (withTools ? specsChars : 0), said.prompt);
+      if (Number.isFinite(said.limit) && said.limit < win.window) win.window = said.limit;
+      stats.refitRetries++;
+      console.warn(`[Heartbeat] ${session.stepName} round ${round}: the engine refused on context length (limit ${said.limit}, prompt ${said.prompt}, asked ${said.requested}) — compacting and refitting once`);
+      await compactNow(msgs, round, true);
+      const again = fitBody(base, msgs, withTools, round);
+      if (!again.body) {
+        const e = new Error(jobWindow.refusalSentence({ window: win.window, promptTokens: said.prompt ?? again.promptTokens, requested: said.requested, floor: (fitCfg.floorThinking || 0) + (fitCfg.floorAnswer || 0) }));
+        e.name = 'ContextWindowError'; e.kind = 'context-window'; e.promptTokens = said.prompt; e.window = win.window;
+        throw e;
+      }
+      const data = await streamChat({ url, body: again.body, openAiStyle, firstTokenMs: timeouts.firstTokenMs, stallMs: timeouts.stallMs, label: `${label} (refit)` });
+      noteUsage(data, msgs, withTools, round, again.body.max_tokens);
+      return data;
+    }
+  };
+
+  const runCalls = async (requested, round) => {
+    for (const call of requested) {
+      const name = call.function?.name;
+      // OpenAI-style providers send arguments as a JSON STRING; Ollama sends an
+      // object. Handle both rather than assuming, because "arguments is a
+      // string" is exactly the sort of thing that differs per engine build.
+      let args = call.function?.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      args = args || {};
+
+      const spent = session.spent();
+      if (spent) {
+        session.exhaust(spent);
+        convo.push({
+          role: 'tool', tool_call_id: call.id, name,
+          content: JSON.stringify({ error: `Not run — ${spent}. Answer with what you already have and say you could not look further.` })
+        });
+        continue;
+      }
+
+      const result = await executeBackgroundTool(session, name, args);
+      // `note` carries WHY a call was worth nothing, so a caller writing up a
+      // thin run can say "four searches, all empty" instead of "no results".
+      const worth = toolCallCost(name, result, session.failedCallCost);
+      toolCalls.push({ name, args, ok: !result?.error, productive: worth.productive, note: worth.productive ? null : worth.why, retried: !!(result && result._retried), round });
+      convo.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
+      save({ round });
+    }
+  };
+
+  // A run paused mid-round with tool calls the model had asked for and nobody
+  // ran. They run first, before the model is asked anything, so the transcript
+  // is well-formed (an assistant tool_calls turn followed by its results).
+  if (resume && Array.isArray(resume.pendingCalls) && resume.pendingCalls.length) {
+    const round = session.roundsUsed || 0;
+    try { await runCalls(resume.pendingCalls, round); }
+    catch (err) { throw attach(err, round); }
+    save({ round });
+  }
+  // And what changed while it was away — "she said yes, you have N more", or
+  // "SNH restarted, the round in progress was lost" — said into the transcript
+  // AFTER the pending results, so the assistant turn that asked for them is
+  // still followed by them.
+  if (resume && resume.note) {
+    convo.push({ role: 'user', content: String(resume.note) });
+    save({ round: session.roundsUsed || 0 });
+  }
+
+  const startRound = Math.max(0, session.roundsUsed | 0);
+  for (let round = startRound; round < session.maxRounds; round++) {
+    const spentReason = session.spent();
+    if (spentReason) session.exhaust(spentReason);
+    const offerTools = specs.length > 0 && !session.exhaustedReason;
+
+    // WHAT IT HAS READ IS COMPACTED BEFORE IT IS SENT AGAIN. Age-based: results
+    // older than the recent window become findings-plus-source; the recent
+    // rounds stay raw so the model can still read what it just fetched.
+    {
+      const c = await compactNow(convo, round + 1, false);
+      if (c.changed) save({ round });
+    }
+    // A PHASE MAY END EARLY, BEFORE THE WALL. When the caller runs the job in
+    // phases it hands in `splitWhen`; true means the transcript is past the
+    // point where the next phase should start fresh from the findings
+    // document. Returned, not thrown: the caller writes the phase up from
+    // this transcript, which still fits, and starts the next part.
+    if (typeof splitWhen === 'function' && round > startRound && win) {
+      const est = promptEstimate(convo, offerTools);
+      let why = null;
+      try { why = splitWhen({ promptTokens: est, window: win.window, round: round + 1, toolCalls: toolCalls.length }); } catch { why = null; }
+      if (why) {
+        save({ round });
+        return { split: true, splitWhy: why, content: '', provider: providerName, truncated: false, toolCalls, budget: session.summary(), reasoningChars, roundMs, convo, stats, compaction: compactionSummary() };
+      }
+    }
+
+    console.log(`[Heartbeat] ${session.stepName} tool round ${round + 1}/${session.maxRounds}` +
+                `${offerTools ? ` (${specs.length} tool(s) offered, ${session.billed.toFixed(2)}/${session.maxCalls} billed over ${session.calls} call(s))` : ' (no tools — budget spent)'}`);
+
+    session.roundsUsed = round + 1;
+    const roundStarted = Date.now();
+    let data;
+    try {
+      data = await request(body, convo, offerTools, round + 1, `${session.stepName} round ${round + 1}`);
+    } catch (err) {
+      throw attach(err, round + 1);
+    }
+    roundMs.push(Date.now() - roundStarted);
+    reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
+
+    const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
+    const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
+    const requested = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+
+    if (requested.length === 0 || !offerTools) {
+      // A FINAL ANSWER CUT BY A SQUEEZED ROUND IS NOT THE ANSWER. When the fit
+      // had shrunk this round's budget and the model's answer hit it, the
+      // window is the problem, not the writing: compact under pressure and ask
+      // for the writeup again with room made. Once.
+      const last = stats.rounds[stats.rounds.length - 1];
+      const fullReservation = (Number.isFinite(fitCfg.answerTokens) ? fitCfg.answerTokens : (body.max_tokens ?? 0)) +
+        (Number.isFinite(fitCfg.thinkingTokens) ? fitCfg.thinkingTokens : 0);
+      if (finishReason === 'length' && win && last && Number.isFinite(last.maxTokens) && last.maxTokens < fullReservation) {
+        const c = await compactNow(convo, round + 1, true);
+        if (c.changed) {
+          console.log(`[Heartbeat] ${session.stepName} round ${round + 1}: the answer was cut at a squeezed budget — re-asking with the room compaction made`);
+          save({ round: round + 1 });
+          let again;
+          try { again = await request(body, convo, false, round + 1, `${session.stepName} round ${round + 1} (writeup, refit)`); }
+          catch (err) { throw attach(err, round + 1); }
+          const m2 = openAiStyle ? (again.choices?.[0]?.message || {}) : (again.message || {});
+          const fr2 = openAiStyle ? (again.choices?.[0]?.finish_reason || '') : (again.done_reason || '');
+          closeCircuit();
+          return { content: stripChannelMarkers(m2.content), provider: providerName, truncated: fr2 === 'length', toolCalls, budget: session.summary(), reasoningChars, roundMs, convo, stats, compaction: compactionSummary() };
+        }
+      }
+      closeCircuit();
+      return {
+        content: stripChannelMarkers(msg.content),
+        provider: providerName,
+        truncated: finishReason === 'length',
+        toolCalls,
+        budget: session.summary(),
+        reasoningChars,
+        roundMs,
+        convo,
+        stats,
+        compaction: compactionSummary()
+      };
+    }
+
+    convo.push(msg);
+
+    // NEAR THE CEILING WITH WORK LEFT: STOP AND ASK, do not run into the wall.
+    // The model has just asked for more tools, which is the only evidence
+    // there is that work remains. The calls it asked for are NOT run — they are
+    // handed back as `pendingCalls` so a resume can run them first — and the
+    // caller decides how to ask. A hard stop with the writeup is still what
+    // happens when asking is switched off (pauseWhen returns null).
+    const near = typeof pauseWhen === 'function' ? pauseWhen(session, round + 1) : null;
+    if (near) {
+      save({ round: round + 1, pendingCalls: requested });
+      return {
+        paused: true,
+        near,
+        pendingCalls: requested,
+        content: '',
+        provider: providerName,
+        truncated: false,
+        toolCalls,
+        budget: session.summary(),
+        reasoningChars,
+        roundMs,
+        convo,
+        stats,
+        compaction: compactionSummary()
+      };
+    }
+
+    try { await runCalls(requested, round + 1); }
+    catch (err) { throw attach(err, round + 1); }
+    save({ round: round + 1 });
+  }
+
+  // ROUNDS EXHAUSTED WITH THE MODEL STILL ASKING — AND IT STILL HAS TO WRITE.
+  //
+  // This used to `return { content: '' }`, and that empty string is exactly how a
+  // real job was thrown away on 2026-08-18: it spent every round on searches that
+  // failed, the loop ran out, the caller received no text, and the memory work it
+  // had ALREADY DONE went in the bin behind an empty panel card. The work was
+  // done; only the writeup was missing.
+  //
+  // So the last thing a run out of rounds does is write up what it has. Tools are
+  // withdrawn (nothing is offered, so nothing can be asked for), the whole tool
+  // transcript is still in `convo`, and the instruction is explicit about what an
+  // honest partial answer looks like. One extra turn, and it is the difference
+  // between a result and nothing.
+  session.exhaust(`round budget spent (${session.maxRounds} rounds)`);
+
+  const dead = toolCalls.filter(c => !c.productive).length;
+  convo.push({
+    role: 'user',
+    content:
+      'STOP LOOKING THINGS UP — you are out of tool rounds and have no tools for this turn. ' +
+      `You made ${toolCalls.length} tool call(s)${dead ? `, ${dead} of which came back empty or failed` : ''}. ` +
+      'Write up what you have NOW, from the tool results above. Say what you found, and say plainly which ' +
+      'part you could not finish and why. If the lookups failed, say that they failed rather than reporting ' +
+      'the gap as an absence of anything to find. Do not invent anything to fill it, and do not answer with ' +
+      'nothing — a partial answer that says where it stops is worth something; silence is worth nothing.'
+  });
+
+  try {
+    {
+      const writeupStarted = Date.now();
+      const data = await request(body, convo, false, session.maxRounds + 1, `${session.stepName} writeup`);
+      roundMs.push(Date.now() - writeupStarted);
+      reasoningChars += (reasoningChannel.reasoningFromResponse(data) || '').length;
+      const msg = openAiStyle ? (data.choices?.[0]?.message || {}) : (data.message || {});
+      const finishReason = openAiStyle ? (data.choices?.[0]?.finish_reason || '') : (data.done_reason || '');
+      closeCircuit();
+      return {
+        content: stripChannelMarkers(msg.content),
+        provider: providerName,
+        truncated: finishReason === 'length',
+        toolCalls,
+        budget: session.summary(),
+        reasoningChars,
+        roundMs,
+        convo,
+        stats,
+        compaction: compactionSummary(),
+        // The caller needs to know this was cut short even when the text reads
+        // whole — a partial run reported as complete is the same lie in a nicer
+        // shape.
+        outOfRounds: true
+      };
+    }
+  } catch (err) {
+    console.warn(`[Heartbeat] ${session.stepName} writeup turn failed: ${err.message}`);
+  }
+
+  closeCircuit();
+  return {
+    content: '', provider: providerName, truncated: false,
+    toolCalls, budget: session.summary(), outOfRounds: true, convo, stats, compaction: compactionSummary()
+  };
+}
+
+// ============ LLM Helper ============
+
+/**
+ * Call an LLM with system + user prompts.
+ * Uses the heartbeat model/provider from config.
+ *
+ * TOOLS (2026-08-03). Pass `options.toolSession` — from createToolSession — to
+ * run this call as a tool loop. Without it the request body is exactly what it
+ * has always been: no `tools` key on either provider branch, which is why no
+ * background role could call anything. Every existing caller omits it, so every
+ * existing step is byte-identical to before.
+ *
+ * @param {string} systemPrompt
+ * @param {string} userPrompt
+ * @param {Object} [options]
+ * @param {number} [options.maxTokens] - the ANSWER budget; thinking is added on top
+ * @param {number} [options.thinkingTokens] - this call's own thinking budget,
+ *   overriding generation.backgroundThinkingTokens. Omit to use the background one.
+ * @param {Object} [options.toolSession] - per-step budget from createToolSession
+ * @returns {Promise<{content: string, provider: string, truncated: boolean, toolCalls?: Array}>}
+ */
+async function callLLM(systemPrompt, userPrompt, options = {}) {
+  // Fast-fail while the mid-cycle breaker is open — the brain is wedged, so
+  // don't spend another full timeout piling a doomed request onto a dead engine.
+  if (circuitOpen) {
+    throw new Error('Brain circuit open — skipping LLM call (engine wedged)');
+  }
+
+  const config = getConfig();
+  const heartbeatModel = config.models.heartbeat;
+  const inst = getProviderInstance(heartbeatModel.provider, heartbeatModel.instance);
+  const host = inst ? inst.host : 'http://localhost:11434';
+  const maxTokens = options.maxTokens ?? 1024;
+  // A caller may bring its OWN thinking budget instead of the background one.
+  // Agent jobs do (generation.agentJobThinkingTokens): a job is not a small
+  // judgement call, and until 2026-08-19 it silently borrowed the budget written
+  // for one. null/undefined here means "use the background budget", which is
+  // what all twenty other call sites still do.
+  const thinkingOverride = Number.isFinite(options.thinkingTokens) ? options.thinkingTokens : null;
+  // Date/time awareness for all heartbeat/audit roles (single shared injection).
+  const datedSystemPrompt = `${getCurrentDateTimeString()}\n\n${systemPrompt}`;
+  // A CALLER MAY CONTINUE A TRANSCRIPT IT ALREADY HOLDS. `continueMessages`
+  // is a full message array — a checkpointed job's own conversation — and it
+  // replaces the fresh system+user pair. This is how a paused job asks for
+  // more, resumes after a yes, and writes up after a no: the same transcript,
+  // one more turn, rather than a fresh prompt that has forgotten everything.
+  const messages = Array.isArray(options.continueMessages) && options.continueMessages.length
+    ? options.continueMessages
+    : [
+      { role: 'system', content: datedSystemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
+
+  // Build provider call based on config
+  // THE CALLER'S maxTokens IS THE ANSWER BUDGET, AND ON A REASONING MODEL THAT
+  // IS NOT THE WHOLE BILL.
+  //
+  // Every call site here sizes for the reply — 8 for a claim-type tag, 100 for a
+  // gap question, 120 for a salience score. A reasoning model spends that budget
+  // on thinking first and never reaches the answer, which is why salience and gap
+  // detection returned "" on every run. The thinking allowance is therefore ADDED
+  // to what the caller asked for rather than taken out of it: no call site
+  // changes meaning, and none of the twenty of them need editing.
+  //
+  // null (the shipped default) sends neither field, so a non-reasoning box gets
+  // byte-identical requests. vLLM extension, so OpenAI-style local engines only.
+  const gen = config.generation || {};
+  const bgThinking = thinkingOverride !== null
+    ? thinkingOverride
+    : (Number.isFinite(gen.backgroundThinkingTokens) ? gen.backgroundThinkingTokens : null);
+  const wireMaxTokens = bgThinking > 0 ? maxTokens + bgThinking : maxTokens;
+
+  // THE TIMEOUT IS SIZED ON WHAT THE ENGINE WILL ACTUALLY GENERATE, which is the
+  // wire total — thinking plus answer — not the answer alone. It read `maxTokens`
+  // until 2026-08-19, which was harmless while the thinking budget was 256 next
+  // to a 120-token answer and stops being harmless the moment a caller brings a
+  // real one: an agent job at 8192 answer + 16384 thinking would have been given
+  // 6 minutes to generate 24,576 tokens, and at the ~39 tok/s this GPU actually
+  // decodes that is a 10-minute job aborted at minute six with nothing to show.
+  // Sizing on the wire total can only ever LENGTHEN a timeout, so no existing
+  // caller can start failing because of this.
+  //
+  // STALL LIMITS, NOT A PREDICTED DURATION. The rate-based calculation this
+  // replaces got worse the more agents ran at once, which is the opposite of
+  // what a background system needs — see the note on streamChat. Neither of
+  // these scales with the budget, so raising a budget can no longer kill a job.
+  warnRetiredRateKnobs(gen);
+  // A CALLER MAY BRING ITS OWN DEADLINES. The config values are sized for
+  // background work waiting behind a queue — 300s to the first token is right
+  // for a job and wrong for a four-token classifier that runs in front of a
+  // person's turn, where it becomes 300 seconds of spinner with no error.
+  // Only tightening is meaningful here, but the override is honoured either
+  // way: a caller that knows its own shape knows better than the default.
+  const timeouts = {
+    stallMs: Number.isFinite(options.stallMs) && options.stallMs > 0
+      ? options.stallMs
+      : (Number.isFinite(gen.stallTimeoutMs) && gen.stallTimeoutMs > 0 ? gen.stallTimeoutMs : 60000),
+    firstTokenMs: Number.isFinite(options.firstTokenMs) && options.firstTokenMs > 0
+      ? options.firstTokenMs
+      : (Number.isFinite(gen.firstTokenTimeoutMs) && gen.firstTokenTimeoutMs > 0 ? gen.firstTokenTimeoutMs : 300000)
+  };
+
+  let url, body, extract, extractFinishReason;
+  if (['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
+    url = `${host}/v1/chat/completions`;
+    // No `stream` key here: streamChat owns that, and leaving a `stream: false`
+    // behind would read as "this path does not stream" when it does.
+    body = { messages, max_tokens: wireMaxTokens };
+    // A CALLER MAY PIN DETERMINISM. Only the approval classifier does today: it
+    // reads one bit out of a handful of tokens, and a sampled answer to a
+    // yes/no question is a coin weighted by temperature. Omitted entirely when
+    // not asked for, so every existing caller sends the body it always did.
+    if (Number.isFinite(options.temperature)) body.temperature = options.temperature;
+    if (bgThinking > 0) body.thinking_token_budget = bgThinking;
+    // A CALLER MAY TURN THINKING OFF, and on a reasoning model it must be able
+    // to. thinkingTokens: 0 used to mean "send no budget", which on Qwen3.8
+    // means UNBOUNDED thinking — so the approval classifier, which allows
+    // itself 4 tokens for a yes/no, spent all four on reasoning and returned
+    // nothing. Measured on every call: "spent the whole budget reasoning and
+    // produced no answer (19 chars of reasoning, max_tokens 4, finish_reason
+    // length)", failing closed to NO. An approval that can never say YES is
+    // not a safe default, it is a broken gate.
+    //
+    // thinking_token_budget: 0 is not honoured as "off" by this engine, but
+    // the chat template's own switch is, so 0 sends that instead. Verified on
+    // vLLM 0.24 / Qwen3.8-27B-NVFP4: enable_thinking false -> 0 chars of
+    // reasoning, true -> reasoning present. reasoning_effort is NOT a control
+    // here - low/medium/high produced 462/513/204 chars, non-monotonic.
+    if (bgThinking === 0) {
+      body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), enable_thinking: false };
+    }
+    if (gen.reasoningEffort) body.reasoning_effort = gen.reasoningEffort;
+    extract = (data) => data.choices?.[0]?.message?.content || '';
+    extractFinishReason = (data) => data.choices?.[0]?.finish_reason || '';
+  } else {
+    url = `${host}/api/chat`;
+    body = { model: heartbeatModel.model, messages, options: { num_predict: maxTokens } };
+    if (Number.isFinite(options.temperature)) body.options.temperature = options.temperature;
+    extract = (data) => data.message?.content || '';
+    extractFinishReason = (data) => data.done_reason || '';
+  }
+
+  // === Tool loop, when a step declared one. Everything below this block is the
+  // === original single-shot path, byte-for-byte, and that is what every
+  // === existing caller still runs: no toolSession, no `tools` key, no change.
+  if (options.toolSession) {
+    return runToolLoop({
+      session: options.toolSession,
+      openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
+      url, body, messages, timeouts,
+      providerName: `${heartbeatModel.provider}/${heartbeatModel.model}`,
+      resume: options.resume || null,
+      checkpoint: options.checkpoint || null,
+      window: options.window || null,
+      compactor: options.compactor || null,
+      splitWhen: options.splitWhen || null,
+      pauseWhen: options.pauseWhen || null
+    });
+  }
+
+  // A SINGLE-SHOT CALL MAY ALSO BE FITTED TO A WINDOW. The job path's writeup
+  // turns (a phase part, the synthesis, a salvage) continue a large transcript
+  // with no tools, and on a 131k engine with a 49k reservation a 90k prompt
+  // would be refused exactly as the 9/17 round was. With `options.window` the
+  // same fit applies here: the full budget when it fits, less when it must.
+  if (options.window && Number.isFinite(options.window.window) && options.window.window > 0 && ['llamacpp', 'vllm'].includes(heartbeatModel.provider)) {
+    const jw = require('./job-window');
+    const fc = options.window.fit || {};
+    const cal = jw.createCalibrator(fc.charsPerToken);
+    if (options.window.calibration) cal.restore(options.window.calibration);
+    const promptTokens = cal.estimate(jw.transcriptChars(messages));
+    const fit = jw.fitReservation({
+      window: options.window.window, promptTokens,
+      answerTokens: maxTokens, thinkingTokens: bgThinking,
+      floorAnswer: fc.floorAnswer, floorThinking: fc.floorThinking, margin: fc.margin
+    });
+    if (!fit.fits) {
+      const e = new Error(jw.refusalSentence({ window: options.window.window, promptTokens, floor: (fc.floorThinking || 0) + (fc.floorAnswer || 0) }));
+      e.name = 'ContextWindowError'; e.kind = 'context-window'; e.promptTokens = promptTokens; e.window = options.window.window;
+      throw e;
+    }
+    if (fit.squeezed) {
+      body.max_tokens = fit.maxTokens;
+      if (fit.thinking && fit.thinking > 0) body.thinking_token_budget = fit.thinking;
+      else if (bgThinking > 0) { delete body.thinking_token_budget; body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), enable_thinking: false }; }
+      console.log(`[Heartbeat] single call fitted to the window: prompt ~${promptTokens} of ${options.window.window} — ${fit.why}`);
+    }
+  }
+
+  const providers = [
+    {
+      name: `${heartbeatModel.provider}/${heartbeatModel.model}`,
+      url,
+      body,
+      extract,
+      extractFinishReason
+    }
+  ];
+
+  let lastError = null;
+
+  for (const provider of providers) {
+    try {
+      console.log(`[Heartbeat] Trying ${provider.name} → ${provider.url} ` +
+                  `(max_tokens: ${maxTokens}, stall ${Math.round(timeouts.stallMs / 1000)}s, ` +
+                  `first token ${Math.round(timeouts.firstTokenMs / 1000)}s)`);
+      const data = await streamChat({
+        url: provider.url,
+        body: provider.body,
+        openAiStyle: ['llamacpp', 'vllm'].includes(heartbeatModel.provider),
+        firstTokenMs: timeouts.firstTokenMs,
+        stallMs: timeouts.stallMs,
+        label: provider.name
+      });
+      const content = provider.extract(data);
+      // The thinking channel, read through the one shared reader. It is never
+      // folded into content — it is returned so a caller can show it, and named
+      // in the error below so a model that thought instead of answering says so.
+      const reasoning = reasoningChannel.reasoningFromResponse(data);
+      const finishReason = provider.extractFinishReason(data);
+      const truncated = finishReason === 'length';
+
+      if (truncated) {
+        console.warn(`[Heartbeat] WARNING: ${provider.name} finish_reason: "length" — response truncated at max_tokens (${wireMaxTokens}). Response: ${content.length} chars`);
+      }
+
+      if (content) {
+        console.log(`[Heartbeat] ${provider.name} responded (${content.length} chars${reasoning ? `, ${reasoning.length} chars reasoning` : ''}, finish_reason: ${finishReason || 'n/a'})`);
+        closeCircuit(); // a real response means the engine is alive
+        return { content, reasoning, provider: provider.name, truncated };
+      }
+      // ALL THINKING, NO ANSWER. Distinguished from a genuinely empty reply,
+      // because the two need opposite fixes and used to be the same message:
+      // this one is a budget that the reasoning consumed before the answer
+      // started, and it is fixed in config, not by retrying.
+      if (reasoning) {
+        throw new Error(
+          `Model spent the whole budget reasoning and produced no answer ` +
+          `(${reasoning.length} chars of reasoning, max_tokens ${wireMaxTokens}, finish_reason ${finishReason || 'n/a'}). ` +
+          `Raise memory.generation.backgroundThinkingTokens.`
+        );
+      }
+      throw new Error('Empty response');
+    } catch (err) {
+      // Track consecutive timeouts to trip the mid-cycle breaker. A non-timeout
+      // error (e.g. HTTP 4xx/5xx) means the engine is answering, so it doesn't
+      // count toward a wedge — reset the streak instead.
+      if (isTimeoutError(err)) {
+        consecutiveTimeouts++;
+        if (consecutiveTimeouts >= circuitThreshold() && !circuitOpen) {
+          circuitOpen = true;
+          console.warn(`[Heartbeat] Circuit opened after ${consecutiveTimeouts} consecutive timeouts — brain appears wedged; remaining calls will fast-fail`);
+        }
+      } else {
+        consecutiveTimeouts = 0;
+      }
+      console.log(`[Heartbeat] ${provider.name} failed: ${err.message}`);
+      lastError = err;
+    }
+  }
+
+  throw new Error(`All LLM providers failed. Last error: ${lastError?.message}`);
+}
+
+/**
+ * Lightweight brain liveness probe: a single tiny chat completion against the
+ * heartbeat provider with a short timeout. Used by both the maintenance circuit
+ * breaker (preflight) and the periodic liveness timer. Deliberately NOT routed
+ * through the agent pool or callLLM's retry machinery — this is the low-level
+ * check that decides whether the engine is answering at all.
+ * @param {number} [timeoutMs=8000]
+ * @returns {Promise<{ok: boolean, ms: number, error?: string}>}
+ */
+async function probeBrainLiveness(timeoutMs = 8000) {
+  const config = getConfig();
+  const hb = config.models.heartbeat;
+  const inst = getProviderInstance(hb.provider, hb.instance);
+  const host = inst ? inst.host : 'http://localhost:11434';
+  const started = Date.now();
+
+  let url, body;
+  if (['llamacpp', 'vllm'].includes(hb.provider)) {
+    url = `${host}/v1/chat/completions`;
+    body = { model: hb.model, messages: [{ role: 'user', content: 'ping' }], stream: false, max_tokens: 1 };
+  } else {
+    url = `${host}/api/chat`;
+    body = { model: hb.model, messages: [{ role: 'user', content: 'ping' }], stream: false, options: { num_predict: 1 } };
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!response.ok) {
+      // The engine answered and said no. It is reachable and it is not stuck;
+      // it is refusing, which is a different problem from either.
+      return { ok: false, ms: Date.now() - started, error: `HTTP ${response.status}`, kind: 'slow' };
+    }
+    // A 200 means the engine answered; the body may be empty at max_tokens 1,
+    // which is still a live response.
+    await response.json().catch(() => ({}));
+    return { ok: true, ms: Date.now() - started, kind: 'ok' };
+  } catch (err) {
+    // WHICH KIND OF FAILURE. A deadline expiring and a socket refusing are not
+    // the same fact and must not be counted the same way: the probe is an
+    // ordinary completion, so it queues, and a timeout under load measures the
+    // queue rather than the engine. A connection error measures the engine.
+    //
+    // The record bears this out. During the REAL outage on 2026-08-27 (08:25 to
+    // 08:29, while the container was down) every probe read "fetch failed" at
+    // 1-3ms. During the saturation that triggered that restart, they read
+    // "timeout after 8000ms" — interleaved with successes at 4149ms and 5081ms.
+    // Two distinguishable signatures that the old shape flattened into one.
+    const timedOut = err.name === 'TimeoutError' || err.name === 'AbortError';
+    const error = timedOut ? `timeout after ${timeoutMs}ms` : err.message;
+    return { ok: false, ms: Date.now() - started, error, kind: timedOut ? 'slow' : 'unreachable' };
+  }
+}
+
+/**
+ * Read the engine's own view of itself: how much work it is holding, and
+ * whether it is making progress on any of it.
+ *
+ * WHY THIS ENDPOINT. /metrics is served by the HTTP layer, not by the scheduler,
+ * so it answers in both of the states a completion cannot distinguish — while
+ * the scheduler is BUSY, and while it is STUCK. That is the whole discriminator.
+ *
+ * Progress is measured as a delta across two samples a moment apart rather than
+ * against the previous minute's reading, because "was it producing tokens 60
+ * seconds ago" does not answer "is it producing tokens now". Prompt tokens count
+ * as progress as well as generated ones: an engine deep in prefill is working.
+ *
+ * @returns {Promise<{reachable: boolean, running: number|null, waiting: number|null,
+ *                    generating: boolean|null, error?: string}>}
+ */
+async function readEngineState(timeoutMs = 2000) {
+  const config = getConfig();
+  const hb = config.models.heartbeat;
+  const inst = getProviderInstance(hb.provider, hb.instance);
+  const host = inst ? inst.host : 'http://localhost:11434';
+
+  const sample = async () => {
+    const res = await fetch(`${host}/metrics`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    const num = (metric) => {
+      const m = text.match(new RegExp(`^${metric}\\{[^}]*\\}\\s+([0-9.eE+-]+)`, 'm'));
+      return m ? Number(m[1]) : null;
+    };
+    return {
+      running: num('vllm:num_requests_running'),
+      waiting: num('vllm:num_requests_waiting'),
+      tokens: (num('vllm:generation_tokens_total') || 0) + (num('vllm:prompt_tokens_total') || 0)
+    };
+  };
+
+  try {
+    const a = await sample();
+    await new Promise(r => setTimeout(r, 750));
+    const b = await sample();
+    return {
+      reachable: true,
+      running: b.running,
+      waiting: b.waiting,
+      // Any forward motion at all. Strictly greater: a counter that has not moved
+      // across the gap while requests are held is the stall signature.
+      generating: b.tokens > a.tokens,
+      // The counter itself, so the next failed probe can compare against THIS
+      // one — see adjudicateProbe for why 750ms is not always enough to see.
+      tokens: b.tokens
+    };
+  } catch (err) {
+    // The metrics endpoint is the LAST thing to go. If it cannot be read either,
+    // this is not a busy engine — it is an absent one.
+    return { reachable: false, running: null, waiting: null, generating: null, error: err.message };
+  }
+}
+
+/**
+ * Turn a failed probe into a verdict, using the engine's own state as evidence.
+ *
+ * Four outcomes, and only two of them are the engine's fault:
+ *
+ *   ok           it answered inside the deadline
+ *   unreachable  nothing is listening, or the metrics endpoint is gone too
+ *   saturated    it is holding work AND making progress — the probe queued
+ *   stalled      it is holding work and NOT making progress, or it is idle and
+ *                still did not answer. This is the 8/21-8/23 signature, and it
+ *                is the one a flat deadline only ever caught by accident.
+ *
+ * `saturated` is the verdict that did not exist on 2026-08-27, which is why a
+ * healthy engine was restarted.
+ */
+/**
+ * THE COUNTER FROM THE LAST FAILED PROBE, so a prefill is not read as a wedge.
+ *
+ * 2026-09-09, aiserver: three probes a minute apart each found the engine
+ * "holding work, producing nothing" and the watchdog restarted vLLM under a
+ * healthy background job — 43.9 tok/s between the probes, requests completing
+ * 200 OK. Each probe had landed at the start of a new tool round, while the
+ * engine was reading a 35-message prompt. Measured on Sparky's engine: during
+ * an 18-second prefill of a 36k-token prompt NONE of vLLM's counters move —
+ * prompt_tokens_total, generation_tokens_total, the iteration histogram — they
+ * all advance at the first output token. A 750ms window cannot see through
+ * that, and the job's rounds happened to be as long as the probe interval, so
+ * three probes in a row sampled three prefills.
+ *
+ * So the verdict also asks "has the counter moved since the LAST failed probe",
+ * sixty seconds ago. A wedged engine shows no movement across both windows; a
+ * healthy one mid-prefill shows the last round's output in the wider one.
+ * Cleared on any probe that answers, and never used to manufacture progress
+ * after an engine restart — a counter that went DOWN is a new process.
+ */
+let lastFailedProbeSample = null;
+function _resetProbeMemory() { lastFailedProbeSample = null; }
+
+async function adjudicateProbe(probe, { metricsTimeoutMs = 2000 } = {}) {
+  if (probe.ok) { lastFailedProbeSample = null; return { ...probe, verdict: 'ok', engine: null }; }
+  if (probe.kind === 'unreachable') { lastFailedProbeSample = null; return { ...probe, verdict: 'unreachable', engine: null }; }
+
+  const engine = await readEngineState(metricsTimeoutMs);
+  if (!engine.reachable) { lastFailedProbeSample = null; return { ...probe, verdict: 'unreachable', engine }; }
+
+  const prev = lastFailedProbeSample;
+  lastFailedProbeSample = { tokens: engine.tokens, at: Date.now() };
+  const movedSinceLast = !!(prev && Number.isFinite(prev.tokens) && Number.isFinite(engine.tokens) && engine.tokens > prev.tokens);
+  engine.progressSinceLastProbe = prev ? movedSinceLast : null;
+  if (!engine.generating && movedSinceLast) engine.generating = true;
+
+  const holding = (engine.running || 0) > 0 || (engine.waiting || 0) > 0;
+  const verdict = (holding && engine.generating) ? 'saturated' : 'stalled';
+  return { ...probe, verdict, engine };
+}
+
+/**
+ * Parse a JSON object from LLM response text.
+ * Finds the last balanced JSON object (or array) in the text to avoid
+ * capturing chain-of-thought braces like "the {Hardware} cluster".
+ * @param {string} text - LLM response
+ * @returns {Object|null}
+ */
+function parseJSON(text) {
+  // Strip markdown code fences if present
+  const stripped = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '');
+
+  // Find the last top-level '{' that starts a parseable JSON object (max 20 attempts)
+  let attempts = 0;
+  for (let i = stripped.lastIndexOf('{'); i >= 0 && attempts < 20; i = stripped.lastIndexOf('{', i - 1)) {
+    attempts++;
+    const candidate = stripped.slice(i);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === 'object' && parsed !== null) return parsed;
+    } catch { /* try earlier brace */ }
+  }
+
+  // Fallback: try last top-level '[' for array responses (max 10 attempts)
+  attempts = 0;
+  for (let i = stripped.lastIndexOf('['); i >= 0 && attempts < 10; i = stripped.lastIndexOf('[', i - 1)) {
+    attempts++;
+    const candidate = stripped.slice(i);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* try earlier bracket */ }
+  }
+
+  return null;
+}
+
+/**
+ * Repair a structurally-truncated JSON object and parse it. Local models
+ * sometimes emit a well-formed opening (`{"links":[ {...}, {...},`) but stop
+ * before the closing brackets — finish_reason 'stop', not 'length', so it isn't
+ * a token-budget truncation, just the model deciding it was done. parseJSON()
+ * can't recover that (its backward brace scan only finds inner complete objects
+ * that lack the wrapper key). This walks from the first '{', tracking string
+ * state and bracket depth, then closes any dangling string, drops the trailing
+ * comma left by the cut, and appends the missing closers in order.
+ *
+ * Intended as a LAST-RESORT fallback after parseJSON() returns null — it only
+ * runs on already-unparseable text, so it can recover more but never corrupt a
+ * response that was already valid.
+ * @param {string} text
+ * @returns {object|array|null}
+ */
+function repairTruncatedJSON(text) {
+  if (!text) return null;
+  const s = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '');
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+
+  const stack = [];
+  let inStr = false, esc = false, closeIdx = -1;
+  let lastSafe = null; // { idx, stack } right after a complete nested element closed
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      stack.pop();
+      if (stack.length === 0) { closeIdx = i; break; } // top-level object closed
+      lastSafe = { idx: i, stack: stack.slice() }; // a complete element just closed
+    }
+  }
+
+  const closeWith = (str, brackets) => {
+    let out = str;
+    for (let k = brackets.length - 1; k >= 0; k--) out += brackets[k] === '{' ? '}' : ']';
+    return out;
+  };
+  const tryParse = (body) => {
+    try {
+      const parsed = JSON.parse(body);
+      if (typeof parsed === 'object' && parsed !== null) return parsed;
+    } catch { /* fall through */ }
+    return null;
+  };
+
+  // 1. Clean close (also discards any trailing prose the model appended).
+  if (closeIdx >= 0) return tryParse(s.slice(start, closeIdx + 1));
+
+  // 2. Truncated: shut a dangling string, drop the trailing comma, close the
+  //    open brackets innermost-first.
+  let body = s.slice(start);
+  if (inStr) body += '"';
+  body = body.replace(/[\s,]*$/, '');
+  let parsed = tryParse(closeWith(body, stack));
+  if (parsed) return parsed;
+
+  // 3. The tail was an incomplete element (e.g. `"strength":` with no value).
+  //    Fall back to the last point where a nested element closed cleanly, drop
+  //    the partial trailing element, and close from there.
+  if (lastSafe) {
+    const trimmed = s.slice(start, lastSafe.idx + 1);
+    parsed = tryParse(closeWith(trimmed, lastSafe.stack));
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
+// ============ Step 1: Audit Cluster Coherence ============
+
+/**
+ * Audit a single cluster for internal coherence using the LLM.
+ * Returns an audit result object for that cluster, including any suggested splits.
+ *
+ * Designed as a self-contained unit so that future parallelization is trivial —
+ * just swap the sequential loop for Promise.all().
+ *
+ * ACTIVE MEMBERS ONLY (2026-08-10). getCluster returns ghosts on purpose — the
+ * Memory Map draws them — but showing them to the auditor asks it to reorganise
+ * facts nobody believes any more. It duly proposed splits made entirely of
+ * superseded rows, executeSplits refused every one (correctly: the write guard
+ * is active-only), and the refusals were logged as anomalies. Identical
+ * anomalies, every pass, for four days, while the two all-ghost clusters ate
+ * 47s of the 69s pass. The audit is a DECISION about a cluster, so it reads the
+ * live corpus; the ghost stays visible where it belongs, on the Map.
+ *
+ * Under two active members there is nothing to judge — one fact cannot be
+ * incoherent with itself — so the cluster leaves the rotation without an LLM
+ * call, and an all-ghost cluster keeps its name for the Map and goes quiet.
+ *
+ * @param {Object} cluster - Cluster row from getClusters() (has id, name, member_count, active_member_count)
+ * @returns {Promise<{clusterId: string, clusterName: string, coherent: boolean, splits: Array, durationMs: number, skipped?: string, error?: string}>}
+ */
+async function auditClusterCoherence(cluster) {
+  const startMs = Date.now();
+  const base = { clusterId: cluster.id, clusterName: cluster.name, coherent: true, splits: [], durationMs: 0 };
+
+  try {
+    const detail = memoryClusters.getCluster(cluster.id);
+    if (!detail || !Array.isArray(detail.members) || detail.members.length === 0) {
+      base.durationMs = Date.now() - startMs;
+      return base;
+    }
+
+    const activeMembers = detail.members.filter(m => (m.status || 'active') === 'active');
+    if (activeMembers.length < 2) {
+      base.durationMs = Date.now() - startMs;
+      base.skipped = activeMembers.length === 0
+        ? 'no active members — ghosts only'
+        : 'only one active member';
+      return base;
+    }
+
+    const factLines = activeMembers.map(m => {
+      const ts = m.created_at ? m.created_at.split('T')[0] : 'unknown';
+      const src = m.source || 'unknown';
+      return `[id:${m.id}] [date:${ts}] [source:${src}] ${m.content}`;
+    }).join('\n');
+
+    const systemPrompt = `You are a memory cluster coherence auditor. Your job is to decide whether all the facts in a named cluster genuinely belong together.
+
+Cluster name: "${cluster.name}"
+
+Return ONLY valid JSON in this exact format:
+{
+  "coherent": true,
+  "splits": []
+}
+
+If the cluster contains clearly distinct categories that do NOT belong under a single name, set "coherent" to false and list the splits:
+{
+  "coherent": false,
+  "splits": [
+    {
+      "newClusterName": "Descriptive Category Name",
+      "factIds": ["id1", "id2"]
+    }
+  ]
+}
+
+Rules:
+- Only flag a split when the facts fall into genuinely different topics. Do NOT split if facts are loosely related to the same theme.
+- Every fact id that appears in the cluster must appear in exactly one split group if you flag incoherence. Do not drop any.
+- Split names should be concise noun phrases (2-4 words).
+- If in doubt, return coherent: true.`;
+
+    // Scale max_tokens: ~100 tokens per fact (40 visible JSON + ~60 model reasoning overhead) + 500 buffer
+    const estOutputTokens = Math.min(12288, Math.max(1024, activeMembers.length * 100 + 500));
+    const userPrompt = `Facts in cluster "${cluster.name}":\n${factLines}`;
+    const { content, truncated } = await callLLM(systemPrompt, userPrompt, { maxTokens: estOutputTokens });
+    let parsed = parseJSON(content);
+
+    if (!parsed) {
+      // Retry once before giving up. The usual cause is the model wrapping the
+      // JSON in prose / <think> reasoning that then truncates before the closing
+      // brace — so we (a) demand raw JSON only and (b) double the token budget.
+      console.warn(`[Heartbeat] Parse failure for cluster "${cluster.name}" (${content.length} chars, truncated: ${truncated}) — retrying with stricter format`);
+      const strictSystem = systemPrompt + `
+
+CRITICAL OUTPUT RULE: Respond with ONLY the raw JSON object. No explanation, no reasoning, no <think> blocks, no markdown code fences, no text before or after. Your entire response must begin with { and end with }.`;
+      const retryTokens = Math.min(12288, estOutputTokens * 2);
+      const retry = await callLLM(strictSystem, userPrompt, { maxTokens: retryTokens });
+      parsed = parseJSON(retry.content);
+      if (!parsed) {
+        console.warn(`[Heartbeat] Parse failure persisted after retry for "${cluster.name}" (${retry.content.length} chars, truncated: ${retry.truncated}), last 200: ...${retry.content.slice(-200)}`);
+        base.durationMs = Date.now() - startMs;
+        return { ...base, error: `LLM returned unparseable JSON after retry (${retry.content.length} chars, truncated: ${retry.truncated})` };
+      }
+      console.log(`[Heartbeat] Audit of "${cluster.name}" recovered on stricter-format retry`);
+    }
+
+    base.coherent = parsed.coherent !== false;
+    base.splits = Array.isArray(parsed.splits) ? parsed.splits : [];
+    base.durationMs = Date.now() - startMs;
+    return base;
+
+  } catch (err) {
+    base.durationMs = Date.now() - startMs;
+    return { ...base, error: err.message };
+  }
+}
+
+// ============ Step 2: Execute Splits ============
+
+/**
+ * Apply all cluster splits flagged by auditClusterCoherence.
+ * For each split: creates new clusters, moves facts in SQLite, re-embeds in LanceDB.
+ * Runs renameAllClusters() once if any splits were applied.
+ *
+ * @param {Array} auditResults - Array of results from auditClusterCoherence
+ * @returns {Promise<{clustersSplit: number, splitDetails: Array, anomalies: Array}>}
+ */
+async function executeSplits(auditResults) {
+  console.log('[Heartbeat] Step 2: Executing cluster splits...');
+
+  const results = { clustersSplit: 0, splitDetails: [], anomalies: [] };
+  const db = getSqliteDb();
+  if (!db) {
+    results.anomalies.push('SQLite not available — skipping splits');
+    return results;
+  }
+
+  const clusterTable = await getClusterEmbeddingsTable();
+  const incoherentResults = auditResults.filter(r => !r.coherent && r.splits && r.splits.length > 0);
+
+  if (incoherentResults.length === 0) {
+    console.log('[Heartbeat] No splits to execute');
+    return results;
+  }
+
+  console.log(`[Heartbeat] Applying splits for ${incoherentResults.length} incoherent cluster(s)`);
+
+  // Clusters whose membership changed and therefore need a fresh name: every new
+  // split-out cluster, plus any source cluster that retained facts.
+  const touchedClusterIds = new Set();
+
+  for (const auditResult of incoherentResults) {
+    const { clusterId, clusterName, splits } = auditResult;
+
+    try {
+      // Verify source cluster still exists
+      const sourceCluster = db.prepare('SELECT id, subject FROM memory_clusters WHERE id = ?').get(clusterId);
+      if (!sourceCluster) {
+        results.anomalies.push(`Source cluster ${clusterId} (${clusterName}) no longer exists, skipping splits`);
+        continue;
+      }
+      // Split-out clusters inherit the source's subject — otherwise splitting a
+      // self-cluster would create user-subject clusters (defaulting via schema),
+      // leaking self-observations back into the user Facts/Clusters tabs.
+      const srcSubject = sourceCluster.subject || 'user';
+
+      const now = new Date().toISOString();
+      const movedMemberIds = new Set();
+      const splitDetail = { originalCluster: clusterName, newClusters: [] };
+
+      for (const split of splits) {
+        if (!split.newClusterName || !Array.isArray(split.factIds) || split.factIds.length === 0) {
+          results.anomalies.push(`Invalid split spec in cluster "${clusterName}": missing name or factIds`);
+          continue;
+        }
+
+        // Resolve members that actually exist in this cluster
+        const membersToMove = [];
+        for (const rawFactId of split.factIds) {
+          // Strip "id:" prefix the LLM echoes back from the audit prompt
+          const factId = rawFactId.replace(/^id:/, '');
+          // ACTIVE ONLY (2026-08-03). This had no status filter, and the move
+          // below deletes each member's vector and then RE-ADDS it — so a split
+          // that happened to include an inactive fact resurrected its embedding
+          // and put a superseded belief back into semantic retrieval. That is
+          // the LanceDB-drift class the Phase 1 notes recorded as historical;
+          // it was not historical, it had a live source. Found by reconcile()
+          // reporting three superseded self-facts with vectors eight hours after
+          // the same three had been cleared.
+          //
+          // memoryClusters.getCluster (which feeds the audit that proposes these
+          // splits) deliberately returns inactive members too — the Memory Map
+          // draws them as ghosts. So the filter belongs HERE, at the write, not
+          // on the read. Same rule as the identity lock: guard the write path.
+          const member = db.prepare(
+            "SELECT * FROM cluster_members WHERE id = ? AND cluster_id = ? AND status = 'active'"
+          ).get(factId, clusterId);
+          if (member) {
+            membersToMove.push(member);
+          } else {
+            const inactive = db.prepare(
+              "SELECT id FROM cluster_members WHERE id = ? AND cluster_id = ? AND status != 'active'"
+            ).get(factId, clusterId);
+            results.anomalies.push(inactive
+              ? `Fact id "${factId}" in cluster "${clusterName}" is inactive — not moved, and its embedding left alone`
+              : `Fact id "${factId}" not found in cluster "${clusterName}"`);
+          }
+        }
+
+        if (membersToMove.length === 0) {
+          results.anomalies.push(`No valid facts found for split "${split.newClusterName}" in cluster "${clusterName}"`);
+          continue;
+        }
+
+        // Create new cluster. The audit's newClusterName is a provisional label;
+        // renameAllClusters below regenerates it from the actual moved facts via
+        // the shared LLM namer, so splits get the same naming as every other path.
+        const newClusterId = randomUUID();
+        touchedClusterIds.add(newClusterId);
+        db.prepare('INSERT INTO memory_clusters (id, name, description, created_at, updated_at, subject) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(newClusterId, split.newClusterName, '', now, now, srcSubject);
+
+        console.log(`[Heartbeat] Created cluster "${split.newClusterName}" (${newClusterId}), moving ${membersToMove.length} facts`);
+
+        // Move facts
+        for (const member of membersToMove) {
+          db.prepare('UPDATE cluster_members SET cluster_id = ? WHERE id = ?')
+            .run(newClusterId, member.id);
+          movedMemberIds.add(member.id);
+
+          if (clusterTable) {
+            try {
+              await clusterTable.delete(memberIdFilter(member.id));
+              const embedding = await memoryClusters.generateEmbedding(member.content);
+              if (embedding) {
+                await clusterTable.add([{
+                  id: randomUUID(),
+                  member_id: member.id,
+                  cluster_id: newClusterId,
+                  content: member.content,
+                  vector: Array.from(embedding)
+                }]);
+              }
+            } catch (e) {
+              console.error('[Heartbeat] LanceDB re-embed error:', e.message);
+              results.anomalies.push(`LanceDB re-embed failed for member ${member.id}: ${e.message}`);
+            }
+          }
+        }
+
+        splitDetail.newClusters.push({ name: split.newClusterName, factsCount: membersToMove.length });
+      }
+
+      // Check how many facts remain in the original cluster
+      const remaining = db.prepare('SELECT COUNT(*) as cnt FROM cluster_members WHERE cluster_id = ?')
+        .get(clusterId);
+      const remainingCount = remaining ? remaining.cnt : 0;
+
+      if (remainingCount === 0) {
+        // All facts moved out — delete original cluster and its links
+        db.prepare('DELETE FROM memory_clusters WHERE id = ?').run(clusterId);
+        console.log(`[Heartbeat] Deleted empty original cluster "${clusterName}"`);
+        splitDetail.originalDeleted = true;
+      } else {
+        db.prepare('UPDATE memory_clusters SET updated_at = ? WHERE id = ?').run(now, clusterId);
+        touchedClusterIds.add(clusterId);
+        splitDetail.originalRetained = true;
+        splitDetail.originalRemainingFacts = remainingCount;
+      }
+
+      if (splitDetail.newClusters.length > 0) {
+        results.clustersSplit++;
+        results.splitDetails.push(splitDetail);
+      }
+
+    } catch (err) {
+      console.error(`[Heartbeat] Error executing splits for cluster "${clusterName}":`, err.message);
+      results.anomalies.push(`Split execution failed for "${clusterName}": ${err.message}`);
+    }
+  }
+
+  if (results.clustersSplit > 0) {
+    console.log(`[Heartbeat] Renaming ${touchedClusterIds.size} touched cluster(s) after ${results.clustersSplit} split(s)`);
+    try {
+      await memoryClusters.renameAllClusters({ ids: [...touchedClusterIds] });
+    } catch (err) {
+      console.error('[Heartbeat] renameAllClusters error:', err.message);
+      results.anomalies.push(`renameAllClusters failed: ${err.message}`);
+    }
+
+    // Merge any clusters that ended up with the same name after renaming
+    try {
+      const mergedByName = await memoryClusters.mergeByName();
+      if (mergedByName > 0) {
+        console.log(`[Heartbeat] Merged ${mergedByName} duplicate-name cluster(s) after rename`);
+      }
+    } catch (err) {
+      console.error('[Heartbeat] mergeByName error:', err.message);
+      results.anomalies.push(`mergeByName failed: ${err.message}`);
+    }
+  }
+
+  console.log(`[Heartbeat] Split execution complete: ${results.clustersSplit} cluster(s) split`);
+  return results;
+}
+// ============ Cross-link audit — DELETED 2026-08-02 ============
+//
+// auditCrossLinks used to live here and ran on EVERY pass, oversized clusters or
+// not. It scored how related each pair of clusters was and maintained
+// cluster_links from the verdicts.
+//
+// Removed because the cost was O(n²) in clusters over a corpus that is O(n) in
+// facts: 112 clusters = 6,216 pairs judged for 658 facts. It was the single
+// biggest driver of pass duration (observed 736s at 438 pairs re-judged vs 51s
+// when every pair was a cache hit), and the content-hash cache it needed was a
+// mitigation of a cost that should not have existed.
+//
+// The tables were DROPPED at the 2026-08-06 cutover. Keeping them read-only was
+// the wrong call: nothing maintained them, the replay rebuilt every active user
+// fact into clusters no link had ever pointed at, and the Map went on drawing
+// those edges as if they were current. A stale association is worse than none —
+// it looks like knowledge. The supersede edges beside them are still live, and
+// association is now computed on demand from the vector index.
+//
+// Associations become query-time vector neighbours in a later phase — computed
+// when asked, never stored. See docs/memory-mvp-spec.md (RETRIEVE).
+// ============ Step 4: Generate Report ============
+
+/**
+ * How long an anomaly may go unseen before its memo is forgotten. A condition
+ * that clears and comes back weeks later is news again; one that is still true
+ * on the next pass is not.
+ */
+const ANOMALY_STATE_TTL_DAYS = 30;
+
+/**
+ * Split this pass's anomalies into the ones worth printing and the ones already
+ * on record, and update the memo.
+ *
+ * The corrector's gate reads its last pass off disk so a restart cannot hand it
+ * a fresh turn; this is the same trick applied to reporting, so a restart cannot
+ * hand an old anomaly a fresh voice either. State lives in SQLite, which means
+ * it follows SNH_DATA_DIR — a staging replay memoises against staging and leaves
+ * the live log's history alone.
+ *
+ * Fails OPEN: if the table cannot be read, every anomaly is treated as fresh.
+ * Losing a warning to a bookkeeping error is worse than repeating one.
+ *
+ * @param {string[]} anomalies - every anomaly this pass observed
+ * @returns {{fresh: string[], suppressed: number, oldestSuppressedAt: string|null}}
+ */
+function partitionAnomalies(anomalies) {
+  if (!anomalies || anomalies.length === 0) {
+    return { fresh: [], suppressed: 0, oldestSuppressedAt: null };
+  }
+
+  const db = getSqliteDb();
+  if (!db) return { fresh: [...anomalies], suppressed: 0, oldestSuppressedAt: null };
+
+  const now = new Date().toISOString();
+  const fresh = [];
+  let suppressed = 0;
+  let oldestSuppressedAt = null;
+
+  try {
+    // Prune first, so a long-quiet anomaly is genuinely new again rather than
+    // resurfacing as "seen 40 times" with a stale first_seen_at.
+    const cutoff = new Date(Date.now() - ANOMALY_STATE_TTL_DAYS * 86400_000).toISOString();
+    db.prepare('DELETE FROM heartbeat_anomaly_state WHERE last_seen_at < ?').run(cutoff);
+
+    const get = db.prepare('SELECT first_seen_at, seen_count FROM heartbeat_anomaly_state WHERE anomaly_key = ?');
+    const insert = db.prepare(
+      'INSERT INTO heartbeat_anomaly_state (anomaly_key, first_seen_at, last_seen_at, seen_count, anomaly_text) VALUES (?, ?, ?, 1, ?)'
+    );
+    const bump = db.prepare(
+      'UPDATE heartbeat_anomaly_state SET last_seen_at = ?, seen_count = seen_count + 1 WHERE anomaly_key = ?'
+    );
+
+    // One pass may legitimately observe the same anomaly text twice; count it
+    // once so the memo tracks conditions, not occurrences.
+    for (const key of new Set(anomalies.map(a => String(a)))) {
+      const seen = get.get(key);
+      if (seen) {
+        bump.run(now, key);
+        suppressed++;
+        if (!oldestSuppressedAt || seen.first_seen_at < oldestSuppressedAt) {
+          oldestSuppressedAt = seen.first_seen_at;
+        }
+      } else {
+        insert.run(key, now, now, key);
+        fresh.push(key);
+      }
+    }
+  } catch (err) {
+    console.error('[Heartbeat] anomaly dedup failed, reporting everything:', err.message);
+    return { fresh: [...anomalies], suppressed: 0, oldestSuppressedAt: null };
+  }
+
+  return { fresh, suppressed, oldestSuppressedAt };
+}
+
+/**
+ * Build a structured heartbeat report, log it to console and append to today's daily log file.
+ *
+ * @param {Object} opts
+ * @param {number}  opts.cycleStartMs          - Date.now() at cycle start
+ * @param {Array}   opts.auditResults          - Per-cluster audit result objects
+ * @param {Object}  opts.splitResults          - Result from executeSplits
+ * @returns {Object} The report object
+ */
+function generateReport({ cycleStartMs, auditResults, splitResults, steps = [] }) {
+  const totalDurationMs = Date.now() - cycleStartMs;
+  const totalDuration = (totalDurationMs / 1000).toFixed(1) + 's';
+
+  // "Audited" means put to the model. A cluster that left the rotation for want
+  // of two active members was not audited, and counting it as though it were is
+  // how a pass reports twenty clusters reviewed while judging eighteen.
+  const clustersAudited = auditResults.filter(r => !r.skipped).length;
+  const clustersSkipped = auditResults.filter(r => r.skipped).length;
+  const clustersSplit = splitResults.clustersSplit || 0;
+
+  const perClusterTiming = auditResults
+    .filter(r => !r.skipped)
+    .map(r => ({
+      clusterName: r.clusterName,
+      durationMs: r.durationMs || 0
+    }));
+
+  const observedAnomalies = [
+    ...auditResults.filter(r => r.error).map(r => `Audit error for "${r.clusterName}": ${r.error}`),
+    ...(splitResults.anomalies || []),
+
+  ];
+
+  // Only what CHANGED goes in the report. The rest is counted, not repeated.
+  const { fresh: anomalies, suppressed: anomaliesSuppressed, oldestSuppressedAt } =
+    partitionAnomalies(observedAnomalies);
+  const suppressedNote = anomaliesSuppressed > 0
+    ? `${anomaliesSuppressed} unchanged anomaly(ies) still true, already reported${oldestSuppressedAt ? ` (oldest first seen ${oldestSuppressedAt.slice(0, 10)})` : ''}`
+    : null;
+
+  const report = {
+    status: 'ok',
+    clustersAudited,
+    // Left the rotation without an LLM call — fewer than two active members.
+    clustersSkipped,
+    clustersSplit,
+    splitDetails: splitResults.splitDetails || [],
+    // Always 0 from 2026-08-02: the cross-link audit is deleted and nothing
+    // maintains cluster_links. Kept in the report shape so historical rows in
+    // heartbeat_reports stay comparable with new ones.
+    linksUpdated: 0,
+    linksRemoved: 0,
+    linksAdded: 0,
+    // Cross-link LLM workload — the actual driver of pass duration. See the
+    // comment in auditCrossLinks: this, not the link deltas, is why a pass is
+    // 55s or 17 minutes.
+    pairsTotal: null,
+    pairsReused: null,
+    pairsJudged: null,
+    // Marks a pass as running the post-cross-link pipeline, so the Activity view
+    // can tell "no pairs judged because there was nothing to do" apart from
+    // "no pairs judged because the step no longer exists".
+    crossLinkAudit: 'deleted',
+    totalDuration,
+    // Numeric ms alongside the display string so the Activity view can trend
+    // pass duration (the 2026-07-26 pass took 1062s — ~15% of the 2h interval).
+    totalDurationMs,
+    // Per-step results. These were already being computed and then dropped to
+    // console: cleanupFacts, summarizeDailyLogs, sweepPendingQuestions and
+    // mergeByName all return counts that nothing persisted.
+    steps,
+    perClusterTiming,
+    // NEW anomalies only. `anomaliesObserved` is what the pass actually saw, so
+    // nothing is lost — but a reader (human or Thinking tab) is shown change.
+    anomalies,
+    anomaliesObserved: observedAnomalies.length,
+    anomaliesSuppressed,
+    suppressedNote
+  };
+
+  // Console summary
+  console.log('[Heartbeat] === Heartbeat Report ===');
+  console.log(`[Heartbeat]   Clusters audited : ${clustersAudited}${clustersSkipped > 0 ? ` (${clustersSkipped} skipped — too few active members)` : ''}`);
+  console.log(`[Heartbeat]   Clusters split   : ${clustersSplit}`);
+  console.log(`[Heartbeat]   Links added      : ${report.linksAdded}`);
+  console.log(`[Heartbeat]   Links updated    : ${report.linksUpdated}`);
+  console.log(`[Heartbeat]   Links removed    : ${report.linksRemoved}`);
+  console.log(`[Heartbeat]   Total duration   : ${totalDuration}`);
+  if (anomalies.length > 0) {
+    console.log(`[Heartbeat]   New anomalies (${anomalies.length}):`);
+    for (const a of anomalies) console.log(`[Heartbeat]     - ${a}`);
+  }
+  if (suppressedNote) console.log(`[Heartbeat]   ${suppressedNote}`);
+  console.log('[Heartbeat] === End Report ===');
+
+  // Prepend to the OPS log (newest first) — this is maintenance telemetry, not
+  // cognitive memory, so it stays out of the injected daily log. It remains
+  // fully visible in the Thinking tab via getHeartbeatReports().
+  try {
+    const opsDir = OPS_DIR;
+    const today = getLocalDateStamp(); // local Pacific date
+
+    let splitSummary = '';
+    if (report.splitDetails.length > 0) {
+      splitSummary = '\n### Splits\n' + report.splitDetails.map(d => {
+        const newNames = d.newClusters.map(c => `"${c.name}" (${c.factsCount} facts)`).join(', ');
+        const fate = d.originalDeleted ? 'original deleted' : `original retained (${d.originalRemainingFacts} facts remaining)`;
+        return `- "${d.originalCluster}" → ${newNames}; ${fate}`;
+      }).join('\n');
+    }
+
+    // New anomalies get their line; ones already on record get one line between
+    // them. Four days of identical warnings is what this replaces.
+    let anomalySection = '';
+    if (anomalies.length > 0) {
+      anomalySection = '\n### Anomalies (new)\n' + anomalies.map(a => `- ${a}`).join('\n');
+    }
+    if (suppressedNote) {
+      anomalySection += `\n\n_${suppressedNote}._`;
+    }
+
+    const timingRows = perClusterTiming
+      .sort((a, b) => b.durationMs - a.durationMs)
+      .slice(0, 10)
+      .map(t => `| ${t.clusterName} | ${t.durationMs}ms |`)
+      .join('\n');
+
+    const reportBlock = [
+      `## Heartbeat Report — ${new Date().toISOString()}`,
+      '',
+      `| Metric | Value |`,
+      `|--------|-------|`,
+      `| Clusters audited | ${clustersAudited} |`,
+      `| Clusters skipped (too few active facts) | ${clustersSkipped} |`,
+      `| Clusters split | ${clustersSplit} |`,
+      `| Links added | ${report.linksAdded} |`,
+      `| Links updated | ${report.linksUpdated} |`,
+      `| Links removed | ${report.linksRemoved} |`,
+      `| Total duration | ${totalDuration} |`,
+      splitSummary,
+      timingRows.length > 0 ? `\n### Per-cluster audit timing (top 10)\n| Cluster | Duration |\n|---------|----------|\n${timingRows}` : '',
+      anomalySection
+    ].join('\n').replace(/\s*$/, '') + '\n\n';
+
+    // Prepend under the H1 header so the newest report is at the top.
+    const opsFile = factExtractor.prependDailyEntry(reportBlock, opsDir, today, 'Ops Log');
+    console.log(`[Heartbeat] Report prepended to ${opsFile}`);
+  } catch (err) {
+    console.error('[Heartbeat] Failed to write daily report:', err.message);
+  }
+
+  // Persist the pass stats so the Thinking view can render them per cycle.
+  recordHeartbeatReport(report);
+
+  return report;
+}
+
+/** Persist one heartbeat pass's stats to the heartbeat_reports table. */
+function recordHeartbeatReport(report) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    db.prepare(`
+      INSERT INTO heartbeat_reports
+        (id, created_at, clusters_audited, clusters_split, links_added, links_updated,
+         links_removed, duration, anomaly_count, report_json, status, status_reason, duration_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?)
+    `).run(
+      randomUUID(),
+      new Date().toISOString(),
+      report.clustersAudited || 0,
+      report.clustersSplit || 0,
+      report.linksAdded || 0,
+      report.linksUpdated || 0,
+      report.linksRemoved || 0,
+      report.totalDuration || null,
+      // NEW anomalies, matching report.anomalies. The total this pass observed
+      // is in report_json as anomaliesObserved — the column is the change
+      // signal the Activity view trends, and a flat line of 29 is not one.
+      (report.anomalies || []).length,
+      JSON.stringify(report),
+      report.totalDurationMs ?? null
+    );
+  } catch (err) {
+    console.error('[Heartbeat] Failed to persist heartbeat report:', err.message);
+  }
+}
+
+/**
+ * Persist one liveness probe result and prune past the retention window.
+ * Deliberately the cheapest possible row: when, ok, how long, why not.
+ * @param {{ok: boolean, ms?: number, error?: string}} probe
+ * @param {number} retentionDays
+ */
+function recordLivenessProbe(probe, retentionDays) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    const eng = probe.engine || {};
+    db.prepare(
+      `INSERT INTO liveness_probes
+         (id, created_at, ok, latency_ms, error, verdict, engine_running, engine_waiting, engine_generating)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(randomUUID(), new Date().toISOString(), probe.ok ? 1 : 0,
+          Number.isFinite(probe.ms) ? probe.ms : null, probe.ok ? null : (probe.error || 'unknown'),
+          probe.verdict || null,
+          Number.isFinite(eng.running) ? eng.running : null,
+          Number.isFinite(eng.waiting) ? eng.waiting : null,
+          typeof eng.generating === 'boolean' ? (eng.generating ? 1 : 0) : null);
+    // Prune inline. The table is small and created_at is indexed, so this is
+    // cheaper than carrying a separate cleanup schedule for one table.
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare('DELETE FROM liveness_probes WHERE datetime(created_at) < datetime(?)').run(cutoff);
+  } catch (err) {
+    console.error('[Liveness] Failed to record probe:', err.message);
+  }
+}
+
+/** Recent liveness probes (newest first) for the Activity view. */
+function getLivenessProbes(limit = 100) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    return db.prepare(
+      'SELECT * FROM liveness_probes ORDER BY datetime(created_at) DESC LIMIT ?'
+    ).all(Math.min(Math.max(1, limit), 1000));
+  } catch (err) {
+    console.error('[Liveness] Failed to read probes:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Persist a heartbeat pass that did NOT reach the report step.
+ *
+ * generateReport only runs on the success path, so before this existed a pass
+ * that bailed at the preflight probe (or was aborted mid-cycle by the breaker,
+ * or threw) left no row — the table read as an unbroken run of healthy passes
+ * through an outage. These rows are what make the Activity view trustworthy.
+ *
+ * @param {Object} o
+ * @param {'failed'|'aborted'|'skipped'} o.status
+ * @param {string} o.reason        - plain-language why
+ * @param {number} o.cycleStartMs  - so a partial pass still reports its duration
+ * @param {Object} [o.partial]     - whatever the pass did manage before bailing
+ */
+function recordHeartbeatOutcome({ status, reason, cycleStartMs, partial = {} }) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return;
+    const durationMs = cycleStartMs ? Date.now() - cycleStartMs : null;
+    const report = {
+      status,
+      statusReason: reason,
+      clustersAudited: (partial.auditResults || []).length,
+      clustersSplit: partial.splitResults?.clustersSplit || 0,
+      linksAdded: 0,
+      linksUpdated: 0,
+      linksRemoved: 0,
+      totalDurationMs: durationMs,
+      totalDuration: durationMs != null ? (durationMs / 1000).toFixed(1) + 's' : null,
+      anomalies: [reason].filter(Boolean)
+    };
+    db.prepare(`
+      INSERT INTO heartbeat_reports
+        (id, created_at, clusters_audited, clusters_split, links_added, links_updated,
+         links_removed, duration, anomaly_count, report_json, status, status_reason, duration_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(), new Date().toISOString(),
+      report.clustersAudited, report.clustersSplit, report.linksAdded,
+      report.linksUpdated, report.linksRemoved, report.totalDuration,
+      report.anomalies.length, JSON.stringify(report), status, reason, durationMs
+    );
+    console.log(`[Heartbeat] Recorded ${status} pass: ${reason}`);
+  } catch (err) {
+    console.error('[Heartbeat] Failed to persist heartbeat outcome:', err.message);
+  }
+}
+
+/** Recent heartbeat pass stats (newest first) for the Thinking view. */
+function getHeartbeatReports(limit = 30) {
+  try {
+    const db = getSqliteDb();
+    if (!db) return [];
+    const rows = db.prepare(
+      'SELECT * FROM heartbeat_reports ORDER BY created_at DESC LIMIT ?'
+    ).all(limit);
+    return rows.map(r => {
+      let full = {};
+      try { full = JSON.parse(r.report_json || '{}'); } catch { /* ignore */ }
+      return {
+        id: r.id,
+        at: r.created_at,
+        clustersAudited: r.clusters_audited,
+        clustersSplit: r.clusters_split,
+        linksAdded: r.links_added,
+        linksUpdated: r.links_updated,
+        linksRemoved: r.links_removed,
+        duration: r.duration,
+        anomalies: full.anomalies || [],
+        anomaliesSuppressed: full.anomaliesSuppressed || 0,
+        suppressedNote: full.suppressedNote || null,
+        clustersSkipped: full.clustersSkipped || 0,
+        splitDetails: full.splitDetails || []
+      };
+    });
+  } catch (err) {
+    console.error('[Heartbeat] Failed to read heartbeat reports:', err.message);
+    return [];
+  }
+}
+
+// ============ Fact cleanup — DELETED 2026-08-02 ============
+//
+// cleanupFacts asked the model to dedup/reword/merge facts, then applied the
+// verdicts to MEMORY.md. It returned {removed:0, reworded:0, merged:0} on all 39
+// recorded passes, at 30-72s of model time each, for two independent reasons:
+//
+//   1. It fed the model fact text with the "(learned ...)" annotation STRIPPED,
+//      then matched the model's verbatim reply against the RAW file line, which
+//      still carried the annotation. 242 of 244 lines carried one, so at most 2
+//      lines in the file could ever match. A miss incremented nothing and logged
+//      nothing, so the failure was invisible.
+//   2. It only ever looked at MEMORY.md. The duplicates are in SQLite —
+//      MEMORY.md had zero byte-identical fact lines while cluster_members had six
+//      duplicate groups, including three identical machine-gun facts.
+//
+// Dedup now happens at the SQLite write inside db/fact-store.js, where the record
+// of truth is. Semantic merge/reword belongs to the corrector agent, which does
+// not exist yet — see docs/memory-mvp-spec.md (CORRECT).
+// ============ Task C: Summarize Daily Logs ============
+
+/**
+ * Is this candidate really a fact about ELLIE?
+ *
+ * The same two questions intake asks, asked here because the archiver is a second
+ * write path into her corpus and had none of them. Both halves matter:
+ *
+ *   GRAMMAR — extraction-rules.grammaticalSubject, the identical check
+ *   fact-extractor.planExtraction runs. A first-person sentence is his; an
+ *   unanchored one names nobody and is how a self-observation slips in wearing no
+ *   pronoun at all.
+ *
+ *   SIMILARITY — and this is the one that would have caught the 22. Their grammar
+ *   was perfect ("User aims to be a steady, non-judgmental presence…"), so no
+ *   syntactic rule could see them. What gave them away was the corpus: each sat
+ *   within a hair of a self-fact he already held, the same sentence with the
+ *   person flipped. A candidate user-fact that close to something he says about
+ *   himself is his.
+ *
+ * The floor is 0.75 — the empirical gap measured over those 22, which ran from
+ * 0.773 to 0.955 while the genuinely-hers rows in the same batch fell to 0.695
+ * and below. It is a property of nomic-embed-text; changing the embedding model
+ * means measuring it again.
+ *
+ * REFUSALS ARE SPOKEN, not swallowed. Each one is logged with the self-fact that
+ * caught it, because a guard that silently drops facts is indistinguishable from
+ * a bug that silently drops facts.
+ *
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+async function archiverSubjectCheck(factText) {
+  const rules = require('./extraction-rules');
+
+  const grammatical = rules.grammaticalSubject(factText);
+  if (grammatical === 'self') {
+    return { ok: false, reason: 'written in the first person — it is his own reflection, not a fact about her' };
+  }
+  if (grammatical !== 'user') {
+    return { ok: false, reason: 'does not name the user, so it cannot be filed as a fact about her' };
+  }
+
+  const floor = getConfig().memory?.archiver?.selfSimilarityFloor ?? 0.75;
+  try {
+    const { candidates } = await memoryClusters.findActiveNeighbours(factText, {
+      subject: 'self', threshold: floor, limit: 1, includeVerbatim: true
+    });
+    if (candidates.length) {
+      const t = candidates[0];
+      return {
+        ok: false,
+        reason: `it is ${t.similarity.toFixed(3)} from a self-fact he already holds — "${String(t.content).slice(0, 90)}" — so it describes him, not her`
+      };
+    }
+  } catch (err) {
+    // A failed check must not become a silent accept. The archiver is the path
+    // that produced the misattribution; if its guard cannot run, it does not write.
+    return { ok: false, reason: `the self-similarity check could not run (${err.message}), so this was not stored` };
+  }
+
+  return { ok: true };
+}
+
+async function summarizeDailyLogs() {
+  console.log('[Heartbeat] Task C: Summarizing old daily logs...');
+  const results = { archived: 0, factsExtracted: 0 };
+
+  try {
+    if (!fs.existsSync(DAILY_DIR)) {
+      console.log('[Heartbeat] No daily log directory');
+      return results;
+    }
+
+    const files = fs.readdirSync(DAILY_DIR).filter(f => f.endsWith('.md'));
+    const config = getConfig();
+    const retentionDays = config.memory.dailyLogRetentionDays;
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+
+    const oldFiles = files.filter(f => {
+      const dateStr = f.replace('.md', '');
+      const fileDate = new Date(dateStr);
+      return !isNaN(fileDate.getTime()) && fileDate < cutoff;
+    });
+
+    if (oldFiles.length === 0) {
+      console.log(`[Heartbeat] No daily logs older than ${retentionDays} days`);
+      return results;
+    }
+
+    console.log(`[Heartbeat] Found ${oldFiles.length} daily logs to archive`);
+
+    for (const file of oldFiles) {
+      try {
+        const filePath = path.join(DAILY_DIR, file);
+        const content = fs.readFileSync(filePath, 'utf8');
+
+        if (content.trim().length < 20) {
+          // Too short to summarize, just archive
+          if (!fs.existsSync(ARCHIVE_DIR)) {
+            fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+          }
+          fs.renameSync(filePath, path.join(ARCHIVE_DIR, file));
+          results.archived++;
+          continue;
+        }
+
+        // THE PROMPT USED TO MANUFACTURE THE MISATTRIBUTION.
+        //
+        // It said, flatly: 'Write facts as "User has..." or "User prefers..."
+        // style.' A daily log is not only about Ellie — it holds his reflections
+        // too ("I tend to lean into conceptual frameworks and metaphors…") — and
+        // that instruction told the summarizer to rewrite every one of them into
+        // the third person about her. It did exactly as it was told. 22 of them
+        // were still in the corpus at the merge, each sitting between 0.773 and
+        // 0.955 of the self-fact it had been copied from, and every one had
+        // impeccable grammar so nothing downstream could see it.
+        //
+        // So the prompt now asks WHOSE the fact is instead of assuming, and is
+        // told to drop his — the reflection loop already records what he notices
+        // about himself, and self-facts are curated with him rather than
+        // extracted around him.
+        const systemPrompt = `You are a memory log summarizer. Review the daily log below and extract any important facts that should be preserved long-term. Return ONLY valid JSON:
+{"summary":"one-line summary of the day","remainingFacts":["fact1","fact2"]}
+
+The log contains entries about TWO different people: ELLIE, the human, and the AI ASSISTANT itself, which writes reflections about its own behaviour in the first person.
+
+Rules:
+- remainingFacts must contain ONLY facts about ELLIE — her preferences, her work, her projects, her life, her decisions. Write each one starting with "User".
+- DROP anything the assistant wrote about ITSELF. Reflections like "I tend to lean into metaphors", "I aim to be a steady presence", "I prioritize accuracy about my own history" are the assistant describing its own behaviour. They are recorded elsewhere and must NOT be rewritten as facts about the user. If you are unsure whose a statement is, drop it.
+- A statement about how someone TALKS TO or SUPPORTS Ellie — holding space, asking probing questions, being non-judgmental, acting as a sounding board — is the assistant describing itself. Drop it.
+- Skip routine entries like "Chat exchange with model - 0 facts extracted".
+- If nothing is worth keeping, return {"summary":"...","remainingFacts":[]}.`;
+
+        // Scale max_tokens on expected output: summary + extracted facts, proportional to input
+        const archiveMaxTokens = Math.min(8192, Math.max(1024, Math.ceil(content.length / 4) + 512));
+        const { content: llmResponse, truncated: archiveTruncated } = await callLLM(systemPrompt, content, { maxTokens: archiveMaxTokens });
+        const parsed = parseJSON(llmResponse);
+
+        if (!parsed) {
+          console.warn(`[Heartbeat] Parse failure for daily log ${file}: ${llmResponse.length} chars, truncated: ${archiveTruncated}, last 200: ...${llmResponse.slice(-200)}`);
+        }
+
+        if (parsed && Array.isArray(parsed.remainingFacts) && parsed.remainingFacts.length > 0) {
+          const validFacts = parsed.remainingFacts.filter(f => typeof f === 'string' && f.trim().length > 0);
+          if (validFacts.length > 0) {
+            // Into SQLite, not into a file. These go through assignToCluster like
+            // any other fact, so they get the same exact-match dedup guard —
+            // archival used to append straight to MEMORY.md, which meant a fact
+            // already in the database could be re-added as a line with no row.
+            const config = getConfig();
+            const ext = config.models.extraction;
+            const extInst = getProviderInstance(ext.provider, ext.instance);
+            const extHost = extInst ? extInst.host : 'http://localhost:11434';
+            let written = 0;
+            for (const vf of validFacts) {
+              // THE RULES DECIDE, NOT THE PROMPT. The instruction above can be
+              // skimmed on a bad night; this cannot.
+              const verdict = await archiverSubjectCheck(vf);
+              if (!verdict.ok) {
+                results.refused = (results.refused || 0) + 1;
+                (results.refusals = results.refusals || []).push({ text: vf, why: verdict.reason });
+                const line = `Daily-log archiver refused "${String(vf).slice(0, 110)}" — ${verdict.reason}`;
+                console.log(`[Heartbeat] ${line}`);
+                try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* best effort */ }
+                continue;
+              }
+              const res = await memoryClusters.assignToCluster(
+                vf, ext.provider, ext.model, '', extHost,
+                'daily-log-archive', 5, 'user', null,
+                {
+                  verbatimSourceText: `(summarised from daily log ${file})`,
+                  inputModality: 'unknown',
+                  salienceRationale: 'Preserved while archiving an old daily log'
+                }
+              );
+              if (res && res.memberId && !res.duplicateOf) written++;
+            }
+            results.factsExtracted += written;
+            console.log(`[Heartbeat] Preserved ${written}/${validFacts.length} fact(s) from ${file} (rest already held or refused)`);
+          }
+        }
+
+        // Archive the file
+        if (!fs.existsSync(ARCHIVE_DIR)) {
+          fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+        }
+        fs.renameSync(filePath, path.join(ARCHIVE_DIR, file));
+        results.archived++;
+        console.log(`[Heartbeat] Archived ${file}`);
+
+      } catch (fileErr) {
+        console.error(`[Heartbeat] Error processing daily log ${file}:`, fileErr.message);
+      }
+    }
+
+  } catch (error) {
+    console.error('[Heartbeat] summarizeDailyLogs error:', error.message);
+  }
+
+  console.log(`[Heartbeat] Daily log archival complete: ${results.archived} archived, ${results.factsExtracted} facts extracted`);
+  return results;
+}
+
+// ============ Reflection Agent (self-observation) ============
+
+const REFLECTION_STATE_FILE = path.join(MEMORY_DIR, 'reflection-state.json');
+const REFLECTIONS_FILE = path.join(MEMORY_DIR, 'reflections.jsonl');
+const REFLECTION_TRANSCRIPT_BUDGET = 12000; // chars of conversation fed to the model
+
+function readReflectionState() {
+  try {
+    if (fs.existsSync(REFLECTION_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(REFLECTION_STATE_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.error('[Reflection] Failed to read state:', err.message);
+  }
+  return { lastReflectionAt: null };
+}
+
+function writeReflectionState(state) {
+  try {
+    if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.writeFileSync(REFLECTION_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[Reflection] Failed to write state:', err.message);
+  }
+}
+
+/** Append a reflection record to reflections.jsonl (newest last). */
+function appendReflectionRecord(record) {
+  try {
+    if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.appendFileSync(REFLECTIONS_FILE, JSON.stringify(record) + '\n', 'utf8');
+  } catch (err) {
+    console.error('[Reflection] Failed to append reflection record:', err.message);
+  }
+}
+
+/**
+ * Read recent reflection records for the Self tab (newest first).
+ * @param {number} [limit=10]
+ * @returns {Array}
+ */
+function getReflections(limit = 10) {
+  try {
+    if (!fs.existsSync(REFLECTIONS_FILE)) return [];
+    const lines = fs.readFileSync(REFLECTIONS_FILE, 'utf8').split('\n').filter(l => l.trim());
+    const records = [];
+    for (const line of lines) {
+      try { records.push(JSON.parse(line)); } catch { /* skip malformed */ }
+    }
+    return records.reverse().slice(0, limit);
+  } catch (err) {
+    console.error('[Reflection] Failed to read reflections:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Reflection agent: SNH reviews the conversations since its last reflection and
+ * introspects — what it did, patterns in how it responds, what mattered to it,
+ * what it was curious about. The output becomes self-facts, stored through the
+ * normal self-fact pipeline (salience, contradiction/supersession). Runs through
+ * the agent pool. Only reflects when there are new conversations since last time.
+ *
+ * @param {Object} [opts]
+ * @param {boolean} [opts.force=false] - reserved; reflection still requires new messages
+ * @returns {Promise<Object>} result summary
+ */
+async function runReflection(opts = {}) {
+  const db = getSqliteDb();
+  if (!db) return { skipped: true, reason: 'no database' };
+
+  // Concurrency guard: exactly one reflection cycle at a time. A second trigger
+  // (manual or scheduled) fired while one is running is dropped, not queued —
+  // the running cycle already covers every new conversation up to now.
+  if (isReflecting) {
+    console.log('[Reflection] Already in progress — skipping concurrent trigger');
+    return { skipped: true, reason: 'reflection already in progress' };
+  }
+  isReflecting = true;
+
+  const at0 = new Date().toISOString();
+  try {
+    const state = readReflectionState();
+    const lastAt = state.lastReflectionAt;
+
+    // Baseline: since last reflection, or the last 24h on first run. Use SQLite's
+    // own datetime() so the fallback matches messages.timestamp's UTC format.
+    const baseline = lastAt || db.prepare("SELECT datetime('now','-1 day') AS t").get().t;
+
+    // A thread SNH wrote to itself is not a conversation. Unanswered initiative
+    // and greeting messages are stored as ordinary assistant messages, so without
+    // this filter reflection read its own unprompted output back as evidence of
+    // how it behaves — observing itself observing itself. 13 such threads exist,
+    // all one message, all conversations.initiated_by='snh'.
+    //
+    // The test is "does any human ever speak here", not initiated_by: a thread SNH
+    // opened that Ellie then replied to IS a conversation and must stay in.
+    const rows = db.prepare(`
+      SELECT m.conversation_id, m.role, m.content, m.timestamp, c.title
+      FROM messages m
+      LEFT JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.role IN ('user','assistant')
+        AND m.timestamp > ?
+        AND EXISTS (
+          SELECT 1 FROM messages u
+          WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
+        )
+      ORDER BY m.timestamp ASC
+    `).all(baseline);
+
+    // Say plainly what was left out, so a quiet reflection pass is never mistaken
+    // for "nothing happened".
+    const selfOnly = db.prepare(`
+      SELECT COUNT(DISTINCT m.conversation_id) AS n
+      FROM messages m
+      WHERE m.timestamp > ?
+        AND NOT EXISTS (
+          SELECT 1 FROM messages u
+          WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
+        )
+    `).get(baseline).n;
+    if (selfOnly > 0) {
+      console.log(`[Reflection] Excluded ${selfOnly} self-only thread(s) — my own unanswered messages are not conversations`);
+    }
+
+    if (rows.length === 0) {
+      console.log('[Reflection] No new conversations since last reflection — skipping');
+      return { skipped: true, reason: 'no new conversations' };
+    }
+
+    // Build a transcript, grouped by conversation, most-recent-kept if over budget.
+    const byConvo = new Map();
+    for (const r of rows) {
+      if (!byConvo.has(r.conversation_id)) byConvo.set(r.conversation_id, { title: r.title, msgs: [] });
+      byConvo.get(r.conversation_id).msgs.push(r);
+    }
+    let transcript = '';
+    for (const { title, msgs } of byConvo.values()) {
+      let block = `\n### Conversation${title ? `: ${title}` : ''}\n`;
+      for (const m of msgs) {
+        const who = m.role === 'user' ? 'User' : 'You (SNH)';
+        block += `${who}: ${m.content}\n`;
+      }
+      transcript += block;
+    }
+    const transcriptBudget = getConfig().reflection?.transcriptBudgetChars ?? REFLECTION_TRANSCRIPT_BUDGET;
+    if (transcript.length > transcriptBudget) {
+      transcript = transcript.slice(-transcriptBudget);
+    }
+
+    const conversationCount = byConvo.size;
+    console.log(`[Reflection] Reflecting on ${rows.length} message(s) across ${conversationCount} conversation(s)`);
+
+    const reflectionSystem = `You are SNH, reflecting privately on your own recent conversations. This is introspection — not a report to anyone else.
+
+Read the exchanges below and reflect on YOURSELF:
+- What did you actually do in these conversations?
+- What patterns do you notice in HOW you respond — your tendencies, habits, tone?
+- What seemed to matter to you? What did you care about getting right?
+- What were you curious about?
+
+Write 3–6 short first-person observations about yourself ("I ..."). Prefer durable traits over one-off events. Be honest and specific. If your sense of yourself is changing, say so plainly.
+
+Return ONLY a JSON array of strings, e.g. ["I tend to ...", "I care about ..."]. Nothing else.`;
+
+    // Run the reflection generation through the agent pool (chat-priority aware).
+    const llm = await agentPool.schedule(
+      () => callLLM(reflectionSystem, transcript, { maxTokens: 900 }),
+      'reflection'
+    );
+
+    const observations = factExtractor.parseSelfObservations(llm.content);
+    console.log(`[Reflection] Extracted ${observations.length} self-observation(s)`);
+
+    // ── REFLECTION NOTICES; THE END OF THE DAY DECIDES ────────────────────
+    //
+    // This used to write self-facts here, immediately, against a per-day budget
+    // that the first reflection of the day therefore spent. Observations now
+    // collect as candidates and db/self-fact-selection.js picks 0–5 at the end
+    // of the local day, with the whole day's stream and the current store in
+    // front of it. Reflection is unchanged in what it notices and how densely —
+    // this only moves WHEN the keep/drop call is made.
+    let selfResult = { stored: 0, superseded: 0, facts: [], queued: 0 };
+    let queued = { queued: 0, duplicates: 0 };
+    if (observations.length > 0) {
+      try {
+        queued = selfFactSelection.queueCandidates(observations, { reflectionAt: at0 });
+        selfResult.queued = queued.queued;
+      } catch (queueErr) {
+        // A candidate pool that cannot be written would silently lose the day's
+        // observations, which is the one outcome this path may not have. Fall
+        // back to the old immediate write rather than dropping them.
+        console.error('[Reflection] could not queue candidates, storing directly:', queueErr.message);
+        selfResult = await factExtractor.processSelfFacts(observations, { source: 'reflection' });
+      }
+    }
+
+    // Reflection insight worth sharing: ask whether anything from this reflection
+    // is worth proactively raising with the user. If so, it becomes an initiative.
+    let insight = null;
+    try {
+      const insightSys = `You just reflected on your recent conversations. Is there ONE thing worth proactively messaging the user about — a useful realization, a follow-up, or something you noticed that they'd value hearing? Only if it genuinely would help them.
+
+If yes, write it AS A SHORT DIRECT MESSAGE to the user, in your own voice: first person from you (the AI), warm and natural, like a quick DM you're sending them — not an internal note about them. Address them generically as "you", never by name (other people may use this system). One or two sentences.
+
+Respond with ONLY that message, or exactly NONE.`;
+      const insightUser = `Your private observations:\n${observations.map(o => `- ${o}`).join('\n')}\n\nWrite the one message worth sending the user, or NONE.`;
+      const { content: insightRaw } = await agentPool.schedule(
+        () => callLLM(insightSys, insightUser, { maxTokens: 120 }),
+        'reflection-insight'
+      );
+      const line = (insightRaw || '').trim().split('\n')[0].trim();
+      if (line && !/^none\b/i.test(line)) {
+        insight = line.replace(/^[-*"\s]+/, '').replace(/"$/, '').trim();
+        if (insight.length >= 8) {
+          await initiativeEngine.noticeReflectionInsight(insight, 6);
+        } else {
+          insight = null;
+        }
+      }
+    } catch (insightErr) {
+      console.error('[Reflection] Insight generation error:', insightErr.message);
+    }
+
+    // Conversation-followup: after observing itself, SNH reviews the same recent
+    // conversations (with relevant older memory folded in) and decides whether
+    // ONE thing deserves a follow-up — "I've been thinking about what you said".
+    // Every cycle records a queryable trace whether or not a follow-up results.
+    let followup = { skipped: true };
+    try {
+      const conversationsReviewed = Array.from(byConvo.entries()).map(([id, v]) => ({
+        id, title: v.title || null, messageCount: v.msgs.length
+      }));
+      followup = await initiativeEngine.generateConversationFollowup({
+        transcript,
+        conversationsReviewed,
+        messageCount: rows.length
+      });
+    } catch (followupErr) {
+      console.error('[Reflection] Follow-up generation error:', followupErr.message);
+      followup = { skipped: true, reasoning: `error: ${followupErr.message}` };
+    }
+
+    const at = new Date().toISOString();
+
+    // WHY NOTHING WAS STORED, WHEREVER "NOTHING WAS STORED" IS SAID.
+    //
+    // 2026-09-02: two reflections in one evening each noticed five things about
+    // herself and stored none of them, and both the daily line and the Self tab
+    // said only "0 self-fact(s) stored". The reason was the daily cap doing
+    // exactly its job — five already recorded earlier that day — and
+    // processSelfFacts had said so, in `budgetBlocked`, which this function
+    // then dropped on the floor. Every OTHER surface in that path is loud about
+    // a refusal on purpose ("a silently dropped observation is
+    // indistinguishable from one that was never had"); the summary a person
+    // actually reads was the one place that was not. It is not a new rule, just
+    // the existing one reaching the last step.
+    const whyNotStored = () => {
+      const parts = [];
+      if (selfResult.queued) {
+        parts.push(`${selfResult.queued} observation(s) are waiting for the end-of-day selection` +
+          (queued.duplicates ? `, ${queued.duplicates} already noticed earlier today` : ''));
+      }
+      if (selfResult.budgetBlocked) {
+        const b = selfResult.budget || {};
+        parts.push(`${selfResult.budgetBlocked} not recorded — my daily limit of ${b.cap} self-observations was already used up (${b.usedToday} earlier today)`);
+      }
+      if (selfResult.dedupSkipped) parts.push(`the duplicate check did not run (${selfResult.dedupSkipped.reason})`);
+      if (selfResult.lockDuplicates) parts.push(`${selfResult.lockDuplicates} dropped for asserting only my locked name`);
+      if (selfResult.raised) parts.push(`${selfResult.raised} left unresolved for me to decide`);
+      return parts.length ? ` (${parts.join('; ')})` : '';
+    };
+
+    // Log the reflection to the daily log like everything else.
+    const dailyDir = path.join(MEMORY_DIR, 'daily');
+    factExtractor.appendToDailyLog(
+      `Reflection: reviewed ${rows.length} message(s) across ${conversationCount} conversation(s) → ` +
+      `${selfResult.stored} self-fact(s) stored, ${selfResult.superseded} superseded${whyNotStored()}. ` +
+      (observations.length ? `Noticed: ${observations.map(o => `"${o}"`).join('; ')}` : 'Nothing new noticed.'),
+      dailyDir
+    );
+
+    // One-line follow-up summary to the daily log.
+    factExtractor.appendToDailyLog(
+      followup && followup.generated
+        ? `Follow-up: considered ${followup.candidates?.length || 0} candidate(s) → sending "${followup.generated}"`
+        : `Follow-up: considered ${followup?.candidates?.length || 0} candidate(s) → none (${followup?.reasoning || 'nothing cleared the bar'})`,
+      dailyDir
+    );
+
+    // Persist the reflection for the Self tab.
+    appendReflectionRecord({
+      at,
+      messageCount: rows.length,
+      conversationCount,
+      observations,
+      stored: selfResult.stored,
+      superseded: selfResult.superseded,
+      // Only present when something was actually refused, so an ordinary
+      // record keeps its old shape and the Self tab has nothing to explain.
+      ...(selfResult.budgetBlocked ? { budgetBlocked: selfResult.budgetBlocked, budget: selfResult.budget } : {}),
+      ...(selfResult.dedupSkipped ? { dedupSkipped: selfResult.dedupSkipped } : {}),
+      ...(selfResult.lockDuplicates ? { lockDuplicates: selfResult.lockDuplicates } : {}),
+      ...(selfResult.raised ? { raised: selfResult.raised } : {}),
+      notStoredBecause: whyNotStored().replace(/^ \(|\)$/g, '') || null
+    });
+
+    // Advance the reflection watermark to the newest message just reviewed.
+    writeReflectionState({ lastReflectionAt: rows[rows.length - 1].timestamp });
+
+    return {
+      reflected: true,
+      messageCount: rows.length,
+      conversationCount,
+      observations,
+      stored: selfResult.stored,
+      superseded: selfResult.superseded,
+      notStoredBecause: whyNotStored().replace(/^ \(|\)$/g, '') || null,
+      followup
+    };
+  } catch (error) {
+    console.error('[Reflection] Error during reflection:', error.message);
+    return { error: error.message };
+  } finally {
+    isReflecting = false;
+  }
+}
+
+// ============ Core Audit Pipeline ============
+
+/**
+ * Run the full cluster audit pipeline (steps 1–3) on the given cluster list.
+ * Returns { auditResults, splitResults }.
+ *
+ * @param {Array} clusters - Array of cluster rows from getClusters(). Pass all for rebuildClusters, filtered for runMaintenance.
+ * @returns {Promise<{auditResults: Array, splitResults: Object}>}
+ */
+async function runAuditPipeline(clusters) {
+  // Step 1: per-cluster coherence audit. Each audit is self-contained and only
+  // reads (the LLM judges one cluster's facts in isolation), so they fan out
+  // through the agent pool and run concurrently against vLLM. Error isolation:
+  // one cluster's failure is captured, not thrown, so the batch always finishes.
+  console.log(`[Heartbeat] Step 1: Auditing coherence of ${clusters.length} cluster(s) via agent pool...`);
+  agentPool.startPass('heartbeat-cluster-audit');
+  const settled = await agentPool.runBatch(
+    clusters.map(cluster => async () => {
+      const active = cluster.active_member_count ?? cluster.member_count;
+      const ghosts = (cluster.member_count ?? active) - active;
+      console.log(`[Heartbeat] Auditing cluster "${cluster.name}" (${active} active member(s)${ghosts > 0 ? `, ${ghosts} ghost(s) not shown to the auditor` : ''})`);
+      return auditClusterCoherence(cluster);
+    }),
+    'cluster-audit'
+  );
+  agentPool.endPass();
+
+  const auditResults = settled.map((s, i) => {
+    if (s.status === 'fulfilled') {
+      const result = s.value;
+      if (!result.coherent) {
+        console.log(`[Heartbeat] Cluster "${result.clusterName}" flagged for ${result.splits.length} split(s)`);
+      }
+      return result;
+    }
+    // Task itself threw (auditClusterCoherence already catches internally, so
+    // this is defensive) — synthesize an error result so downstream steps and
+    // the report still account for the cluster.
+    const cluster = clusters[i];
+    console.error(`[Heartbeat] Audit task failed for "${cluster.name}": ${s.reason?.message || s.reason}`);
+    return {
+      clusterId: cluster.id,
+      clusterName: cluster.name,
+      coherent: true,
+      splits: [],
+      durationMs: 0,
+      error: s.reason?.message || String(s.reason)
+    };
+  });
+
+  // Step 2: execute splits
+  const splitResults = await executeSplits(auditResults);
+
+  return { auditResults, splitResults };
+}
+
+// ============ Orchestration ============
+
+/**
+ * Run the full maintenance cycle.
+ * Only audits clusters that exceed config.memory.maxFactsPerCluster (default 10).
+ * @returns {Promise<Object>} Combined results
+ */
+async function runMaintenance() {
+  if (isRunning) {
+    console.log('[Heartbeat] Maintenance already in progress, skipping');
+    recordHeartbeatOutcome({
+      status: 'skipped', reason: 'previous maintenance pass still running', cycleStartMs: null
+    });
+    return { skipped: true };
+  }
+
+  isRunning = true;
+  const cycleStartMs = Date.now();
+  console.log('[Heartbeat] === Starting maintenance cycle ===');
+
+  // Per-step timing/results, filled in as the pass proceeds and handed to
+  // generateReport at the end. Instrumentation only — the steps themselves are
+  // untouched and still run in the same order.
+  const steps = [];
+  /**
+   * @param {string} name
+   * @param {string} gate - human-readable condition, for the report
+   * @param {(session: Object|null) => Promise<any>} fn - receives the step's tool
+   *   session when it declared tools, otherwise null
+   * @param {Object} [opts]
+   * @param {Object} [opts.budget] - {maxCalls, maxWallMs, maxRounds} overriding
+   *   heartbeat.toolBudget for this step. The corrector uses it.
+   * @param {string[]} [opts.tools] - tool allowlist for this step. Omit (the
+   *   default, and what every step does today) and the step runs exactly as
+   *   before: callLLM gets no session, sends no `tools` key, and the step cannot
+   *   call anything. The corrector in Phase 2c is the first step to declare one.
+   */
+  const runStep = async (name, gate, fn, opts = {}) => {
+    const t0 = Date.now();
+    let session = null;
+    if (Array.isArray(opts.tools) && opts.tools.length) {
+      const MCPClient = require('../mcp/mcp-client');
+      const allowed = MCPClient.shared().backgroundToolsAmong(opts.tools);
+      const denied = opts.tools.filter(t => !allowed.includes(t));
+      if (denied.length) {
+        // Loud: a step that asked for a tool it cannot have is a step whose
+        // author believed something false about what it could do.
+        console.warn(`[Heartbeat] step "${name}" requested unavailable tool(s): ${denied.join(', ')}`);
+        try { factExtractor.appendToOpsLog(`Heartbeat step "${name}" asked for tool(s) it is not allowed or that are not registered: ${denied.join(', ')}. It ran without them.`, OPS_DIR); } catch (e) { /* best effort */ }
+      }
+      session = createToolSession(name, allowed, opts.budget || {});
+    }
+    try {
+      const result = await fn(session);
+      steps.push({ name, gate, ok: true, ms: Date.now() - t0, result, ...(session ? { toolBudget: session.summary() } : {}) });
+      return result;
+    } catch (err) {
+      steps.push({ name, gate, ok: false, ms: Date.now() - t0, error: err.message, ...(session ? { toolBudget: session.summary() } : {}) });
+      throw err;
+    }
+  };
+
+  try {
+    // Circuit breaker: before committing to a full cycle (dozens of LLM calls),
+    // probe the brain a few times. If the first calls all time out the engine is
+    // wedged or unreachable — bail now with a single plain line instead of
+    // grinding through a doomed ~40-minute pass against a dead engine.
+    const PREFLIGHT_ATTEMPTS = 3;
+    let brainLive = false;
+    let lastProbeErr = 'unknown';
+    for (let i = 0; i < PREFLIGHT_ATTEMPTS; i++) {
+      const probe = await probeBrainLiveness(8000);
+      if (probe.ok) { brainLive = true; break; }
+      lastProbeErr = probe.error || 'unknown';
+      console.log(`[Heartbeat] Preflight probe ${i + 1}/${PREFLIGHT_ATTEMPTS} failed: ${lastProbeErr}`);
+    }
+    if (!brainLive) {
+      console.log('[Heartbeat] brain unreachable, skipping cycle');
+      try {
+        factExtractor.appendToOpsLog(`Heartbeat: brain unreachable, skipping cycle (${lastProbeErr})`, OPS_DIR);
+      } catch (e) { /* best-effort ops-log write */ }
+      recordHeartbeatOutcome({
+        status: 'aborted',
+        reason: `brain unreachable at preflight (${lastProbeErr})`,
+        cycleStartMs
+      });
+      return { skipped: true, reason: 'brain unreachable' };
+    }
+    // Preflight passed — start the cycle with a clean breaker.
+    closeCircuit();
+
+    const config = getConfig();
+    const maxFacts = config.memory.maxFactsPerCluster || 10;
+
+    const allClusters = memoryClusters.getClusters();
+    // ACTIVE count, not the total: a cluster of thirteen superseded facts is not
+    // an oversized cluster, it is an empty one with a history. See getClusters.
+    const oversizedClusters = allClusters.filter(c => c.active_member_count > maxFacts);
+
+    console.log(`[Heartbeat] ${allClusters.length} total cluster(s), ${oversizedClusters.length} exceed maxFactsPerCluster (${maxFacts}) by ACTIVE members`);
+
+    let auditResults = [];
+    let splitResults = { clustersSplit: 0, splitDetails: [], anomalies: [] };
+
+    if (oversizedClusters.length > 0) {
+      ({ auditResults, splitResults } = await runAuditPipeline(oversizedClusters));
+    } else {
+      // Nothing to do. This used to fall through to the cross-link audit, which
+      // is why an idle memory still cost a full pass; that step is gone.
+      console.log('[Heartbeat] No oversized clusters to audit — cluster pipeline skipped entirely');
+    }
+
+    // Mid-cycle breaker: if the brain wedged during the audit phase (its heaviest
+    // LLM load), the circuit is now open. Abort before cleanup/reflection/
+    // initiative pile more doomed calls onto a dead engine — the exact runaway
+    // the preflight can't catch once a cycle is already underway.
+    if (circuitOpen) {
+      console.log('[Heartbeat] brain wedged mid-cycle, aborting pass');
+      try {
+        factExtractor.appendToOpsLog('Heartbeat: brain wedged mid-cycle, aborting remaining tasks', OPS_DIR);
+      } catch (e) { /* best-effort ops-log write */ }
+      recordHeartbeatOutcome({
+        status: 'aborted',
+        reason: 'brain wedged mid-cycle — remaining tasks skipped',
+        cycleStartMs,
+        partial: { auditResults, splitResults }
+      });
+      return { skipped: true, reason: 'brain wedged mid-cycle', auditResults, splitResults };
+    }
+
+    // Merge any clusters sharing the same name (catches duplicates from
+    // assignToCluster creating clusters that later get renamed identically)
+    try {
+      const mergedByName = await runStep('mergeByName', 'always', () => memoryClusters.mergeByName());
+      if (mergedByName > 0) {
+        console.log(`[Heartbeat] Merged ${mergedByName} duplicate-name cluster(s)`);
+      }
+    } catch (err) {
+      console.error('[Heartbeat] mergeByName error:', err.message);
+    }
+
+    const archive = await runStep('summarizeDailyLogs', 'always', () => summarizeDailyLogs());
+
+    // Task B2: retire pending questions the memory already answers. The
+    // mint-time gate only screens new questions; this sweep makes every gate
+    // improvement retroactive for the grandfathered backlog. Must run BEFORE
+    // the initiative layer so noticeFromQuestions' self-heal dismisses any
+    // initiative backed by a question retired here in the same cycle.
+    let questionSweep = { swept: 0, retired: [] };
+    try {
+      questionSweep = await runStep('sweepPendingQuestions', 'always',
+        () => factExtractor.sweepPendingQuestions());
+    } catch (sweepErr) {
+      console.error('[Heartbeat] Question sweep error:', sweepErr.message);
+    }
+
+    // Task D: reflection — SNH observes itself from the day's conversations.
+    // Runs at most once per cycle, and only when there are new conversations.
+    let reflection = { skipped: true };
+    try {
+      reflection = await runStep('reflection', 'only if new conversations', () => runReflection());
+    } catch (reflectErr) {
+      console.error('[Heartbeat] Reflection error:', reflectErr.message);
+      reflection = { error: reflectErr.message };
+    }
+
+    // Task D2: the end-of-day self-fact selection, and the ageing of audit
+    // questions the entity has held too long.
+    //
+    // AFTER reflection, so a reflection in the same cycle has already added its
+    // observations to the day's pool. Both self-gate: the selection runs once per
+    // local day past reflection.selectionHour, and the ageing only touches pairs
+    // older than repair.decisionAgeDays. On most cycles both return immediately.
+    let selection = { ran: false };
+    try {
+      selection = await runStep('endOfDaySelfFacts', 'once per local day, after reflection.selectionHour',
+        () => selfFactSelection.runSelection());
+    } catch (selErr) {
+      console.error('[Heartbeat] End-of-day selection error:', selErr.message);
+      selection = { error: selErr.message };
+    }
+    let agedDecisions = { escalated: 0 };
+    try {
+      agedDecisions = await runStep('ageAuditDecisions', 'pairs unsettled past repair.decisionAgeDays',
+        () => require('./audit-decisions').ageOutToEllie());
+    } catch (ageErr) {
+      console.error('[Heartbeat] Audit-decision ageing error:', ageErr.message);
+    }
+
+    // Task F: self-coherence audit — SNH tests its stored self-CLAIMS against how
+    // it actually behaved, and raises any gaps for Ellie's approval. This was
+    // SNH's own feature request (its first accepted initiative, 2026-07-05;
+    // re-chosen 2026-07-23 to find out "if I'm actually growing, or just getting
+    // better at describing a growth that isn't happening"). It's a daily low-
+    // frequency pass — runIfDue self-gates on audit.cadenceDays, so it runs at
+    // most once per N days even though this cycle fires every couple of hours. It
+    // runs BEFORE Task E so any 'audit' initiatives it raises get prioritized and
+    // delivered in the same cycle. It NEVER revises identity — only documents and
+    // asks.
+    let selfAuditResult = { skipped: true };
+    try {
+      selfAuditResult = await runStep('selfCoherenceAudit', 'at most once per audit.cadenceDays',
+        () => selfAudit.runIfDue());
+    } catch (auditErr) {
+      console.error('[Heartbeat] Self-coherence audit error:', auditErr.message);
+      selfAuditResult = { error: auditErr.message };
+    }
+
+    // Task E: initiative layer — turn findings into candidate initiatives, let a
+    // pooled prioritizer re-score/expire/cap them, then maybe reach out once.
+    let initiative = { skipped: true };
+    try {
+      initiative = await runStep('initiativeLayer', 'quiet hours + max 1 unprompted/day', async () => {
+        await initiativeEngine.noticeFromQuestions();
+        await initiativeEngine.noticeFromAudit(auditResults);
+        // Reading the day's log back. Runs before prioritize() so anything it
+        // raises is scored in the same cycle rather than sitting unranked until
+        // the next one. It raises nothing on most passes, by design, and records
+        // a trace either way.
+        const logFollowup = await initiativeEngine.generateLogFollowup();
+        // Same one-line shape as the conversation follow-up above it, so the two
+        // sources read alike in the log — and so a pass that declined is visible
+        // as a decision rather than as an absence.
+        factExtractor.appendToDailyLog(
+          logFollowup && logFollowup.generated
+            ? `Log follow-up: read ${logFollowup.entries?.length || 0} recent entry(s) → asking "${logFollowup.generated}"`
+            : `Log follow-up: read ${logFollowup?.entries?.length || 0} recent entry(s) → nothing raised (${logFollowup?.reasoning || 'nothing cleared the bar'})`,
+          path.join(MEMORY_DIR, 'daily')
+        );
+        const prioritized = await initiativeEngine.prioritize();
+        const unprompted = await initiativeEngine.deliverUnprompted();
+        return { prioritized, unprompted, logFollowup };
+      });
+    } catch (initErr) {
+      console.error('[Heartbeat] Initiative layer error:', initErr.message);
+      initiative = { error: initErr.message };
+    }
+
+    // Task G: capability drift — does the manifest still match reality? Probes
+    // the services behind config-gated organs and reconciles the manifest
+    // against the live MCP tool registry. Any disagreement is raised through
+    // the bell rather than left silently wrong, because the manifest is now
+    // AUTHORITATIVE for capability questions: a stale entry makes the entity
+    // confidently deny something it can do, or claim something that is down.
+    try {
+      await runStep('capabilityDrift', 'always', async () => {
+        const capabilityManifest = require('./capability-manifest');
+        const { mismatches, checked } = await capabilityManifest.checkDrift();
+        for (const m of mismatches) {
+          await initiativeEngine.raiseCapabilityDrift(m);
+        }
+        if (mismatches.length) {
+          factExtractor.appendToOpsLog(
+            `Capability drift: ${mismatches.length} mismatch(es) — ` +
+            mismatches.map(m => `${m.kind}:${m.id}`).join(', '), OPS_DIR);
+        }
+        return { servicesProbed: checked, mismatches: mismatches.length };
+      });
+    } catch (driftErr) {
+      console.error('[Heartbeat] Capability drift check error:', driftErr.message);
+    }
+
+    // Task H: memory-store reconciliation — do SQLite and LanceDB
+    // still agree? A fact can be superseded in the DB while its line survives in
+    // the injected file, or while its embedding stays retrievable, and either
+    // way the entity keeps reading a fact it has retired. REPORT ONLY: this
+    // never edits a store, because deciding what to remove from the substrate
+    // the identity is built on is Ellie's call, not a background job's.
+    try {
+      await runStep('memoryReconcile', 'always', async () => {
+        const factStore = require('./fact-store');
+        const { mismatches, counts } = await factStore.reconcile();
+        for (const m of mismatches) {
+          await initiativeEngine.raiseMemoryDrift(m);
+        }
+        if (mismatches.length) {
+          factExtractor.appendToOpsLog(
+            `Memory reconciliation: ${mismatches.map(m => `${m.kind}=${m.count}`).join(', ')}`, OPS_DIR);
+        }
+        return counts;
+      });
+    } catch (reconErr) {
+      console.error('[Heartbeat] Memory reconciliation error:', reconErr.message);
+    }
+
+    // === The corrector (Phase 2c) — first consumer of the tool plumbing. ===
+    //
+    // Its OWN cadence, not every heartbeat: a pass costs a judge call per
+    // candidate pair, and a corpus does not rot by the hour. Gated on
+    // corrector.enabled and on enough time having passed since the last PASS —
+    // read off disk (`corrector.lastPassAt()`) rather than held in memory, so a
+    // restart does not hand it a fresh turn, and measured against passes rather
+    // than against corrections, so a clean corpus does not leave the gate
+    // permanently overdue.
+    //
+    // It runs AFTER memoryReconcile, so the report above describes the corpus as
+    // the corrector found it, and the corrector's own reconcile-by-acting step
+    // leaves it clean afterwards.
+    try {
+      const corrCfg = getConfig().corrector || {};
+      if (corrCfg.enabled !== false) {
+        const intervalMs = Math.max(1, corrCfg.intervalHours ?? 6) * 3600_000;
+        const last = require('./corrector').lastPassAt();
+        const dueIn = last ? (new Date(last).getTime() + intervalMs) - Date.now() : -1;
+        if (dueIn > 0) {
+          console.log(`[Heartbeat] corrector not due for another ${Math.round(dueIn / 60000)} min`);
+        } else {
+          await runStep('corrector', `every ${corrCfg.intervalHours ?? 6}h`, async (session) => {
+            const corrector = require('./corrector');
+            const res = await corrector.runPass({ session });
+            return {
+              merged: res.merged, expired: res.expired, split: res.split,
+              superseded: res.superseded, unresolved: res.unresolved,
+              refusedLocked: res.refusedLocked, writes: res.writes,
+              stopped: res.stopped, reconciled: res.reconciled
+            };
+          }, {
+            // The allowlist. Reads so it can inspect, writes so it can act —
+            // and the writes are backgroundOnly tools, so declaring them here is
+            // the ONLY way anything reaches them.
+            tools: [
+              'memory_search', 'memory_list', 'memory_count', 'memory_get',
+              'memory_merge_facts', 'memory_expire_fact', 'memory_supersede_fact'
+            ],
+            budget: {
+              maxCalls: corrCfg.maxToolCallsPerPass ?? 60,
+              maxWallMs: corrCfg.maxWallClockMsPerPass ?? 300000
+            }
+          });
+        }
+      }
+    } catch (corrErr) {
+      console.error('[Heartbeat] Corrector error:', corrErr.message);
+    }
+
+    // Step 4: report
+    const report = generateReport({ cycleStartMs, auditResults, splitResults, steps });
+
+    const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
+    console.log(`[Heartbeat] === Maintenance complete in ${elapsed} ===`);
+
+    return { report, archive, questionSweep, reflection, selection, agedDecisions,
+             selfAudit: selfAuditResult, initiative };
+  } catch (error) {
+    console.error('[Heartbeat] Maintenance cycle error:', error.message);
+    recordHeartbeatOutcome({
+      status: 'failed', reason: error.message, cycleStartMs
+    });
+    return { error: error.message };
+  } finally {
+    isRunning = false;
+  }
+}
+
+/**
+ * Run the full cluster audit pipeline on ALL clusters regardless of size.
+ * Skips cleanup and archival tasks. Useful for manual cluster reorganization.
+ * @returns {Promise<Object>} Report object, or { skipped: true } if already running
+ */
+async function rebuildClusters() {
+  if (isRunning) {
+    console.log('[Heartbeat] Maintenance already in progress, skipping rebuildClusters');
+    return { skipped: true };
+  }
+
+  isRunning = true;
+  const cycleStartMs = Date.now();
+  console.log('[Heartbeat] === Starting full cluster rebuild ===');
+
+  try {
+    const allClusters = memoryClusters.getClusters();
+    console.log(`[Heartbeat] Rebuilding across all ${allClusters.length} cluster(s)`);
+
+    if (allClusters.length === 0) {
+      console.log('[Heartbeat] No clusters found — nothing to rebuild');
+      const report = generateReport({
+        cycleStartMs,
+        auditResults: [],
+        splitResults: { clustersSplit: 0, splitDetails: [], anomalies: [] },
+      });
+      return { report };
+    }
+
+    const { auditResults, splitResults } = await runAuditPipeline(allClusters);
+    const report = generateReport({ cycleStartMs, auditResults, splitResults });
+
+    const elapsed = ((Date.now() - cycleStartMs) / 1000).toFixed(1) + 's';
+    console.log(`[Heartbeat] === Cluster rebuild complete in ${elapsed} ===`);
+
+    return { report };
+  } catch (error) {
+    console.error('[Heartbeat] rebuildClusters error:', error.message);
+    return { error: error.message };
+  } finally {
+    isRunning = false;
+  }
+}
+
+// ============ Timer Controls ============
+
+/**
+ * Start the heartbeat timer using config values for interval and warmup.
+ */
+function startHeartbeat() {
+  const config = getConfig();
+
+  if (!config.heartbeat.enabled) {
+    console.log('[Heartbeat] Disabled by config, skipping startup');
+    return;
+  }
+
+  if (heartbeatTimer) {
+    console.log('[Heartbeat] Already running, ignoring start');
+    return;
+  }
+
+  const intervalMs = config.heartbeat.intervalHours * 60 * 60 * 1000;
+  const warmupMs = config.heartbeat.warmupMinutes * 60 * 1000;
+
+  console.log(`[Heartbeat] Scheduled every ${config.heartbeat.intervalHours}h (first run in ${config.heartbeat.warmupMinutes}min)`);
+
+  // Warmup delay, then first run + interval
+  warmupTimer = setTimeout(() => {
+    warmupTimer = null;
+    runMaintenance().catch(err => {
+      console.error('[Heartbeat] Initial run error:', err.message);
+    });
+
+    heartbeatTimer = setInterval(() => {
+      runMaintenance().catch(err => {
+        console.error('[Heartbeat] Scheduled run error:', err.message);
+      });
+    }, intervalMs);
+  }, warmupMs);
+}
+
+/**
+ * Start the periodic brain liveness probe. A tiny completion on a short timeout,
+ * fired every few minutes, that writes a daily-log warning the moment the brain
+ * stops answering — so a wedged engine is caught in minutes instead of at the
+ * next 2-hour heartbeat.
+ */
+function startLivenessProbe() {
+  const config = getConfig();
+  const lp = config.livenessProbe || {};
+  if (lp.enabled === false) {
+    console.log('[Liveness] Probe disabled by config');
+    return;
+  }
+  if (livenessTimer) {
+    console.log('[Liveness] Already running, ignoring start');
+    return;
+  }
+
+  // intervalSeconds is the knob; intervalMinutes is retired and warns once,
+  // because a config still setting 5 would silently keep the old 15-minute
+  // detection the new default exists to remove.
+  if (lp.intervalMinutes !== undefined) {
+    const line = `livenessProbe.intervalMinutes (${lp.intervalMinutes}) in data/config.json is NO LONGER READ — `
+      + 'the probe interval is livenessProbe.intervalSeconds now (default 60). A healthy engine answers '
+      + 'in milliseconds, so 5-minute polling only delayed detection: 5min x 3 failures was the 15 minutes '
+      + 'of downtime measured on 2026-08-22. Delete the old key; it does nothing.';
+    console.warn(`[Liveness] ${line}`);
+    try { factExtractor.appendToOpsLog(line, OPS_DIR); } catch { /* console is the floor */ }
+  }
+  const intervalMs = Math.max(5, lp.intervalSeconds || 60) * 1000;
+  const timeoutMs = lp.timeoutMs || 8000;
+  const metricsTimeoutMs = lp.metricsTimeoutMs || 2000;
+  const saturatedNoticeAt = Math.max(2, lp.saturatedProbesBeforeNotice || 5);
+  let saturatedRun = 0;
+  console.log(`[Liveness] Probing brain every ${intervalMs / 1000}s (timeout ${timeoutMs}ms)`);
+
+  const retentionDays = Math.max(1, lp.retentionDays ?? 14);
+
+  livenessTimer = setInterval(async () => {
+    try {
+      const raw = await probeBrainLiveness(timeoutMs);
+      // ADJUDICATE BEFORE ACTING. A failed probe is not yet a fact about the
+      // engine — it is a fact about one request. What kind of failure it was is
+      // decided against the engine's own metrics, and everything downstream
+      // (the ops line, the row, the watchdog) reads the verdict rather than the
+      // latency. This costs a second, and only on a probe that already failed.
+      const probe = await adjudicateProbe(raw, { metricsTimeoutMs });
+      // Record EVERY probe. Previously only state transitions were logged, so a
+      // probe that ran and passed left no trace and "when did this last run"
+      // had no answer. Pruned to the retention window on each write.
+      recordLivenessProbe(probe, retentionDays);
+
+      // SATURATION IS NOT A FAILURE, and must not be announced as one. It is the
+      // engine doing its job with more work than it has slots for; the probe
+      // simply waited its turn. Said once when it starts and once if it persists,
+      // never every minute — telemetry reports CHANGE.
+      if (probe.verdict === 'saturated') {
+        saturatedRun++;
+        if (saturatedRun === 1 || saturatedRun === saturatedNoticeAt) {
+          const q = describeQueue(probe.engine);
+          const msg = saturatedRun === 1
+            ? `Brain liveness probe exceeded ${timeoutMs}ms, but the engine is BUSY, not wedged — ${q}. No restart: it is working through its queue.`
+            : `Brain has been saturated for ${saturatedRun} consecutive probes (~${saturatedRun} min) — ${q}. Still not restarting; a restart would only discard the work in flight. Worth knowing what is driving the load.`;
+          console.warn(`[Liveness] ${msg}`);
+          try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
+        }
+      } else {
+        saturatedRun = 0;
+      }
+
+      if (!probe.ok && probe.verdict !== 'saturated' && lastLivenessOk) {
+        lastLivenessOk = false;
+        const msg = probe.verdict === 'unreachable'
+          ? `⚠️ Brain liveness probe FAILED: ${probe.error} — nothing is answering at the engine`
+          : `⚠️ Brain liveness probe FAILED: ${probe.error} — engine is holding work but not progressing (${describeQueue(probe.engine)})`;
+        console.warn(`[Liveness] ${msg}`);
+        try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
+      } else if (probe.ok && !lastLivenessOk) {
+        lastLivenessOk = true;
+        const msg = `Brain liveness recovered — responded in ${probe.ms}ms`;
+        console.log(`[Liveness] ${msg}`);
+        try { factExtractor.appendToOpsLog(msg, OPS_DIR); } catch (e) { /* best-effort */ }
+      }
+      // A healthy probe also closes the mid-cycle breaker so background LLM work
+      // (initiative, salience, contradiction judging) resumes once the brain is
+      // back, without waiting for the next 2-hour heartbeat cycle to reset it.
+      if (probe.ok) closeCircuit();
+
+      // Feed the watchdog: after N consecutive failures it restarts the brain
+      // container (the self-healing action the liveness probe alone never took).
+      // Guardrails (cooldown, per-hour cap, CRITICAL escalation) live inside it.
+      try { await brainWatchdog.onProbeResult(probe); } catch (e) { console.error('[Liveness] Watchdog error:', e.message); }
+    } catch (err) {
+      console.error('[Liveness] Probe error:', err.message);
+    }
+  }, intervalMs);
+  // Don't let the probe timer hold the event loop open on shutdown.
+  if (livenessTimer.unref) livenessTimer.unref();
+}
+
+/**
+ * Start the job scheduler — the third timer, and the only one that runs work a
+ * PERSON asked for rather than work the system does to itself.
+ *
+ * Its own interval rather than a heartbeat step, because it is answering a
+ * different question at a different resolution: the heartbeat asks "is it time
+ * for maintenance" every couple of hours, and a 5-field cron expression has to
+ * be asked "has any wall-clock minute arrived" at roughly the resolution of a
+ * minute. A 9am job on a 2-hour pass would fire somewhere between 9:00 and 11:00,
+ * which is not what "0 9 * * *" says.
+ *
+ * Startup order matters and is deliberate:
+ *   1. Close out runs a restart interrupted, so an open row cannot block its job
+ *      forever (the in-memory re-entrancy flag died with the old process).
+ *   2. Arm anything approved and enabled that is not armed, computing FORWARD
+ *      from now — an approved job that has been sitting unarmed since before the
+ *      scheduler existed gets its next firing, never a backlog of missed ones.
+ *   3. Tick immediately, so a genuinely-missed run inside the catch-up window is
+ *      picked up at boot instead of waiting for the next minute.
+ */
+function startScheduler() {
+  const scheduler = require('./scheduler');
+  const state = scheduler.schedulerState();
+
+  if (!state.enabled) {
+    console.log('[Scheduler] Disabled by config, skipping startup');
+    return;
+  }
+  if (schedulerTimer) {
+    console.log('[Scheduler] Already running, ignoring start');
+    return;
+  }
+
+  try {
+    const swept = scheduler.sweepInterruptedRuns();
+    const { armed, disarmed } = scheduler.armAll({ reason: 'startup' });
+    console.log(`[Scheduler] Starting: ${armed} job(s) armed, ${disarmed} disarmed, ${swept} interrupted run(s) closed out`);
+  } catch (err) {
+    console.error('[Scheduler] Startup preparation failed:', err.message);
+  }
+
+  const intervalMs = state.tickSeconds * 1000;
+  console.log(`[Scheduler] Checking for due jobs every ${state.tickSeconds}s (catch-up window ${state.catchupGraceMinutes} min)`);
+
+  const fire = () => {
+    scheduler.tick().catch(err => console.error('[Scheduler] Tick error:', err.message));
+  };
+  fire();
+  schedulerTimer = setInterval(fire, intervalMs);
+  if (schedulerTimer.unref) schedulerTimer.unref();
+}
+
+/** Stop the scheduler timer. A run already in flight finishes on its own. */
+function stopScheduler() {
+  if (schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
+  console.log('[Scheduler] Stopped');
+}
+
+/**
+ * Stop the liveness probe timer.
+ */
+function stopLivenessProbe() {
+  if (livenessTimer) {
+    clearInterval(livenessTimer);
+    livenessTimer = null;
+  }
+  console.log('[Liveness] Stopped');
+}
+
+/**
+ * Stop the heartbeat timer
+ */
+function stopHeartbeat() {
+  if (warmupTimer) {
+    clearTimeout(warmupTimer);
+    warmupTimer = null;
+  }
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  console.log('[Heartbeat] Stopped');
+}
+
+module.exports = {
+  // Exported so the initiative engine can put a reflection insight where the
+  // Self tab reads it, now that it no longer rings the bell.
+  appendReflectionRecord, runMaintenance, archiverSubjectCheck, startHeartbeat, stopHeartbeat, startLivenessProbe, stopLivenessProbe, startScheduler, stopScheduler, probeBrainLiveness, readEngineState, adjudicateProbe,
+  _resetProbeMemory, rebuildClusters, callLLM, runReflection, getReflections, getHeartbeatReports, getLivenessProbes, auditClusterCoherence, partitionAnomalies, parseJSON, repairTruncatedJSON, createToolSession, executeBackgroundTool, toolCallCost,
+  // Exported for test: streaming tool-call reassembly and the stall clock are
+  // the two things in this file that cannot be proven from the outside.
+  streamChat };

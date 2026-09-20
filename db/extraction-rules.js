@@ -1,0 +1,888 @@
+/**
+ * Deterministic intake rules — the half of passive extraction that must NOT be a
+ * language model's opinion.
+ *
+ * The extractor asks a model to split, route and attribute; this module is the
+ * floor underneath that. Anything a prompt can be talked out of on a bad night is
+ * enforced here instead, where it is a regex with a test rather than a paragraph
+ * the model may skim. Three rules live here:
+ *
+ *   1. EVENT MARKERS — text that carries a time qualifier is an event no matter
+ *      what the model called it. Strip the timestamp and nothing durable is left.
+ *   2. IDENTITY ANCHOR — a fact about the user's own name, pronouns, or a core
+ *      relationship needs the VERBATIM message to contain an explicit
+ *      self-introduction. This is the F1 rule: "Hey, it's Mike not picking up the
+ *      right words" — a mis-transcribed "mic", in a conversation about fixing the
+ *      microphone — must never become "User's name is Mike".
+ *   3. COMPOUND DETECTION — a fact that still joins unrelated assertions after
+ *      the model has been asked for atoms gets sent back to be split.
+ *
+ * Everything here is pure and synchronous. No model calls, no database.
+ */
+
+// ============ 1. EVENT vs STATE ============
+
+/**
+ * Time qualifiers. Their presence in a candidate fact is decisive: the sentence
+ * needed a date to be true, which is the definition of an event.
+ *
+ * Note "as of": the OLD extractor prompt actively instructed the model to anchor
+ * time-relative statements to an absolute date ("As of July 2026, User is
+ * migrating…"). That instruction manufactured the exact marker the
+ * strip-the-timestamp test now treats as disqualifying, which is why it was
+ * removed from the prompt in the same change that added this list.
+ */
+const TEMPORAL_MARKERS = [
+  /\bas of\b/i,
+  /\b(today|tonight|yesterday|tomorrow)\b/i,
+  /\b(last|this|next)\s+(night|morning|afternoon|evening|week|weekend|month)\b/i,
+  /\b(currently|right now|at the moment|these days|just now|earlier|recently|lately)\b/i,
+  /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/i,
+  /\b\d{4}-\d{2}-\d{2}\b/,
+  /\bon\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i,
+  /\bthe other (day|night|week)\b/i
+];
+
+/**
+ * In-progress and momentary-state phrasings. Distinct from the temporal list
+ * because they carry no date at all — the sentence is about a happening rather
+ * than a standing truth. Deliberately narrow: "User is building SNH" is durable
+ * and must not be caught, so this matches specific transient verbs rather than
+ * any progressive form.
+ */
+const INPROGRESS_MARKERS = [
+  /\b(is|are|was|were)\s+(currently\s+)?(experiencing|feeling|dealing with|going through|in the middle of|recovering from|struggling with)\b/i,
+  /\b(had|has had)\s+(a|an)\s+\w+\s+(night|day|morning|week)\b/i,
+  /\b(is|are)\s+(currently\s+)?(waiting|about to|on their way)\b/i,
+  // Someone else temporarily present or engaged on the user's behalf — "has
+  // cleaners working in the yard", "has a plumber coming". Anchored to have +
+  // an object + a present participle, so "User is working at IEC" (durable, and
+  // about the user themselves) cannot match. Being a candidate is not being
+  // retired: the strip-the-timestamp judge still decides, and it is the half
+  // that refuses.
+  /\b(has|have|had)\s+(a|an|the|some|\d+)?\s*\w+(s)?\s+(working|coming|visiting|staying|scheduled|booked)\b/i
+];
+
+/**
+ * Does this candidate carry a marker that FORCES the event branch?
+ * @param {string} text
+ * @returns {{isEvent: boolean, marker: string|null, kind: string|null}}
+ */
+function eventMarker(text) {
+  const t = String(text || '');
+  for (const re of TEMPORAL_MARKERS) {
+    const m = t.match(re);
+    if (m) return { isEvent: true, marker: m[0], kind: 'temporal' };
+  }
+  for (const re of INPROGRESS_MARKERS) {
+    const m = t.match(re);
+    if (m) return { isEvent: true, marker: m[0], kind: 'in-progress' };
+  }
+  return { isEvent: false, marker: null, kind: null };
+}
+
+// ============ 2. IDENTITY ANCHOR ============
+
+const RELATIONSHIP_TERMS = [
+  'wife', 'husband', 'spouse', 'partner', 'fiancé', 'fiancee', 'fiancée',
+  'mother', 'mom', 'father', 'dad', 'son', 'daughter', 'brother', 'sister',
+  'grandmother', 'grandfather', 'grandma', 'grandpa'
+];
+
+/**
+ * Which identity slot, if any, does this fact assert?
+ *
+ * Scoped tightly to the USER'S OWN identity. "User has a dog named Biscuit" holds
+ * the word "named" and is not an identity fact; "User's name is Mike" is. The
+ * distinction is whose name is being asserted, so the patterns are anchored to
+ * the sentence subject rather than searching for a keyword anywhere.
+ *
+ * @param {string} factText
+ * @returns {{klass: 'name'|'pronouns'|'relationship', term?: string}|null}
+ */
+function identityClassOf(factText) {
+  const t = String(factText || '').trim();
+
+  // Name: the user's own, asserted as the sentence's main claim.
+  if (/^(the\s+)?user'?s?\s+(full\s+)?name\s+(is|was)\b/i.test(t) ||
+      /^(the\s+)?user\s+(is\s+named|goes\s+by|is\s+called)\b/i.test(t) ||
+      /^(the\s+)?user'?s?\s+name,?\s/i.test(t)) {
+    return { klass: 'name' };
+  }
+
+  // Pronouns.
+  if (/^(the\s+)?user'?s?\s+pronouns\b/i.test(t) ||
+      /^(the\s+)?user\s+uses\s+(he|she|they|it)\s*\//i.test(t)) {
+    return { klass: 'pronouns' };
+  }
+
+  // Core relationships: "User's wife is X", "User's father is named X".
+  const rel = t.match(new RegExp(`^(the\\s+)?user'?s?\\s+(${RELATIONSHIP_TERMS.join('|')})\\b`, 'i'));
+  if (rel) return { klass: 'relationship', term: rel[2].toLowerCase() };
+
+  return null;
+}
+
+/** Explicit self-introduction phrasings, per identity class. */
+const NAME_INTRO = /\b(my name'?s?\s+is|my name\s+is|my names\s+is|i'?m\s+called|i\s+am\s+called|call\s+me|you\s+can\s+call\s+me|i\s+go\s+by|name'?s\s+\w+\s*,?\s*(nice|pleased)\s+to\s+meet)\b/i;
+const PRONOUN_INTRO = /\b(my\s+pronouns|i\s+use\s+(he|she|they|it)\s*\/|use\s+(he|she|they)\s*\/\s*(him|her|them|it))\b/i;
+
+/**
+ * Does the verbatim message contain the explicit self-introduction this identity
+ * class requires?
+ *
+ * For relationships the bar is different and weaker on purpose: there is no such
+ * thing as "introducing" a sister the way you introduce a name, so the test is
+ * that the relationship word the fact claims actually appears in what was said.
+ * An incidental mishearing does not usually produce the exact kinship noun.
+ *
+ * @param {string} verbatim - the user's actual words, not a paraphrase
+ * @param {{klass: string, term?: string}} klass
+ * @returns {{ok: boolean, evidence: string|null}}
+ */
+function hasIdentityAnchor(verbatim, klass) {
+  const v = String(verbatim || '');
+  if (klass.klass === 'name') {
+    const m = v.match(NAME_INTRO);
+    return { ok: !!m, evidence: m ? m[0] : null };
+  }
+  if (klass.klass === 'pronouns') {
+    const m = v.match(PRONOUN_INTRO);
+    return { ok: !!m, evidence: m ? m[0] : null };
+  }
+  if (klass.klass === 'relationship' && klass.term) {
+    const m = v.match(new RegExp(`\\b${klass.term}\\b`, 'i'));
+    return { ok: !!m, evidence: m ? m[0] : null };
+  }
+  return { ok: true, evidence: null };
+}
+
+/**
+ * The full gate. Returns null to allow the fact, or a refusal describing why.
+ *
+ * @param {string} factText
+ * @param {string} verbatim
+ * @param {string} modality - 'stt' | 'typed' | 'unknown'
+ * @param {string[]} gatedModalities - from config
+ */
+function identityAnchorRefusal(factText, verbatim, modality, gatedModalities) {
+  const klass = identityClassOf(factText);
+  if (!klass) return null;
+  const mod = (modality || 'unknown').toLowerCase();
+  if (!gatedModalities.map(m => String(m).toLowerCase()).includes(mod)) return null;
+
+  const anchor = hasIdentityAnchor(verbatim, klass);
+  if (anchor.ok) return null;
+
+  return {
+    rule: 'identity-anchor',
+    klass: klass.klass,
+    modality: mod,
+    detail: klass.klass === 'relationship'
+      ? `a ${klass.klass} fact from a ${mod}-modality message, and the word "${klass.term}" does not appear in what was actually said`
+      : `a ${klass.klass} fact from ${/^[aeiou]/i.test(mod) ? 'an' : 'a'} ${mod}-modality message with no explicit self-introduction in what was actually said`
+  };
+}
+
+// ============ 2b. CAPABILITY AND DEPLOYMENT FACTS ============
+//
+// THE MANIFEST OWNS THIS GROUND, AND A FACT IN THE STORE CANNOT BE MADE TO
+// AGREE WITH IT.
+//
+// db/capability-manifest.js is config-gated: every tool-bearing entry carries a
+// `when` that reads the same flag which registers the tool, so what SNH claims
+// it can do and what it can actually call cannot drift apart. A row in
+// cluster_members has no such gate. On 2026-08-15 extraction proposed
+//
+//   "User's system has web search tool loaded"
+//
+// from a message about testing search. Turn tools.searxng.enabled off and the
+// manifest entry disappears while that fact goes on asserting the opposite,
+// forever, with salience and provenance behind it — and the injected memory
+// block sits in the same prompt as the manifest, contradicting it. That is the
+// two-flags-for-one-capability defect of 2026-07-27 coming back through intake.
+//
+// It also is not a fact about the user. It describes the deployment she is
+// talking to, which config and the manifest already record exactly.
+//
+// The rule is deliberately narrow, because "tools" in the ordinary sense are
+// legitimate and valuable user facts — the salience prompt itself rates
+// "stable preferences/tools/hardware" at 5–7. So a refusal needs the SYSTEM to
+// be what the sentence is ABOUT, not merely a word inside it: "User is the
+// creator of SNH" is an identity fact and must survive, while "User's SNH
+// instance runs Qwen3.8-27B" is deployment state and must not.
+
+/**
+ * SNH itself, in subject position.
+ *
+ * The SUBJECT is the whole test, with no accompanying list of capability nouns
+ * or state verbs. A first version required both and let four facts through in a
+ * single conversation — "User's SNH system allows the AI to search the web when
+ * the user requests it", "...displays an alert when the user arrives at the
+ * computer", "...creates a new chat for important messages", "...allows the AI
+ * to initiate conversations on its own". Every one of those is a capability
+ * statement; none used a verb from any plausible list. Enumerating the ways a
+ * system can be described is a losing game, and each miss is a permanent row.
+ *
+ * So: if what the sentence is ABOUT is SNH, the manifest owns it and it does not
+ * belong here, whatever the sentence goes on to say.
+ *
+ * The anchor is what keeps this narrow. It matches only in subject position, so
+ * "User is the creator of SNH" and "User named the first instance Aurelius" are
+ * facts about Ellie and survive. Deliberately absent: `server`, `box`, `pc`,
+ * `laptop` — her hardware is a legitimate thing to remember about her, and the
+ * salience prompt rates it 5–7.
+ */
+const SYSTEM_SUBJECT = new RegExp(
+  '^(?:the\\s+)?(?:user\'?s?\\s+)?' +
+  '(?:(?:second|first|new|local|other|primary)\\s+)?' +
+  '(?:snh|squatch\\s+neuro\\s+hub|aurelius|sparky)?\\s*' +
+  '(?:system|instance|setup|deployment|assistant|ai|memory\\s+system|brain|engine|model|tool\\s*chain|stack)\\b',
+  'i'
+);
+
+/**
+ * Refuse a fact that describes SNH's own capabilities or deployment.
+ *
+ * @param {string} factText
+ * @returns {{rule: string, detail: string}|null} null to allow
+ */
+function capabilityFactRefusal(factText) {
+  const t = String(factText || '').trim();
+  if (!t) return null;
+  if (!SYSTEM_SUBJECT.test(t)) return null;
+
+  return {
+    rule: 'capability-manifest-owns-this',
+    detail: 'describes the assistant\'s own capabilities or deployment, which the ' +
+      'capability manifest records from config and this store cannot be kept in step with'
+  };
+}
+
+// ============ 3. COMPOUND DETECTION ============
+
+const PREDICATE_VERBS = /\b(is|are|was|were|has|have|had|owns?|runs?|uses?|prefers?|likes?|enjoys?|works?|builds?|wants?|needs?|plans?|includes?|drives?|lives?)\b/gi;
+
+/**
+ * Does this still look like more than one assertion?
+ *
+ * Two shapes, both from the corpus:
+ *   - a list: "enjoys computers, gaming, cars, and guns"
+ *   - two predicates joined: "User's professional entities include her MSP,
+ *     MettaSphere, and her AI research venture, Coastal Squatch."
+ *
+ * A hit does not split anything by itself — it sends the sentence back to the
+ * model for one re-split call. Mechanically chopping on "and" would happily cut
+ * "User has a dog named Biscuit and Maple" into nonsense.
+ *
+ * @returns {{compound: boolean, why: string|null}}
+ */
+function looksCompound(text) {
+  const t = String(text || '').trim();
+  if (t.length < 25) return { compound: false, why: null };
+
+  // a, b, and c  — three or more list items
+  if (/,[^,]{2,60},\s*(and|or)\s/i.test(t)) {
+    return { compound: true, why: 'reads as a list of three or more items' };
+  }
+
+  const predicates = (t.match(PREDICATE_VERBS) || []).length;
+  if (predicates >= 2 && /\b(and|but|while|whereas|as well as)\b/i.test(t)) {
+    // Relative clauses ("the dog that has ...") are one assertion with two verbs;
+    // require the conjunction to be joining top-level clauses, not a "who/that".
+    if (!/\b(who|which|that)\b/i.test(t)) {
+      return { compound: true, why: 'joins two assertions with a conjunction' };
+    }
+  }
+  return { compound: false, why: null };
+}
+
+// ============ subject attribution sanity ============
+
+/**
+ * The subject a fact claims, read off its grammar. Same idea as
+ * memory-write.verifySubjectAgreement: the passive path had no such check at all,
+ * so a first-person self-observation the model happened to emit went into the
+ * user's corpus wearing no pronoun.
+ *
+ * @returns {'user'|'self'|null} null = unanchored, which is itself a failure
+ */
+function grammaticalSubject(text) {
+  const t = String(text || '').trim();
+  if (/^(the\s+)?(user|ellie)\b/i.test(t)) return 'user';
+  if (/^(i|my|i'm|i am|i've|i'd|i'll)\b/i.test(t)) return 'self';
+  return null;
+}
+
+// ============ 5. SUBJECT ANNOTATION ============
+
+/**
+ * Strip the parenthetical name the archiver staples onto its subject.
+ *
+ * "User (Ellie) has brown eyes and her favorite color is orange" — the "(Ellie)"
+ * is an ANNOTATION saying who "User" refers to. It is not a claim the sentence is
+ * making, and the corpus already holds her name as a locked identity fact, so
+ * nothing is lost by removing it.
+ *
+ * It has to be removed before a compound is split, and here is the chain that
+ * makes that non-optional. The splitter is told not to lose anything, so it
+ * faithfully renders the parenthetical as its own atom: "User's name is Ellie."
+ * The corrector then sees an atom asserting an identity slot and ABANDONS the
+ * whole split — correctly, because manufacturing a name fact from a parenthetical
+ * is the F1 defect, observed live twice. So the compound stays whole. And a
+ * compound that is still whole when contradiction resolution runs can lose
+ * ENTIRELY over a dispute about one of its clauses: this exact sentence was
+ * retired for "User's favorite color is purple", taking "has brown eyes" with it.
+ *
+ * Deliberately narrow. Only a parenthetical immediately after the subject word,
+ * only where it contains a bare name — "User (Ellie)" and "User (Ellie)'s" —
+ * never a parenthetical carrying substance ("User's system (which runs 24/7)").
+ *
+ * @returns {{text: string, stripped: string|null}}
+ */
+function stripSubjectAnnotation(text) {
+  const t = String(text || '');
+  //                       subject      (  Name  )   optional possessive
+  const re = /^(\s*(?:the\s+)?user)\s*\(\s*([A-Z][\w'-]{1,30})\s*\)(\'s)?/i;
+  const m = t.match(re);
+  if (!m) return { text: t, stripped: null };
+  return { text: t.replace(re, `${m[1]}${m[3] || ''}`), stripped: m[2] };
+}
+
+// ============ 6. HISTORY vs CURRENT STATE ============
+
+/**
+ * Verbs and phrasings that put a sentence in the PAST — something that happened
+ * or was once so, rather than something that is so now.
+ *
+ * Deliberately anchored to the sentence's main verb rather than searching for a
+ * past-tense word anywhere, because "User has a dog that was born in 2019" is a
+ * present-tense fact with a past-tense clause inside it.
+ */
+const PAST_VERBS = 'had|kept|traded|sold|bought|purchased|acquired|owned|used|preferred|liked|wanted|worked|lived|studied|drove|got rid of|was|were';
+const PRESENT_VERBS = 'has|have|owns|drives|prefers|likes|uses|works|lives|runs|is|are|keeps|holds';
+
+/**
+ * A noun phrase between the possessive and the verb: "User's CR-V is…",
+ * "User's gaming system has…". Bounded so it cannot swallow a whole sentence and
+ * match a verb three clauses away.
+ *
+ * The negative lookahead is what stops it eating a PRESENT-tense auxiliary on the
+ * way to a past participle. Without it, "User's CR-V has not had wax applied"
+ * consumed "CR-V has not" as the noun phrase, matched "had", and was filed as
+ * history — a present-perfect statement about the car's current condition, read
+ * as something that used to be true. Seen firing live in a corrector pass.
+ */
+const POSSESSED = "(?:(?!\\b(?:has|have|is|are|was|were|does|do|did|not)\\b)[\\w''-]+\\s+){0,3}";
+
+const HISTORICAL_MARKERS = [
+  new RegExp(`^(the\\s+)?user\\s+(${PAST_VERBS})\\b`, 'i'),
+  // "User's Frontier was totalled", "User's old truck had 200k miles"
+  new RegExp(`^(the\\s+)?user'?s\\s+${POSSESSED}(${PAST_VERBS})\\b`, 'i'),
+  /^(the\s+)?user\s+has\s+(previously|formerly|since)\b/i,
+  /\bused to\b/i,
+  /\bno longer\b/i,
+  /\b(before|prior to|until)\s+(trading|selling|moving|leaving|switching)\b/i
+];
+
+/**
+ * Present-tense possession, state or preference — what is so NOW.
+ *
+ * The possessed-noun form is not optional garnish. Without it the rule missed
+ * "User's CR-V is brand new" and "User's Frontier is brand new", and on the very
+ * next corrector pass "User had to get rid of the CR-V and the Ridgeline due to
+ * painful memories associated with a move" was retired for a SECOND time — the
+ * rule had exempted it against "User has a CR-V" and "User owns a CR-V Sport"
+ * and then let the same pairing through in a different grammatical dress.
+ */
+const CURRENT_STATE_MARKERS = [
+  new RegExp(`^(the\\s+)?user\\s+(${PRESENT_VERBS})\\b`, 'i'),
+  new RegExp(`^(the\\s+)?user'?s\\s+${POSSESSED}(${PRESENT_VERBS})\\b`, 'i'),
+  /^(the\s+)?user\s+is\s+(a|an|the)?\s*\w+/i
+];
+
+/**
+ * Is this sentence about what WAS, rather than what IS?
+ * @returns {{historical: boolean, marker: string|null}}
+ */
+function isHistorical(text) {
+  const t = String(text || '');
+  for (const re of HISTORICAL_MARKERS) {
+    const m = t.match(re);
+    if (m) return { historical: true, marker: m[0].trim() };
+  }
+  return { historical: false, marker: null };
+}
+
+/** Is this sentence about what is so now? */
+function isCurrentState(text) {
+  const t = String(text || '');
+  if (isHistorical(t).historical) return false;   // past wins — "used to have" is not "has"
+  return CURRENT_STATE_MARKERS.some(re => re.test(t));
+}
+
+/**
+ * HISTORY IS NOT A CONTRADICTION.
+ *
+ * A past-tense sentence and a present-tense one about the same subject matter do
+ * not compete: they are two true statements about two different times, and both
+ * belong in the corpus. "User had to get rid of the CR-V and the Ridgeline due to
+ * painful memories associated with a move" and "User has a CR-V" are both true —
+ * different vehicles, years apart — and one does not retire the other.
+ *
+ * The corrector proved the point on 2026-08-06, on the merged staging corpus.
+ * Three of its five supersessions were this shape:
+ *
+ *   retired "User kept the Pilot Elite for six months before trading it
+ *            for a 2023 CR-V Hybrid."          for  "User owns a CR-V Sport"
+ *   retired "User had to get rid of the CR-V and the Ridgeline due to painful
+ *            memories associated with a move."  for  "User has a CR-V"
+ *   retired "User preferred AMD"               for  "User prefers their MacBook"
+ *
+ * Nothing malfunctioned. The contradiction judge answered YES, evidence dominance
+ * preferred the newer and better-evidenced sentence, and both did exactly what
+ * they are written to do — on a pair they should never have been handed. The
+ * second one is the one that matters: it took the reason a car went with it, and
+ * that reason was a death.
+ *
+ * So the pair is excluded at ENUMERATION, before any judge sees it. That is where
+ * it belongs: the corrector's design is deterministic enumeration and model
+ * judgement, and "these two are not candidates" is an enumeration question.
+ *
+ * ONE-SIDED ON PURPOSE. Two past-tense facts CAN contradict ("User owned a Frontier
+ * in 2019" / "User never owned a Frontier"), and so can two present-tense ones.
+ * Only the mixed pair is exempt.
+ *
+ * @returns {{exempt: boolean, reason: string|null}}
+ */
+function historyCoexists(a, b) {
+  const aPast = isHistorical(a);
+  const bPast = isHistorical(b);
+  if (aPast.historical === bPast.historical) return { exempt: false, reason: null };
+
+  const past = aPast.historical ? a : b;
+  const present = aPast.historical ? b : a;
+  if (!isCurrentState(present)) return { exempt: false, reason: null };
+
+  return {
+    exempt: true,
+    reason: `one is about what was ("${(aPast.marker || bPast.marker)}") and the other about what is — history and current state coexist, so they are not a contradiction`
+  };
+}
+
+
+// ============ 8. ENTITY MENTIONS — the creation rule, as rules ============
+
+/**
+ * WHICH THINGS GET AN ENTITY OF THEIR OWN.
+ *
+ * The rule Ellie and Athena settled on: a thing gets its own entity when it is
+ * a SUBJECT IN ITS OWN RIGHT — something that accumulates facts of its own.
+ * Clients, client contacts, household members, her pets, specific devices. An
+ * ATTRIBUTE of a subject does not: "Bob's house" is a fact about Bob.
+ *
+ * That is easy to say and hard to encode, and the shape of the difficulty is
+ * worth writing down because the first two attempts were both wrong.
+ *
+ * ATTEMPT 1 — "a proper noun is an entity." Over-creates wildly. Every message
+ * carries capitalised things that are not subjects: Monday, Oregon, Lincoln
+ * City, Shift4, the first word of every sentence. Registering those buries the
+ * twenty real clients in noise, and asking about them is worse than silence.
+ *
+ * ATTEMPT 2 — "a proper noun that is not on a stoplist." A stoplist is an
+ * enumeration of an open set. It fails on the first unlisted city.
+ *
+ * WHAT ACTUALLY WORKS is to require a SUBJECT CUE — a construction in the
+ * sentence that shows the thing is being treated as a subject rather than as a
+ * property of one. And the useful accident is that THE CUE THAT PROVES IT IS A
+ * SUBJECT ALSO SAYS WHAT KIND IT IS: "my dog Maple" proves Maple is a subject and
+ * says she is an animal; "our client Newport Dental" does both for an
+ * organization. Type inference and subject detection are the same read.
+ *
+ * A mention with no cue is not refused, it is simply NOT A CANDIDATE — nothing
+ * is created and nothing is asked. Silence is the right default for "Monday".
+ *
+ * WHAT THIS DELIBERATELY CANNOT DO. It cannot see that a house which has
+ * started accumulating its own facts should be promoted to a subject. That is
+ * promotion, and by design promotion is something the entity ASKS about rather
+ * than decides — there is no rule here that will ever fire for it.
+ */
+
+/** The starting type set. Extensible: `type` is a free string in the schema, so
+ *  a new kind needs a cue row here and no migration. */
+const ENTITY_TYPE_CUES = {
+  organization: ['client', 'clients', 'customer', 'company', 'business', 'org', 'organisation', 'organization',
+    'clinic', 'inn', 'hotel', 'restaurant', 'practice', 'firm', 'agency', 'vendor', 'supplier',
+    'shop', 'store', 'school', 'church', 'nonprofit', 'msp', 'account'],
+  person: ['contact', 'manager', 'owner', 'director', 'receptionist', 'technician', 'tech', 'admin',
+    'friend', 'neighbor', 'neighbour', 'sister', 'brother', 'mother', 'father', 'mom', 'dad',
+    'son', 'daughter', 'husband', 'wife', 'partner', 'colleague', 'coworker', 'boss', 'employee',
+    'vet', 'doctor', 'nurse', 'guy', 'lady', 'woman', 'man'],
+  animal: ['dog', 'dogs', 'cat', 'cats', 'puppy', 'kitten', 'pet', 'pets', 'horse', 'bird', 'rabbit',
+    'goat', 'chicken', 'ferret', 'snake', 'lizard', 'fish'],
+  device: ['router', 'switch', 'firewall', 'ap', 'access point', 'server', 'nas', 'printer', 'camera',
+    'laptop', 'desktop', 'workstation', 'phone', 'tablet', 'box', 'appliance', 'ups', 'modem'],
+  // Software her clients run. Deliberately WITHOUT 'system' and 'server' —
+  // both already mean a device here, and a word that means two types resolves
+  // to whichever list is declared first, which is a coin toss dressed as a rule.
+  product: ['software', 'app', 'application', 'platform', 'suite', 'product', 'program',
+    'portal', 'saas', 'pms', 'crm', 'erp', 'package', 'licence', 'license', 'subscription']
+};
+
+/** Verbs and prepositions that say one party USES another. */
+const USAGE_CONNECTIVE = /^(?:,?\s*(?:runs?|running|uses?|using|is\s+on|are\s+on|is\s+running|runs\s+on|host(?:s|ed)?\s+on|sits\s+on)\s*)$/i;
+/** Connectives that say one thing was MADE BY another. */
+const MAKER_CONNECTIVE = /^(?:,?\s*(?:from|by|made\s+by|built\s+by|developed\s+by|written\s+by)\s*)$/i;
+
+/** Words that look like names in a name slot but never denote a subject. */
+const NON_SUBJECT_WORDS = new Set([
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+  'september', 'october', 'november', 'december',
+  'today', 'tomorrow', 'yesterday', 'tonight', 'morning', 'afternoon', 'evening',
+  'user', 'i', 'we', 'you', 'she', 'he', 'they', 'it', 'the', 'a', 'an',
+  'ok', 'okay', 'yes', 'no', 'hi', 'hello', 'thanks', 'thank',
+  // Determiners and pronouns. A sentence opening "My dog Maple…" capitalises
+  // "My", and the type noun right behind it made it an animal called My.
+  'my', 'our', 'his', 'her', 'their', 'its', 'your',
+  'this', 'that', 'these', 'those', 'there', 'here',
+  'im', 'ive', 'id', 'ill', 'and', 'but', 'so', 'if', 'when', 'then', 'also',
+  // Email and message headers. "From me, for your store:" made an organisation
+  // called "From" — the header word was capitalised, sat at the start of a
+  // line, and had a cue word further down the sentence.
+  'from', 'to', 'subject', 're', 'cc', 'bcc', 'date', 'sent', 'fwd', 'fw', 'reply',
+  'at', 'in', 'on', 'for', 'with', 'by', 'of',
+  // Quantifiers, numerals and discourse markers. Sentence-initial capitalisation
+  // says nothing about namehood, so "Both now sit in the store", "Um why would
+  // any of my dogs", "Four paws marching" and "Good morning my friend" each
+  // produced an entity out of the first word of a sentence.
+  //
+  // This IS an enumeration, and it is defensible where the place-name stoplist
+  // was not, because these are CLOSED CLASSES — English does not acquire new
+  // quantifiers or new numerals. A stoplist of cities can always be beaten by
+  // the next city; a stoplist of determiners cannot.
+  'both', 'all', 'each', 'every', 'some', 'any', 'few', 'many', 'most', 'several', 'none',
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'first', 'second', 'third', 'next', 'last', 'another', 'other', 'such',
+  'um', 'uh', 'oh', 'ah', 'well', 'hmm', 'yeah', 'yep', 'nope', 'sure', 'please', 'sorry',
+  'good', 'great', 'nice', 'cool', 'right', 'exactly', 'actually', 'honestly', 'anyway',
+  'maybe', 'perhaps', 'just', 'still', 'even', 'only', 'once', 'again', 'always', 'never',
+  'everything', 'something', 'nothing', 'anything', 'everyone', 'someone', 'nobody', 'anybody',
+  'what', 'why', 'how', 'where', 'who', 'which', 'because', 'since', 'while', 'after', 'before'
+]);
+
+/**
+ * A proper-name shape.
+ *
+ * JOINERS ARE "of / the / de / von / van" AND NOTHING ELSE. The first cut also
+ * allowed "at" and "and", and both join two DIFFERENT subjects into one
+ * imaginary third: "Sarah at Newport Dental" came out as a single name, and
+ * with it went both the person and the organisation.
+ */
+// A POSSESSIVE ENDS THE NAME. It used to be allowed on every token, so
+// "Oracle's Opera" matched as ONE name — the maker and the product fused into
+// a single imaginary organisation, and the relation between them vanished with
+// them. The 's is only legal at the very end now.
+const NAME_RE = /\b([A-Z][A-Za-z0-9&.\-]*(?:\s+(?:of|the|de|von|van)\s+)?(?:\s*[A-Z][A-Za-z0-9&.\-]*)*(?:'s)?)/g;
+
+function typeFromCueWord(word) {
+  const w = String(word || '').toLowerCase();
+  for (const [type, cues] of Object.entries(ENTITY_TYPE_CUES)) {
+    if (cues.includes(w)) return type;
+  }
+  return null;
+}
+
+/**
+ * Words before the name, for reading its type out of "my dog Maple".
+ *
+ * Stops at the previous capitalised name, so a cue can never be read across a
+ * different subject — and ALSO at punctuation, for the same reason the
+ * after-scan does. "Sam, your mom, your dad, Athena" is a LIST: reading back
+ * across the comma took "dad" as Athena's type. A cue only describes the name
+ * it is actually attached to.
+ */
+function cueWordsBefore(before) {
+  const cut = before
+    .replace(/^[\s\S]*[A-Z][A-Za-z0-9'&.\-]*/, '')
+    .split(/[,;:—\n]/).pop()
+    // …and at a CONNECTIVE, which separates two noun phrases exactly as a
+    // comma does. "The clinic is on Vetline Cloud" read back over "is on" and
+    // typed the SOFTWARE as a clinic — the cue belonged to the subject on the
+    // other side of the verb.
+    .split(/\b(?:is on|are on|runs on|sits on|hosted on|runs|running|uses|using|use|from|by|made by|built by)\b/i).pop();
+  return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(-3);
+}
+
+/**
+ * Words after the name, for reading its type out of "X is my contact".
+ *
+ * THREE STOPS, and each one is a bug that got through without it:
+ *
+ *  - The next CAPITALISED name. "Sarah ... at Newport Dental Clinic" must not
+ *    make Sarah a clinic.
+ *  - PUNCTUATION. "From me, for your store:" reached across a comma and a
+ *    preposition to "store" and made an organisation out of an email header.
+ *  - A POSSESSIVE. "Juno's store" describes the STORE, not Juno — reading past
+ *    the apostrophe turned a person into an organisation. A possessive is the
+ *    one construction where the following noun is guaranteed NOT to be the
+ *    type of the name in front of it, which is the mirror image of why the
+ *    possessive makes a good subject cue for the possessor.
+ */
+function cueWordsAfter(after) {
+  if (/^\s*'s\b/i.test(after)) return [];
+  const cut = after.split(/[A-Z]/)[0].split(/[,;:—\n]/)[0];
+  return cut.toLowerCase().split(/[^a-z]+/).filter(Boolean).slice(0, 6);
+}
+
+/**
+ * Candidate entity mentions in a piece of text.
+ *
+ * @returns {Array<{name, type|null, cue, cueKind, possessive, index}>}
+ *   type is null when a cue proved it is a subject without saying what kind
+ *   (a relational verb: "Newport called"). The caller may then ask.
+ */
+function entityMentions(text) {
+  const src = String(text || '');
+  if (!src.trim()) return [];
+  const out = [];
+  const seen = new Set();
+
+  // SEGMENT FIRST. A name may not span a sentence boundary. Without this,
+  // "…a new client, Newport Dental Clinic. My dog Maple…" matched as the single
+  // name "Newport Dental Clinic. My", because a full stop is a legal character
+  // inside an abbreviation and the matcher happily walked through it into the
+  // next sentence. One imaginary entity, and the two real ones lost with it.
+  const segments = [];
+  {
+    const re = /[^.!?\n]+[.!?]*/g;
+    let seg;
+    while ((seg = re.exec(src)) !== null) {
+      if (seg[0].trim()) segments.push({ text: seg[0], offset: seg.index });
+    }
+  }
+
+  for (const segment of segments) {
+  const src2 = segment.text;
+  let m;
+  NAME_RE.lastIndex = 0;
+  while ((m = NAME_RE.exec(src2)) !== null) {
+    let raw = m[1].trim().replace(/[.,;:!?]+$/, '');
+    if (!raw) continue;
+
+    // POSSESSIVE. "Bob's house" — the name is Bob and the 's is the cue that
+    // makes him a subject. Absorbing it into the name loses both.
+    let possessive = false;
+    if (/'s$/i.test(raw)) { raw = raw.replace(/'s$/i, ''); possessive = true; }
+    if (!raw) continue;
+
+    const key = raw.toLowerCase();
+    if (seen.has(key)) continue;
+    if (NON_SUBJECT_WORDS.has(key)) continue;
+    if (raw.split(/\s+/).every(w => NON_SUBJECT_WORDS.has(w.toLowerCase()))) continue;
+    // A WORD THAT SAYS WHAT KIND OF THING SOMETHING IS CANNOT BE ITS NAME.
+    // "It's an MSP on the Oregon coast" registered an organisation called MSP,
+    // because the same word that proves a subject exists was read as the
+    // subject. A name made ENTIRELY of cue and filler words is a description.
+    // "Newport Dental Clinic" survives — only one of its three words is a cue.
+    if (raw.split(/\s+/).every(w => {
+      const lw = w.toLowerCase().replace(/[^a-z]/g, '');
+      return !lw || typeFromCueWord(lw) || NON_SUBJECT_WORDS.has(lw);
+    })) continue;
+    // No sentence-initial length guard. One was tried and it ate "Bob's house"
+    // — three letters, first word, and the possessive right behind it. The cue
+    // requirement below already drops the capitalised-because-it-starts-a-
+    // sentence case, because those words have no cue.
+
+    const before = src2.slice(Math.max(0, m.index - 80), m.index);
+    const after = src2.slice(m.index + m[1].length, m.index + m[1].length + 60);
+
+    let cue = null, cueKind = null, type = null;
+
+    // CUE A — a type noun INSIDE the name. Checked first, and that order is
+    // load-bearing: "my contact at Newport Dental Clinic" has "contact" sitting
+    // before the organisation, and reading before-first types the clinic as a
+    // person.
+    // The cue may not be the FIRST word of a multi-word name. English puts the
+    // head of a compound name last — "Newport Dental Clinic", "Example City
+    // Animal Clinic" — so a type word in front is a modifier, not the head:
+    // "the 4 Dog Army" (a song lyric) registered an animal called Dog Army.
+    // A head-first name like "Inn at Example Cove" therefore comes out
+    // type-unknown and is ASKED about rather than guessed at, which is the
+    // right trade — it asks once and is registered thereafter.
+    const nameWords = raw.toLowerCase().split(/\s+/);
+    const inName = nameWords.map((w, i) => (i === 0 && nameWords.length > 1 ? null : typeFromCueWord(w))).find(Boolean);
+    if (inName) { type = inName; cue = raw; cueKind = 'type-noun-in-name'; }
+
+    // CUE B — a type noun immediately before: "my dog Maple", "our client X".
+    if (!type) {
+      const tail = cueWordsBefore(before);
+      for (let i = tail.length - 1; i >= 0; i--) {
+        const t = typeFromCueWord(tail[i]);
+        if (t) { type = t; cue = tail[i]; cueKind = 'type-noun-before'; break; }
+      }
+    }
+
+    // CUE P1 — A MAKER FOLLOWS IT. "Opera from Oracle", "Opera by Oracle".
+    // The maker cue is what types the thing as a product: on its own "Opera"
+    // says nothing, and a name that something is FROM is a made thing.
+    if (!type && /^[\s,]*(?:from|by|made by|built by|developed by)\s+[A-Z]/.test(after)) {
+      type = 'product'; cue = 'from/by'; cueKind = 'maker-after';
+    }
+
+    // CUE P2 — A MAKER PRECEDES IT, possessively. "Oracle's Opera". Note this
+    // is the ONE place a possessive types the thing that FOLLOWS it, and it is
+    // safe only because both sides are capitalised: "Juno's store" has a
+    // lowercase head and never reaches here.
+    if (!type && /[A-Z][A-Za-z0-9&.\-]*'s\s+$/.test(before)) {
+      type = 'product'; cue = "maker's"; cueKind = 'maker-possessive';
+    }
+
+    // CUE P3 — SOMETHING RUNS IT. "IEC runs Opera", "the clinic is on Vetline
+    // Pulse". What a business runs is software.
+    if (!type) {
+      const usageBefore = before.match(/(?:\brun|\bruns|\brunning|\buse|\buses|\busing|\bis on|\bare on|\bhosted on|\bsits on)\s+$/i);
+      if (usageBefore) { type = 'product'; cue = usageBefore[0].trim(); cueKind = 'usage-object'; }
+    }
+
+
+    // CUE C — a type noun just after: "Sarah Whitfield is my contact at ...".
+    //
+    // NEVER after a possessive. "Juno's store" describes the store, not Juno,
+    // and reading across the apostrophe typed a person as an organisation. The
+    // guard is the `possessive` flag rather than a look at `after`, because the
+    // 's has already been consumed into the match by the time we get here —
+    // which is exactly why the first version of this guard silently did nothing.
+    if (!type && !possessive) {
+      for (const w of cueWordsAfter(after)) {
+        const t = typeFromCueWord(w);
+        if (t) { type = t; cue = w; cueKind = 'type-noun-after'; break; }
+      }
+    }
+
+    // CUE P4 — IT IS THE MAKER. "Opera from Oracle" — Oracle is a party in its
+    // own right, but the sentence does not say what KIND, so the type is left
+    // open and resolveMentions settles it from the relation: the far side of a
+    // made-by is an organisation. Guessing here would type "an email from
+    // Jordan" as a company.
+    if (!cue && /\b(?:from|by|made by|built by|developed by|written by)\s+$/i.test(before)) {
+      cue = 'maker'; cueKind = 'maker-object';
+    }
+
+    // CUE D — POSSESSOR. Makes the possessor a subject and says nothing at all
+    // about the thing possessed, which is exactly the rule.
+    if (!cue && possessive) { cue = "'s"; cueKind = 'possessor'; }
+
+    // CUE E — treated as a party in its own right.
+    if (!cue) {
+      if (/^\s+(called|emailed|phoned|asked|said|wants|needs|reported|sent|replied)\b/i.test(after)) {
+        cue = after.trim().split(/\s+/)[0]; cueKind = 'relational-verb';
+      } else if (/\b(?:own|owns|owned|run|runs|manage|manages|hired|bought|acquired)\s+$/i.test(before)) {
+        // "I own MettaSphere" — a possession verb makes what follows a party.
+        // Without this the real subject of that sentence was missed entirely
+        // while "From" and "MSP" got through, which is the worst of both.
+        cue = before.trim().split(/\s+/).pop(); cueKind = 'possession-verb';
+      } else if (/\b(?:at|for|with)\s+$/i.test(before) && /\s/.test(raw)) {
+        // Multi-word only: "at IEC" is a party, "at Portland" is probably a place.
+        cue = 'preposition'; cueKind = 'party-preposition';
+      }
+    }
+
+    // NO CUE, NO CANDIDATE. This is the line that keeps Monday and Oregon out,
+    // and it fails SILENT on purpose: nothing created, nothing asked.
+    if (!cue) continue;
+
+    seen.add(key);
+    out.push({ name: raw, type, cue, cueKind, possessive, index: segment.offset + m.index });
+  }
+  }
+  return out;
+}
+
+/**
+ * RELATIONS BETWEEN TWO MENTIONS IN ONE SENTENCE.
+ *
+ * Read from the text BETWEEN two adjacent names, which is the only place a
+ * deterministic reader can find the verb that joins them. Pairs never cross a
+ * sentence boundary, for the same reason a name never does.
+ *
+ * THE PART THAT IS HARDER THAN IT SOUNDS is that the two relations point
+ * opposite ways through the same grammar. "Opera from Oracle" and "IEC runs
+ * Opera" are both <name> <connective> <name>, and in the first the SECOND name
+ * is the parent while in the second the FIRST name is. Getting that backwards
+ * files Oracle as a user of Opera and IEC as its manufacturer, and both read
+ * plausibly in a list. So direction is carried by the connective, never by
+ * position.
+ *
+ * @returns [{ kind: 'made-by'|'uses', from, to, cue }]
+ *   made-by: `from` is the product, `to` is the maker.
+ *   uses:    `from` is the user,    `to` is the thing used.
+ */
+function entityRelations(text, mentions = null) {
+  const src = String(text || '');
+  const ms = (mentions || entityMentions(src)).slice().sort((a, b) => a.index - b.index);
+  const out = [];
+  for (let i = 0; i < ms.length - 1; i++) {
+    const a = ms[i], b = ms[i + 1];
+    const start = a.index + a.name.length;
+    if (b.index <= start) continue;
+    const between = src.slice(start, b.index);
+    if (/[.!?\n]/.test(between)) continue;             // not the same sentence
+    if (between.replace(/[^A-Za-z]/g, '').length > 24) continue;  // too far apart to be joined
+
+    if (MAKER_CONNECTIVE.test(between)) {
+      out.push({ kind: 'made-by', from: a.name, to: b.name, cue: between.trim() });
+      continue;
+    }
+    if (USAGE_CONNECTIVE.test(between)) {
+      out.push({ kind: 'uses', from: a.name, to: b.name, cue: between.trim() });
+      continue;
+    }
+    // "Oracle's Opera" — the possessive sits ON the first name, so all that
+    // stands between them is the 's itself. The maker is the possessor.
+    if (a.possessive && !between.replace(/^\s*'s/i, '').trim()) {
+      out.push({ kind: 'made-by', from: b.name, to: a.name, cue: "'s" });
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this fact ABOUT the given mention, rather than merely mentioning it?
+ *
+ * Deliberately narrow: the mention has to be the grammatical subject — the
+ * fact opens with it, or with its possessive. "Newport Dental uses Shift4" is
+ * about Newport; "User works at IEC" is about the user, and reassigning it to
+ * IEC would be the same misattribution this whole line of work exists to stop.
+ */
+function factIsAbout(factText, mentionName) {
+  const t = String(factText || '').trim();
+  const n = String(mentionName || '').trim();
+  if (!t || !n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^(?:the\\s+)?${esc}(?:'s)?\\b`, 'i').test(t);
+}
+
+module.exports = {
+  eventMarker,
+  identityClassOf,
+  hasIdentityAnchor,
+  identityAnchorRefusal,
+  capabilityFactRefusal,
+  looksCompound,
+  grammaticalSubject,
+  isHistorical,
+  isCurrentState,
+  historyCoexists,
+  stripSubjectAnnotation,
+  entityMentions,
+  entityRelations,
+  factIsAbout,
+  typeFromCueWord,
+  ENTITY_TYPE_CUES,
+  NON_SUBJECT_WORDS,
+  RELATIONSHIP_TERMS,
+  TEMPORAL_MARKERS,
+  INPROGRESS_MARKERS,
+  HISTORICAL_MARKERS
+};

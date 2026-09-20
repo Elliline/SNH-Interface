@@ -1,0 +1,56 @@
+# Environment variables (contains API keys)
+.env
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Runtime server log
+server.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Database files
+/data/
+
+# SQLite databases and their WAL/shared-memory sidecars (never track DB files —
+# db/chat.db was an empty tracked placeholder; the real DB lives under /data/)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Replay staging store and its log — build artefacts, rebuilt by
+# scripts/replay-to-staging.js. Never a system of record.
+data-staging/
+data-staging-*/
+data-staging-replay.log
+
+# Secrets — every variant, but keep the template
+.env.*
+!.env.example
+secrets.json
+.secret-key
+
+# Any data directory, at any depth (live store, LanceDB, config.json, secrets)
+data/
+lancedb/
+*.lance
+
+# Snapshots, backups, logs, scratch output
+snapshots/
+backups/
+logs/
+*.log
+scratchpad/
+scratch/
+
+# Staging-gate reports and carry/quarantine reviews are rendered FROM the live
+# memory store by scripts/*-report.js and scripts/carry-to-staging.js. They
+# quote real facts, so they stay on disk and out of git.
+docs/carry-review.md
+docs/staging-gate*-report.txt
+docs/subject-quarantine.md

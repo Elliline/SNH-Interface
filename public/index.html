@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Squatch Neuro Hub</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Sidebar -->
+  <div id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <button id="sidebar-new-chat-btn" class="sidebar-new-chat-btn">+ New Chat</button>
+      <!-- ONE LIST. Everything SNH wants to say arrives here, either as a new
+           conversation or added to one already open. Archive is the same area,
+           not another place. -->
+      <div class="conversation-scopes">
+        <button id="scopeActive" class="conversation-scope active" data-scope="active">
+          Conversations<span id="sidebarUnreadTotal" class="sidebar-unread-total" style="display: none;">0</span>
+        </button>
+        <button id="scopeArchived" class="conversation-scope" data-scope="archived">Archive</button>
+      </div>
+    </div>
+    <div id="conversation-list" class="conversation-list">
+      <!-- Conversations will be populated here -->
+    </div>
+  </div>
+
+  <!-- Sidebar Toggle Button -->
+  <button id="sidebar-toggle" class="sidebar-toggle">☰</button>
+
+  <!-- Sidebar Overlay for Mobile -->
+  <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+  <div class="main-content">
+  <div class="container">
+    <div class="header">
+      <h1>Squatch Neuro Hub</h1>
+      <div class="controls">
+        <select id="providerSelect" class="provider-select">
+          <option value="">Select a provider</option>
+        </select>
+        <select id="modelSelect" class="model-select">
+          <option value="">Select a model</option>
+        </select>
+        <button id="settingsBtn" class="settings-btn" title="Settings">⚙️</button>
+        <button id="initiativeBtn" class="initiative-btn" title="Things that need you">
+          🔔<span id="initiativeBadge" class="initiative-badge" style="display: none;">0</span>
+        </button>
+        <button id="jobsBtn" class="jobs-btn" title="Background jobs — results, not messages">
+          🤖<span id="jobsBadge" class="jobs-badge" style="display: none;">0</span><span id="jobsRunning" class="jobs-running-count" style="display: none;">0</span>
+        </button>
+        <button id="memoryBtn" class="memory-panel-btn" title="Memory">&#x1F9E0;</button>
+        <button id="newChatBtn" class="new-chat-btn">New Chat</button>
+      </div>
+      <!-- SquatchServe Model Status -->
+      <div id="modelStatusBar" class="model-status-bar" style="display: none;">
+        <span id="modelStatusText" class="model-status-text">No model loaded</span>
+        <button id="unloadModelBtn" class="unload-btn" style="display: none;" title="Unload model to free VRAM">Unload</button>
+      </div>
+    </div>
+
+    <div id="chatContainer" class="chat-container">
+      <div id="messages" class="messages"></div>
+      <div id="typingIndicator" class="typing-indicator" style="display: none;">
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <span id="typingStatus" class="typing-status"></span>
+      </div>
+    </div>
+    
+    <div class="input-area">
+      <textarea id="messageInput" class="message-input" placeholder="Type your message..." rows="1"></textarea>
+      <button id="micBtn" class="mic-btn" title="Hold to talk">🎤</button>
+      <button id="convoModeBtn" class="convo-btn" title="Toggle conversation mode">💬</button>
+      <button id="speakerToggle" class="speaker-btn" title="Toggle voice responses">🔇</button>
+      <button id="superSearchBtn" class="search-btn" title="Toggle Super Search">🔍</button>
+      <button id="sendBtn" class="send-btn">Send</button>
+    </div>
+  </div>
+
+  <!-- Memory Panel (right side slide-out) -->
+  <div id="memoryPanel" class="memory-panel">
+    <div class="memory-panel-header">
+      <h2>Memory</h2>
+      <button id="memoryPanelClose" class="close-btn">&times;</button>
+    </div>
+    <div class="memory-panel-tabs">
+      <button class="memory-tab active" data-tab="facts">Facts</button>
+      <button class="memory-tab" data-tab="clusters">Clusters</button>
+      <button class="memory-tab" data-tab="map">Map</button>
+      <button class="memory-tab" data-tab="daily">Daily Logs</button>
+      <button class="memory-tab" data-tab="self">Self</button>
+      <button class="memory-tab" data-tab="thinking">Thinking</button>
+      <button class="memory-tab" data-tab="activity">Activity</button>
+      <button class="memory-tab" data-tab="search">Search</button>
+    </div>
+    <div class="memory-panel-content">
+      <!-- Facts Tab -->
+      <div id="memoryTabFacts" class="memory-tab-content active">
+        <div class="memory-add-fact">
+          <input type="text" id="memoryAddFactInput" placeholder="Add a fact..." />
+          <button id="memoryAddFactBtn">+</button>
+        </div>
+        <div class="memory-facts-toolbar">
+          <select id="memoryFactsEntity" class="memory-facts-entity-select" title="Show facts about one entity">
+            <option value="all">All entities</option>
+          </select>
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryFactsGroup" /> Group by entity</label>
+        </div>
+        <div id="memoryFactsList" class="memory-facts-list">
+          <div class="memory-loading">Loading facts...</div>
+        </div>
+      </div>
+      <!-- Clusters Tab -->
+      <div id="memoryTabClusters" class="memory-tab-content">
+        <div id="memoryClustersList" class="memory-clusters-list">
+          <div class="memory-loading">Loading clusters...</div>
+        </div>
+      </div>
+      <!-- Map Tab (interactive memory graph) -->
+      <div id="memoryTabMap" class="memory-tab-content">
+        <div class="memory-map-toolbar">
+          <input type="text" id="memoryMapSearch" class="memory-map-search" placeholder="Highlight nodes…" />
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryMapGhosts" checked /> Ghosts</label>
+          <label class="memory-map-toggle"><input type="checkbox" id="memoryMapCollapse" /> Collapse</label>
+          <button id="memoryMapFit" class="memory-map-btn" title="Fit to view">Fit</button>
+        </div>
+        <div class="memory-map-stage">
+          <div id="memoryMapGraph" class="memory-map-graph">
+            <div class="memory-loading">Loading map…</div>
+          </div>
+          <div id="memoryMapDetail" class="memory-map-detail"></div>
+          <div class="memory-map-legend">
+            <span class="lg lg-user">User</span>
+            <span class="lg lg-self">Self</span>
+            <span class="lg lg-ghost">Superseded</span>
+            <span class="lg lg-pending">Pending Q</span>
+            <span class="lg lg-strength">Link&nbsp;strength<span class="lg-strength-bar"></span></span>
+          </div>
+        </div>
+      </div>
+      <!-- Daily Tab -->
+      <div id="memoryTabDaily" class="memory-tab-content">
+        <div id="memoryDailyContent" class="memory-daily-content">
+          <div class="memory-loading">Loading daily logs...</div>
+        </div>
+      </div>
+      <!-- Self Tab (read-only: SNH's self-developed identity) -->
+      <div id="memoryTabSelf" class="memory-tab-content">
+        <div id="memorySelfContent" class="memory-self-content">
+          <div class="memory-loading">Loading self...</div>
+        </div>
+      </div>
+      <!-- Thinking Tab (read-only: reflection + heartbeat traces per cycle) -->
+      <div id="memoryTabThinking" class="memory-tab-content">
+        <div id="memoryThinkingContent" class="memory-thinking-content">
+          <div class="memory-loading">Loading thinking…</div>
+        </div>
+      </div>
+      <!-- Activity Tab (read-only: everything scheduled, plus inert cron proposals) -->
+      <div id="memoryTabActivity" class="memory-tab-content">
+        <div id="memoryActivityContent" class="memory-activity-content">
+          <div class="memory-loading">Loading activity…</div>
+        </div>
+      </div>
+      <!-- Search Tab -->
+      <div id="memoryTabSearch" class="memory-tab-content">
+        <div class="memory-search-bar">
+          <input type="text" id="memorySearchInput" placeholder="Search memory..." />
+          <button id="memorySearchBtn">Search</button>
+        </div>
+        <div id="memorySearchResults" class="memory-search-results"></div>
+      </div>
+    </div>
+  </div>
+  <div id="memoryPanelOverlay" class="memory-panel-overlay"></div>
+
+  <!-- Initiative Panel (things SNH wants to raise, read-only) -->
+  <div id="initiativePanel" class="initiative-panel">
+    <div class="initiative-panel-header">
+      <h2>Notifications</h2>
+      <button id="initiativePanelClose" class="close-btn">&times;</button>
+    </div>
+    <div class="initiative-panel-note">Things that need you: something degraded, something waiting on your decision, a question of SNH's you have not answered, or messages piling up. Its thinking — audits, reflections and housekeeping — lives in the Self tab and the activity log instead.</div>
+    <div class="initiative-view-toggle">
+      <button class="initiative-view-btn active" data-init-view="pending">Pending</button>
+      <button class="initiative-view-btn" data-init-view="history">History</button>
+    </div>
+    <div id="initiativeList" class="initiative-list">
+      <div class="memory-loading">Loading…</div>
+    </div>
+  </div>
+  <div id="initiativePanelOverlay" class="initiative-panel-overlay"></div>
+
+  <!-- Jobs Panel (results of background work — never opens a conversation) -->
+  <!-- Visible while squatch-code is working. Hidden entirely otherwise:
+       "when nothing is running, I see nothing". -->
+  <div id="coderStrip" class="coder-strip" style="display: none;">
+    <span class="coder-strip-dot"></span>
+    <span class="coder-strip-label">squatch-code</span>
+    <span id="coderStripBody" class="coder-strip-body"></span>
+  </div>
+
+  <div id="jobsPanel" class="initiative-panel jobs-panel">
+    <div class="initiative-panel-header">
+      <h2>Background Jobs</h2>
+      <button id="jobsPanelClose" class="close-btn">&times;</button>
+    </div>
+    <div class="initiative-panel-note">
+      Work SNH ran in the background — jobs it started during a conversation, and its scheduled jobs.
+      These are results, not messages: nothing here will start a conversation with you.
+    </div>
+    <div id="jobsActivity" class="jobs-activity" style="display: none;"></div>
+    <div id="jobsList" class="initiative-list">
+      <div class="memory-loading">Loading…</div>
+    </div>
+  </div>
+  <div id="jobsPanelOverlay" class="initiative-panel-overlay"></div>
+
+  <!-- Unified Settings Modal -->
+  <div id="settingsModal" class="modal" style="display: none;">
+    <div class="unified-settings">
+      <div class="unified-settings-header">
+        <h2>Settings</h2>
+        <button id="closeModal" class="close-btn">&times;</button>
+      </div>
+      <div class="unified-settings-body">
+        <nav class="settings-nav">
+          <button class="settings-nav-item active" data-settings-tab="chat">Chat</button>
+          <button class="settings-nav-item" data-settings-tab="brain">Brain</button>
+          <button class="settings-nav-item" data-settings-tab="voice">Voice</button>
+          <button class="settings-nav-item" data-settings-tab="tools">Tools</button>
+          <button class="settings-nav-item" data-settings-tab="about">About</button>
+        </nav>
+        <div class="settings-content">
+          <div id="settingsTabChat" class="settings-tab-content active"></div>
+          <div id="settingsTabBrain" class="settings-tab-content"></div>
+          <div id="settingsTabVoice" class="settings-tab-content"></div>
+          <div id="settingsTabTools" class="settings-tab-content"></div>
+          <div id="settingsTabAbout" class="settings-tab-content"></div>
+        </div>
+      </div>
+      <div class="unified-settings-footer">
+        <div id="settingsStatus" class="config-status"></div>
+        <button id="saveSettings" class="save-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  </div>
+
+    <script src="vendor/cytoscape.min.js"></script>
+    <!-- fcose layout (compound-aware) and its dependency chain: layout-base -> cose-base -> cytoscape-fcose -->
+    <script src="vendor/layout-base.js"></script>
+    <script src="vendor/cose-base.js"></script>
+    <script src="vendor/cytoscape-fcose.js"></script>
+    <script src="markdown.js"></script>
+    <script>document.write('<script src="script.js?v=' + Date.now() + '"><\/script>');</script>
+</body>
+</html>
